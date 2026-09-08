@@ -2,7 +2,7 @@
   "name": "@aesa/db",
   "private": true,
   "type": "module",
-  "exports": { ".": "./src/index.ts", "./raw": "./src/raw.ts" },
+  "exports": { ".": "./src/index.ts", "./raw": "./src/raw.ts", "./testing": "./src/testing.ts" },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
