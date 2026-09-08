@@ -5,7 +5,7 @@ import { platformState } from '../src/index.ts'
 import { createDb, runMigrations } from '../src/raw.ts'
 import { createTestDatabase } from './helpers/test-db.ts'
 
-const EXPECTED_TABLES = ['audit_log', 'org_data_keys', 'org_settings', 'platform_state', 'usage_counters', 'workspaces']
+const EXPECTED_TABLES = ['account', 'audit_log', 'invitation', 'member', 'notification_devices', 'org_data_keys', 'org_settings', 'organization', 'platform_state', 'session', 'usage_counters', 'user', 'verification', 'workspaces']
 
 describe('migrations', () => {
   let t: Awaited<ReturnType<typeof createTestDatabase>>

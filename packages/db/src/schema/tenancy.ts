@@ -2,6 +2,7 @@ import { sql } from 'drizzle-orm'
 import {
   bigint, bigserial, boolean, check, date, index, inet, integer, jsonb, pgTable, primaryKey, text, timestamp, uuid,
 } from 'drizzle-orm/pg-core'
+import { organization } from './auth.ts'
 import { bytea, createdAt, emptyTextArray, orgId, tenantPolicies, updatedAt } from './helpers.ts'
 
 // The check constraints below spell the same literals: drizzle-kit inlines sql`` parameters into DDL only
@@ -10,7 +11,7 @@ export { ONBOARDING_STEPS, TONES } from '@aesa/contracts'
 
 /** One row per organization: business identity, guardrail allowlists, guidance, switches. */
 export const workspaces = pgTable('workspaces', {
-  orgId: uuid('org_id').primaryKey(),               // FK to Better Auth's organization.id lands in Phase 1
+  orgId: uuid('org_id').primaryKey().references(() => organization.id),   // Better Auth organization; deletion is disabled in the plugin
   businessName: text('business_name').notNull(),
   websiteUrl: text('website_url'),
   description: text('description'),

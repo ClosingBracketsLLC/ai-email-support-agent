@@ -1,4 +1,6 @@
 export * from './roles.ts'
 export * from './helpers.ts'
 export * from './tenancy.ts'
+export * from './auth.ts'
+export * from './notifications.ts'
 export * from './platform.ts'
