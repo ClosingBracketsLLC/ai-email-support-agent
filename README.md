@@ -13,3 +13,7 @@ Requires Node >= 22, pnpm 10, Docker.
 
 Layout: `apps/api` (Fastify), `apps/worker` (pg-boss), `packages/{db,crypto,core,queue}`.
 Design spec: `docs/superpowers/specs/2026-09-07-ai-email-support-agent-design.md`.
+
+## Dependency pins
+
+- `libsodium-wrappers` is pinned to exactly `0.7.15` in `packages/crypto`: `0.7.16` ships a broken ESM build (its entry references a missing sibling file), which fails `import` resolution under Node ESM and vitest. Re-test the sealed-box suite (`pnpm --filter @aesa/crypto test -- sealed`) before lifting the pin.
