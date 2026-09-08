@@ -22,6 +22,7 @@
   "dependencies": {
     "@aesa/contracts": "workspace:*",
     "@better-auth/expo": "1.7.3",
+    "@expo/vector-icons": "^15.1.1",
     "@tanstack/react-query": "^5.102.0",
     "@trpc/client": "11.18.0",
     "@trpc/server": "11.18.0",

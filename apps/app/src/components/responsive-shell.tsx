@@ -1,0 +1,61 @@
+import Ionicons from '@expo/vector-icons/Ionicons'
+import { Link, usePathname } from 'expo-router'
+import { Tabs } from 'expo-router/js-tabs'
+import { Pressable, StyleSheet, Text, View, useWindowDimensions } from 'react-native'
+import { WIDE_BREAKPOINT, radius, spacing, typeScale, useColors } from '@/theme'
+
+type Glyph = keyof typeof Ionicons.glyphMap
+const TABS: { name: 'inbox' | 'activity' | 'settings'; title: string; icon: Glyph; iconActive: Glyph; href: '/inbox' | '/activity' | '/settings' }[] = [
+  { name: 'inbox', title: 'Inbox', icon: 'mail-outline', iconActive: 'mail', href: '/inbox' },
+  { name: 'activity', title: 'Activity', icon: 'pulse-outline', iconActive: 'pulse', href: '/activity' },
+  { name: 'settings', title: 'Settings', icon: 'settings-outline', iconActive: 'settings', href: '/settings' },
+]
+
+/**
+ * One navigator, two compositions (spec, UX: native vs web): bottom tabs on phones, a sidebar with the tab bar
+ * hidden on tablets-landscape and desktop. Must be rendered by app/(app)/_layout.tsx because it owns the <Tabs>.
+ */
+export function ResponsiveShell() {
+  const c = useColors()
+  const { width } = useWindowDimensions()
+  const wide = width >= WIDE_BREAKPOINT
+  const pathname = usePathname()
+
+  const tabs = (
+    <Tabs screenOptions={{ headerShown: false, tabBarActiveTintColor: c.primary, tabBarInactiveTintColor: c.muted, tabBarStyle: wide ? { display: 'none' } : { backgroundColor: c.bg, borderTopColor: c.border } }}>
+      {TABS.map((t) => (
+        <Tabs.Screen key={t.name} name={t.name} options={{ title: t.title, tabBarButtonTestID: `tab-${t.name}`, tabBarIcon: ({ color, focused }) => <Ionicons name={focused ? t.iconActive : t.icon} size={22} color={color} /> }} />
+      ))}
+    </Tabs>
+  )
+  if (!wide) return tabs
+
+  return (
+    <View style={[styles.row, { backgroundColor: c.bg }]}>
+      <View style={[styles.sidebar, { borderRightColor: c.border, backgroundColor: c.surface }]} accessibilityRole="menu">
+        <Text style={[typeScale.heading, styles.brand, { color: c.text }]}>aesa</Text>
+        {TABS.map((t) => {
+          const active = pathname === t.href || pathname.startsWith(`${t.href}/`)
+          return (
+            <Link key={t.name} href={t.href} asChild>
+              {/* asChild hands onPress to the child, so it must be pressable — a View would swallow the navigation */}
+              <Pressable accessibilityRole="menuitem" testID={`nav-${t.name}`} style={[styles.item, active && { backgroundColor: c.info }]}>
+                <Ionicons name={active ? t.iconActive : t.icon} size={20} color={active ? c.primary : c.muted} />
+                <Text style={[typeScale.body, { color: active ? c.primary : c.text }]}>{t.title}</Text>
+              </Pressable>
+            </Link>
+          )
+        })}
+      </View>
+      <View style={styles.main}>{tabs}</View>
+    </View>
+  )
+}
+
+const styles = StyleSheet.create({
+  row: { flex: 1, flexDirection: 'row' },
+  sidebar: { width: 240, borderRightWidth: StyleSheet.hairlineWidth, padding: spacing.md, gap: spacing.xs },
+  brand: { paddingVertical: spacing.md, paddingHorizontal: spacing.sm },
+  item: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, paddingVertical: spacing.sm, paddingHorizontal: spacing.sm, borderRadius: radius.md },
+  main: { flex: 1 },
+})
