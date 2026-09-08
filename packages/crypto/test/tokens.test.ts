@@ -15,7 +15,8 @@ describe('tokens', () => {
   it('compares hashes in constant time and rejects length mismatches', () => {
     const { hash } = generateToken('session')
     expect(hashesEqual(hash, hash)).toBe(true)
-    expect(hashesEqual(hash, hash.slice(0, 63) + '0')).toBe(false)
+    const flipped = hash.slice(0, 63) + (hash.endsWith('0') ? '1' : '0')
+    expect(hashesEqual(hash, flipped)).toBe(false)
     expect(hashesEqual(hash, 'short')).toBe(false)
   })
 })
