@@ -1,2 +1,4 @@
 export * from './pg-boss.ts'
 export * from './fair-select.ts'
+export * from './define-job.ts'
+export * from './enqueue.ts'
