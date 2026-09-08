@@ -317,15 +317,15 @@ describe('migrations', () => {
     await expect(runMigrations(t.url)).resolves.not.toThrow()
   })
 
+  // platform_state (not a tenant table) so this test keeps passing after Task 3 forces RLS on tenant tables.
   it('bumps updated_at through $onUpdate', async () => {
     const { db, pool } = createDb(t.url, { role: 'owner' })
     try {
-      const orgId = crypto.randomUUID()
-      await db.insert(workspaces).values({ orgId, businessName: 'Acme', timezone: 'UTC' })
-      const [before] = await db.select().from(workspaces).where(eq(workspaces.orgId, orgId))
+      await db.insert(platformState).values({ key: 'onupdate-test', value: { n: 1 } })
+      const [before] = await db.select().from(platformState).where(eq(platformState.key, 'onupdate-test'))
       await new Promise((r) => setTimeout(r, 20))
-      await db.update(workspaces).set({ businessName: 'Acme Inc' }).where(eq(workspaces.orgId, orgId))
-      const [after] = await db.select().from(workspaces).where(eq(workspaces.orgId, orgId))
+      await db.update(platformState).set({ value: { n: 2 } }).where(eq(platformState.key, 'onupdate-test'))
+      const [after] = await db.select().from(platformState).where(eq(platformState.key, 'onupdate-test'))
       expect(after!.updatedAt.getTime()).toBeGreaterThan(before!.updatedAt.getTime())
     } finally {
       await pool.end()
@@ -333,6 +333,7 @@ describe('migrations', () => {
   })
 })
 ```
+(import `platformState` instead of `workspaces` from `../src/index.ts`.)
 
 - [ ] **Step 2: Run it to verify it fails**
 
