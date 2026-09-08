@@ -51,4 +51,16 @@ describe('row-level security', () => {
     const second = await createTestDatabase()
     await second.drop()
   })
+
+  it('aesa_owner does not inherit the runtime roles (membership is for SET ROLE only)', async () => {
+    const res = await c.query(
+      `SELECT r.rolname, m.inherit_option FROM pg_auth_members m
+       JOIN pg_roles r ON r.oid = m.roleid JOIN pg_roles o ON o.oid = m.member
+       WHERE o.rolname = 'aesa_owner' AND r.rolname IN ('aesa_app','aesa_platform') ORDER BY 1`,
+    )
+    expect(res.rows).toEqual([
+      { rolname: 'aesa_app', inherit_option: false },
+      { rolname: 'aesa_platform', inherit_option: false },
+    ])
+  })
 })
