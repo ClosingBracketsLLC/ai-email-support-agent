@@ -37,7 +37,7 @@ describe('defineJob / enqueue', () => {
             resolve()
           },
         })
-        registerJob(boss, def).then(() => enqueue(boss, def, { orgId: crypto.randomUUID() }, { entityId: 'e' }))
+        registerJob(boss, def, { pollingIntervalSeconds: 0.5 }).then(() => enqueue(boss, def, { orgId: crypto.randomUUID() }, { entityId: 'e' }))
       })
       await done
       expect(observed).toEqual({ aborted: true })       // aborted after ~1 s, well before the 5 s fallback

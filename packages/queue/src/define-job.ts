@@ -29,12 +29,20 @@ export function defineJob<T extends { orgId: string }>(def: JobDefinition<T>): J
   return def
 }
 
+export interface RegisterJobOptions {
+  batchSize?: number
+  /** Defaults to pg-boss's polling interval; tests pass a small value to keep signal-deadline checks fast. */
+  pollingIntervalSeconds?: number
+}
+
 /** Creates/updates the queue with the definition's options and registers a worker that validates, times and aborts. */
-export async function registerJob<T extends { orgId: string }>(boss: PgBoss, def: JobDefinition<T>, opts: { batchSize?: number } = {}): Promise<void> {
+export async function registerJob<T extends { orgId: string }>(boss: PgBoss, def: JobDefinition<T>, opts: RegisterJobOptions = {}): Promise<void> {
   const { policy = 'standard', ...queueOpts } = def.queue
   await createQueueRetrying(boss, def.name, { name: def.name, policy, ...queueOpts })
   await boss.updateQueue(def.name, { name: def.name, policy, ...queueOpts })   // createQueue is a no-op on an existing queue
-  await boss.work<T>(def.name, { batchSize: opts.batchSize ?? 1, includeMetadata: true, pollingIntervalSeconds: 0.5 }, async (jobs) => {
+  const workOptions: PgBoss.WorkOptions & { includeMetadata: true } = { batchSize: opts.batchSize ?? 1, includeMetadata: true }
+  if (opts.pollingIntervalSeconds !== undefined) workOptions.pollingIntervalSeconds = opts.pollingIntervalSeconds
+  await boss.work<T>(def.name, workOptions, async (jobs) => {
     for (const job of jobs) {
       const data = def.schema.parse(job.data)                                    // invalid payload → job fails loudly
       const controller = new AbortController()
