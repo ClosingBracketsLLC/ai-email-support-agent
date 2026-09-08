@@ -30,6 +30,11 @@ export function defineJob<T extends { orgId: string }>(def: JobDefinition<T>): J
 }
 
 export interface RegisterJobOptions {
+  /**
+   * Jobs per worker invocation (default 1). NOTE: pg-boss completes or fails a batch as a unit — a throw
+   * from any job (payload validation or the handler) fails every job in the batch, including siblings that
+   * already ran. Use the default of 1 for handlers with side effects; raise it only for idempotent work.
+   */
   batchSize?: number
   /** Defaults to pg-boss's polling interval; tests pass a small value to keep signal-deadline checks fast. */
   pollingIntervalSeconds?: number
@@ -43,6 +48,9 @@ export async function registerJob<T extends { orgId: string }>(boss: PgBoss, def
   const workOptions: PgBoss.WorkOptions & { includeMetadata: true } = { batchSize: opts.batchSize ?? 1, includeMetadata: true }
   if (opts.pollingIntervalSeconds !== undefined) workOptions.pollingIntervalSeconds = opts.pollingIntervalSeconds
   await boss.work<T>(def.name, workOptions, async (jobs) => {
+    // pg-boss invokes this callback once per batch inside a single try/catch: a throw from any job here
+    // (schema validation or the handler) fails every job in the batch, including siblings that already
+    // completed. There is no per-job isolation without manual complete/fail bookkeeping — see batchSize doc.
     for (const job of jobs) {
       const data = def.schema.parse(job.data)                                    // invalid payload → job fails loudly
       const controller = new AbortController()

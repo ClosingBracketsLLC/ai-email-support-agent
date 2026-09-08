@@ -11,6 +11,11 @@ describe('defineJob / enqueue', () => {
       .toThrow(/orgId/)
   })
 
+  it('refuses expireInSeconds at or below the signal margin', () => {
+    expect(() => defineJob({ name: 'x', schema: z.object({ orgId: z.uuid() }), queue: { expireInSeconds: 30 }, handler: async () => {} }))
+      .toThrow(/expireInSeconds/)
+  })
+
   it('enqueue validates the payload and sets the org-scoped singletonKey', async () => {
     const def = defineJob({ name: 'test.enq', schema: z.object({ orgId: z.uuid(), ticketId: z.string() }), queue: { expireInSeconds: 60 }, handler: async () => {} })
     const boss = { send: vi.fn().mockResolvedValue('job-1') } as unknown as PgBoss
@@ -40,8 +45,12 @@ describe('defineJob / enqueue', () => {
         registerJob(boss, def, { pollingIntervalSeconds: 0.5 }).then(() => enqueue(boss, def, { orgId: crypto.randomUUID() }, { entityId: 'e' }))
       })
       await done
-      expect(observed).toEqual({ aborted: true })       // aborted after ~1 s, well before the 5 s fallback
-      await deleteAllJobs(name); await boss.deleteQueue(name)
+      try {
+        expect(observed).toEqual({ aborted: true })       // aborted after ~1 s, well before the 5 s fallback
+      } finally {
+        await deleteAllJobs(name)
+        await boss.deleteQueue(name)
+      }
     }, 15_000)
   })
 })
