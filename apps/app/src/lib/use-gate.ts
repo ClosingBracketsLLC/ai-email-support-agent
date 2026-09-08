@@ -32,19 +32,24 @@ export function useGate(): GateTarget {
       : { onboardingStep: workspace.data.onboardingStep },
   })
 
-  // Guards against a retry storm: on failure activating.current is left set to the org id, so the effect below
-  // will not fire again for the same target until retryActivate() explicitly clears it.
+  // Guards against a retry storm: activating.current is left set to the org id for the whole chain — including
+  // the intermediate re-render authClient.useSession()'s refetch() produces while it is still in flight, still
+  // carrying the OLD activeOrganizationId — so the effect below only re-fires for the same target once
+  // retryActivate() explicitly clears it. Resetting it as soon as setActive() resolves (rather than after the
+  // full chain settles) would let that intermediate render's still-'activate' target pass the guard again.
   const activating = useRef<string | null>(null)
-  const [activateError, setActivateError] = useState<string | null>(null)
+  const [activateError, setActivateError] = useState<{ orgId: string; message: string } | null>(null)
   const [activateAttempt, setActivateAttempt] = useState(0)
 
   useEffect(() => {
     if (target.kind !== 'activate' || activating.current === target.orgId) return
-    activating.current = target.orgId
-    authClient.organization.setActive({ organizationId: target.orgId })
-      .then(() => { activating.current = null; return refetch() })
+    const orgId = target.orgId
+    activating.current = orgId
+    authClient.organization.setActive({ organizationId: orgId })
+      .then(() => refetch())
       .then(() => queryClient.invalidateQueries())
-      .catch(() => setActivateError('Could not open your workspace.'))
+      .then(() => { activating.current = null; setActivateError(null) })
+      .catch(() => setActivateError({ orgId, message: 'Could not open your workspace.' }))
     // activateAttempt is bumped by retryActivate() purely to re-run this effect for one more attempt.
   }, [target, refetch, queryClient, activateAttempt])
 
@@ -55,7 +60,9 @@ export function useGate(): GateTarget {
   }
 
   if (sessionError) return { kind: 'error', message: 'Could not load your session.', retry: () => void refetch() }
-  if (activateError) return { kind: 'error', message: activateError, retry: retryActivate }
+  if (activateError && target.kind === 'activate' && target.orgId === activateError.orgId) {
+    return { kind: 'error', message: activateError.message, retry: retryActivate }
+  }
   if (workspace.error && classifyWorkspaceError(workspace.error) === 'error') {
     return { kind: 'error', message: 'Could not load your workspace.', retry: () => void workspace.refetch() }
   }

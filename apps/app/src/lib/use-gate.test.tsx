@@ -49,6 +49,13 @@ function asError(target: GateTarget) {
   return target
 }
 
+/** A promise this test resolves by hand, to pin down exactly when each step of an async chain proceeds. */
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((res) => { resolve = res })
+  return { promise, resolve }
+}
+
 beforeEach(() => {
   mockSetActive.mockReset()
   mockUseSession.mockReset()
@@ -78,6 +85,53 @@ describe('useGate — activating the first membership', () => {
 
     await act(() => { asError(result.current).retry() })
     await waitFor(() => expect(mockSetActive).toHaveBeenCalledTimes(2))
+  })
+
+  it('a successful activation keeps the guard set through the session refetch race, so setActive fires only once', async () => {
+    const staleSession = { session: { activeOrganizationId: null } }
+    const settledSession = { session: { activeOrganizationId: 'o1' } }
+
+    const setActiveGate = deferred<void>()
+    mockSetActive.mockReturnValue(setActiveGate.promise)
+
+    const refetchGate = deferred<void>()
+    const refetch = jest.fn(() => refetchGate.promise)
+
+    mockUseSession.mockReturnValue({ data: staleSession, isPending: false, error: null, refetch })
+    mockUseListOrganizations.mockReturnValue({ data: [{ id: 'o1' }], isPending: false })
+
+    const { result, rerender } = await setupGate()
+
+    await waitFor(() => expect(result.current.kind).toBe('activate'))
+    expect(mockSetActive).toHaveBeenCalledTimes(1)
+
+    // setActive is still pending: re-rendering must not fire a second attempt.
+    await rerender(undefined)
+    await rerender(undefined)
+    expect(mockSetActive).toHaveBeenCalledTimes(1)
+
+    // setActive resolves. better-auth's session atom now reports `isRefetching: true` with the OLD, stale
+    // activeOrganizationId while the network refetch is still in flight — reproduce that exact window: the
+    // mocked session hasn't changed yet, but a re-render happens anyway.
+    await act(async () => {
+      setActiveGate.resolve()
+      await Promise.resolve()
+    })
+    await rerender(undefined)
+    expect(result.current.kind).toBe('activate')
+    expect(mockSetActive).toHaveBeenCalledTimes(1)
+
+    // The refetch settles: the session now carries the new org, whose workspace is already onboarded.
+    mockUseSession.mockReturnValue({ data: settledSession, isPending: false, error: null, refetch })
+    mockWorkspaceQueryFn = () => Promise.resolve({ onboardingStep: 'done' })
+    await act(async () => {
+      refetchGate.resolve()
+      await Promise.resolve()
+    })
+    await rerender(undefined)
+
+    await waitFor(() => expect(result.current.kind).not.toBe('activate'))
+    expect(mockSetActive).toHaveBeenCalledTimes(1)
   })
 })
 
