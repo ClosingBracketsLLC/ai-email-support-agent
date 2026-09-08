@@ -11,7 +11,8 @@ for (const [addr, prefix] of [
 // Node v22.23.2) — it would make isBlockedAddress reject all of IPv4. v4-mapped
 // addresses (e.g. '::ffff:127.0.0.1') are instead handled explicitly below by
 // extracting the v4 form and recursing, so this subnet is unnecessary for that purpose.
-for (const [addr, prefix] of [['::', 128], ['::1', 128], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8]] as const)
+// 64:ff9b::/96 (NAT64) and 2002::/16 (6to4) embed an IPv4 address a translator would reach for us.
+for (const [addr, prefix] of [['::', 128], ['::1', 128], ['64:ff9b::', 96], ['2002::', 16], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8]] as const)
   blocked.addSubnet(addr, prefix, 'ipv6')
 
 /** True for loopback, private, link-local (incl. cloud metadata), CGNAT, multicast, reserved and v4-mapped addresses. */
