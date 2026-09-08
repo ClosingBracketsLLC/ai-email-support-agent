@@ -6,13 +6,13 @@ export class IllegalTransitionError extends Error {
 }
 
 /** Pure legal-transition matrix (ported from doge-buddy's proposals/transitions.ts). Guarded UPDATEs live in each repository. */
-export function defineTransitions<S extends string>(matrix: Record<string, readonly string[]> & Record<S, readonly S[]>) {
+export function defineTransitions<S extends string>(matrix: Record<S, readonly NoInfer<S>[]>) {
   for (const [from, tos] of Object.entries(matrix) as [S, readonly S[]][]) {
     if (tos.includes(from)) throw new Error(`transition matrix lists a self-transition for ${from}`)
   }
   return {
-    can: (from: S, to: S): boolean => (matrix[from] as readonly S[]).includes(to),
-    assert: (from: S, to: S): void => { if (!(matrix[from] as readonly S[]).includes(to)) throw new IllegalTransitionError(from, to) },
+    can: (from: S, to: S): boolean => matrix[from].includes(to),
+    assert: (from: S, to: S): void => { if (!matrix[from].includes(to)) throw new IllegalTransitionError(from, to) },
   }
 }
 

@@ -20,4 +20,10 @@ describe('transitions', () => {
   it('defineTransitions rejects a matrix that lists a self-transition', () => {
     expect(() => defineTransitions({ a: ['a'], b: [] } as const)).toThrow(/self/)
   })
+  it('rejects an unknown status key at compile time when the status type is explicit', () => {
+    type S = 'x' | 'y'
+    // @ts-expect-error 'bogus' is not a status
+    defineTransitions<S>({ x: ['y'], y: [], bogus: [] })
+    expect(true).toBe(true)
+  })
 })
