@@ -1,6 +1,8 @@
 # ai-email-support-agent
 An AI agent that supports customers through email
 
+Start with `CLAUDE.md` (how to work in this repo) and `docs/STATUS.md` (what is built and what comes next).
+
 ## Development
 
 Requires Node >= 22, pnpm 10, Docker.
@@ -9,9 +11,11 @@ Requires Node >= 22, pnpm 10, Docker.
     pnpm install
     pnpm db:up                                   # Postgres 17 + pgvector on :5434
     DATABASE_URL=postgres://aesa:aesa@localhost:5434/aesa_dev pnpm --filter @aesa/db migrate
-    pnpm typecheck && pnpm test && pnpm lint
+    pnpm typecheck && pnpm lint && pnpm test && pnpm db:check
 
 Layout: `apps/api` (Fastify), `apps/worker` (pg-boss), `packages/{db,crypto,core,queue}`.
+Ports: the api listens on 3001 (`PORT`; `HOST` defaults to `0.0.0.0`), the worker binds no port, Postgres
+is on 5434. `APP_BASE_URL` is parsed by the api but has no consumer until Phase 1.
 Design spec: `docs/superpowers/specs/2026-09-07-ai-email-support-agent-design.md`.
 
 ## Database roles
@@ -49,6 +53,8 @@ check compares drizzle's snapshots, not the SQL, so this stays valid — do not 
 
 `.github/workflows/ci.yml`: typecheck → lint → migrate → tests (fresh database per test file) →
 migration drift check. Run the same locally with `pnpm typecheck && pnpm lint && pnpm test && pnpm db:check`.
+It runs only on pushes to `main` and on pull requests, so a phase branch is covered by the local gate alone
+until a PR is opened.
 
 ## Dependency pins
 
