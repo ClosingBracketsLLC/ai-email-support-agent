@@ -6,9 +6,14 @@ const URL_IN_TEXT = /https?:\/\/[^\s"'<>)\]]+/g
 /** Short machine codes are safe to log: Postgres SQLSTATEs, Fastify FST_*, Node ECONN*. Never a message. */
 const SAFE_CODE = /^[A-Z0-9_]{1,40}$/
 
-/** Masks any URL found inside free-form text (Better Auth log messages, error messages) with redactUrl(). */
+/**
+ * Masks any URL found inside free-form text (Better Auth log messages, error messages) with redactUrl(), then
+ * collapses anything after a `Failed query:` marker — Better Auth's onError path (`api/index.mjs`) can log a
+ * drizzle error's plain `.message` string (`Failed query: <sql>\nparams: <bound values>`) directly, not only
+ * as an Error object the `err` serializer would otherwise catch.
+ */
 export function redactText(s: string): string {
-  return s.replace(URL_IN_TEXT, (url) => redactUrl(url))
+  return s.replace(URL_IN_TEXT, (url) => redactUrl(url)).replace(/Failed query:[\s\S]*$/, 'Failed query: [redacted]')
 }
 
 interface SerializedError { [key: string]: unknown; type: string; message: string; stack: string; code?: string }
@@ -58,11 +63,18 @@ export function createAppLogger({ level, stream }: AppLoggerOptions): pino.Logge
 
 type BetterAuthLogLevel = 'debug' | 'info' | 'success' | 'warn' | 'error'
 
-/** The shape betterAuth({ logger }) expects — kept local (not re-exported by better-auth or @better-auth/core). */
+/**
+ * The shape betterAuth({ logger }) expects — kept local (not re-exported by better-auth or @better-auth/core).
+ * `message` is typed `unknown`, not `string`: Better Auth's own documented contract says `string`, but at
+ * least one of its call sites (better-auth@1.7.3 dist/api/routes/session.mjs's list-sessions catch block)
+ * calls `logger.error(e)` — a raw Error as the sole, positional argument — so the adapter below must survive
+ * whatever actually arrives, not only what the type promises. A wider parameter type here is still assignable
+ * everywhere Better Auth expects its own (narrower, `string`) `Logger.log`.
+ */
 export interface BetterAuthLoggerOption {
   level?: 'debug' | 'info' | 'warn' | 'error'
   disableColors?: boolean
-  log: (level: BetterAuthLogLevel, message: string, ...args: unknown[]) => void
+  log: (level: BetterAuthLogLevel, message: unknown, ...args: unknown[]) => void
 }
 
 /**
@@ -82,11 +94,17 @@ export function betterAuthLogger(logger: pino.Logger): BetterAuthLoggerOption {
         : level === 'warn' ? logger.warn.bind(logger)
         : level === 'debug' ? logger.debug.bind(logger)
         : logger.info.bind(logger)   // 'info' and 'success' both land at info
-      // Only an Error argument is kept (as `err`, so the serializer above collapses/redacts it); anything
-      // else Better Auth passes (raw strings, request bodies) is dropped rather than logged verbatim.
-      const err = args.find((a): a is Error => a instanceof Error)
-      const text = redactText(message)
-      if (err) write({ err }, text)
+      // `message` itself may be an Error (see the interface note above), not only the `...args`. Either way,
+      // only the `err` serializer is allowed to render an Error's own content (it may embed bound SQL
+      // parameters) — never this function directly, so a non-string message is replaced with a fixed
+      // placeholder rather than stringified. Nothing here may throw regardless of what Better Auth passes.
+      const errs = [message, ...args].filter((a): a is Error => a instanceof Error)
+      const text = redactText(
+        typeof message === 'string' ? message
+          : message instanceof Error ? 'better-auth error'
+          : `[non-string ${typeof message} message dropped]`,
+      )
+      if (errs[0]) write({ err: errs[0] }, text)
       else write(text)
     },
   }

@@ -1,6 +1,6 @@
 import { DrizzleQueryError } from 'drizzle-orm/errors'
 import { describe, expect, it } from 'vitest'
-import { betterAuthLogger, createAppLogger } from '../src/logging.ts'
+import { betterAuthLogger, createAppLogger, redactText } from '../src/logging.ts'
 
 const SECRET = 'tok_SUPER_SECRET_SESSION_TOKEN'
 const QUERY = 'insert into "session" ("token") values ($1)'
@@ -35,5 +35,27 @@ describe('betterAuthLogger', () => {
     betterAuthLogger(logger).log('success', 'ok')
     expect(log()).toContain('"level":30')
     expect(log()).toContain('"msg":"ok"')
+  })
+
+  it('never throws when called with an Error as the message and no further args (better-auth@1.7.3 list-sessions catch)', () => {
+    const { logger, log } = buildCapturingLogger()
+    expect(() => betterAuthLogger(logger).log('error', new DrizzleQueryError(QUERY, [SECRET], new Error('duplicate key')))).not.toThrow()
+    expect(log()).toContain('"level":50')
+    expect(log()).toContain('Failed query: [redacted]')
+    expect(log()).not.toContain(SECRET)
+    expect(log()).not.toContain('insert into')
+  })
+
+  it('never throws when called with a non-Error, non-string message, and drops its content entirely', () => {
+    const { logger, log } = buildCapturingLogger()
+    expect(() => betterAuthLogger(logger).log('warn', { token: SECRET })).not.toThrow()
+    expect(log()).not.toContain(SECRET)
+    expect(log()).not.toContain('token')
+  })
+})
+
+describe('redactText', () => {
+  it('collapses a Failed query: tail (bound SQL parameters) wherever it appears, not only inside an Error', () => {
+    expect(redactText(`boom: Failed query: ${QUERY}\nparams: ${SECRET}`)).toBe('boom: Failed query: [redacted]')
   })
 })
