@@ -8,14 +8,28 @@ const env = {
   AESA_KEK_ACTIVE: '2',
 }
 
+const orgA = '11111111-1111-4111-8111-111111111111'
+const orgB = '22222222-2222-4222-8222-222222222222'
+
 describe('envelope encryption', () => {
   const ring = loadKekRing(env)
 
   it('wraps a DEK under the active KEK and unwraps it', () => {
     const dek = generateDek()
-    const { kekVersion, wrapped } = wrapDek(dek, ring)
+    const { kekVersion, wrapped } = wrapDek(dek, ring, orgA)
     expect(kekVersion).toBe(2)
-    expect(unwrapDek(wrapped, kekVersion, ring).equals(dek)).toBe(true)
+    expect(unwrapDek(wrapped, kekVersion, ring, orgA).equals(dek)).toBe(true)
+  })
+
+  it('binds the wrapped DEK to its organization (AAD)', () => {
+    const { kekVersion, wrapped } = wrapDek(generateDek(), ring, orgA)
+    expect(() => unwrapDek(wrapped, kekVersion, ring, orgB)).toThrow()
+  })
+
+  it('refuses a blob too short to hold a version byte, nonce and tag', () => {
+    const { wrapped } = wrapDek(generateDek(), ring, orgA)
+    expect(() => unwrapDek(wrapped.subarray(0, 28), 2, ring, orgA)).toThrow(/too short/i)
+    expect(() => unwrapDek(Buffer.alloc(0), 2, ring, orgA)).toThrow(/too short/i)
   })
 
   it('encrypts and decrypts with AAD binding', () => {
@@ -31,11 +45,11 @@ describe('envelope encryption', () => {
 
   it('re-wraps from a retired KEK version to the active one', () => {
     const dek = generateDek()
-    const v1 = wrapDek(dek, loadKekRing({ ...env, AESA_KEK_ACTIVE: '1' }))
-    const v2 = rewrapDek(v1.wrapped, v1.kekVersion, ring)
+    const v1 = wrapDek(dek, loadKekRing({ ...env, AESA_KEK_ACTIVE: '1' }), orgA)
+    const v2 = rewrapDek(v1.wrapped, v1.kekVersion, ring, orgA)
     expect(v2.kekVersion).toBe(2)
-    expect(unwrapDek(v2.wrapped, 2, ring).equals(dek)).toBe(true)
-    expect(() => unwrapDek(v2.wrapped, 1, ring)).toThrow()
+    expect(unwrapDek(v2.wrapped, 2, ring, orgA).equals(dek)).toBe(true)
+    expect(() => unwrapDek(v2.wrapped, 1, ring, orgA)).toThrow()
   })
 
   it('rejects a malformed ring', () => {

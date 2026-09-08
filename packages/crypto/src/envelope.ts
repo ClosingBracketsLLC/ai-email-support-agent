@@ -33,29 +33,34 @@ function seal(key: Buffer, plaintext: Buffer, aad: string): Buffer {
 }
 
 function open(key: Buffer, blob: Buffer, aad: string): Buffer {
+  // Without the length check a truncated blob is verified against a short tag; authTagLength pins it to 16.
+  if (blob.length < 1 + NONCE_LEN + TAG_LEN) throw new Error('ciphertext is too short to be an envelope')
   if (blob[0] !== VERSION) throw new Error('unsupported ciphertext version')
   const nonce = blob.subarray(1, 1 + NONCE_LEN)
   const tag = blob.subarray(1 + NONCE_LEN, 1 + NONCE_LEN + TAG_LEN)
   const ct = blob.subarray(1 + NONCE_LEN + TAG_LEN)
-  const decipher = createDecipheriv('aes-256-gcm', key, nonce)
+  const decipher = createDecipheriv('aes-256-gcm', key, nonce, { authTagLength: TAG_LEN })
   decipher.setAAD(Buffer.from(aad, 'utf8'))
   decipher.setAuthTag(tag)
   return Buffer.concat([decipher.update(ct), decipher.final()])   // throws on tag/AAD mismatch
 }
 
-export function wrapDek(dek: Buffer, ring: KekRing): { kekVersion: number; wrapped: Buffer } {
+/** The KEK AAD binds a wrapped DEK to one organization, so a row cannot be transplanted between orgs. */
+const kekAad = (version: number, orgId: string) => `kek:v${version}:${orgId}`
+
+export function wrapDek(dek: Buffer, ring: KekRing, orgId: string): { kekVersion: number; wrapped: Buffer } {
   const kek = ring.keys.get(ring.active)!
-  return { kekVersion: ring.active, wrapped: seal(kek, dek, `kek:${ring.active}`) }
+  return { kekVersion: ring.active, wrapped: seal(kek, dek, kekAad(ring.active, orgId)) }
 }
 
-export function unwrapDek(wrapped: Buffer, kekVersion: number, ring: KekRing): Buffer {
+export function unwrapDek(wrapped: Buffer, kekVersion: number, ring: KekRing, orgId: string): Buffer {
   const kek = ring.keys.get(kekVersion)
   if (!kek) throw new Error(`KEK version ${kekVersion} is not configured`)
-  return open(kek, wrapped, `kek:${kekVersion}`)
+  return open(kek, wrapped, kekAad(kekVersion, orgId))
 }
 
-export function rewrapDek(wrapped: Buffer, kekVersion: number, ring: KekRing): { kekVersion: number; wrapped: Buffer } {
-  return wrapDek(unwrapDek(wrapped, kekVersion, ring), ring)
+export function rewrapDek(wrapped: Buffer, kekVersion: number, ring: KekRing, orgId: string): { kekVersion: number; wrapped: Buffer } {
+  return wrapDek(unwrapDek(wrapped, kekVersion, ring, orgId), ring, orgId)
 }
 
 /** Row-level encryption under an org DEK. `aad` MUST be `${orgId}:${rowId}` so a ciphertext cannot be transplanted. */
