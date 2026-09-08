@@ -17,12 +17,13 @@ describe('team router', () => {
   let owner: ReturnType<typeof client>
   let ownerId: string
   let orgId: string
+  let cookieA: string
   let cookieB: string
   let bob: ReturnType<typeof client>
   let bobId: string
   beforeAll(async () => {
     t = await createTestApi(); base = await listen(t.app)
-    const a = await signInWithOtp(t.app, t.mail, 'ann@example.com', 'Ann'); ownerId = a.user.id; owner = client(base, a.cookie)
+    const a = await signInWithOtp(t.app, t.mail, 'ann@example.com', 'Ann'); ownerId = a.user.id; cookieA = a.cookie; owner = client(base, a.cookie)
     orgId = (await owner.workspace.create.mutate({ businessName: 'Acme', timezone: 'UTC' })).orgId
     const b = await signInWithOtp(t.app, t.mail, 'bob@example.com', 'Bob'); cookieB = b.cookie; bobId = b.user.id; bob = client(base, cookieB)
   })
@@ -68,5 +69,19 @@ describe('team router', () => {
     const { invitationId } = await owner.team.invite.mutate({ email: 'carol@example.com', role: 'admin' })
     await owner.team.cancelInvitation.mutate({ invitationId })
     expect((await owner.team.list.query()).invitations.find((i) => i.id === invitationId)).toBeUndefined()
+  })
+
+  it('cancelInvitation is scoped to the active workspace', async () => {
+    const { invitationId } = await owner.team.invite.mutate({ email: 'dave@example.com', role: 'member' })
+    const { orgId: orgB } = await owner.workspace.create.mutate({ businessName: 'Ann Two', timezone: 'UTC' })   // creating it makes B active
+    await expect(owner.team.cancelInvitation.mutate({ invitationId })).rejects.toMatchObject({ data: { code: 'NOT_FOUND' } })
+    await t.app.inject({ method: 'POST', url: '/api/auth/organization/set-active', headers: { origin: WEB, cookie: cookieA, 'content-type': 'application/json' }, payload: { organizationId: orgId } })
+    expect((await owner.team.list.query()).invitations.find((i) => i.id === invitationId)).toBeDefined()
+    await owner.team.cancelInvitation.mutate({ invitationId })
+    expect((await owner.team.list.query()).invitations.find((i) => i.id === invitationId)).toBeUndefined()
+    const inA = await t.api.withOrg(orgId, (tx) => tx.select().from(auditLog).where(eq(auditLog.action, 'team.invite.cancel')))
+    const inB = await t.api.withOrg(orgB, (tx) => tx.select().from(auditLog).where(eq(auditLog.action, 'team.invite.cancel')))
+    expect(inA.map((r) => r.entityId)).toContain(invitationId)
+    expect(inB).toHaveLength(0)
   })
 })

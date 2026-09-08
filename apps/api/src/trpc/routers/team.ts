@@ -27,6 +27,13 @@ export const teamRouter = router({
   }),
 
   cancelInvitation: managerProcedure.input(z.object({ invitationId: z.uuid() })).mutation(async ({ ctx, input }) => {
+    // Better Auth's cancel-invitation endpoint takes no organizationId — it authorizes against the
+    // invitation's own org, independent of ctx.orgId. Confirm the invitation is pending in the active
+    // workspace first, so neither the cancellation nor its audit row can land against the wrong org.
+    const full = await ctx.deps.auth.api.getFullOrganization({ headers: ctx.headers, query: { organizationId: ctx.orgId } })
+    if (!full || !full.invitations.some((i) => i.id === input.invitationId && i.status === 'pending')) {
+      throw new TRPCError({ code: 'NOT_FOUND', message: 'no pending invitation with that id in this workspace' })
+    }
     await ctx.deps.auth.api.cancelInvitation({ headers: ctx.headers, body: { invitationId: input.invitationId } })
     await ctx.deps.api.withOrg(ctx.orgId, (tx) => audit(tx, { actor: ctx.actor, action: 'team.invite.cancel', entityType: 'invitation', entityId: input.invitationId, ip: ctx.ip, userAgent: ctx.userAgent }))
     return { ok: true as const }
