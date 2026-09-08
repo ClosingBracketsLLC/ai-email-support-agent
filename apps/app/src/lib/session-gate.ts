@@ -17,6 +17,8 @@ export type GateTarget =
   | { kind: 'create-workspace' }
   | { kind: 'onboarding'; step: Exclude<OnboardingStep, 'done'> }
   | { kind: 'app' }
+  /** A session, activation or workspace lookup failed outright (not merely absent). resolveGate never produces this: it is raised by useGate. */
+  | { kind: 'error'; message: string; retry: () => void }
 
 /** Pure routing decision. Every layout renders what this says; nothing else decides where a user goes. */
 export function resolveGate(i: GateInput): GateTarget {

@@ -25,5 +25,6 @@ describe('resolveGate', () => {
     expect(hrefFor({ kind: 'app' })).toBe('/inbox')
     expect(hrefFor({ kind: 'loading' })).toBeNull()
     expect(hrefFor({ kind: 'activate', orgId: 'o1' })).toBeNull()
+    expect(hrefFor({ kind: 'error', message: 'nope', retry: () => {} })).toBeNull()
   })
 })
