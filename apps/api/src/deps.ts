@@ -1,4 +1,5 @@
 import type pg from 'pg'
+import type pino from 'pino'
 import { withOrg, withPlatform, type Db, type OrgTx, type PlatformTx } from '@aesa/db'
 import type { Auth } from './auth.ts'
 import type { ApiConfig } from './config.ts'
@@ -39,7 +40,6 @@ export interface ServerDeps {
   auth: Auth
   api: ApiFacade
   mail: MailTransport
-  logLevel?: string
-  /** Test seam: a pino destination so a suite can assert on the real log output. Production logs to stdout. */
-  logStream?: { write(line: string): void }
+  /** Shared by Fastify's request logging and Better Auth's own logger (see src/logging.ts). */
+  logger: pino.Logger
 }

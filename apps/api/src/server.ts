@@ -1,49 +1,22 @@
 import { STATUS_CODES } from 'node:http'
 import cors from '@fastify/cors'
 import { fromNodeHeaders } from 'better-auth/node'
-import { DrizzleQueryError } from 'drizzle-orm/errors'
-import Fastify, { type FastifyError, type FastifyInstance, type FastifyServerOptions } from 'fastify'
+import Fastify, { type FastifyBaseLogger, type FastifyError, type FastifyInstance } from 'fastify'
 import type { ServerDeps } from './deps.ts'
-import { redactUrl } from './redact.ts'
 
 export type { ServerDeps } from './deps.ts'
-
-const URL_IN_TEXT = /https?:\/\/[^\s"'<>)\]]+/g
-/** Short machine codes are safe to log: Postgres SQLSTATEs, Fastify FST_*, Node ECONN*. Never a message. */
-const SAFE_CODE = /^[A-Z0-9_]{1,40}$/
-
-interface SerializedError { [key: string]: unknown; type: string; message: string; stack: string; code?: string }
-
-/**
- * pino `err` serializer. Emits type/message/stack (+ a short code) only — never `params`, `query` or `cause`
- * messages: drizzle's DrizzleQueryError message is `Failed query: <sql>\nparams: <bound values>` (session tokens,
- * verification codes) and a pg `cause` repeats the offending value in its own `detail`.
- */
-function serializeError(err: Error & { code?: unknown; cause?: unknown }): SerializedError {
-  const type = err?.constructor?.name ?? 'Error'
-  const raw = err instanceof DrizzleQueryError ? 'Failed query: [redacted]' : String(err?.message ?? err)
-  const message = raw.replace(URL_IN_TEXT, (url) => redactUrl(url))
-  const frames = String(err?.stack ?? '').split('\n').filter((line) => /^\s*at /.test(line))
-  const candidate = typeof err?.code === 'string' ? err.code : typeof (err?.cause as { code?: unknown })?.code === 'string' ? (err.cause as { code: string }).code : undefined
-  const code = candidate && SAFE_CODE.test(candidate) ? candidate : undefined
-  return { type, message, stack: [`${type}: ${message}`, ...frames].join('\n'), ...(code ? { code } : {}) }
-}
 
 type ThrownError = FastifyError & { status?: number; headers?: Record<string, string> }
 
 export function buildServer(deps: ServerDeps): FastifyInstance {
-  const logger: FastifyServerOptions['logger'] = {
-    level: deps.logLevel ?? 'info',
-    // Defence in depth: the `req` serializer never emits headers, so these paths cannot match today; they stay so
-    // that adding a header to that serializer cannot silently start leaking one.
-    redact: { paths: ['req.headers.authorization', 'req.headers.cookie', 'req.headers["x-api-key"]'], censor: '[redacted]' },
-    serializers: {
-      req: (req) => ({ method: req.method, url: redactUrl(req.url), host: req.host, remoteAddress: req.ip }),
-      err: serializeError,
-    },
-    ...(deps.logStream ? { stream: deps.logStream } : {}),
-  }
-  const app = Fastify({ logger })
+  // deps.logger (src/logging.ts) is shared with Better Auth (see auth.ts) so every log line, from either
+  // source, goes through the same redaction and the same destination. trustProxy governs both Fastify's own
+  // request.ip (used by the `req` serializer) and, separately, Better Auth's rate-limiter IP resolution.
+  // Widened to FastifyBaseLogger (pino.Logger satisfies it structurally) so Fastify's own generic Logger
+  // param resolves to its default — otherwise the more specific pino type makes app's inferred type
+  // incompatible with the plain `FastifyInstance` this function returns (a childLoggerFactory variance issue).
+  const loggerInstance: FastifyBaseLogger = deps.logger
+  const app = Fastify({ loggerInstance, trustProxy: deps.config.trustProxy })
   const startedAt = Date.now()
 
   // Better Auth's client posts JSON; some calls carry no body. Fastify's stock parser 400s an empty JSON body.

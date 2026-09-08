@@ -3,7 +3,9 @@ import { betterAuth } from 'better-auth'
 import { drizzleAdapter } from 'better-auth/adapters/drizzle'
 import { emailOTP, organization } from 'better-auth/plugins'
 import { authSchema, type AuditEntry, type Db } from '@aesa/db'
+import type pino from 'pino'
 import type { ApiConfig } from './config.ts'
+import { betterAuthLogger } from './logging.ts'
 import { invitationMail, otpMail } from './mail/templates.ts'
 import type { MailTransport } from './mail/transport.ts'
 
@@ -12,22 +14,33 @@ export interface AuthDeps {
   db: Db
   config: ApiConfig
   mail: MailTransport
+  logger: pino.Logger
   /** Writes an org-scoped audit row from a Better Auth hook (hooks run outside any request transaction). */
   audit: (orgId: string, entry: AuditEntry) => Promise<void>
 }
 
-export function createAuth({ db, config, mail, audit }: AuthDeps) {
+export function createAuth({ db, config, mail, logger, audit }: AuthDeps) {
   return betterAuth({
     appName: 'aesa',
     baseURL: config.appBaseUrl,
     basePath: '/api/auth',
     secret: config.betterAuthSecret.expose(),
     database: drizzleAdapter(db, { provider: 'pg', schema: authSchema }),
+    // Routes Better Auth's own diagnostics (including a raw DrizzleQueryError the drizzle adapter doesn't catch)
+    // through the shared pino logger instead of its default console.error/warn/log, which bypasses redaction.
+    logger: betterAuthLogger(logger),
     advanced: {
       database: { generateId: false },   // Postgres mints uuid ids (packages/db/src/schema/auth.ts)
       // Better Auth defaults origin/CSRF checking OFF when NODE_ENV === 'test' (its own isTest(), unrelated to
       // ApiConfig.env). Force it on here so the checks this api relies on hold under vitest too.
       disableOriginCheck: false,
+      // Rate-limit keying reads x-forwarded-for directly (independent of Fastify's own trustProxy, set in
+      // server.ts). trustProxy === true: leave trustedProxies unset — Better Auth's documented default already
+      // trusts a single-value header as-is. trustProxy is a list: pass it through so a known multi-hop chain
+      // (CDN + load balancer, say) is walked past those hops to the real client IP. trustProxy === false: leave
+      // unset too; loadConfig refuses AUTH_RATE_LIMIT=on with TRUST_PROXY unset in production, so the only way
+      // here is dev/test, where Better Auth's own getIP() falls back to localhost.
+      ...(Array.isArray(config.trustProxy) ? { ipAddress: { trustedProxies: config.trustProxy } } : {}),
       ...(config.crossSiteCookies ? { defaultCookieAttributes: { sameSite: 'none' as const, secure: true } } : {}),
     },
     trustedOrigins: config.trustedOrigins,

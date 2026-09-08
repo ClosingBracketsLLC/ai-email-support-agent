@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { buildServer } from '../src/server.ts'
 import { WEB, createTestApi, signInWithOtp, stubDeps } from './helpers/app.ts'
 
@@ -24,9 +24,17 @@ describe('Better Auth on Fastify', () => {
     for (const r of rows) expect(r.value).not.toContain(otp)
   })
 
-  it('rejects a state-changing request from an untrusted origin', async () => {
+  it('rejects a state-changing request from an untrusted origin, logging it through pino and never the console', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const before = t.lines.length
     const res = await t.app.inject({ method: 'POST', url: '/api/auth/email-otp/send-verification-otp', headers: { origin: 'https://evil.example', 'content-type': 'application/json' }, payload: { email: 'x@example.com', type: 'sign-in' } })
     expect(res.statusCode).toBe(403)
+    expect(t.lines.slice(before).join('')).toContain('Invalid origin')
+    expect(consoleError).not.toHaveBeenCalled()
+    expect(consoleLog).not.toHaveBeenCalled()
+    consoleError.mockRestore()
+    consoleLog.mockRestore()
   })
 
   it('get-session without a cookie is null, and a forged cookie is null', async () => {
@@ -60,5 +68,27 @@ describe('/meta', () => {
     const on = buildServer(stubDeps({ GOOGLE_CLIENT_ID: 'g', GOOGLE_CLIENT_SECRET: 's' }))
     expect((await on.inject({ method: 'GET', url: '/meta' })).json()).toEqual({ providers: { google: true, microsoft: false } })
     await on.close()
+  })
+})
+
+describe('rate limiting', () => {
+  // getIP() resolves to 127.0.0.1 in dev/test (better-auth's own isTest()/isDevelopment() fallback), so this
+  // only pins the custom per-path rule firing — not per-IP keying, which needs a real proxied deployment.
+  it('the email-otp send-verification-otp custom rule (3/min) 429s the 4th request in the window', async () => {
+    const rl = await createTestApi({ AUTH_RATE_LIMIT: 'on' })
+    try {
+      const post = () => rl.app.inject({
+        method: 'POST', url: '/api/auth/email-otp/send-verification-otp',
+        headers: { origin: WEB, 'content-type': 'application/json' }, payload: { email: 'ratelimited@example.com', type: 'sign-in' },
+      })
+      expect((await post()).statusCode).toBe(200)
+      expect((await post()).statusCode).toBe(200)
+      expect((await post()).statusCode).toBe(200)
+      const fourth = await post()
+      expect(fourth.statusCode).toBe(429)
+      expect(fourth.headers['x-retry-after']).toBeDefined()
+    } finally {
+      await rl.close()
+    }
   })
 })

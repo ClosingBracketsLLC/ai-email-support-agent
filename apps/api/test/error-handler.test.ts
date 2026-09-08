@@ -9,11 +9,7 @@ const QUERY = 'insert into "session" ("token") values ($1)'
 /** The error paths never touch the database, so deps stay stubs. */
 function buildCapturingServer() {
   const lines: string[] = []
-  const app = buildServer({
-    ...stubDeps(),
-    logLevel: 'trace',
-    logStream: { write: (line: string) => void lines.push(line) },
-  })
+  const app = buildServer(stubDeps({}, { level: 'trace', stream: { write: (line: string) => void lines.push(line) } }))
   return { app, lines, log: () => lines.join('') }
 }
 

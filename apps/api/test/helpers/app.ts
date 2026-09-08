@@ -3,10 +3,12 @@ import type { FastifyInstance } from 'fastify'
 import { audit } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase } from '@aesa/db/testing'
+import type pino from 'pino'
 import { expect } from 'vitest'
 import { createAuth } from '../../src/auth.ts'
 import { loadConfig } from '../../src/config.ts'
 import { createApiFacade, type ServerDeps } from '../../src/deps.ts'
+import { createAppLogger } from '../../src/logging.ts'
 import { createDevSink, type DevSink } from '../../src/mail/transport.ts'
 import { buildServer } from '../../src/server.ts'
 
@@ -23,14 +25,15 @@ export async function createTestApi(overrides: Partial<NodeJS.ProcessEnv> = {}) 
   const handle = createDb(t.url, { role: 'app' })
   const api = createApiFacade(handle)
   const mail = createDevSink()
-  const auth = createAuth({ db: handle.db, config, mail, audit: (orgId, entry) => api.withOrg(orgId, (tx) => audit(tx, entry)) })
   const lines: string[] = []
-  const app = buildServer({ config, auth, api, mail, logLevel: 'warn', logStream: { write: (line: string) => void lines.push(line) } })
+  const logger = createAppLogger({ level: 'warn', stream: { write: (line: string) => void lines.push(line) } })
+  const auth = createAuth({ db: handle.db, config, mail, logger, audit: (orgId, entry) => api.withOrg(orgId, (tx) => audit(tx, entry)) })
+  const app = buildServer({ config, auth, api, mail, logger })
   return { app, config, mail, api, handle, lines, close: async () => { await app.close(); await handle.pool.end(); await t.drop() } }
 }
 
-/** Deps for suites that never touch the database (error handler, redaction, /meta). */
-export function stubDeps(env: Partial<NodeJS.ProcessEnv> = {}): ServerDeps {
+/** Deps for suites that never touch the database (error handler, redaction, /meta). Silent by default. */
+export function stubDeps(env: Partial<NodeJS.ProcessEnv> = {}, opts: { level?: string; stream?: pino.DestinationStream } = {}): ServerDeps {
   const config = loadConfig({ ...TEST_ENV, ...env })
   const auth = { handler: async () => new Response(null, { status: 404 }), api: {} } as unknown as ServerDeps['auth']
   const api: ServerDeps['api'] = {
@@ -38,7 +41,8 @@ export function stubDeps(env: Partial<NodeJS.ProcessEnv> = {}): ServerDeps {
     withPlatform: async () => { throw new Error('no database in stubDeps') },
     health: async () => ({ db: 'error', migrations: { count: 0, latest: null } }),
   }
-  return { config, auth, api, mail: createDevSink() }
+  const logger = createAppLogger({ level: opts.level ?? 'silent', stream: opts.stream })
+  return { config, auth, api, mail: createDevSink(), logger }
 }
 
 /** Email OTP sign-in through the real routes. Returns the session cookie (name=value) and the user. */

@@ -21,6 +21,13 @@ const EnvSchema = z.object({
   AUTH_RATE_LIMIT: z.enum(['on', 'off']).default('on'),
   /** Set when the web app and the api live on different registrable domains (cookies need SameSite=None; Secure). */
   AUTH_CROSS_SITE_COOKIES: z.enum(['true', 'false']).default('false'),
+  /**
+   * 'false' (default): no reverse proxy is trusted. 'true': trust a single hop's x-forwarded-for as-is.
+   * A comma-separated list of IPs/CIDRs: trust exactly those proxies and walk a multi-hop chain past them.
+   * Feeds both Fastify's own `trustProxy` and Better Auth's `advanced.ipAddress.trustedProxies` (see auth.ts) —
+   * without it, behind any proxy, every client collapses into Better Auth's rate limiter's single fallback bucket.
+   */
+  TRUST_PROXY: z.string().default('false'),
   GOOGLE_CLIENT_ID: z.string().optional(),
   GOOGLE_CLIENT_SECRET: z.string().optional(),
   MICROSOFT_CLIENT_ID: z.string().optional(),
@@ -46,6 +53,8 @@ export interface ApiConfig {
   betterAuthSecret: Secret
   authRateLimit: boolean
   crossSiteCookies: boolean
+  /** false: no proxy trusted. true: trust one hop's x-forwarded-for as-is. string[]: trust exactly these proxies. */
+  trustProxy: boolean | string[]
   google: OAuthClient | null
   microsoft: OAuthClient | null
   mail: MailConfig
@@ -84,10 +93,17 @@ export function loadConfig(env: NodeJS.ProcessEnv): ApiConfig {
   const extraOrigins = csv(d.AUTH_TRUSTED_ORIGINS).map((o) => o.startsWith('aesa://') || o.startsWith('exp://') ? o : o.replace(/\/+$/, ''))
   const trustedOrigins = [...new Set([appWebOrigin, 'aesa://', ...(production ? [] : ['exp://']), ...extraOrigins])]
 
+  const trustProxyRaw = d.TRUST_PROXY.trim()
+  const trustProxy: boolean | string[] = trustProxyRaw === '' || trustProxyRaw === 'false' ? false : trustProxyRaw === 'true' ? true : csv(trustProxyRaw)
+  const authRateLimit = d.AUTH_RATE_LIMIT === 'on'
+  if (production && authRateLimit && trustProxy === false) {
+    throw new Error('AUTH_RATE_LIMIT=on requires TRUST_PROXY in production: Better Auth keys its limiter on x-forwarded-for and otherwise puts every client in one bucket')
+  }
+
   return {
     env: d.NODE_ENV, databaseUrl: d.DATABASE_URL, port: d.PORT, host: d.HOST, logLevel: d.LOG_LEVEL,
-    appBaseUrl, appWebOrigin, trustedOrigins,
-    betterAuthSecret: new Secret(d.BETTER_AUTH_SECRET), authRateLimit: d.AUTH_RATE_LIMIT === 'on', crossSiteCookies: d.AUTH_CROSS_SITE_COOKIES === 'true',
+    appBaseUrl, appWebOrigin, trustedOrigins, trustProxy,
+    betterAuthSecret: new Secret(d.BETTER_AUTH_SECRET), authRateLimit, crossSiteCookies: d.AUTH_CROSS_SITE_COOKIES === 'true',
     google: oauthPair('GOOGLE', d.GOOGLE_CLIENT_ID, d.GOOGLE_CLIENT_SECRET),
     microsoft: oauthPair('MICROSOFT', d.MICROSOFT_CLIENT_ID, d.MICROSOFT_CLIENT_SECRET),
     mail,

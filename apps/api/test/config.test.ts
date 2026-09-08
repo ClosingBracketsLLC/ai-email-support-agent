@@ -32,7 +32,7 @@ describe('api config', () => {
     expect(() => loadConfig({ ...BASE, NODE_ENV: 'production' })).toThrow(/RESEND_API_KEY/)
     expect(() => loadConfig({ ...BASE, NODE_ENV: 'production', RESEND_API_KEY: 're_x' })).toThrow(/MAIL_FROM/)
     expect(() => loadConfig({ ...BASE, NODE_ENV: 'production', EMAIL_TRANSPORT: 'devsink' })).toThrow(/devsink/)
-    const c = loadConfig({ ...BASE, NODE_ENV: 'production', RESEND_API_KEY: 're_x', MAIL_FROM: 'aesa <no-reply@mail.example.com>', AUTH_TRUSTED_ORIGINS: 'https://app.example.com, https://staging.example.com' })
+    const c = loadConfig({ ...BASE, NODE_ENV: 'production', RESEND_API_KEY: 're_x', MAIL_FROM: 'aesa <no-reply@mail.example.com>', AUTH_TRUSTED_ORIGINS: 'https://app.example.com, https://staging.example.com', TRUST_PROXY: 'true' })
     expect(c.mail.transport).toBe('resend')
     expect(c.trustedOrigins).toEqual(['http://localhost:8081', 'aesa://', 'https://app.example.com', 'https://staging.example.com'])
   })
@@ -41,5 +41,13 @@ describe('api config', () => {
     expect(c.appBaseUrl).toBe('http://localhost:3001')
     expect(c.appWebOrigin).toBe('http://localhost:8081')
     expect(c.trustedOrigins).toEqual(['http://localhost:8081', 'aesa://', 'exp://', 'https://app.example.com'])
+  })
+  it('production with rate limiting on requires TRUST_PROXY, or Better Auth buckets every client together', () => {
+    expect(() => loadConfig({ ...BASE, NODE_ENV: 'production', RESEND_API_KEY: 're_x', MAIL_FROM: 'aesa <no-reply@mail.example.com>' })).toThrow(/TRUST_PROXY/)
+  })
+  it('parses TRUST_PROXY as a proxy IP/CIDR list or a boolean, defaulting to false', () => {
+    expect(loadConfig(BASE).trustProxy).toBe(false)
+    expect(loadConfig({ ...BASE, TRUST_PROXY: '10.0.0.0/8, 10.1.2.3' }).trustProxy).toEqual(['10.0.0.0/8', '10.1.2.3'])
+    expect(loadConfig({ ...BASE, TRUST_PROXY: 'true' }).trustProxy).toBe(true)
   })
 })
