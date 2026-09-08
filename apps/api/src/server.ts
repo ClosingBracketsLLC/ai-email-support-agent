@@ -1,8 +1,11 @@
 import { STATUS_CODES } from 'node:http'
 import cors from '@fastify/cors'
+import { fastifyTRPCPlugin, type FastifyTRPCPluginOptions } from '@trpc/server/adapters/fastify'
 import { fromNodeHeaders } from 'better-auth/node'
 import Fastify, { type FastifyBaseLogger, type FastifyError, type FastifyInstance } from 'fastify'
 import type { ServerDeps } from './deps.ts'
+import { createContextFactory } from './trpc/context.ts'
+import { appRouter, type AppRouter } from './trpc/router.ts'
 
 export type { ServerDeps } from './deps.ts'
 
@@ -64,6 +67,25 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       if (cookies.length) reply.header('set-cookie', cookies)
       return reply.send(response.body ? await response.text() : null)
     },
+  })
+
+  // Browser CSRF guard for mutations: a POST that carries an Origin must come from the web app. Native clients
+  // send no Origin (and no ambient cookies), so they pass; CORS already blocks other browsers' reads.
+  app.addHook('onRequest', async (req, reply) => {
+    if (req.method !== 'POST' || !req.url.startsWith('/trpc')) return
+    if (req.headers.origin && req.headers.origin !== deps.config.appWebOrigin) return reply.code(403).send({ statusCode: 403, error: 'Forbidden' })
+  })
+  app.register(fastifyTRPCPlugin, {
+    prefix: '/trpc',
+    trpcOptions: {
+      router: appRouter,
+      createContext: createContextFactory(deps),
+      onError({ path, error }) {
+        // Client errors are expected traffic; only unexpected failures deserve the (redacting) err serializer.
+        if (error.code === 'INTERNAL_SERVER_ERROR') app.log.error({ err: error.cause ?? error, path }, 'trpc failed')
+        else app.log.warn({ path, code: error.code }, 'trpc rejected')
+      },
+    } satisfies FastifyTRPCPluginOptions<AppRouter>['trpcOptions'],
   })
 
   app.get('/meta', async () => ({ providers: { google: deps.config.google !== null, microsoft: deps.config.microsoft !== null } }))
