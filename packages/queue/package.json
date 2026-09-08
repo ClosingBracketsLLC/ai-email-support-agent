@@ -4,6 +4,6 @@
   "type": "module",
   "exports": { ".": "./src/index.ts" },
   "scripts": { "typecheck": "tsc --noEmit", "test": "vitest run" },
-  "dependencies": { "pg-boss": "^10.4.2", "zod": "^4.0.0" },
+  "dependencies": { "@aesa/core": "workspace:*", "pg-boss": "^10.4.2", "zod": "^4.0.0" },
   "devDependencies": { "@types/node": "^22", "@types/pg": "^8.15.0", "pg": "^8.16.0", "tsx": "^4.20.0", "typescript": "^5.9.2", "vitest": "^3.2.0" }
 }

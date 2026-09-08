@@ -1,6 +1,7 @@
 import type PgBoss from 'pg-boss'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { z } from 'zod'
+import { JOB_SIGNAL_MARGIN_SECONDS } from '@aesa/core'
 import { defineJob, registerJob } from '../src/define-job.ts'
 import { enqueue } from '../src/enqueue.ts'
 import { deleteAllJobs, startTestBoss, uniqueName } from './helpers/boss.ts'
@@ -12,7 +13,7 @@ describe('defineJob / enqueue', () => {
   })
 
   it('refuses expireInSeconds at or below the signal margin', () => {
-    expect(() => defineJob({ name: 'x', schema: z.object({ orgId: z.uuid() }), queue: { expireInSeconds: 30 }, handler: async () => {} }))
+    expect(() => defineJob({ name: 'x', schema: z.object({ orgId: z.uuid() }), queue: { expireInSeconds: JOB_SIGNAL_MARGIN_SECONDS }, handler: async () => {} }))
       .toThrow(/expireInSeconds/)
   })
 
@@ -30,15 +31,17 @@ describe('defineJob / enqueue', () => {
     beforeAll(async () => { boss = await startTestBoss() })
     afterAll(async () => { await boss.stop({ graceful: false, wait: true }) })
 
-    it('hands the handler an AbortSignal that fires at expireInSeconds - 30', async () => {
+    it('hands the handler an AbortSignal whose deadline is expireInSeconds - JOB_SIGNAL_MARGIN_SECONDS', async () => {
       const name = uniqueName('test.signal')
-      let observed: { aborted: boolean } | null = null
+      const expireInSeconds = JOB_SIGNAL_MARGIN_SECONDS + 2                 // 2 s of handler time
+      let observed: { aborted: boolean; elapsedMs: number } | null = null
       const done = new Promise<void>((resolve) => {
         const def = defineJob({
-          name, schema: z.object({ orgId: z.uuid() }), queue: { expireInSeconds: 31, retryLimit: 0 },
+          name, schema: z.object({ orgId: z.uuid() }), queue: { expireInSeconds, retryLimit: 0 },
           handler: async ({ signal }) => {
-            await new Promise<void>((r) => { signal.addEventListener('abort', () => r(), { once: true }); setTimeout(r, 5_000) })
-            observed = { aborted: signal.aborted }
+            const startedAt = Date.now()
+            await new Promise<void>((r) => { signal.addEventListener('abort', () => r(), { once: true }); setTimeout(r, 8_000) })
+            observed = { aborted: signal.aborted, elapsedMs: Date.now() - startedAt }
             resolve()
           },
         })
@@ -46,11 +49,14 @@ describe('defineJob / enqueue', () => {
       })
       await done
       try {
-        expect(observed).toEqual({ aborted: true })       // aborted after ~1 s, well before the 5 s fallback
+        const seen = observed as unknown as { aborted: boolean; elapsedMs: number }
+        expect(seen.aborted).toBe(true)                                     // not the 8 s fallback
+        expect(seen.elapsedMs).toBeGreaterThan((expireInSeconds - JOB_SIGNAL_MARGIN_SECONDS) * 1000 - 500)
+        expect(seen.elapsedMs).toBeLessThan((expireInSeconds - JOB_SIGNAL_MARGIN_SECONDS) * 1000 + 1500)
       } finally {
         await deleteAllJobs(name)
         await boss.deleteQueue(name)
       }
-    }, 15_000)
+    }, 20_000)
   })
 })

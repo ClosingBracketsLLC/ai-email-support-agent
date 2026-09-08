@@ -1,8 +1,7 @@
 import type PgBoss from 'pg-boss'
 import type { z } from 'zod'
+import { JOB_SIGNAL_MARGIN_SECONDS } from '@aesa/core'
 import { createQueueRetrying } from './pg-boss.ts'
-
-export const JOB_SIGNAL_MARGIN_SECONDS = 30
 
 export interface JobQueueOptions {
   policy?: 'standard' | 'singleton' | 'stately'

@@ -1,3 +1,9 @@
+/**
+ * The margin between a job's pg-boss expiry and the AbortSignal deadline defineJob() gives its handler.
+ * @aesa/queue imports this one: two copies would let the boot invariant pass while the real deadline drifts.
+ */
+export const JOB_SIGNAL_MARGIN_SECONDS = 30
+
 /** Coupled constants the reference enforced only by comment. Asserted at api/worker boot; tested here. */
 export const INVARIANTS = {
   REDRAFT_MAX: 2,
@@ -7,7 +13,7 @@ export const INVARIANTS = {
   SEND_CLAIM_HORIZON_SECONDS: 600,
   DRAFT_JOB_EXPIRE_SECONDS: 600,
   DRAFT_WATCHDOG_SECONDS: 240,
-  JOB_SIGNAL_MARGIN_SECONDS: 30,
+  JOB_SIGNAL_MARGIN_SECONDS,
 } as const
 
 export function checkInvariants(v: Record<keyof typeof INVARIANTS, number>): string[] {
