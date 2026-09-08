@@ -26,12 +26,12 @@ importers:
       '@aesa/core':
         specifier: workspace:*
         version: link:../../packages/core
-      '@aesa/crypto':
-        specifier: workspace:*
-        version: link:../../packages/crypto
       '@aesa/db':
         specifier: workspace:*
         version: link:../../packages/db
+      drizzle-orm:
+        specifier: ^0.44.0
+        version: 0.44.7(@types/pg@8.23.1)(pg@8.23.0)
       fastify:
         specifier: ^5.4.0
         version: 5.12.3
