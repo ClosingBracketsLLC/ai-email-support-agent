@@ -3457,7 +3457,7 @@ Run: `cd apps/app && npx expo install @expo/vector-icons`
 import Ionicons from '@expo/vector-icons/Ionicons'
 import { Link, usePathname } from 'expo-router'
 import { Tabs } from 'expo-router/js-tabs'
-import { StyleSheet, Text, View, useWindowDimensions } from 'react-native'
+import { Pressable, StyleSheet, Text, View, useWindowDimensions } from 'react-native'
 import { WIDE_BREAKPOINT, radius, spacing, typeScale, useColors } from '@/theme'
 
 type Glyph = keyof typeof Ionicons.glyphMap
@@ -3494,10 +3494,11 @@ export function ResponsiveShell() {
           const active = pathname === t.href || pathname.startsWith(`${t.href}/`)
           return (
             <Link key={t.name} href={t.href} asChild>
-              <View accessibilityRole="menuitem" testID={`nav-${t.name}`} style={[styles.item, active && { backgroundColor: c.info }]}>
+              {/* asChild hands onPress to the child, so it must be pressable — a View would swallow the navigation */}
+              <Pressable accessibilityRole="menuitem" testID={`nav-${t.name}`} style={[styles.item, active && { backgroundColor: c.info }]}>
                 <Ionicons name={active ? t.iconActive : t.icon} size={20} color={active ? c.primary : c.muted} />
                 <Text style={[typeScale.body, { color: active ? c.primary : c.text }]}>{t.title}</Text>
-              </View>
+              </Pressable>
             </Link>
           )
         })}
@@ -3885,29 +3886,30 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```ts
 jest.mock('expo-device', () => ({ isDevice: true, deviceName: 'Test Phone' }))
 jest.mock('expo-constants', () => ({ __esModule: true, default: { expoConfig: { extra: { eas: { projectId: 'proj_123' } } } } }))
-const notifications = {
+// babel-jest hoists jest.mock above imports and only lets the factory close over variables named mock*.
+const mockNotifications = {
   getPermissionsAsync: jest.fn(), requestPermissionsAsync: jest.fn(), getExpoPushTokenAsync: jest.fn(), setNotificationChannelAsync: jest.fn(),
   AndroidImportance: { HIGH: 4 },
 }
-jest.mock('expo-notifications', () => notifications)
-jest.mock('react-native/Libraries/Utilities/Platform', () => ({ OS: 'ios', select: (o: Record<string, unknown>) => o.ios }))
+jest.mock('expo-notifications', () => mockNotifications)
+// jest-expo's default preset runs as iOS, so Platform.OS is already 'ios'; no Platform mock is needed.
 
 import { registerForPush } from './push'
 
 beforeEach(() => jest.clearAllMocks())
 
 test('does not prompt when not asked and permission is missing', async () => {
-  notifications.getPermissionsAsync.mockResolvedValue({ status: 'undetermined' })
+  mockNotifications.getPermissionsAsync.mockResolvedValue({ status: 'undetermined' })
   expect(await registerForPush({ ask: false })).toEqual({ kind: 'denied' })
-  expect(notifications.requestPermissionsAsync).not.toHaveBeenCalled()
+  expect(mockNotifications.requestPermissionsAsync).not.toHaveBeenCalled()
 })
 
 test('prompts when asked, then returns the Expo token with the EAS project id', async () => {
-  notifications.getPermissionsAsync.mockResolvedValue({ status: 'undetermined' })
-  notifications.requestPermissionsAsync.mockResolvedValue({ status: 'granted' })
-  notifications.getExpoPushTokenAsync.mockResolvedValue({ type: 'expo', data: 'ExponentPushToken[abc]' })
+  mockNotifications.getPermissionsAsync.mockResolvedValue({ status: 'undetermined' })
+  mockNotifications.requestPermissionsAsync.mockResolvedValue({ status: 'granted' })
+  mockNotifications.getExpoPushTokenAsync.mockResolvedValue({ type: 'expo', data: 'ExponentPushToken[abc]' })
   expect(await registerForPush({ ask: true })).toEqual({ kind: 'ok', expoPushToken: 'ExponentPushToken[abc]', platform: 'ios', deviceName: 'Test Phone' })
-  expect(notifications.getExpoPushTokenAsync).toHaveBeenCalledWith({ projectId: 'proj_123' })
+  expect(mockNotifications.getExpoPushTokenAsync).toHaveBeenCalledWith({ projectId: 'proj_123' })
 })
 ```
 
