@@ -27,7 +27,10 @@
 1. **Better Auth tables move to Phase 1.** They are generated from the auth config (`npx @better-auth/cli generate`) that Phase 1 creates; Phase 0 leaves `workspaces.org_id` as `uuid` **without** a foreign key, and Phase 1 adds the FK after generating Better Auth's tables with `advanced.database.generateId: false` and `uuid` id columns.
 2. **`SECURITY DEFINER` resolvers move to Phase 2** with the first table they resolve (`mailbox_connections`); Phase 0 establishes the role split they rely on and proves it in the isolation suite.
 3. **`agent.orphan-sweep` moves to Phase 3** (it needs `agent_runs`); Phase 0's worker registers a `platform.heartbeat` cron instead to prove the cron rails, `WORKER_ROLES` partitioning and `withPlatform()`.
-4. **Role model:** one `DATABASE_URL` (the migration/owner role); app pools run `SET ROLE aesa_app` on every checked-out connection, and `withPlatform()` uses `SET LOCAL ROLE aesa_platform`. Separate LOGIN roles per process are a production hardening step documented in the README, not code.
+4. **Role model:** one `DATABASE_URL` (the migration/owner role); app pools start every connection as `aesa_app` via the libpq startup options (`-c role=aesa_app`, applied by the server before the first query), and `withPlatform()` uses `SET LOCAL ROLE aesa_platform`. Separate LOGIN roles per process are a production hardening step documented in the README, not code.
+5. **`minio` is omitted from `compose.yaml`** until Phase 4 needs object storage for uploads; nothing in Phase 0-3 writes an object.
+
+Implemented, not deviated, as of the final fix wave: the spec's "audit line per `withPlatform()` call" — `withPlatform()` writes one `audit_log` row (org_id NULL, actor `system:<reason>`, action `platform.access`) inside the same transaction, before the callback runs.
 
 ## File structure
 
@@ -523,10 +526,11 @@ export type Db = NodePgDatabase<typeof schema>
 
 export interface CreateDbOptions {
   /**
-   * 'app' (the default for api/worker): every checked-out connection runs `SET ROLE aesa_app` plus the
-   * app-role timeouts, so even a raw handle is subject to forced RLS and sees no tenant rows without
-   * `withOrg`. 'owner': the migration/test-admin role — no SET ROLE, bypasses nothing by policy but
-   * is the table owner (RLS is FORCED, so it still sees nothing without a policy match).
+   * 'app' (the default for api/worker): every connection STARTS as `aesa_app` (via libpq startup
+   * options) plus the app-role timeouts, so even a raw handle is subject to forced RLS and sees no
+   * tenant rows without `withOrg`. 'owner': the migration/test-admin role — starts as `aesa_owner`,
+   * bypasses nothing by policy but is the table owner (RLS is FORCED, so it still sees nothing
+   * without a policy match).
    */
   role?: 'owner' | 'app'
   pool?: Omit<pg.PoolConfig, 'connectionString'>
