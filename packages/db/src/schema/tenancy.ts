@@ -4,8 +4,9 @@ import {
 } from 'drizzle-orm/pg-core'
 import { bytea, createdAt, emptyTextArray, orgId, tenantPolicies, updatedAt } from './helpers.ts'
 
-export const ONBOARDING_STEPS = ['profile', 'mailbox', 'knowledge', 'go_live', 'done'] as const
-export const TONES = ['friendly', 'formal', 'concise'] as const
+// The check constraints below spell the same literals: drizzle-kit inlines sql`` parameters into DDL only
+// partially, so building them from the arrays would change the snapshot. Keep both in sync by hand.
+export { ONBOARDING_STEPS, TONES } from '@aesa/contracts'
 
 /** One row per organization: business identity, guardrail allowlists, guidance, switches. */
 export const workspaces = pgTable('workspaces', {

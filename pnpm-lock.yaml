@@ -101,6 +101,22 @@ importers:
         specifier: ^3.2.0
         version: 3.2.7(@types/node@22.20.1)(tsx@4.23.13)
 
+  packages/contracts:
+    dependencies:
+      zod:
+        specifier: ^4.0.0
+        version: 4.5.4
+    devDependencies:
+      '@types/node':
+        specifier: ^22
+        version: 22.20.1
+      typescript:
+        specifier: ^5.9.2
+        version: 5.9.3
+      vitest:
+        specifier: ^3.2.0
+        version: 3.2.7(@types/node@22.20.1)(tsx@4.23.13)
+
   packages/core:
     dependencies:
       zod:
@@ -147,6 +163,9 @@ importers:
 
   packages/db:
     dependencies:
+      '@aesa/contracts':
+        specifier: workspace:*
+        version: link:../contracts
       '@aesa/crypto':
         specifier: workspace:*
         version: link:../crypto
