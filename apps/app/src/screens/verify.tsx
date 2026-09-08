@@ -12,10 +12,12 @@ export function VerifyScreen() {
   const { email = '' } = useLocalSearchParams<{ email?: string }>()
   const [code, setCode] = useState('')
   const [busy, setBusy] = useState(false)
+  const [resendBusy, setResendBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [resent, setResent] = useState(false)
 
   async function verify() {
+    if (busy) return
     setBusy(true); setError(null)
     const { error } = await authClient.signIn.emailOtp({ email, otp: code.trim() })
     setBusy(false)
@@ -24,8 +26,10 @@ export function VerifyScreen() {
   }
 
   async function resend() {
-    setError(null); setResent(false)
+    if (resendBusy) return
+    setResendBusy(true); setError(null); setResent(false)
     const { error } = await authClient.emailOtp.sendVerificationOtp({ email, type: 'sign-in' })
+    setResendBusy(false)
     if (error) setError('Could not resend the code. Wait a minute and try again.'); else setResent(true)
   }
 
@@ -35,7 +39,7 @@ export function VerifyScreen() {
       <Muted>We sent a 6-digit code to {email}.</Muted>
       <TextField label="Code" value={code} onChangeText={setCode} keyboardType="number-pad" autoComplete="one-time-code" textContentType="oneTimeCode" maxLength={6} testID="otp" onSubmitEditing={verify} />
       <Button label="Continue" onPress={verify} loading={busy} disabled={code.trim().length !== 6} testID="verify-code" />
-      <Button variant="secondary" label="Send a new code" onPress={resend} />
+      <Button variant="secondary" label="Send a new code" onPress={resend} loading={resendBusy} />
       <Button variant="secondary" label="Use a different email" onPress={() => router.replace('/sign-in')} />
       {resent ? <Banner tone="success">A new code is on its way.</Banner> : null}
       {error ? <Banner tone="error" testID="verify-error">{error}</Banner> : null}

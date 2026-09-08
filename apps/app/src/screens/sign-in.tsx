@@ -23,6 +23,7 @@ export function SignInScreen() {
   const [error, setError] = useState<string | null>(null)
 
   async function sendCode() {
+    if (busy) return
     const address = email.trim().toLowerCase()
     setBusy(true); setError(null)
     const { error } = await authClient.emailOtp.sendVerificationOtp({ email: address, type: 'sign-in' })

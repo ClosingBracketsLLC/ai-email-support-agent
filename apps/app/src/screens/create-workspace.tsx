@@ -29,15 +29,20 @@ export function CreateWorkspaceScreen() {
     },
   }))
 
+  function submit() {
+    if (!input.success || create.isPending) return
+    create.mutate(input.data)
+  }
+
   return (
     <Screen testID="create-workspace">
       <Title>Create your workspace</Title>
       <Muted>One workspace per business. You can invite teammates afterwards.</Muted>
       {!session?.user.name ? <TextField label="Your name" value={yourName} onChangeText={setYourName} autoComplete="name" testID="your-name" /> : null}
-      <TextField label="Business name" value={businessName} onChangeText={setBusinessName} placeholder="Acme Socks" testID="business-name" onSubmitEditing={() => input.success && create.mutate(input.data)} />
+      <TextField label="Business name" value={businessName} onChangeText={setBusinessName} placeholder="Acme Socks" testID="business-name" onSubmitEditing={submit} />
       <Muted>Time zone: {timezone}</Muted>
       {create.isError ? <Banner tone="error">Could not create the workspace. Try again.</Banner> : null}
-      <Button label="Create workspace" onPress={() => input.success && create.mutate(input.data)} loading={create.isPending} disabled={!input.success} testID="create" />
+      <Button label="Create workspace" onPress={submit} loading={create.isPending} disabled={!input.success} testID="create" />
     </Screen>
   )
 }
