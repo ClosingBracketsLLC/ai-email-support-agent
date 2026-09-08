@@ -8,31 +8,27 @@ export type Db = NodePgDatabase<typeof schema>
 
 export interface CreateDbOptions {
   /**
-   * 'app' (the default for api/worker): every checked-out connection runs `SET ROLE aesa_app` plus the
-   * app-role timeouts, so even a raw handle is subject to forced RLS and sees no tenant rows without
-   * `withOrg`. 'owner': the migration/test-admin role — no SET ROLE, bypasses nothing by policy but
-   * is the table owner (RLS is FORCED, so it still sees nothing without a policy match).
+   * 'app' (the default for api/worker): every connection STARTS as `aesa_app` (via libpq startup
+   * options) plus the app-role timeouts, so even a raw handle is subject to forced RLS and sees no
+   * tenant rows without `withOrg`. 'owner': the migration/test-admin role — starts as `aesa_owner`,
+   * bypasses nothing by policy but is the table owner (RLS is FORCED, so it still sees nothing without
+   * a policy match).
    */
   role?: 'owner' | 'app'
   pool?: Omit<pg.PoolConfig, 'connectionString'>
 }
 
 export function createDb(connectionString: string, opts: CreateDbOptions = {}): { db: Db; pool: pg.Pool } {
-  const pool = new pg.Pool({ ...opts.pool, connectionString })
-  // The connection user is the cluster admin (locally a superuser, which bypasses RLS). Every checked-out
-  // connection switches to a NON-superuser role first: 'app' → aesa_app (forced RLS + timeouts),
-  // 'owner' → aesa_owner (owns the tables; migrations run as it; FORCE RLS applies to it too).
-  // pg queues this statement on the client before the caller's first query, so ordering is guaranteed.
-  const roleStatement =
+  // The connection user is the cluster admin (locally a superuser, which bypasses RLS). Every connection
+  // STARTS in a non-superuser role via libpq startup options (`-c role=…` is applied by the server before
+  // the first query — no client-side SET ROLE race, nothing for pg's deprecated query queuing to order):
+  // 'app' → aesa_app (forced RLS + the app timeouts), 'owner' → aesa_owner (owns the tables; migrations
+  // run as it; FORCE RLS applies to it too). The login user must be a member of both roles.
+  const startupOptions =
     (opts.role ?? 'app') === 'app'
-      ? "SET ROLE aesa_app; SET idle_in_transaction_session_timeout = '5s'; SET statement_timeout = '30s'"
-      : 'SET ROLE aesa_owner'
-  pool.on('connect', (client) => {
-    client.query(roleStatement).catch((err) => {
-      console.error('[db] failed to set connection role', err)
-      client.release(err)
-    })
-  })
+      ? '-c role=aesa_app -c idle_in_transaction_session_timeout=5s -c statement_timeout=30s'
+      : '-c role=aesa_owner'
+  const pool = new pg.Pool({ ...opts.pool, connectionString, options: startupOptions })
   return { db: drizzle(pool, { schema }), pool }
 }
 

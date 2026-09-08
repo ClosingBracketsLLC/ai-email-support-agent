@@ -42,4 +42,14 @@ describe('migrations', () => {
       await pool.end()
     }
   })
+
+  it('owner pool connections run as aesa_owner from the first query', async () => {
+    const { pool } = createDb(t.url, { role: 'owner' })
+    try {
+      const res = await pool.query<{ current_user: string }>('SELECT current_user')
+      expect(res.rows[0]!.current_user).toBe('aesa_owner')
+    } finally {
+      await pool.end()
+    }
+  })
 })
