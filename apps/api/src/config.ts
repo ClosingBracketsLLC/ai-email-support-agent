@@ -76,12 +76,17 @@ export function loadConfig(env: NodeJS.ProcessEnv): ApiConfig {
     mail = { transport, from: d.MAIL_FROM ?? 'aesa <onboarding@resend.dev>' }
   }
 
+  // Normalize origins once: strip trailing slashes so they match browser Origin headers exactly.
+  const appBaseUrl = d.APP_BASE_URL.replace(/\/+$/, '')
+  const appWebOrigin = d.APP_WEB_ORIGIN.replace(/\/+$/, '')
+
   // aesa:// is the native deep-link scheme (OAuth callbacks land there); exp:// covers Expo Go in development.
-  const trustedOrigins = [...new Set([d.APP_WEB_ORIGIN, 'aesa://', ...(production ? [] : ['exp://']), ...csv(d.AUTH_TRUSTED_ORIGINS)])]
+  const extraOrigins = csv(d.AUTH_TRUSTED_ORIGINS).map((o) => o.startsWith('aesa://') || o.startsWith('exp://') ? o : o.replace(/\/+$/, ''))
+  const trustedOrigins = [...new Set([appWebOrigin, 'aesa://', ...(production ? [] : ['exp://']), ...extraOrigins])]
 
   return {
     env: d.NODE_ENV, databaseUrl: d.DATABASE_URL, port: d.PORT, host: d.HOST, logLevel: d.LOG_LEVEL,
-    appBaseUrl: d.APP_BASE_URL.replace(/\/+$/, ''), appWebOrigin: d.APP_WEB_ORIGIN.replace(/\/+$/, ''), trustedOrigins,
+    appBaseUrl, appWebOrigin, trustedOrigins,
     betterAuthSecret: new Secret(d.BETTER_AUTH_SECRET), authRateLimit: d.AUTH_RATE_LIMIT === 'on', crossSiteCookies: d.AUTH_CROSS_SITE_COOKIES === 'true',
     google: oauthPair('GOOGLE', d.GOOGLE_CLIENT_ID, d.GOOGLE_CLIENT_SECRET),
     microsoft: oauthPair('MICROSOFT', d.MICROSOFT_CLIENT_ID, d.MICROSOFT_CLIENT_SECRET),

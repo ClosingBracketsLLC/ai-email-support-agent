@@ -36,4 +36,10 @@ describe('api config', () => {
     expect(c.mail.transport).toBe('resend')
     expect(c.trustedOrigins).toEqual(['http://localhost:8081', 'aesa://', 'https://app.example.com', 'https://staging.example.com'])
   })
+  it('strips trailing slashes from the origins before trusting them', () => {
+    const c = loadConfig({ DATABASE_URL: 'postgres://x', APP_BASE_URL: 'http://localhost:3001/', APP_WEB_ORIGIN: 'http://localhost:8081/', BETTER_AUTH_SECRET: 's'.repeat(32), AUTH_TRUSTED_ORIGINS: 'https://app.example.com/' })
+    expect(c.appBaseUrl).toBe('http://localhost:3001')
+    expect(c.appWebOrigin).toBe('http://localhost:8081')
+    expect(c.trustedOrigins).toEqual(['http://localhost:8081', 'aesa://', 'exp://', 'https://app.example.com'])
+  })
 })
