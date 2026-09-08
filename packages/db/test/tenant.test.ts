@@ -5,7 +5,7 @@ import { createDb } from '../src/raw.ts'
 import { withOrg, withPlatform } from '../src/tenant.ts'
 import { createTestDatabase } from './helpers/test-db.ts'
 
-const acceptOrgTx = (_tx: OrgTx) => {}
+const acceptOrgTx = (_tx: OrgTx) => { void _tx }
 
 describe('tenant isolation', () => {
   let t: Awaited<ReturnType<typeof createTestDatabase>>
