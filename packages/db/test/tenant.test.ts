@@ -1,6 +1,6 @@
 import { eq } from 'drizzle-orm'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { orgSettings, workspaces, type OrgTx } from '../src/index.ts'
+import { auditLog, orgSettings, workspaces, type OrgTx } from '../src/index.ts'
 import { createDb } from '../src/raw.ts'
 import { withOrg, withPlatform } from '../src/tenant.ts'
 import { createTestDatabase } from './helpers/test-db.ts'
@@ -74,6 +74,14 @@ describe('tenant isolation', () => {
   it('withPlatform sees every organization', async () => {
     const rows = await withPlatform(app.db, 'test:list-all', (tx) => tx.select().from(workspaces))
     expect(rows.map((r) => r.businessName).sort()).toEqual(['A', 'B'])
+  })
+
+  it('withPlatform writes its audit line before the callback runs', async () => {
+    const reason = `test.audit-${crypto.randomUUID()}`
+    const rows = await withPlatform(app.db, reason, (tx) =>
+      tx.select().from(auditLog).where(eq(auditLog.actor, `system:${reason}`)))
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ orgId: null, actor: `system:${reason}`, action: 'platform.access', entityType: 'platform', entityId: reason })
   })
 
   it('withOrg rejects a non-uuid org id before touching the database', async () => {

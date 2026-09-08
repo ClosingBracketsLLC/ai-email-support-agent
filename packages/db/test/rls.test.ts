@@ -1,8 +1,13 @@
 import pg from 'pg'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { ORG_ID_PREDICATE_SQL } from '../src/schema/helpers.ts'
 import { createTestDatabase } from './helpers/test-db.ts'
 
-const TENANT_TABLES = ['workspaces', 'org_settings', 'usage_counters', 'audit_log', 'org_data_keys']
+/** Tables that legitimately carry no org_id. Every other ordinary table in `public` must be tenant-scoped. */
+const RLS_EXEMPT = ['platform_state']
+
+/** pg renders a policy expression with its own casts and parentheses; compare the shape, not the formatting. */
+const normalize = (predicate: string) => predicate.toLowerCase().replaceAll('::text', '').replace(/[()\s]/g, '')
 
 describe('row-level security', () => {
   let t: Awaited<ReturnType<typeof createTestDatabase>>
@@ -19,19 +24,33 @@ describe('row-level security', () => {
     expect(res.rows.map((r) => r.rolname)).toEqual(['aesa_app', 'aesa_platform'])
   })
 
-  it.each(TENANT_TABLES)('%s has RLS enabled AND forced', async (table) => {
-    const res = await c.query(`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = $1`, [table])
-    expect(res.rows[0]).toEqual({ relrowsecurity: true, relforcerowsecurity: true })
-  })
-
-  it.each(TENANT_TABLES)('%s has an org-isolation policy for aesa_app and a platform policy for aesa_platform', async (table) => {
-    const res = await c.query(
-      `SELECT policyname, roles::text[] AS roles, qual FROM pg_policies WHERE tablename = $1 ORDER BY policyname`, [table],
+  // The invariant, not a list: a Phase 1-7 table that forgets tenantPolicies() or its FORCE line fails here.
+  it('every ordinary public table outside RLS_EXEMPT has forced RLS and exactly the two tenant policies', async () => {
+    const expected = normalize(ORG_ID_PREDICATE_SQL)
+    const tables = await c.query<{ relname: string; relrowsecurity: boolean; relforcerowsecurity: boolean }>(
+      `SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity FROM pg_class c
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = 'public' AND c.relkind = 'r' AND NOT (c.relname = ANY($1::text[])) ORDER BY 1`,
+      [RLS_EXEMPT],
     )
-    const byName = Object.fromEntries(res.rows.map((r) => [r.policyname, r]))
-    expect(byName[`${table}_org_isolation`].roles).toEqual(['aesa_app'])
-    expect(byName[`${table}_org_isolation`].qual).toContain("NULLIF(current_setting('app.org_id'::text, true), ''::text))::uuid")
-    expect(byName[`${table}_platform_all`].roles).toEqual(['aesa_platform'])
+    // A superset check, so a new tenant table extends the loop instead of failing this line.
+    expect(tables.rows.map((t) => t.relname))
+      .toEqual(expect.arrayContaining(['audit_log', 'org_data_keys', 'org_settings', 'usage_counters', 'workspaces']))
+
+    for (const t of tables.rows) {
+      expect({ table: t.relname, rls: t.relrowsecurity, forced: t.relforcerowsecurity })
+        .toEqual({ table: t.relname, rls: true, forced: true })
+      const policies = await c.query<{ policyname: string; roles: string[]; qual: string; with_check: string }>(
+        `SELECT policyname, roles::text[] AS roles, qual, with_check FROM pg_policies
+         WHERE schemaname = 'public' AND tablename = $1 ORDER BY policyname`, [t.relname],
+      )
+      expect(policies.rows.map((p) => p.policyname)).toEqual([`${t.relname}_org_isolation`, `${t.relname}_platform_all`])
+      const [isolation, platform] = policies.rows as [typeof policies.rows[number], typeof policies.rows[number]]
+      expect({ table: t.relname, roles: isolation.roles, qual: normalize(isolation.qual), withCheck: normalize(isolation.with_check) })
+        .toEqual({ table: t.relname, roles: ['aesa_app'], qual: expected, withCheck: expected })
+      expect({ table: t.relname, roles: platform.roles, qual: platform.qual, withCheck: platform.with_check })
+        .toEqual({ table: t.relname, roles: ['aesa_platform'], qual: 'true', withCheck: 'true' })
+    }
   })
 
   it('platform_state has no RLS, is readable by aesa_app and writable only by aesa_platform', async () => {

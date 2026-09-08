@@ -1,5 +1,6 @@
 import { sql } from 'drizzle-orm'
 import type { Db } from './client.ts'
+import { auditLog } from './schema/index.ts'
 
 type Tx = Parameters<Parameters<Db['transaction']>[0]>[0]
 
@@ -30,14 +31,17 @@ export async function withOrg<T>(db: Db, orgId: string, fn: (tx: OrgTx) => Promi
 
 /**
  * Cross-organization access for sweeps and crons. `reason` is required so every call site documents
- * why it needs to see all tenants (grep `withPlatform(` to audit). Switches the transaction's role to
- * aesa_platform; the session user (owner/admin) is a member of it via migration 0002.
+ * why it needs to see all tenants. Switches the transaction's role to aesa_platform; the session user
+ * (owner/admin) is a member of it via migration 0002. Every call writes one `audit_log` row (org_id NULL,
+ * actor `system:<reason>`) inside the same transaction and before `fn`, so the trail is a table, not a grep,
+ * and a rolled-back sweep leaves no claim that it ran.
  */
 export async function withPlatform<T>(db: Db, reason: string, fn: (tx: PlatformTx) => Promise<T>): Promise<T> {
   if (!reason) throw new TypeError('withPlatform: reason is required')
   return db.transaction(async (tx) => {
     await tx.execute(sql`SET LOCAL ROLE aesa_platform`)
     await tx.execute(sql`SELECT set_config('app.org_id', '', true)`)
+    await tx.insert(auditLog).values({ orgId: null, actor: `system:${reason}`, action: 'platform.access', entityType: 'platform', entityId: reason })
     return fn(tx as PlatformTx)
   })
 }
