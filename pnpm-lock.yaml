@@ -58,6 +58,49 @@ importers:
         specifier: ^3.2.0
         version: 3.2.7(@types/node@22.20.1)(tsx@4.23.13)
 
+  apps/worker:
+    dependencies:
+      '@aesa/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+      '@aesa/crypto':
+        specifier: workspace:*
+        version: link:../../packages/crypto
+      '@aesa/db':
+        specifier: workspace:*
+        version: link:../../packages/db
+      '@aesa/queue':
+        specifier: workspace:*
+        version: link:../../packages/queue
+      pg:
+        specifier: ^8.16.0
+        version: 8.23.0
+      pg-boss:
+        specifier: ^10.4.2
+        version: 10.4.2
+      tsx:
+        specifier: ^4.20.0
+        version: 4.23.13
+      zod:
+        specifier: ^4.0.0
+        version: 4.5.4
+    devDependencies:
+      '@types/node':
+        specifier: ^22
+        version: 22.20.1
+      '@types/pg':
+        specifier: ^8.15.0
+        version: 8.23.1
+      drizzle-orm:
+        specifier: ^0.44.0
+        version: 0.44.7(@types/pg@8.23.1)(pg@8.23.0)
+      typescript:
+        specifier: ^5.9.2
+        version: 5.9.3
+      vitest:
+        specifier: ^3.2.0
+        version: 3.2.7(@types/node@22.20.1)(tsx@4.23.13)
+
   packages/core:
     dependencies:
       zod:
