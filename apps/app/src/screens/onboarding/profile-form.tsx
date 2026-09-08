@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Pressable, StyleSheet, Text, View } from 'react-native'
 import { TONES, UpdateProfileInput, deriveAllowedHosts, type Tone } from '@aesa/contracts'
 import { Banner } from '@/components/banner'
@@ -25,6 +25,10 @@ export function ProfileForm({ initial, submitLabel, onSaved }: { initial: Profil
   const [contactUrls, setContactUrls] = useState(initial.contactUrls.join('\n'))
   const [error, setError] = useState<string | null>(null)
   const [dirty, setDirty] = useState(false)
+  // Bumped by every setter. Lets a save's onSuccess tell whether the user edited the form again while that
+  // save was in flight, so it never clears `dirty` out from under a newer, not-yet-saved edit.
+  const editVersion = useRef(0)
+  const pendingVersion = useRef<number | null>(null)
 
   // A background refetch (window focus, another device's save) must not silently clobber what's on screen.
   // While the form is untouched, keep it in sync with the server; once the user edits anything, their
@@ -38,11 +42,11 @@ export function ProfileForm({ initial, submitLabel, onSaved }: { initial: Profil
     setContactUrls(initial.contactUrls.join('\n'))
   }, [dirty, initial.websiteUrl, initial.description, initial.tone, initial.contactPhone, initial.contactUrls.join('\n')])
 
-  function onWebsiteUrlChange(v: string) { setDirty(true); setWebsiteUrl(v) }
-  function onDescriptionChange(v: string) { setDirty(true); setDescription(v) }
-  function onToneChange(t: Tone) { setDirty(true); setTone(t) }
-  function onContactPhoneChange(v: string) { setDirty(true); setContactPhone(v) }
-  function onContactUrlsChange(v: string) { setDirty(true); setContactUrls(v) }
+  function onWebsiteUrlChange(v: string) { setDirty(true); editVersion.current += 1; setWebsiteUrl(v) }
+  function onDescriptionChange(v: string) { setDirty(true); editVersion.current += 1; setDescription(v) }
+  function onToneChange(t: Tone) { setDirty(true); editVersion.current += 1; setTone(t) }
+  function onContactPhoneChange(v: string) { setDirty(true); editVersion.current += 1; setContactPhone(v) }
+  function onContactUrlsChange(v: string) { setDirty(true); editVersion.current += 1; setContactUrls(v) }
 
   const draft = useMemo(() => ({
     websiteUrl: websiteUrl.trim() ? websiteUrl.trim() : null,
@@ -55,9 +59,24 @@ export function ProfileForm({ initial, submitLabel, onSaved }: { initial: Profil
   const hosts = parsed.success ? deriveAllowedHosts(parsed.data.websiteUrl, parsed.data.contactUrls) : []
 
   const save = useMutation(trpc.workspace.updateProfile.mutationOptions({
-    onSuccess: async () => { setDirty(false); await queryClient.invalidateQueries({ queryKey: trpc.workspace.get.queryKey() }); onSaved() },
+    onSuccess: async () => {
+      // Invalidate (and let the refetch land) before deciding whether to clear `dirty` — TanStack Query keeps
+      // the previous `initial` in place during the background refetch, so clearing `dirty` any earlier would
+      // let the re-seed effect briefly clobber the screen with the pre-save data. Only clear it if nothing was
+      // typed since this save started; an edit made while it was in flight must keep winning.
+      await queryClient.invalidateQueries({ queryKey: trpc.workspace.get.queryKey() })
+      if (editVersion.current === pendingVersion.current) setDirty(false)
+      onSaved()
+    },
     onError: () => setError('Could not save. Check the URLs and try again.'),
   }))
+
+  function submit() {
+    if (!parsed.success || save.isPending) return
+    setError(null)
+    pendingVersion.current = editVersion.current
+    save.mutate(parsed.data)
+  }
 
   return (
     <View style={styles.form}>
@@ -81,7 +100,7 @@ export function ProfileForm({ initial, submitLabel, onSaved }: { initial: Profil
         <Text style={[typeScale.body, { color: c.text }]}>{hosts.length ? `Replies may link only to ${hosts.join(', ')}.` : 'Replies will contain no links until you add a website or contact links.'}</Text>
       </Card>
       {error ? <Banner tone="error">{error}</Banner> : null}
-      <Button label={submitLabel} onPress={() => { setError(null); if (parsed.success) save.mutate(parsed.data) }} loading={save.isPending} disabled={!parsed.success} testID="save-profile" />
+      <Button label={submitLabel} onPress={submit} loading={save.isPending} disabled={!parsed.success} testID="save-profile" />
     </View>
   )
 }
