@@ -18,11 +18,12 @@ export function normalizeForMatch(text: string): string {
 const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 const cache = new Map<string, RegExp>()
 function phraseRegex(phrase: string): RegExp {
-  let re = cache.get(phrase)
+  const key = normalizeForMatch(phrase).trim()
+  let re = cache.get(key)
   if (!re) {
-    const words = normalizeForMatch(phrase).split(' ').map(escape).join('\\s+')
+    const words = key.split(' ').map(escape).join('\\s+')
     re = new RegExp(`(?<![\\p{L}\\p{N}])${words}(?![\\p{L}\\p{N}])`, 'u')
-    cache.set(phrase, re)
+    cache.set(key, re)
   }
   return re
 }
@@ -31,7 +32,7 @@ function phraseRegex(phrase: string): RegExp {
 export function tripwireHit(text: string, extraPhrases: readonly string[] = []): string | null {
   const haystack = normalizeForMatch(text)
   for (const phrase of [...TRIPWIRE_BASELINE, ...extraPhrases]) {
-    if (phrase.trim() && phraseRegex(phrase).test(haystack)) return normalizeForMatch(phrase)
+    if (phrase.trim() && phraseRegex(phrase).test(haystack)) return normalizeForMatch(phrase).trim()
   }
   return null
 }

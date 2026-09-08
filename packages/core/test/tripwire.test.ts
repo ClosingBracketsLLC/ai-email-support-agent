@@ -32,4 +32,10 @@ describe('tripwire', () => {
   it('baseline contains no bare short tokens that collide with ordinary words', () => {
     for (const bad of ['sue', 'press', 'minor']) expect(TRIPWIRE_BASELINE).not.toContain(bad)
   })
+
+  it('tolerates leading/trailing whitespace in extra phrases and returns the canonical phrase', () => {
+    expect(tripwireHit('please see the vet today', ['vet '])).toBe('vet')
+    expect(tripwireHit('the vet said it is fine', [' vet'])).toBe('vet')
+    expect(tripwireHit('the VET said it is fine', ['  Vet  '])).toBe('vet')
+  })
 })
