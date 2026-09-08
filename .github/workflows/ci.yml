@@ -1,0 +1,37 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: aesa
+          POSTGRES_PASSWORD: aesa
+          POSTGRES_DB: aesa_dev
+        ports: ["5434:5432"]
+        options: >-
+          --health-cmd "pg_isready -U aesa -d aesa_dev"
+          --health-interval 2s --health-timeout 3s --health-retries 15
+    env:
+      DATABASE_URL: postgres://aesa:aesa@localhost:5434/aesa_dev
+      PGPASSWORD: aesa
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - name: Create database roles (mirrors scripts/db-init for the service container)
+        run: psql -h localhost -p 5434 -U aesa -d aesa_dev -v ON_ERROR_STOP=1 -f scripts/db-init/001-roles.sql
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm --filter @aesa/db migrate
+      - run: pnpm test
+      - run: pnpm db:check

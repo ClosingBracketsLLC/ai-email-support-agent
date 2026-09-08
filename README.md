@@ -18,6 +18,21 @@ Design spec: `docs/superpowers/specs/2026-09-07-ai-email-support-agent-design.md
 
 - pg-boss owns the `pgboss` schema and creates it itself on first `boss.start()`; locally the connection user is a superuser so this just works, but in production the worker's connection user must be granted `CREATE` on the database (or have the `pgboss` schema pre-created and owned by it) so pg-boss can bootstrap its tables.
 
+One `DATABASE_URL` (the cluster admin locally; the migration owner in production). Every pool
+connection immediately switches role: `aesa_owner` for migrations, `aesa_app` for api/worker
+traffic (forced row-level security — a handle without `withOrg()` sees no tenant rows), and
+`aesa_platform` only inside `withPlatform()`. Local roles come from `scripts/db-init/001-roles.sql`
+(run once by the compose container); CI runs the same file with `psql`.
+
+Production hardening (not code): create `aesa_app` and `aesa_platform` as LOGIN roles with their
+own passwords and point the api/worker `DATABASE_URL` at `aesa_app`; keep the owner URL for
+migrations only. `SET ROLE` to the same role is a no-op, so no code changes.
+
+## CI
+
+`.github/workflows/ci.yml`: typecheck → lint → migrate → tests (fresh database per test file) →
+migration drift check. Run the same locally with `pnpm typecheck && pnpm lint && pnpm test && pnpm db:check`.
+
 ## Dependency pins
 
 - `libsodium-wrappers` is pinned to exactly `0.7.15` in `packages/crypto`: `0.7.16` ships a broken ESM build (its entry references a missing sibling file), which fails `import` resolution under Node ESM and vitest. Re-test the sealed-box suite (`pnpm --filter @aesa/crypto test -- sealed`) before lifting the pin.
