@@ -9,7 +9,9 @@ export interface WorkerConfig { databaseUrl: string; roles: Set<WorkerRole>; kek
 export function loadConfig(env: NodeJS.ProcessEnv): WorkerConfig {
   const parsed = EnvSchema.safeParse(env)
   if (!parsed.success) throw new Error(`Invalid environment: ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}`)
-  const hasKek = Object.keys(env).some((k) => /^AESA_KEK_V\d+$/.test(k))
+  // A *present but blank* AESA_KEK_V1 is the shipped .env.example shape; loadKekRing skips blanks and
+  // then throws on AESA_KEK_ACTIVE, so presence alone must not claim a ring.
+  const hasKek = Object.entries(env).some(([k, v]) => /^AESA_KEK_V\d+$/.test(k) && Boolean(v))
   return {
     databaseUrl: parsed.data.DATABASE_URL,
     roles: parseWorkerRoles(parsed.data.WORKER_ROLES),
