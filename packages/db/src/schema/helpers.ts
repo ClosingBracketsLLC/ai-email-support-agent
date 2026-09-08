@@ -1,5 +1,6 @@
 import { sql } from 'drizzle-orm'
-import { customType, timestamp, uuid } from 'drizzle-orm/pg-core'
+import { customType, pgPolicy, timestamp, uuid, type AnyPgColumn } from 'drizzle-orm/pg-core'
+import { aesaApp, aesaPlatform } from './roles.ts'
 
 export const id = () => uuid('id').primaryKey().defaultRandom()
 export const orgId = () => uuid('org_id').notNull()
@@ -13,3 +14,17 @@ export const bytea = customType<{ data: Buffer; driverData: Buffer }>({
 })
 
 export const emptyTextArray = () => sql`'{}'::text[]`
+
+export const ORG_ID_PREDICATE_SQL = "org_id = NULLIF(current_setting('app.org_id', true), '')::uuid"
+
+/**
+ * The two policies every tenant table gets. NULLIF matters: a pooled connection that ran SET LOCAL in an
+ * earlier transaction leaves app.org_id as '' (not NULL) and ''::uuid would raise instead of matching nothing.
+ */
+export function tenantPolicies(orgIdColumn: AnyPgColumn, table: string) {
+  const predicate = sql`${orgIdColumn} = NULLIF(current_setting('app.org_id', true), '')::uuid`
+  return [
+    pgPolicy(`${table}_org_isolation`, { as: 'permissive', for: 'all', to: aesaApp, using: predicate, withCheck: predicate }),
+    pgPolicy(`${table}_platform_all`, { as: 'permissive', for: 'all', to: aesaPlatform, using: sql`true`, withCheck: sql`true` }),
+  ]
+}

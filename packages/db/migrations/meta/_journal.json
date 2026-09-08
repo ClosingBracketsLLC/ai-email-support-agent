@@ -8,6 +8,20 @@
       "when": 1788837403015,
       "tag": "0000_friendly_machine_man",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1788839015543,
+      "tag": "0001_outgoing_zeigeist",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1788839029525,
+      "tag": "0002_force_rls_and_grants",
+      "breakpoints": true
     }
   ]
 }

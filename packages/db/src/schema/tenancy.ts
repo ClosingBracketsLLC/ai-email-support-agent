@@ -2,7 +2,7 @@ import { sql } from 'drizzle-orm'
 import {
   bigint, bigserial, boolean, check, date, index, inet, integer, jsonb, pgTable, primaryKey, text, timestamp, uuid,
 } from 'drizzle-orm/pg-core'
-import { bytea, createdAt, emptyTextArray, orgId, updatedAt } from './helpers.ts'
+import { bytea, createdAt, emptyTextArray, orgId, tenantPolicies, updatedAt } from './helpers.ts'
 
 export const ONBOARDING_STEPS = ['profile', 'mailbox', 'knowledge', 'go_live', 'done'] as const
 export const TONES = ['friendly', 'formal', 'concise'] as const
@@ -36,6 +36,7 @@ export const workspaces = pgTable('workspaces', {
   check('workspaces_tone_check', sql`${t.tone} IN ('friendly','formal','concise')`),
   check('workspaces_onboarding_step_check', sql`${t.onboardingStep} IN ('profile','mailbox','knowledge','go_live','done')`),
   check('workspaces_retention_days_check', sql`${t.retentionDays} BETWEEN 30 AND 730`),
+  ...tenantPolicies(t.orgId, 'workspaces'),
 ])
 
 /** Per-org typed key/value overrides; resolution is org override > plan default > code default. */
@@ -45,7 +46,7 @@ export const orgSettings = pgTable('org_settings', {
   value: jsonb('value').notNull(),
   updatedBy: text('updated_by'),
   updatedAt: updatedAt(),
-}, (t) => [primaryKey({ columns: [t.orgId, t.key] })])
+}, (t) => [primaryKey({ columns: [t.orgId, t.key] }), ...tenantPolicies(t.orgId, 'org_settings')])
 
 /** The metering table every cap and every bill reads. Meters are plain text so adding one needs no migration. */
 export const usageCounters = pgTable('usage_counters', {
@@ -54,7 +55,7 @@ export const usageCounters = pgTable('usage_counters', {
   meter: text('meter').notNull(),
   value: bigint('value', { mode: 'number' }).notNull().default(0),
   updatedAt: updatedAt(),
-}, (t) => [primaryKey({ columns: [t.orgId, t.day, t.meter] })])
+}, (t) => [primaryKey({ columns: [t.orgId, t.day, t.meter] }), ...tenantPolicies(t.orgId, 'usage_counters')])
 
 /** Append-only trail with real actor identity: user:<id> | agent:<run_id> | system:<job>. Never bodies. */
 export const auditLog = pgTable('audit_log', {
@@ -71,6 +72,7 @@ export const auditLog = pgTable('audit_log', {
 }, (t) => [
   index('audit_log_org_created_idx').on(t.orgId, t.createdAt.desc()),
   index('audit_log_org_entity_idx').on(t.orgId, t.entityType, t.entityId),
+  ...tenantPolicies(t.orgId, 'audit_log'),
 ])
 
 /** Per-org data-encryption keys (Task 6/7): the DEK wrapped by a versioned KEK, and the sealed-box keypair. */
@@ -82,4 +84,4 @@ export const orgDataKeys = pgTable('org_data_keys', {
   boxPublicKey: bytea('box_public_key').notNull(),
   boxPrivateKeyCiphertext: bytea('box_private_key_ciphertext').notNull(),   // encrypted under the DEK
   createdAt: createdAt(),
-}, (t) => [primaryKey({ columns: [t.orgId, t.version] })])
+}, (t) => [primaryKey({ columns: [t.orgId, t.version] }), ...tenantPolicies(t.orgId, 'org_data_keys')])
