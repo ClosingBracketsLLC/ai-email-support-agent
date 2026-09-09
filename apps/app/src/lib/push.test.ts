@@ -1,0 +1,61 @@
+import Constants from 'expo-constants'
+import { Platform } from 'react-native'
+
+jest.mock('expo-device', () => ({ isDevice: true, deviceName: 'Test Phone' }))
+jest.mock('expo-constants', () => ({ __esModule: true, default: { expoConfig: { extra: { eas: { projectId: 'proj_123' } } } } }))
+// Self-contained factory (no reference to an outer variable): expo-notifications is required by push.ts via
+// a static top-level import, and static imports resolve before any of this file's own top-level statements
+// run (including a `const` a factory might close over) — so the factory itself must carry everything it needs.
+jest.mock('expo-notifications', () => ({
+  getPermissionsAsync: jest.fn(), requestPermissionsAsync: jest.fn(), getExpoPushTokenAsync: jest.fn(), setNotificationChannelAsync: jest.fn(),
+  AndroidImportance: { HIGH: 4 },
+}))
+// jest-expo's default preset runs as iOS, so Platform.OS is already 'ios'; no Platform mock is needed
+// except in the one test below that deliberately switches it to 'web'.
+
+import * as Notifications from 'expo-notifications'
+import { registerForPush } from './push'
+
+const getPermissionsAsync = jest.mocked(Notifications.getPermissionsAsync)
+const requestPermissionsAsync = jest.mocked(Notifications.requestPermissionsAsync)
+const getExpoPushTokenAsync = jest.mocked(Notifications.getExpoPushTokenAsync)
+
+function permissions(status: 'granted' | 'undetermined' | 'denied') {
+  return { status, granted: status === 'granted', expires: 'never', canAskAgain: true } as Awaited<ReturnType<typeof Notifications.getPermissionsAsync>>
+}
+
+beforeEach(() => jest.clearAllMocks())
+
+test('does not prompt when not asked and permission is missing', async () => {
+  getPermissionsAsync.mockResolvedValue(permissions('undetermined'))
+  expect(await registerForPush({ ask: false })).toEqual({ kind: 'denied' })
+  expect(requestPermissionsAsync).not.toHaveBeenCalled()
+})
+
+test('prompts when asked, then returns the Expo token with the EAS project id', async () => {
+  getPermissionsAsync.mockResolvedValue(permissions('undetermined'))
+  requestPermissionsAsync.mockResolvedValue(permissions('granted'))
+  getExpoPushTokenAsync.mockResolvedValue({ type: 'expo', data: 'ExponentPushToken[abc]' })
+  expect(await registerForPush({ ask: true })).toEqual({ kind: 'ok', expoPushToken: 'ExponentPushToken[abc]', platform: 'ios', deviceName: 'Test Phone' })
+  expect(getExpoPushTokenAsync).toHaveBeenCalledWith({ projectId: 'proj_123' })
+})
+
+test('on web, push is unsupported and never touches expo-notifications', async () => {
+  const os = jest.replaceProperty(Platform, 'OS', 'web')
+  try {
+    expect(await registerForPush({ ask: false })).toEqual({ kind: 'unsupported' })
+    expect(getPermissionsAsync).not.toHaveBeenCalled()
+  } finally {
+    os.restore()
+  }
+})
+
+test('permission granted but no EAS project id yet (eas init not run) returns no-project', async () => {
+  getPermissionsAsync.mockResolvedValue(permissions('granted'))
+  const config = jest.replaceProperty(Constants, 'expoConfig', { name: 'aesa', slug: 'aesa', extra: {} })
+  try {
+    expect(await registerForPush({ ask: false })).toEqual({ kind: 'no-project' })
+  } finally {
+    config.restore()
+  }
+})

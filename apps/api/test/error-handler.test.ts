@@ -1,21 +1,15 @@
 import { DrizzleQueryError } from 'drizzle-orm/errors'
-import type pg from 'pg'
-import type { Db } from '@aesa/db'
 import { describe, expect, it } from 'vitest'
 import { buildServer } from '../src/server.ts'
+import { stubDeps } from './helpers/app.ts'
 
 const SECRET = 'tok_SUPER_SECRET_SESSION_TOKEN'
 const QUERY = 'insert into "session" ("token") values ($1)'
 
-/** The error paths never touch the database, so the handles stay unused stubs. */
+/** The error paths never touch the database, so deps stay stubs. */
 function buildCapturingServer() {
   const lines: string[] = []
-  const app = buildServer({
-    db: {} as Db,
-    pool: {} as pg.Pool,
-    logLevel: 'trace',
-    logStream: { write: (line: string) => void lines.push(line) },
-  })
+  const app = buildServer(stubDeps({}, { level: 'trace', stream: { write: (line: string) => void lines.push(line) } }))
   return { app, lines, log: () => lines.join('') }
 }
 
@@ -67,5 +61,36 @@ describe('error handler', () => {
 
     expect(res.statusCode).toBe(400)
     expect(res.json()).toMatchObject({ statusCode: 400, code: 'FST_ERR_VALIDATION', error: 'Bad Request', message: expect.stringContaining("must have required property 'q'") })
+  })
+
+  it('copies err.headers onto the reply and honours err.status (Better Auth throws status + headers)', async () => {
+    const { app } = buildCapturingServer()
+    app.get('/rl', async () => { throw Object.assign(new Error('slow down'), { status: 429, headers: { 'retry-after': '7' } }) })
+    const res = await app.inject({ method: 'GET', url: '/rl' })
+    await app.close()
+    expect(res.statusCode).toBe(429)
+    expect(res.headers['retry-after']).toBe('7')
+    expect(res.json()).toEqual({ statusCode: 429, error: 'Too Many Requests', message: 'Too Many Requests' })
+  })
+
+  it('lets a deliberate 502/503 through and collapses every other 5xx to 500', async () => {
+    const { app } = buildCapturingServer()
+    app.get('/down', async () => { throw Object.assign(new Error('db gone'), { statusCode: 503 }) })
+    app.get('/odd', async () => { throw Object.assign(new Error('x'), { statusCode: 507 }) })
+    const a = await app.inject({ method: 'GET', url: '/down' })
+    const b = await app.inject({ method: 'GET', url: '/odd' })
+    await app.close()
+    expect(a.statusCode).toBe(503); expect(a.json()).toEqual({ statusCode: 503, error: 'Service Unavailable' })
+    expect(b.statusCode).toBe(500); expect(b.json()).toEqual({ statusCode: 500, error: 'Internal Server Error' })
+  })
+
+  it('keeps a short error code (Postgres SQLSTATE) in the log line but never the cause message', async () => {
+    const { app, log } = buildCapturingServer()
+    app.get('/pg', async () => { throw new DrizzleQueryError(QUERY, [SECRET], Object.assign(new Error(`duplicate key ${SECRET}`), { code: '23505' })) })
+    const res = await app.inject({ method: 'GET', url: '/pg' })
+    await app.close()
+    expect(res.statusCode).toBe(500)
+    expect(log()).toContain('"code":"23505"')
+    expect(log()).not.toContain(SECRET)
   })
 })

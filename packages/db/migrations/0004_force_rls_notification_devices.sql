@@ -1,0 +1,1 @@
+ALTER TABLE "notification_devices" FORCE ROW LEVEL SECURITY;

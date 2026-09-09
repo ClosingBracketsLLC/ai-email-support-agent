@@ -28,6 +28,10 @@ jobs:
           node-version: 22
       - run: corepack enable
       - run: pnpm install --frozen-lockfile
+      - name: Expo web export (also generates the typed-route declarations tsc reads)
+        run: pnpm --filter @aesa/app export:web
+        env:
+          EXPO_PUBLIC_API_URL: http://localhost:3001
       - name: Create database roles (mirrors scripts/db-init for the service container)
         run: psql -h localhost -p 5434 -U aesa -d aesa_dev -v ON_ERROR_STOP=1 -f scripts/db-init/001-roles.sql
       - run: pnpm typecheck
@@ -35,3 +39,16 @@ jobs:
       - run: pnpm --filter @aesa/db migrate
       - run: pnpm test
       - run: pnpm db:check
+      - name: Install Playwright Chromium
+        run: pnpm --filter @aesa/app exec playwright install --with-deps chromium
+      - name: Playwright signup smoke (api with devsink mail + the served web export)
+        run: pnpm e2e
+        env:
+          CI: 'true'
+          BETTER_AUTH_SECRET: playwright-secret-playwright-secret-playwright
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: apps/app/playwright-report

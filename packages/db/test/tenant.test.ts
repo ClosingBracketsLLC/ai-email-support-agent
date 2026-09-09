@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { auditLog, orgSettings, workspaces, type OrgTx } from '../src/index.ts'
 import { createDb } from '../src/raw.ts'
 import { withOrg, withPlatform } from '../src/tenant.ts'
-import { createTestDatabase } from './helpers/test-db.ts'
+import { createTestDatabase, createTestOrganization } from './helpers/test-db.ts'
 
 const acceptOrgTx = (_tx: OrgTx) => { void _tx }
 
@@ -11,13 +11,15 @@ describe('tenant isolation', () => {
   let t: Awaited<ReturnType<typeof createTestDatabase>>
   let app: ReturnType<typeof createDb>
   let owner: ReturnType<typeof createDb>
-  const orgA = crypto.randomUUID()
-  const orgB = crypto.randomUUID()
+  let orgA: string
+  let orgB: string
 
   beforeAll(async () => {
     t = await createTestDatabase()
     app = createDb(t.url, { role: 'app', pool: { max: 1 } })   // max 1 forces connection reuse (GUC-leak test)
     owner = createDb(t.url, { role: 'owner' })
+    orgA = await createTestOrganization(app)
+    orgB = await createTestOrganization(app)
     for (const [orgId, name] of [[orgA, 'A'], [orgB, 'B']] as const) {
       await withOrg(app.db, orgId, async (tx) => {
         await tx.insert(workspaces).values({ orgId, businessName: name, timezone: 'UTC' })

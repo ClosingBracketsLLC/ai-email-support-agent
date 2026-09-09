@@ -30,3 +30,10 @@ export async function createTestDatabase(): Promise<{ url: string; drop: () => P
     },
   }
 }
+
+/** Tests only: inserts a Better Auth organization row so tenant rows can satisfy workspaces.org_id → organization.id. */
+export async function createTestOrganization(handle: { pool: pg.Pool }, name = 'Test Org'): Promise<string> {
+  const { rows } = await handle.pool.query<{ id: string }>(
+    `INSERT INTO organization (name, slug) VALUES ($1, $2) RETURNING id`, [name, `t-${randomBytes(4).toString('hex')}`])
+  return rows[0]!.id
+}

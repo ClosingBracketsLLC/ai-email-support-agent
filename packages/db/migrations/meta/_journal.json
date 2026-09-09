@@ -22,6 +22,20 @@
       "when": 1788839029525,
       "tag": "0002_force_rls_and_grants",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1788888521598,
+      "tag": "0003_free_paladin",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1788888528996,
+      "tag": "0004_force_rls_notification_devices",
+      "breakpoints": true
     }
   ]
 }

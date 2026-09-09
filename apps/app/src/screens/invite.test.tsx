@@ -1,0 +1,111 @@
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react-native'
+import type { ReactNode } from 'react'
+import { InviteScreen, isNotRecipient } from './invite'
+
+const mockReplace = jest.fn()
+jest.mock('expo-router', () => ({
+  useLocalSearchParams: () => ({ id: 'inv1' }),
+  useRouter: () => ({ replace: mockReplace }),
+  Redirect: () => null,
+}))
+
+const mockGetInvitation = jest.fn()
+const mockAcceptInvitation = jest.fn()
+const mockSignOut = jest.fn()
+const mockSession = { user: { id: 'u1', email: 'me@example.com', name: 'Me' }, session: { activeOrganizationId: null } }
+
+jest.mock('@/lib/auth-client', () => ({
+  authClient: {
+    useSession: () => ({ data: mockSession, isPending: false, refetch: jest.fn() }),
+    organization: {
+      getInvitation: (...args: unknown[]) => mockGetInvitation(...args),
+      acceptInvitation: (...args: unknown[]) => mockAcceptInvitation(...args),
+      setActive: jest.fn(),
+    },
+    updateUser: jest.fn(),
+    signOut: (...args: unknown[]) => mockSignOut(...args),
+  },
+}))
+
+const teardowns: Array<() => Promise<void> | void> = []
+
+async function setup() {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false, gcTime: 0, refetchOnWindowFocus: false, refetchOnReconnect: false }, mutations: { retry: false, gcTime: 0 } },
+  })
+  function Wrapper({ children }: { children: ReactNode }) {
+    return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  }
+  const rendered = await render(<InviteScreen />, { wrapper: Wrapper })
+  teardowns.push(rendered.unmount, () => queryClient.unmount())
+  return rendered
+}
+
+beforeEach(() => {
+  mockReplace.mockReset()
+  mockSignOut.mockReset()
+  mockSignOut.mockResolvedValue(undefined)
+  mockGetInvitation.mockReset()
+  mockAcceptInvitation.mockReset()
+})
+afterEach(async () => { for (const teardown of teardowns.splice(0)) await teardown() })
+
+test('a wrong-account refusal offers sign-out without disclosing the invited address', async () => {
+  mockGetInvitation.mockResolvedValue({ data: null, error: { status: 403, message: 'You are not the recipient of the invitation' } })
+  await setup()
+
+  await waitFor(() => expect(screen.getByTestId('invite-wrong-account')).toBeTruthy())
+  expect(screen.getByText('This invitation is for a different email address')).toBeTruthy()
+  expect(screen.queryByText(/invited you as/)).toBeNull()
+
+  await fireEvent.press(screen.getByTestId('invite-sign-out'))
+  expect(mockSignOut).toHaveBeenCalledTimes(1)
+  await waitFor(() => expect(mockReplace).toHaveBeenCalledWith({ pathname: '/sign-in', params: { next: '/invite/inv1' } }))
+})
+
+test('any other getInvitation failure shows the generic not-found state, never the wrong-account one', async () => {
+  mockGetInvitation.mockResolvedValue({ data: null, error: { status: 404, message: 'not found' } })
+  await setup()
+
+  await waitFor(() => expect(screen.getByText('Invitation not found')).toBeTruthy())
+  expect(screen.queryByTestId('invite-wrong-account')).toBeNull()
+})
+
+test('a non-recipient acceptInvitation refusal (e.g. a full organization) stays generic, with the server detail shown', async () => {
+  mockGetInvitation.mockResolvedValue({
+    data: {
+      id: 'inv1', email: 'me@example.com', role: 'member', expiresAt: new Date('2026-01-01'),
+      organizationId: 'org1', organizationName: 'Acme', organizationSlug: 'acme', inviterEmail: 'owner@example.com',
+    },
+    error: null,
+  })
+  mockAcceptInvitation.mockResolvedValue({ data: null, error: { status: 403, message: 'Organization membership limit reached' } })
+  await setup()
+
+  await waitFor(() => expect(screen.getByTestId('accept-invite')).toBeTruthy())
+  await fireEvent.press(screen.getByTestId('accept-invite'))
+
+  await waitFor(() => expect(screen.getByText('Could not accept the invitation.')).toBeTruthy())
+  expect(screen.getByTestId('invite-accept-detail')).toBeTruthy()
+  expect(screen.getByText('Organization membership limit reached')).toBeTruthy()
+  expect(screen.queryByTestId('invite-wrong-account')).toBeNull()
+})
+
+describe('isNotRecipient', () => {
+  test('true for the recipient-mismatch message', () => {
+    expect(isNotRecipient({ status: 403, message: 'You are not the recipient of the invitation' })).toBe(true)
+  })
+  test('true for the recipient-mismatch error code, regardless of message', () => {
+    expect(isNotRecipient({ code: 'YOU_ARE_NOT_THE_RECIPIENT_OF_THE_INVITATION' })).toBe(true)
+  })
+  test('false for a membership-limit refusal, even though it is also a 403', () => {
+    expect(isNotRecipient({ status: 403, message: 'Organization membership limit reached' })).toBe(false)
+  })
+  test('false for an email-verification refusal, even though it is also a 403', () => {
+    expect(isNotRecipient({ status: 403, message: 'Email verification required before accepting or rejecting invitation' })).toBe(false)
+  })
+  test('false for no error', () => {
+    expect(isNotRecipient(null)).toBe(false)
+  })
+})

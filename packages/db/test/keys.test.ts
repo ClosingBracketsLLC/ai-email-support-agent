@@ -5,16 +5,17 @@ import { loadKekRing, sealTo, decrypt, encrypt } from '@aesa/crypto'
 import { orgDataKeys, withOrg, workspaces } from '../src/index.ts'
 import { getOrgBoxPublicKey, loadOrgDek, openSealedForOrg, provisionOrgKeys } from '../src/keys.ts'
 import { createDb } from '../src/raw.ts'
-import { createTestDatabase } from './helpers/test-db.ts'
+import { createTestDatabase, createTestOrganization } from './helpers/test-db.ts'
 
 const ring = loadKekRing({ AESA_KEK_V1: randomBytes(32).toString('base64'), AESA_KEK_ACTIVE: '1' })
 
 describe('org keys', () => {
   let t: Awaited<ReturnType<typeof createTestDatabase>>
   let app: ReturnType<typeof createDb>
-  const orgId = crypto.randomUUID()
+  let orgId: string
   beforeAll(async () => {
     t = await createTestDatabase(); app = createDb(t.url)
+    orgId = await createTestOrganization(app)
     await withOrg(app.db, orgId, (tx) => tx.insert(workspaces).values({ orgId, businessName: 'A', timezone: 'UTC' }))
   })
   afterAll(async () => { await app.pool.end(); await t.drop() })
