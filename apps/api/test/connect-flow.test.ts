@@ -90,11 +90,15 @@ describe('mailbox connect flow', () => {
   let startUrl: string
   let flowId: string
 
-  it('startConnect with provisioned keys returns a /connect/gmail/start url', async () => {
+  it('startConnect with provisioned keys returns a /connect/gmail/start url with no caller-supplied challenge', async () => {
     await t.api.withOrg(orgId, (tx) => provisionOrgKeys(tx, ring))
     const res = await a.mailboxes.startConnect.mutate({ provider: 'gmail', platform: 'web' })
-    expect(res.url).toContain(`${t.config.appBaseUrl}/connect/gmail/start?state=`)
-    expect(res.url).toContain('challenge=')
+    const url = new URL(res.url)
+    expect(`${url.origin}${url.pathname}`).toBe(`${t.config.appBaseUrl}/connect/gmail/start`)
+    // Only `state` — the challenge is derived server-side (Task 17 review, Important 1), never taken
+    // from this unauthenticated response's own caller.
+    expect([...url.searchParams.keys()]).toEqual(['state'])
+    expect(url.searchParams.get('state')).toBeTruthy()
     startUrl = res.url
     flowId = res.flowId
   })
@@ -108,6 +112,24 @@ describe('mailbox connect flow', () => {
     expect(location.searchParams.get('state')).toBeTruthy()
     expect(location.searchParams.get('code_challenge')).toBeTruthy()
     expect(location.searchParams.get('code_challenge_method')).toBe('S256')
+  })
+
+  it('an attacker-supplied &challenge= on /start is ignored — the redirect always carries the server-derived, deterministic S256 challenge', async () => {
+    const relative = startUrl.slice(t.config.appBaseUrl.length)
+    const res = await t.app.inject({ method: 'GET', url: `${relative}&challenge=attacker-junk` })
+    expect(res.statusCode).toBe(302)
+    const attackerAttemptChallenge = new URL(res.headers.location as string).searchParams.get('code_challenge')
+    expect(attackerAttemptChallenge).not.toBe('attacker-junk')
+
+    // Still pending (GET /start never consumes) — hitting it again re-derives the SAME challenge from
+    // the same stored, encrypted verifier, proving it's not accepting whatever the caller sends.
+    const again = await t.app.inject({ method: 'GET', url: relative })
+    expect(new URL(again.headers.location as string).searchParams.get('code_challenge')).toBe(attackerAttemptChallenge)
+  })
+
+  it('GET /connect/:provider/start with an unresolvable state 400s', async () => {
+    const res = await t.app.inject({ method: 'GET', url: '/connect/gmail/start?state=00000000-0000-0000-0000-000000000000.garbage-nonce' })
+    expect(res.statusCode).toBe(400)
   })
 
   let connectionId: string
@@ -141,6 +163,51 @@ describe('mailbox connect flow', () => {
 
     const [flow] = await t.api.withOrg(orgId, (tx) => tx.select().from(oauthFlows).where(eq(oauthFlows.id, flowId)))
     expect(flow).toMatchObject({ status: 'consumed', connectionId, userId: userA.id })
+  })
+
+  it('replaying the already-consumed state 400s and creates no second connection', async () => {
+    const state = new URL(startUrl).searchParams.get('state')!
+    const before = await t.api.withOrg(orgId, (tx) => tx.select().from(mailboxConnections).where(eq(mailboxConnections.orgId, orgId)))
+    const res = await t.app.inject({ method: 'GET', url: `/connect/gmail/callback?code=fake-code&state=${encodeURIComponent(state)}` })
+    expect(res.statusCode).toBe(400)
+    const after = await t.api.withOrg(orgId, (tx) => tx.select().from(mailboxConnections).where(eq(mailboxConnections.orgId, orgId)))
+    expect(after).toHaveLength(before.length)
+  })
+
+  it('escapes an email address containing an apostrophe before rendering it into the success page (Task 17 review, Important 2)', async () => {
+    providerOverrides.gmail = fakeGmailProvider(fixedExchange({
+      tokens: { refreshToken: 'rt-apos', accessToken: 'at-apos', accessTokenExpiresAt: null },
+      emailAddress: "o'brien@acme.test", // valid per z.email() (the local part allows '), still HTML-unsafe raw
+      providerAccountId: 'acct-apos',
+    }))
+    const started = await a.mailboxes.startConnect.mutate({ provider: 'gmail', platform: 'web' })
+    const state = new URL(started.url).searchParams.get('state')!
+    const res = await t.app.inject({ method: 'GET', url: `/connect/gmail/callback?code=fake-code&state=${encodeURIComponent(state)}` })
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toContain('o&#39;brien@acme.test')
+    expect(res.body).not.toContain("o'brien@acme.test")
+
+    // Escaping is presentation-only: the stored row keeps the real, unescaped address.
+    const [conn] = await t.api.withOrg(orgId, (tx) => tx.select().from(mailboxConnections).where(eq(mailboxConnections.emailAddress, "o'brien@acme.test")))
+    expect(conn).toBeDefined()
+  })
+
+  it('a malformed provider-returned email address fails the flow instead of being stored or rendered (Task 17 review, Important 2)', async () => {
+    providerOverrides.gmail = fakeGmailProvider(fixedExchange({
+      tokens: { refreshToken: 'rt-evil', accessToken: 'at-evil', accessTokenExpiresAt: null },
+      emailAddress: '<script>alert(1)</script>', // fails z.email() outright — not merely unescaped, invalid
+      providerAccountId: 'acct-evil',
+    }))
+    const started = await a.mailboxes.startConnect.mutate({ provider: 'gmail', platform: 'web' })
+    const state = new URL(started.url).searchParams.get('state')!
+    const before = await t.api.withOrg(orgId, (tx) => tx.select().from(mailboxConnections).where(eq(mailboxConnections.orgId, orgId)))
+    const res = await t.app.inject({ method: 'GET', url: `/connect/gmail/callback?code=fake-code&state=${encodeURIComponent(state)}` })
+    expect(res.body).not.toContain('<script>')
+    const after = await t.api.withOrg(orgId, (tx) => tx.select().from(mailboxConnections).where(eq(mailboxConnections.orgId, orgId)))
+    expect(after).toHaveLength(before.length)
+
+    const [flow] = await t.api.withOrg(orgId, (tx) => tx.select().from(oauthFlows).where(eq(oauthFlows.id, started.flowId)))
+    expect(flow).toMatchObject({ status: 'failed', failureReason: 'invalid_email' })
   })
 
   it('callback with a tampered nonce is rejected 400 and creates no connection', async () => {
@@ -181,6 +248,16 @@ describe('mailbox connect flow', () => {
 
     const rowsB = await t.api.withOrg(orgBId, (tx) => tx.select().from(mailboxConnections).where(eq(mailboxConnections.orgId, orgBId)))
     expect(rowsB).toHaveLength(0)
+  })
+
+  it("an org-B manager claiming org-A's flowId is NOT_FOUND — RLS-by-construction, not a cross-org leak", async () => {
+    const signedD = await signInWithOtp(t.app, t.mail, 'owner-d@example.com', 'Dana')
+    const d = client(base, signedD.cookie)
+    await d.workspace.create.mutate({ businessName: 'Delta Corp', timezone: 'UTC' })
+
+    // orgA's flowId (already claimed by orgA above) is a real row — just invisible to orgB's RLS scope,
+    // so the SELECT inside claimConnection's withOrg(orgB, …) finds nothing, same as a made-up id would.
+    await expect(d.mailboxes.claimConnection.mutate({ flowId })).rejects.toMatchObject({ data: { code: 'NOT_FOUND' } })
   })
 
   it('claimConnection by the starting user connects the mailbox, seeds categories, and enqueues mailbox.sync', async () => {
@@ -249,6 +326,16 @@ describe('mailbox connect flow', () => {
     const revokeCall = enqueueCalls.find((c) => c.name === JOB_NAMES.revokeMailbox && c.data.connectionId === connectionId)
     expect(revokeCall).toBeDefined()
     expect(revokeCall!.data.orgId).toBe(orgId)
+  })
+
+  it('re-claiming a flow whose connection was disconnected in the meantime is PRECONDITION_FAILED, not a silent OK (Task 17 review, Important 4)', async () => {
+    const syncCallsBefore = enqueueCalls.filter((c) => c.name === JOB_NAMES.mailboxSync && c.data.connectionId === connectionId).length
+    // flowId/connectionId still refer to the flow claimed above and just disabled by the disconnect test.
+    await expect(a.mailboxes.claimConnection.mutate({ flowId })).rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' } })
+    const [conn] = await t.api.withOrg(orgId, (tx) => tx.select().from(mailboxConnections).where(eq(mailboxConnections.id, connectionId)))
+    expect(conn?.status).toBe('disabled')
+    const syncCallsAfter = enqueueCalls.filter((c) => c.name === JOB_NAMES.mailboxSync && c.data.connectionId === connectionId).length
+    expect(syncCallsAfter).toBe(syncCallsBefore)
   })
 
   it('AADSTS65001 in error_description marks the flow failed with admin_consent_required', async () => {

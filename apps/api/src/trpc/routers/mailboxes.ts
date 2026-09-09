@@ -9,9 +9,9 @@
 import { TRPCError } from '@trpc/server'
 import { eq } from 'drizzle-orm'
 import { ClaimConnectionInput, DisconnectInput, StartConnectInput } from '@aesa/contracts'
-import { audit, ensureDefaultCategories, mailboxConnections, oauthFlows } from '@aesa/db'
+import { audit, ensureDefaultCategories, getOrgBoxPublicKeyOrNull, mailboxConnections, oauthFlows } from '@aesa/db'
 import { JOB_NAMES } from '@aesa/queue'
-import { createFlow, tryGetOrgBoxPublicKey } from '../../connect/flows.ts'
+import { createFlow } from '../../connect/flows.ts'
 import { managerProcedure, router } from '../init.ts'
 
 type ClaimOutcome =
@@ -19,6 +19,7 @@ type ClaimOutcome =
   | { kind: 'failed'; reason: string }
   | { kind: 'not_ready' }
   | { kind: 'rejected' }
+  | { kind: 'not_connectable'; status: string }
   | { kind: 'ok'; connectionId: string; emailAddress: string }
 
 export const mailboxesRouter = router({
@@ -31,8 +32,8 @@ export const mailboxesRouter = router({
 
     await ctx.deps.enqueue(JOB_NAMES.keysProvision, { orgId: ctx.orgId }, { entityId: 'keys', debounceSeconds: 30 })
 
-    const { flowId, state, codeChallenge } = await ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
-      const boxPublicKey = await tryGetOrgBoxPublicKey(tx)
+    const { flowId, state } = await ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
+      const boxPublicKey = await getOrgBoxPublicKeyOrNull(tx)
       if (!boxPublicKey) throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'provisioning' })
 
       const flow = await createFlow(tx, { userId: ctx.user.id, provider: input.provider, platform: input.platform, flowKey: ctx.deps.config.flowKey })
@@ -43,7 +44,9 @@ export const mailboxesRouter = router({
       return flow
     })
 
-    const url = `${ctx.deps.config.appBaseUrl}/connect/${input.provider}/start?state=${encodeURIComponent(state)}&challenge=${encodeURIComponent(codeChallenge)}`
+    // No challenge param: the /start route derives it server-side from the stored verifier
+    // (connect/flows.ts's prepareAuthorization) rather than trusting one from this unauthenticated hop.
+    const url = `${ctx.deps.config.appBaseUrl}/connect/${input.provider}/start?state=${encodeURIComponent(state)}`
     return { url, flowId }
   }),
 
@@ -74,9 +77,16 @@ export const mailboxesRouter = router({
           actor: ctx.actor, action: 'mailbox.connected', entityType: 'mailbox_connection', entityId: conn.id,
           detail: { emailAddress: conn.emailAddress }, ip: ctx.ip, userAgent: ctx.userAgent,
         })
+        return { kind: 'ok', connectionId: conn.id, emailAddress: conn.emailAddress }
       }
-      // Idempotent: a second call for an already-'connected' row just returns the same result.
-      return { kind: 'ok', connectionId: conn.id, emailAddress: conn.emailAddress }
+      if (conn.status === 'connected') {
+        // Idempotent: a second call for an already-connected row returns the same result with no writes.
+        return { kind: 'ok', connectionId: conn.id, emailAddress: conn.emailAddress }
+      }
+      // 'disabled' (disconnected since this flow was consumed) or 'reauth_required': claiming it now
+      // would silently report success for a mailbox that isn't actually usable (Task 17 review,
+      // Important 4 — a re-claim after disconnect used to report OK and re-enqueue mailbox.sync).
+      return { kind: 'not_connectable', status: conn.status }
     })
 
     switch (outcome.kind) {
@@ -84,6 +94,7 @@ export const mailboxesRouter = router({
       case 'failed': throw new TRPCError({ code: 'PRECONDITION_FAILED', message: outcome.reason })
       case 'not_ready': throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'connect flow not ready' })
       case 'rejected': throw new TRPCError({ code: 'FORBIDDEN', message: 'this connection was started by a different user' })
+      case 'not_connectable': throw new TRPCError({ code: 'PRECONDITION_FAILED', message: `mailbox connection is ${outcome.status}, cannot claim` })
       case 'ok': break
     }
 

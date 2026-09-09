@@ -4,20 +4,24 @@
  * not on `app` directly, for @fastify/rate-limit's `global: true` mode to actually wrap them).
  *
  * GET /connect/:provider/start    — the tRPC mutation already created the flow; this hop exists only so
- *   the system browser sees the already-opaque `state` (and the public PKCE `code_challenge`), never a
- *   token, before it 302s on to the real provider.
+ *   the system browser sees the already-opaque `state`, never a token, before it 302s on to the real
+ *   provider. The PKCE `code_challenge` is derived HERE, server-side, from the stored verifier
+ *   (`prepareAuthorization`) — never accepted from the caller (Task 17 review, Important 1): an
+ *   unauthenticated caller-supplied challenge would let anyone bounce an arbitrary `state` on to the
+ *   provider with a challenge no longer provably bound to the verifier the callback will decrypt.
  * GET /connect/:provider/callback — sessionless: the provider redirects the system browser straight
  *   back here, so every authorization this route needs comes from `state` (via `consumeFlow`'s
  *   cross-org resolver) — see connect/flows.ts.
  */
 import { and, eq, ne } from 'drizzle-orm'
 import type { FastifyInstance } from 'fastify'
+import { z } from 'zod'
 import { MAIL_PROVIDERS, type MailProvider } from '@aesa/contracts'
-import { mailboxConnections, oauthFlows } from '@aesa/db'
+import { getOrgBoxPublicKeyOrNull, mailboxConnections, oauthFlows } from '@aesa/db'
 import { gmailProvider, graphProvider, sealTokens, type MailboxProvider, type TokenSet } from '@aesa/mail'
 import { JOB_NAMES } from '@aesa/queue'
 import type { ServerDeps } from '../deps.ts'
-import { consumeFlow, failPendingFlow, tryGetOrgBoxPublicKey } from './flows.ts'
+import { consumeFlow, failPendingFlow, prepareAuthorization } from './flows.ts'
 
 function isMailProvider(v: string): v is MailProvider {
   return (MAIL_PROVIDERS as readonly string[]).includes(v)
@@ -29,9 +33,17 @@ function resolveProvider(deps: ServerDeps, provider: MailProvider): MailboxProvi
   return deps.mailProviders?.[provider] ?? (provider === 'gmail' ? gmailProvider() : graphProvider())
 }
 
+/** Minimal HTML-entity escaper — every value interpolated into a page this route renders goes through
+ * this (Task 17 review, Important 2): the provider-supplied `emailAddress` is untrusted input on its way
+ * into an HTML response, and even `metaRefresh` (built from config, not user input) is escaped for the
+ * same reason belt-and-braces attribute encoding costs nothing here. */
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+}
+
 function htmlPage(message: string, opts: { metaRefresh?: string } = {}): string {
-  const refresh = opts.metaRefresh ? `<meta http-equiv="refresh" content="1;url=${opts.metaRefresh}">` : ''
-  return `<!doctype html><html><head><meta charset="utf-8">${refresh}<title>aesa</title></head><body><p>${message}</p></body></html>`
+  const refresh = opts.metaRefresh ? `<meta http-equiv="refresh" content="1;url=${escapeHtml(opts.metaRefresh)}">` : ''
+  return `<!doctype html><html><head><meta charset="utf-8">${refresh}<title>aesa</title></head><body><p>${escapeHtml(message)}</p></body></html>`
 }
 
 /** Postgres unique_violation, surfaced through drizzle's DrizzleQueryError (`.cause` holds the raw pg
@@ -62,18 +74,23 @@ type ConnectOutcome =
   | { kind: 'connected'; connectionId: string; emailAddress: string; boxPublicKey: Buffer }
 
 export function registerConnectRoutes(routes: FastifyInstance, deps: ServerDeps): void {
-  routes.get<{ Params: { provider: string }; Querystring: { state?: string; challenge?: string } }>(
+  routes.get<{ Params: { provider: string }; Querystring: { state?: string } }>(
     '/connect/:provider/start',
     async (req, reply) => {
       const provider = req.params.provider
       if (!isMailProvider(provider)) return reply.code(404).send({ statusCode: 404, error: 'Not Found' })
       const oauth = provider === 'gmail' ? deps.config.gmailOauth : deps.config.msOauth
-      const { state, challenge } = req.query
-      if (!oauth || !state || !challenge) return reply.code(400).send({ statusCode: 400, error: 'Bad Request' })
+      const { state } = req.query
+      if (!oauth || !state) return reply.code(400).send({ statusCode: 400, error: 'Bad Request' })
+
+      // No caller-supplied challenge: verified against the stored flow (still pending, unexpired, right
+      // nonce) and derived server-side from the verifier this flow itself encrypted at createFlow time.
+      const prepared = await prepareAuthorization(deps.api, { state, flowKey: deps.config.flowKey })
+      if (!prepared || prepared.provider !== provider) return reply.code(400).send({ statusCode: 400, error: 'Bad Request' })
 
       const adapter = resolveProvider(deps, provider)
       const redirectUri = `${deps.config.appBaseUrl}/connect/${provider}/callback`
-      const authorizationUrl = adapter.authorizationUrl({ clientId: oauth.clientId, redirectUri, state, codeChallenge: challenge })
+      const authorizationUrl = adapter.authorizationUrl({ clientId: oauth.clientId, redirectUri, state, codeChallenge: prepared.codeChallenge })
       return reply.redirect(authorizationUrl, 302)
     },
   )
@@ -123,8 +140,22 @@ export function registerConnectRoutes(routes: FastifyInstance, deps: ServerDeps)
     })
     if (!exchanged) return reply.code(400).send(htmlPage(GENERIC_RETRY_MESSAGE))
 
+    // The provider-returned address is about to be persisted (mailbox_connections.email_address, an
+    // enqueued job payload) and rendered into the success page — validate its SHAPE before either
+    // (Task 17 review, Important 2). A provider that hands back something malformed is a flow failure,
+    // not a value this route trusts as-is; the flow already left 'pending' (consumeFlow marked it
+    // 'consumed' above), so this is a direct update, not failPendingFlow (which only touches 'pending' rows).
+    const parsedEmail = z.email().max(254).safeParse(exchanged.emailAddress)
+    if (!parsedEmail.success) {
+      await deps.api.withOrg(consumed.orgId, (tx) =>
+        tx.update(oauthFlows).set({ status: 'failed', failureReason: 'invalid_email' }).where(eq(oauthFlows.id, consumed.flowId)),
+      )
+      return reply.send(htmlPage(GENERIC_RETRY_MESSAGE))
+    }
+    const emailAddress = parsedEmail.data
+
     const outcome = await deps.api.withOrg<ConnectOutcome>(consumed.orgId, async (tx) => {
-      const boxPublicKey = await tryGetOrgBoxPublicKey(tx)
+      const boxPublicKey = await getOrgBoxPublicKeyOrNull(tx)
       if (!boxPublicKey) {
         await tx.update(oauthFlows).set({ status: 'failed', failureReason: 'keys_missing' }).where(eq(oauthFlows.id, consumed.flowId))
         return { kind: 'failed', reason: 'keys_missing' }
@@ -138,7 +169,7 @@ export function registerConnectRoutes(routes: FastifyInstance, deps: ServerDeps)
         and(
           eq(mailboxConnections.orgId, consumed.orgId),
           eq(mailboxConnections.provider, consumed.provider),
-          eq(mailboxConnections.emailAddress, exchanged.emailAddress),
+          eq(mailboxConnections.emailAddress, emailAddress),
           ne(mailboxConnections.status, 'disabled'),
         ),
       )
@@ -160,7 +191,7 @@ export function registerConnectRoutes(routes: FastifyInstance, deps: ServerDeps)
               orgId: consumed.orgId,
               provider: consumed.provider,
               providerAccountId: exchanged.providerAccountId,
-              emailAddress: exchanged.emailAddress,
+              emailAddress,
               status: 'pending_claim',
               connectedByUserId: consumed.userId,
             }).returning()
@@ -177,7 +208,7 @@ export function registerConnectRoutes(routes: FastifyInstance, deps: ServerDeps)
       }
 
       await tx.update(oauthFlows).set({ connectionId }).where(eq(oauthFlows.id, consumed.flowId))
-      return { kind: 'connected', connectionId, emailAddress: exchanged.emailAddress, boxPublicKey }
+      return { kind: 'connected', connectionId, emailAddress, boxPublicKey }
     })
 
     if (outcome.kind === 'failed') {

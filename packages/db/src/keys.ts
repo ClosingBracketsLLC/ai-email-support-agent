@@ -34,6 +34,19 @@ export async function getOrgBoxPublicKey(tx: OrgTx): Promise<Buffer> {
   return ws.pk
 }
 
+/**
+ * Null-returning sibling of `getOrgBoxPublicKey`, for callers that need to tell "not provisioned yet"
+ * apart from every other failure (a permission regression, a statement timeout, …) — those must still
+ * surface as a real thrown error, not be silently folded into "not provisioned" the way a bare
+ * try/catch around `getOrgBoxPublicKey` would (Task 17 review, Important 3). There is no try/catch here
+ * at all: the only "not provisioned" case this function recognizes is the query itself succeeding with
+ * zero rows or a null column, so anything the query throws propagates unchanged.
+ */
+export async function getOrgBoxPublicKeyOrNull(tx: OrgTx): Promise<Buffer | null> {
+  const [ws] = await tx.select({ pk: workspaces.boxPublicKey }).from(workspaces).where(eq(workspaces.orgId, tx.orgId))
+  return ws?.pk ?? null
+}
+
 /** Worker side: open a secret the api sealed to the org's public key. */
 export async function openSealedForOrg(tx: OrgTx, ring: KekRing, sealed: Buffer): Promise<Buffer> {
   const [row] = await tx.select().from(orgDataKeys).orderBy(desc(orgDataKeys.version)).limit(1)
