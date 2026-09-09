@@ -56,6 +56,17 @@ off `main`; never push, merge, or open a PR without Robert.
   Postgres is on 5434 because doge-buddy already uses 5433. `APP_BASE_URL` is the api's public
   origin (Better Auth's `baseURL`; OAuth redirect URIs are `<APP_BASE_URL>/api/auth/callback/<provider>`);
   `APP_WEB_ORIGIN` is the Expo web origin (CORS, trusted origin, invitation links).
+- Phase 2 env (see each app's `.env.example` for the full list). `apps/worker`: `AESA_KEK_V1`/
+  `AESA_KEK_ACTIVE` (the KEK ring; required in production when `WORKER_ROLES` includes `sync`),
+  `ANTHROPIC_API_KEY` (required in production when `WORKER_ROLES` includes `agent`),
+  `GMAIL_OAUTH_CLIENT_ID`/`_SECRET` and `MS_OAUTH_CLIENT_ID`/`_SECRET` (all-or-none pairs, one per
+  provider), `MAIL_FROM`. `apps/api`: the same `GMAIL_OAUTH_CLIENT_ID`/`_SECRET` and
+  `MS_OAUTH_CLIENT_ID`/`_SECRET` pairs (the connect flow's own OAuth, distinct from Better Auth's
+  `GOOGLE_CLIENT_ID`/`MICROSOFT_CLIENT_ID` SSO login), `GMAIL_PUBSUB_AUDIENCE`/`_SA_EMAIL` (the
+  webhook's OIDC verification), and `MAIL_FROM`. **`MAIL_FROM` must be identical in both `.env`
+  files** — the worker's sync walk (platform-sender skip) and the api's verification-code
+  interception both key off it, and drift between the two breaks both silently, with no error at
+  boot in either app.
 
 ## Layout
 
@@ -68,11 +79,25 @@ off `main`; never push, merge, or open a PR without Robert.
   invariants, `loadDotEnv`.
 - `packages/queue` — pg-boss wrappers (`startBoss`, `registerCron`), `defineJob` / `registerJob`,
   `enqueue`, `fairSelectSql`.
+- `packages/mail` — the provider-agnostic mailbox port: Gmail + Microsoft Graph adapters, credential
+  lease/refresh, rfc2822/address/body/threading helpers, the sync walk (`sync.ts`), `MockMailbox`,
+  the send limiter. No database dependency beyond what `sync.ts` itself needs via `@aesa/db`.
+- `packages/llm` — the provider-agnostic chat port (`LlmProvider`), the Anthropic adapter, and
+  `createFakeProvider` for tests. No database dependency.
+- `packages/agent` — the triage prompt and one-model-call (`runTriageCall`); no database dependency
+  — `apps/worker`'s `ticket.triage` job owns every read and write around it.
+- `packages/test-kit` — `MockMailbox` re-export, the scrubbed fixture recorder (`MAIL_RECORD=1`),
+  and the provider conformance suite run against both the mock and recorded fixtures.
 - `apps/api` — Fastify skeleton: `/healthz`, config, scrubbed error handler, log redaction. The api
   never holds the KEK, never calls a model, never touches customer mail (it sends platform email —
-  sign-in codes, invitations — through the `MailTransport`; Resend in production, the devsink
-  elsewhere).
-- `apps/worker` — `WORKER_ROLES` partition, KEK ring, `jobs/` (a `platform.heartbeat` cron so far).
+  sign-in codes, invitations, address-verification codes — through the `MailTransport`; Resend in
+  production, the devsink elsewhere). It never touches `mailbox_credentials` either (platform-role
+  only) — a connect flow's sealed OAuth tokens ride a job payload to the worker, which is the only
+  process that ever opens them.
+- `apps/worker` — `WORKER_ROLES` partition, KEK ring, `jobs/`: `platform.heartbeat` (cron),
+  `mailbox.sync` / `mailbox.poll-sweep` / `mailbox.renew-watch` / `mailbox.store-credentials` /
+  `mailbox.revoke` (mailbox lifecycle, `sync` role), `ticket.triage` (`agent` role), `notify.dispatch`
+  / `notify.digest` (escalation and collapsed-overflow push).
 - `apps/app` — the Expo universal app (`@aesa/app`, SDK 57, Expo Router, `web.output` server):
   `src/app` routes only, `src/screens` bodies, `src/lib` clients and the session gate, `src/components`
   primitives; jest-expo + RNTL for units, Playwright for the signup smoke.
@@ -110,10 +135,15 @@ off `main`; never push, merge, or open a PR without Robert.
   active organization plus `getActiveMember`, never from input.
 - **Audit.** Tenant-side audit rows go through `audit(tx, entry)` with actor `user:<id>` |
   `agent:<run_id>` | `system:<job>`; every tRPC mutation writes one.
+- **Mailbox credentials.** `mailbox_credentials` is platform-role-only (migration 0006 `REVOKE`s
+  `aesa_app`'s default DML entirely) — the api never reads or writes that table, not even through
+  `withPlatform()`. A connect flow's sealed OAuth tokens reach it only via the
+  `mailbox.store-credentials` job payload; the worker is the only process that ever opens them
+  (`getAccessToken`, the KEK ring).
 - **Toolchain.** TypeScript strict NodeNext ESM with explicit `.ts` imports, `tsx` at runtime (no
   build step), runtime dependencies in `dependencies`, vitest, zod 4. This covers the server
   packages and `apps/api` / `apps/worker`; `apps/app` extends `expo/tsconfig.base` instead
   (bundler resolution, JSX, extensionless imports) with `allowImportingTsExtensions`, `noEmit` and
   `types: ["node", "jest"]`, and is built by EAS; the root ESLint TypeScript block covers `**/*.tsx`.
-- **Commits** end with the trailer `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`
+- **Commits** end with the trailer `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`
   (a convention, not a check).

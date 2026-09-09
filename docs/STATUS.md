@@ -1,6 +1,6 @@
 # Project status
 
-Updated 2026-09-08. The spec (`docs/superpowers/specs/2026-09-07-ai-email-support-agent-design.md`)
+Updated 2026-09-09. The spec (`docs/superpowers/specs/2026-09-07-ai-email-support-agent-design.md`)
 defines seven build phases; this file records where the build stands against them.
 
 ## Done
@@ -122,53 +122,180 @@ defines seven build phases; this file records where the build stands against the
     sidebar's `Link asChild` crash and `useGate`'s post-sign-out stranding, both above — which is why
     it is a hard gate rather than a nice-to-have.
 
-## Next: Phase 2 — mailboxes, agents, ingest, triage
+### Phase 2 — mailboxes, agents, ingest, triage (complete on branch `phase-2`; not yet merged)
 
-**Where to start.** Branch `phase-1` is pushed to `origin` and ends at the commit that added this
-paragraph; it is Robert's call whether it merges into `main` locally or through a pull request. At the
-start of the next session run `git fetch origin && git log --oneline origin/main | grep -c "Phase 1 final review record"`:
-if it prints `1`, Phase 1 has landed — check out `main`, pull, and branch `phase-2` off it; if it
-prints `0`, Phase 1 is still unmerged — stop and ask Robert whether to merge first or to branch
-`phase-2` off `origin/phase-1`. Never merge or push on your own. Then run the local setup below
-before touching code: `pnpm install`, `pnpm db:up`, the `migrate` command from `CLAUDE.md`, and
-`pnpm typecheck && pnpm lint && pnpm test && pnpm db:check` to confirm the baseline (234 tests).
+- Plan: `docs/superpowers/plans/2026-09-08-phase-2-mailboxes-ingest-triage.md` (23 tasks, executed
+  with subagent-driven development). Commits `f5210cc..345b3b4` on `phase-2`, branched from
+  `phase-1` at `1b0fc34` (Phase 1 still unmerged at branch time — Robert's call): the plan, 23 task
+  commits with their fix rounds, followed by this task's own commit adding the E2E suite, the
+  external-setup runbook, and this record. Execution ledger:
+  `.superpowers/sdd/2026-09-08-phase-2-mailboxes-ingest-triage/progress.md` (per-task implementer/
+  review/fix-round log; authoritative for anything not distilled below). Gate on the branch after
+  this task: typecheck and lint clean across all 13 packages/apps; `pnpm test` green with **807
+  tests** (`@aesa/contracts` 12, `@aesa/core` 30, `@aesa/crypto` 42, `@aesa/agent` 9, `@aesa/llm` 26,
+  `@aesa/db` 46, `@aesa/queue` 15, `@aesa/mail` 226, `@aesa/test-kit` 43 [39 run + 4 conditional
+  skips], `apps/api` 132, `apps/worker` 122 [including this task's 8-scenario `e2e-phase2.test.ts`],
+  `apps/app` 104 jest — no database); `db:check` reports no drift; the Expo web export produces 21
+  static routes; the Playwright signup smoke passes (ends at the gated mailbox step, per Task 20's
+  ruling below — the spec does not mark that step skippable providerless). Robert decides how and
+  when `phase-2` lands on `main`.
+- Review: `docs/superpowers/reviews/2026-09-09-phase-2-final-review.md` — forthcoming. The
+  whole-branch review and its fix wave happen after this task, per `superpowers:subagent-driven-
+  development`; this record will be updated once it lands.
+- What exists now: `@aesa/mail` (the provider-agnostic mailbox port — Gmail + Microsoft Graph
+  adapters, credential lease/refresh, rfc2822/address/body/threading ports, the sync walk,
+  `MockMailbox`, the send limiter); `@aesa/test-kit` (fixture recorder + conformance suite);
+  `@aesa/llm` (chat port, Anthropic adapter, `FakeProvider`); `@aesa/agent` (the triage prompt + one
+  model call); the ten new tables (`oauth_flows`, `mailbox_connections`, `mailbox_credentials`,
+  `agents`, `categories`, `agent_category_policies`, `tickets`, `messages`, `webhook_events`,
+  `notifications`, plus `gmail_access_requests`); the mailbox connect flow (claim step, address
+  selection, alias round-trip verification, admin-consent and Gmail early-access branches); worker
+  jobs `mailbox.sync`, `mailbox.poll-sweep`, `mailbox.renew-watch`, `mailbox.store-credentials`,
+  `mailbox.revoke`, `ticket.triage`, `notify.dispatch`, `notify.digest`; app screens for connect
+  mailbox + health, agents (presets, persona text, reply-from choice), the read-only inbox (To
+  review / Auto-sending / Recent) and ticket thread, escalation push; CASA Tier 2 submission started
+  (runbook, `docs/runbooks/2026-09-phase-2-external-setup.md`).
+- Deviations from the spec's Phase 2 list, all recorded in the plan header:
+  1. `resolve_stripe_customer(id)` does not land here — it needs Phase 7's `billing_subscriptions`
+     table. Phase 2 lands `resolve_mailbox_connection(provider, email)` and
+     `resolve_mailbox_subscription(subscription_id)` only.
+  2. `mailbox_credentials` is platform-role-only; the api never touches the table (no third DB
+     role). The api seals the token set to the org's box public key at the OAuth callback and hands
+     the sealed blob to the worker in a `mailbox.store-credentials` job payload; the worker writes
+     the row and re-wraps under the org DEK on first open.
+  3. `MockMailbox` lives in `packages/mail/src/mock.ts`, not `packages/test-kit` (avoids a
+     dependency cycle); `@aesa/test-kit` holds the conformance suite and fixture recorder, and
+     re-exports the mock.
+  4. The Anthropic adapter uses forced-tool structured output (doge-buddy's proven mechanism), not
+     `messages.parse`/`zodOutputFormat`; the full fallback ladder arrives with Phase 3's draft role.
+  5. Phase 2's `packages/llm` slice omits the limiter, registry, probe, pricing, metering wrapper
+     and streaming (Phase 3/6 per the spec's own phase list); the triage runtime writes its own
+     fail-closed spend-guard row into `usage_counters` before each call.
+  6. `notify.digest` collapses into a push, not an email, in Phase 2 — the email channel joins in
+     Phase 3, once the review pages exist for it to link to.
+  7. The reference's repeat-complainant escalation and order-number linking are not ported (no
+     commerce in v1; the per-sender flood fold covers volume abuse instead).
+  8. Live verification is Robert's runbook step (`docs/runbooks/2026-09-phase-2-external-setup.md`)
+     — CI proves the mock tier and (once recorded) the fixture tier only.
+  9. `sync.ts` lives in `packages/mail` and takes `OrgTx`-scoped store functions — `@aesa/mail`
+     depends on `@aesa/db` (the ESLint gate only bans raw `pg`/`drizzle-orm/node-postgres` handles,
+     not `@aesa/db` itself); the walk never opens a transaction around network I/O.
+  10. Triage stores `questions[]` on the ticket (`tickets.triage_questions text[]`) so Phase 3's
+      pre-retrieval can read them.
+  11. Org data keys are provisioned by a `keys.provision` job the api enqueues from
+      `mailboxes.startConnect`, which returns `PRECONDITION_FAILED` until the key exists and the app
+      retries briefly — only the worker ever holds the KEK.
+  12. Gmail scopes are `gmail.readonly` + `gmail.send` only — no label machinery, since the product
+      never mutates the mailbox.
+  13. Agent statuses are `pending_verification | active | disabled`; a primary-address agent
+      activates immediately, an alias activates on the sync walk's verification-code round trip.
+- Execution-time rulings recorded during the build, by area (full detail in the ledger cited above):
+  - **db (Task 3)**: the resolver functions are `OWNER TO aesa_platform` with `PUBLIC` `EXECUTE`
+    revoked and re-granted in the correct ACL order (the initial migration's REVOKE/GRANT was a
+    no-op against a function it didn't yet own — reviewer-caught, fixed same task); `oauth_flows`'
+    status CHECK gained the `'expired'` value the poll-sweep needs.
+  - **mail (Task 6)**: the DMARC parser ports the reference's clause-anchored `dmarcPasses`
+    semantics (splitting on `;` before matching `dmarc=pass`), not the plan's lossy
+    `/dmarc=pass\b/i` regex — the plan's version is bypassable by a quoted-local-part forgery
+    (`"x;dmarc=pass"@evil`) the reference's mechanism defeats.
+  - **mail (Task 7)**: `findSentByMarker`'s scan contract, pinned for both the mock and the real
+    adapters: scan up to `scanLimit` candidates newest-first; a match returns its id; no match with
+    older candidates still unexamined throws `MailApiError` 429 (refuse to guess — a wrong `null`
+    risks a duplicate send); no match with the scan exhausted returns `null`.
+  - **mail (Task 11)**: the sync walk drops (no insert, no ticket) any inbound whose `From` is the
+    platform's own `MAIL_FROM` — platform mail must never become a customer ticket. Accepted
+    trade-off: this drop carries no DMARC gate, so a forged platform-`From` message is silently
+    dropped too; a DMARC-gated variant would re-open the exact noise-ticket hole this closes for our
+    own mail on a day it fails DMARC. Flood fold: the count is org-wide (protects the owner's
+    attention as a whole) but the fold TARGET is connection-scoped (a ticket's thread belongs to one
+    connection; folding a message from another connection would leave it unreplyable).
+  - **worker (Task 14)**: the escalation notification's dedupe key is
+    `escalation:${ticketId}:${utcDay}`, not a lifetime key — a lifetime key would let the first
+    escalation ever sent for a ticket permanently win the dedupe index, silently swallowing every
+    later re-escalation (a resolve-then-reopen-then-anger cycle) forever.
+  - **worker (Task 15)**: the triage-cap re-entry never resets a ticket's status directly
+    (`needs_owner → new` is not a legal edge in `@aesa/core`'s transition matrix, superseding the
+    implementer's draft, which did). Instead `ticket.triage`'s own selection (Task 14) extends to
+    `needs_owner`/`triage_cap`, and the verdict write lands through the legal
+    `needs_owner → triaged/resolved` edges — the poll-sweep only ever enqueues, never mutates status.
+  - **api (Task 17)**: the connect flow's `/start` route no longer forwards a caller-supplied PKCE
+    challenge; it generates and owns the challenge itself server-side (the original shape let an
+    unauthenticated caller inject one, opening a bounce/replay angle the fix closed).
+  - **api (Task 19)**: the consent gate is hardened so a verification code is issued only once
+    `consent_required_from_user_id IS NULL` — a gated alias never gets a code at `addAddress` time
+    regardless of the UI state, `consentAddress`'s approve path issues a fresh code afterward, and
+    the sync walk's verification interception independently skips any agent still gated as defense
+    in depth. The inbox list's keyset cursor orders and pages on
+    `COALESCE(last_inbound_at, created_at) DESC` so a ticket that has never received a reply is
+    never excluded once any cursor exists.
+  - **app (Task 20)**: the Playwright signup smoke's gate stops at the mailbox-connect step (assert
+    the connect UI renders and the gate holds) rather than skipping past it — the spec never marks
+    that onboarding step optional, so a providerless CI environment proves the gate exists rather
+    than routing around it.
+  - **worker/app (Tasks 16, 22)**: every push payload's `data` is stamped with a `kind` field by the
+    worker (both `notify.dispatch` and `notify.digest`) so the app's tap-routing reads `data.kind`
+    directly instead of inferring the notification's kind from which payload field happens to be
+    present — the ambiguous `{ticketId, connectionId}` shape a bare escalation push carries had no
+    reliable inference otherwise.
+- Deferred-minors summary: dozens of minor findings were raised and either fixed in a task's own fix
+  round or deliberately parked — the full per-task list lives in the execution ledger cited above and
+  will be triaged into a residuals list in the forthcoming final review record
+  (`docs/superpowers/reviews/2026-09-09-phase-2-final-review.md`). Nothing parked is believed to
+  block the mock-tier gate or the live verification walk.
 
-Start with `superpowers:writing-plans` against the spec's *Build phases → Phase 2* section. Scope
-from the spec: `packages/mail` (port, Gmail + Microsoft Graph adapters, credentials with lease
-refresh, rfc2822/address/body/threading ports, sync, mock, limiter), `packages/test-kit`
-(MockMailbox, scrubbed fixture recorder, conformance suite), `packages/llm` core + Anthropic adapter
-(triage role) + FakeProvider, `packages/agent/triage.ts`; tables `oauth_flows`,
-`mailbox_connections`, `mailbox_credentials`, `agents`, `categories`, `agent_category_policies`,
-`tickets`, `messages`, `webhook_events`, `notifications`; the mailbox connect flow (claim step,
-address selection, alias round-trip verification, admin-consent and Gmail early-access branches);
-jobs `mailbox.sync`, `mailbox.poll-sweep`, `mailbox.renew-watch`, `ticket.triage`, `notify.dispatch`,
-`notify.digest`, health rollup; screens for connect mailbox + health, agents (presets, persona text,
-reply-from choice), the read-only inbox (To review / Auto-sending / Recent) and ticket thread;
-escalation push.
+## Next: Phase 3 — draft, review, send
 
-Verify (from the spec): the mock-tier E2E ported from the reference implementation (inbound →
-ticket; re-poll zero side effects; reopen only for DMARC-pass; cursor-expired bounded resync; no
-reopen storm); the conformance suite green on mock and fixtures for both providers; live, a Gmail
-test user and an M365 sandbox each show a triaged ticket in under 60 s via push.
+**Where to start.** Start with `superpowers:writing-plans` against the spec's *Build phases → Phase
+3* section, once Robert has decided how `phase-2` lands (never merge or push without him — see
+`superpowers:finishing-a-development-branch`). Run the local setup from `CLAUDE.md` and confirm the
+807-test baseline above before writing the plan.
 
-Rulings the planner needs:
+Rulings the Phase 3 planner needs, carried from this phase's execution:
 
-- The `SECURITY DEFINER` resolvers deferred from Phase 0 (`resolve_mailbox_connection(provider, email)`,
-  `resolve_subscription(id)`, `resolve_stripe_customer(id)`) land here — they stay the api's only
-  cross-org read path; the api still never holds `aesa_platform`.
-- `mailbox_credentials` holds sealed-then-DEK-encrypted refresh/access tokens; grant column access
-  to the worker role only via an explicit `REVOKE`, the same pattern a worker-only table already
-  needs against migration 0002's default `aesa_app` DML grants.
-- Org data keys are not provisioned yet (Phase 1 deviation 2): the worker must call
-  `provisionOrgKeys` before the first mailbox credential is written for an org — not the api at
-  workspace creation.
-- Start the CASA Tier 2 submission alongside this phase's build; the spec expects the evidence this
-  design produces to accompany it, and the review is a 4–12 week process independent of the code.
+- The send path must consume `SendReplyInput.replyToProviderMessageId`/`existingDraftId` (Graph's
+  two-phase send needs the first to create a reply and the second to resume a crashed one) and
+  persist `outbound_sends.provider_draft_id` — both fields already exist on the Phase 2 port/types
+  (`packages/mail/src/types.ts`) with no consumer yet; Phase 3's send executor is that consumer.
+- `notify.digest` gains the email channel (Phase 2 deviation 6) — worker → Resend (or the api's
+  `MailTransport`, if that boundary is worth crossing) once the review pages exist for a digest
+  email to link to.
+- The inbox's `awaiting_review` section joins `to_review` (Phase 2's inbox only has `to_review` =
+  `needs_owner`, per the plan's own note that Phase 3 extends this) once drafts exist to review.
+- The `llm` ladder (limiter, registry, probe, pricing) and the metering wrapper (`withMetering`,
+  `llm_calls`) land here — Phase 2's triage runtime uses only a fail-closed `usage_counters` spend
+  guard, deliberately omitting all of this per deviation 5.
+- Carry-overs still open (deferred again at Phase 2's close; fix in the first Phase 3 task that
+  touches the file, or record why it moves again):
+  - The api's rate limiters (Better Auth's in-memory limiter, `@fastify/rate-limit`, `team.invite`'s
+    per-org throttle) are all in-memory and therefore per-replica — move to shared/database storage
+    before the api scales past one instance (carried since Phase 1).
+  - `platform.access` audit rows have no retention rule; Phase 2's per-sync credential-read audit
+    trail (`getAccessToken`'s `withPlatform` call on every mailbox poll) meaningfully raises the row
+    volume beyond Phase 1's heartbeat-only baseline — the retention rule is Phase 7's sweep, but
+    note the volume now, before it's a production surprise.
+  - `pnpm-lock.yaml` still carries a duplicate TypeScript variant (Task 1's `pnpm dedupe` pass was
+    peer-driven and could not fully collapse it) — worth a second look once Phase 3's dependencies
+    settle rather than chasing it now.
+  - Better Auth 1.7.3 still declares a peer of `drizzle-orm ^0.45.2` against the workspace's pinned
+    `^0.44.0` (pnpm warns only, carried since Phase 1) — bump both together in a dedicated task,
+    since drizzle snapshots may shift.
+  - `packages/db/test/keys.test.ts` is still order-dependent (file untouched this phase).
+  - The remaining `apps/app` accessibility/UX minors from Phase 1's residuals list, on screens this
+    phase didn't touch, are still open.
 
-### Phase 2 pre-flight carry-overs
+### Carry-overs resolved during Phase 2
 
-Findings deferred during Phase 1 (from the task-review ledger and the still-open Phase 0 items).
-Fix each in the first Phase 2 task that touches the file, or record why it moves again.
+Findings deferred during Phase 1 (from the task-review ledger and the still-open Phase 0 items),
+now folded into Phase 2's own tasks: `pnpm dedupe` + re-export + smoke, `pinned-fetch.ts`'s HEAD
+`content-length` rewrite, the worker's structured logger, and `defineJob`'s zod-invalid-payload
+fail-fast all landed in Task 1; the duplicate `organization.slug` unique index and the non-superuser
+LOGIN role exercising the privilege boundary landed in Task 3; the Better Auth `APIError` → tRPC
+code mapping (the `organizationLimit` masked-500) landed in Task 17; `session.cookieCache` landed
+in Task 19. What did NOT fully resolve is carried forward above, under Phase 3's carry-overs.
+
+<details>
+<summary>Original Phase 1 carry-over text (superseded by the resolution note above; kept for
+the record)</summary>
 
 - Final-review residuals (parked with rulings in the review record): `pnpm-lock.yaml` grew by
   roughly 300 lines during the fix wave with a second Expo toolchain variant resolved against
@@ -252,6 +379,8 @@ Fix each in the first Phase 2 task that touches the file, or record why it moves
   pin down); `push.ts`'s Android-notification-channel branch and the registration hook/screen
   remain untested beyond the two cases the brief specified.
 
+</details>
+
 ## Later phases (see the spec for scope and verification)
 
 - Phase 3 — draft → review → send, the first shippable slice (`agent.orphan-sweep` lands here).
@@ -267,7 +396,13 @@ product name (codename `aesa` until then), pricing numbers, the assumed third-pa
 the managed drafting model per plan, and launch order (Microsoft 365 first, Gmail behind the
 test-user gate until CASA clears).
 
-The external-setup runbook (`docs/runbooks/2026-09-phase-1-external-setup.md`) lists everything
-Phase 1 needs that CI cannot do: the Better Auth secret and production env, the Google and
-Microsoft OAuth consent-screen/publisher-verification steps, the Resend sending domain, and the
-EAS project/dev-build/hosting setup.
+The Phase 1 external-setup runbook (`docs/runbooks/2026-09-phase-1-external-setup.md`) lists
+everything that phase needed that CI cannot do: the Better Auth secret and production env, the
+Google and Microsoft OAuth consent-screen/publisher-verification steps, the Resend sending domain,
+and the EAS project/dev-build/hosting setup.
+
+The Phase 2 external-setup runbook (`docs/runbooks/2026-09-phase-2-external-setup.md`) lists what
+this phase needs the same way: the Gmail OAuth client + Pub/Sub topic/push subscription, starting
+the CASA Tier 2 submission now (independent of code — a 4–12 week clock), the Microsoft Entra app
+registration, the live verification walk against a real Gmail test user and an M365 sandbox, and
+recording real fixtures from that walk.
