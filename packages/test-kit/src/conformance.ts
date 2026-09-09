@@ -19,6 +19,13 @@
  * `{ id, threadId }` `seedInbound` hands back, so this is transparent to the scenario code: a mock
  * harness's `seedInbound` really did just create that message; a fixture harness's `seedInbound`
  * is really just naming a message its fixtures were authored (or recorded) to contain.
+ *
+ * Because of that, a NEGATIVE assertion ("this other message is excluded") can only be driven
+ * against a harness whose `seedInbound` actually mutates state — a fixture harness's `seedInbound`
+ * returns the SAME fixed identity every call, so a second "seed" is not a second message. Every
+ * scenario that needs a negative check gates it on the explicit `seedInboundMutates` capability
+ * field below (never on the harness's name), and simply skips the negative half for a harness that
+ * reports `false`.
  */
 import { expect, describe, it } from 'vitest'
 import { CursorExpiredError, MessageGoneError, MARKER_HEADER, type MailboxClient } from '@aesa/mail'
@@ -26,6 +33,11 @@ import { CursorExpiredError, MessageGoneError, MARKER_HEADER, type MailboxClient
 export interface ConformanceHarness {
   makeClient(): Promise<MailboxClient>
   seedInbound(m: { from: string; to: string[]; subject: string; bodyText: string; threadId?: string }): Promise<{ id: string; threadId: string }>
+  /** `true` when `seedInbound` performs a real, isolated mutation (a mock harness) — `false` when
+   * it just names a fixed identity a canned fixture set already knows how to serve (a
+   * fixture-replay harness). Scenarios that assert a message's EXCLUSION (not merely its
+   * inclusion) can only be driven meaningfully when this is `true` — see the file header. */
+  seedInboundMutates: boolean
   /** Absent → the cursor-expiry scenario is skipped (a fixture-replay tier can't force this). */
   expireCursor?(): Promise<void>
   /** `false` for the recorded-fixture tier — no unsolicited sends (reference rule) — the send
@@ -103,8 +115,23 @@ export function runMailboxConformance(name: string, makeHarness: () => Promise<C
         bodyText: 'Please find my order',
       })
 
+      // A harness that can't seed a second, isolated message (a fixture replay — see the file
+      // header) can only support the positive half of this scenario below.
+      const decoy = harness.seedInboundMutates
+        ? await harness.seedInbound({
+            from: 'other@elsewhere.test',
+            to: ['other@elsewhere.test'],
+            subject: 'Unrelated to support',
+            bodyText: 'Not addressed to the support mailbox at all',
+          })
+        : null
+
       const result = await client.listMessagesForResync(['support@acme.test'], 30)
       expect(result.ids).toContainEqual({ id: seeded.id, threadId: seeded.threadId })
+      // A client that ignored the `addresses` argument entirely would still pass the assertion
+      // above — this is what actually pins the filtering: a message addressed to someone else
+      // must NOT show up in a resync window scoped to the support mailbox's own address.
+      if (decoy) expect(result.ids.map((r) => r.id)).not.toContain(decoy.id)
     })
 
     it('getThreadMessageIds walks the thread and finds the seeded message', async () => {
@@ -117,8 +144,24 @@ export function runMailboxConformance(name: string, makeHarness: () => Promise<C
         bodyText: 'body',
       })
 
+      // Omitting `threadId` seeds a message on its OWN fresh thread — a harness that can't seed a
+      // second, isolated message (a fixture replay — see the file header) can only support the
+      // positive half of this scenario below.
+      const otherThread = harness.seedInboundMutates
+        ? await harness.seedInbound({
+            from: 'jane@example.com',
+            to: ['support@acme.test'],
+            subject: 'A different thread entirely',
+            bodyText: 'unrelated',
+          })
+        : null
+
       const ids = await client.getThreadMessageIds(seeded.threadId)
       expect(ids).toContainEqual({ id: seeded.id })
+      // A client that walked every thread rather than just the requested one would still pass the
+      // assertion above — this is what actually pins the scoping: a message on a DIFFERENT thread
+      // must not appear in this thread's walk.
+      if (otherThread) expect(ids.map((r) => r.id)).not.toContain(otherThread.id)
     })
 
     it('cursor expiry throws CursorExpiredError then recovers', async (ctx) => {

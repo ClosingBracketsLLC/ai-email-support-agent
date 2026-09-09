@@ -20,6 +20,7 @@ function makeMockHarness(mode: 'gmail' | 'graph'): () => Promise<ConformanceHarn
       async seedInbound(m) {
         return mailbox.receiveInbound(m)
       },
+      seedInboundMutates: true,
       async expireCursor() {
         mailbox.expireCursor()
       },
@@ -38,11 +39,14 @@ runMailboxConformance('mock-graph', makeMockHarness('graph'))
 // canned fixture set can't be forced into a fresh cursor-expiry error, and the reference rule is
 // never to send unsolicited mail — there is no real mailbox here to observe or dedupe a resend.
 //
-// A replay harness's `seedInbound` performs NO mutation — it ignores its input entirely and
-// returns the identity of a message the fixture set was authored (or recorded) to already be able
-// to serve back through `listChanges`/`getMessage`/`listMessagesForResync`/`getThreadMessageIds`.
-// Every scenario in `conformance.ts` only asserts against the `{ id, threadId }` this returns, so
-// that substitution is invisible to the shared scenario code.
+// A replay harness's `seedInbound` performs NO mutation (`seedInboundMutates: false`) — it ignores
+// its input entirely and returns the identity of a message the fixture set was authored (or
+// recorded) to already be able to serve back through
+// `listChanges`/`getMessage`/`listMessagesForResync`/`getThreadMessageIds`. Every scenario in
+// `conformance.ts` only asserts against the `{ id, threadId }` this returns, so that substitution
+// is invisible to the shared scenario code — except for the two scenarios that assert a message's
+// EXCLUSION, which `seedInboundMutates: false` tells to skip their negative half entirely (a
+// second "seed" against a fixture harness is not a second, isolated message).
 //
 // The routing below is intentionally NOT a byte-exact replay of each fixture's own recorded
 // `request` field (the adapter unit tests in `packages/mail` do that, matching one fixture per
@@ -197,6 +201,7 @@ function makeGmailFixtureHarness(): () => Promise<ConformanceHarness> {
       async seedInbound() {
         return { id: 'msg-a1', threadId: 'thread-a1' }
       },
+      seedInboundMutates: false,
       supportsSend: false,
     }
   }
@@ -215,6 +220,7 @@ function makeGraphFixtureHarness(): () => Promise<ConformanceHarness> {
       async seedInbound() {
         return { id: 'msg-in-1', threadId: 'thread-in-1' }
       },
+      seedInboundMutates: false,
       supportsSend: false,
     }
   }
