@@ -10,7 +10,7 @@ import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import { z } from 'zod'
 import { PUSH_DAILY_CAP } from '@aesa/contracts'
-import { notificationDevices, notifications, tickets, usageCounters, withOrg, type Db } from '@aesa/db'
+import { notificationDevices, notifications, tickets, usageCounters, withOrg, type Db, type OrgTx } from '@aesa/db'
 import { defineJob, enqueue, registerJob, JOB_NAMES, type JobDefinition } from '@aesa/queue'
 import { utcDayString } from '../date-utils.ts'
 import type { SendPush } from '../push.ts'
@@ -104,12 +104,14 @@ async function loadForDispatch(db: Db, orgId: string, notificationId: string, da
   })
 }
 
-/** Rule 5: the escalation kind stamps the ticket's escalation_notified_at, once, on push success. */
-async function stampEscalatedTicket(db: Db, orgId: string, payload: unknown, now: Date): Promise<void> {
+/** Rule 5: the escalation kind stamps the ticket's escalation_notified_at, once, on push success —
+ * called INSIDE the same tx as the status flip below (fix review Finding 1): splitting these across
+ * two transactions let a crash between them leave the notification 'sent' with the ticket never
+ * stamped, forever — rule 1's idempotency guard blocks any retry once status is no longer 'pending'. */
+async function stampEscalatedTicket(tx: OrgTx, payload: unknown, now: Date): Promise<void> {
   const ticketId = (payload as { ticketId?: string } | null)?.ticketId
   if (!ticketId) return
-  await withOrg(db, orgId, (tx) =>
-    tx.update(tickets).set({ escalationNotifiedAt: now }).where(and(eq(tickets.id, ticketId), isNull(tickets.escalationNotifiedAt))))
+  await tx.update(tickets).set({ escalationNotifiedAt: now }).where(and(eq(tickets.id, ticketId), isNull(tickets.escalationNotifiedAt)))
 }
 
 export async function runNotifyDispatch(deps: NotifyDispatchDeps, payload: NotifyDispatchPayload): Promise<void> {
@@ -148,7 +150,7 @@ export async function runNotifyDispatch(deps: NotifyDispatchDeps, payload: Notif
         .set({ disabledAt: now })
         .where(and(eq(notificationDevices.orgId, orgId), inArray(notificationDevices.expoPushToken, result.invalidTokens)))
     }
+    // Finding 1: same tx as the status flip above — see stampEscalatedTicket's own doc comment.
+    if (ready.kind === 'escalation') await stampEscalatedTicket(tx, ready.payload, now)
   })
-
-  if (ready.kind === 'escalation') await stampEscalatedTicket(deps.db, orgId, ready.payload, now)
 }

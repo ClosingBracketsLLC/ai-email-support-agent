@@ -179,9 +179,10 @@ describe('notify.dispatch', () => {
     expect(calls).toHaveLength(0)
   })
 
-  it('rule 4 (invalid token): a DeviceNotRegistered token gets disabled_at stamped on its device row', async () => {
+  it('rule 4 (invalid token): a DeviceNotRegistered token gets disabled_at stamped on its device row — a second, still-valid device is untouched', async () => {
     const orgId = await newOrg()
     const device = await seedDevice(orgId)
+    const stillValid = await seedDevice(orgId)
     const notificationId = await seedNotification(orgId)
     const { send } = createStubPush({ ok: true, invalidTokens: [device.expoPushToken] })
 
@@ -189,7 +190,23 @@ describe('notify.dispatch', () => {
 
     const after = await readDevice(orgId, device.id)
     expect(after?.disabledAt?.getTime()).toBe(NOW.getTime())
+    const untouched = await readDevice(orgId, stillValid.id)
+    expect(untouched?.disabledAt).toBeNull()
     expect((await readNotification(orgId, notificationId))?.status).toBe('sent')
+  })
+
+  it('rule 2 (cap boundary): at PUSH_DAILY_CAP - 1, the push still goes through (an off-by-one would collapse it)', async () => {
+    const orgId = await newOrg()
+    await seedDevice(orgId)
+    const notificationId = await seedNotification(orgId)
+    await setMeter(orgId, TODAY, 'push_sent', PUSH_DAILY_CAP - 1)
+    const { send, calls } = createStubPush({ ok: true, invalidTokens: [] })
+
+    await runNotifyDispatch(makeDeps(send), { orgId, notificationId })
+
+    expect(calls).toHaveLength(1)
+    expect((await readNotification(orgId, notificationId))?.status).toBe('sent')
+    expect(await readMeter(orgId, TODAY, 'push_sent')).toBe(PUSH_DAILY_CAP)
   })
 
   it('rule 4 (push failure): !ok -> status failed, terminal — meter is not incremented', async () => {
@@ -241,5 +258,24 @@ describe('notify.dispatch', () => {
     await runNotifyDispatch({ ...makeDeps(send), now: () => LATER }, { orgId, notificationId: secondNotificationId })
 
     expect((await readTicket(orgId, ticketId))?.escalationNotifiedAt?.getTime()).toBe(stampedAt)
+  })
+
+  it('fix review Finding 1: the escalation stamp commits in the SAME tx as the status flip — a failing stamp rolls back the whole write', async () => {
+    const orgId = await newOrg()
+    await seedDevice(orgId)
+    // `tickets.id` is a uuid column; a non-uuid payload.ticketId makes the stamp's UPDATE fail at
+    // the database level ("invalid input syntax for type uuid"), which — now that the stamp runs
+    // inside the SAME withOrg tx as the 'sent' write (Finding 1's fix) — rolls back that entire
+    // transaction: the notification must stay 'pending', not commit as 'sent' with no stamp.
+    const notificationId = await seedNotification(orgId, { kind: 'escalation', payload: { ticketId: 'not-a-uuid' } })
+    const { send, calls } = createStubPush({ ok: true, invalidTokens: [] })
+
+    await expect(runNotifyDispatch(makeDeps(send), { orgId, notificationId })).rejects.toThrow()
+
+    expect(calls).toHaveLength(1) // the push itself (outside any tx) still happened
+    const after = await readNotification(orgId, notificationId)
+    expect(after?.status).toBe('pending') // NOT 'sent' — the whole write rolled back together
+    expect(after?.sentAt).toBeNull()
+    expect(await readMeter(orgId, TODAY, 'push_sent')).toBe(0)
   })
 })

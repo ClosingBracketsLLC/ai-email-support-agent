@@ -10,7 +10,7 @@ import { randomBytes } from 'node:crypto'
 import { eq, inArray } from 'drizzle-orm'
 import pino from 'pino'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { notificationDevices, notifications, orgSettings, user, withOrg } from '@aesa/db'
+import { mailboxConnections, notificationDevices, notifications, orgSettings, tickets, user, withOrg } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
 import { runNotifyDigest, type NotifyDigestDeps } from '../src/jobs/notify-digest.ts'
@@ -53,11 +53,11 @@ async function newOrg(): Promise<string> {
   return createTestOrganization(app)
 }
 
-async function seedCollapsed(orgId: string, title: string, createdAt: Date): Promise<string> {
+async function seedCollapsed(orgId: string, title: string, createdAt: Date, payload: Record<string, unknown> = {}): Promise<string> {
   const [row] = await withOrg(app.db, orgId, (tx) =>
     tx
       .insert(notifications)
-      .values({ orgId, kind: 'escalation', title, body: 'b', dedupeKey: `dk-${rand()}`, status: 'collapsed', createdAt })
+      .values({ orgId, kind: 'escalation', title, body: 'b', dedupeKey: `dk-${rand()}`, status: 'collapsed', createdAt, payload })
       .returning({ id: notifications.id }))
   return row!.id
 }
@@ -66,6 +66,29 @@ async function seedDevice(orgId: string): Promise<string> {
   const token = `ExponentPushToken[${rand()}]`
   await withOrg(app.db, orgId, (tx) => tx.insert(notificationDevices).values({ orgId, userId, expoPushToken: token, platform: 'ios' }))
   return token
+}
+
+async function seedTicket(orgId: string, overrides: Partial<typeof tickets.$inferInsert> = {}): Promise<string> {
+  const connectionId = await withOrg(app.db, orgId, async (tx) => {
+    const [row] = await tx
+      .insert(mailboxConnections)
+      .values({ orgId, provider: 'gmail', providerAccountId: `acct-${rand()}`, emailAddress: `support-${rand()}@acme.test`, status: 'connected', connectedByUserId: userId })
+      .returning({ id: mailboxConnections.id })
+    return row!.id
+  })
+  const [ticket] = await withOrg(app.db, orgId, (tx) =>
+    tx.insert(tickets).values({ orgId, connectionId, providerThreadId: `thread-${rand()}`, status: 'needs_owner', needsOwnerReason: 'triage_flags', ...overrides }).returning({ id: tickets.id }))
+  return ticket!.id
+}
+
+async function readTicket(orgId: string, id: string) {
+  const [row] = await withOrg(app.db, orgId, (tx) => tx.select().from(tickets).where(eq(tickets.id, id)))
+  return row
+}
+
+async function readDeviceByToken(orgId: string, token: string) {
+  const [row] = await withOrg(app.db, orgId, (tx) => tx.select().from(notificationDevices).where(eq(notificationDevices.expoPushToken, token)))
+  return row
 }
 
 async function setDigestMinutes(orgId: string, minutes: number): Promise<void> {
@@ -176,15 +199,45 @@ describe('notify.digest', () => {
     expect((await readNotification(orgId, id))?.status).toBe('collapsed')
   })
 
-  it('an invalid token surfaced by the digest push gets its device row disabled', async () => {
+  it('an invalid token surfaced by the digest push gets its device row disabled — a second, still-valid device is untouched', async () => {
     const orgId = await newOrg()
     const token = await seedDevice(orgId)
+    const stillValidToken = await seedDevice(orgId)
     await seedCollapsed(orgId, 'Dead device', OLD_ENOUGH)
     const { send } = createRecordingPush({ ok: true, invalidTokens: [token] })
 
     await runNotifyDigest(makeDeps(send))
 
-    const [device] = await withOrg(app.db, orgId, (tx) => tx.select().from(notificationDevices).where(eq(notificationDevices.expoPushToken, token)))
+    const device = await readDeviceByToken(orgId, token)
     expect(device?.disabledAt?.getTime()).toBe(NOW.getTime())
+    const stillValid = await readDeviceByToken(orgId, stillValidToken)
+    expect(stillValid?.disabledAt).toBeNull()
+  })
+
+  it('fix review Finding 2: a collapsed escalation row gets its ticket stamped once the digest actually sends', async () => {
+    const orgId = await newOrg()
+    await seedDevice(orgId)
+    const ticketId = await seedTicket(orgId)
+    const id = await seedCollapsed(orgId, 'Escalated while capped', OLD_ENOUGH, { ticketId })
+    const { send } = createRecordingPush()
+
+    await runNotifyDigest(makeDeps(send))
+
+    expect((await readNotification(orgId, id))?.status).toBe('sent')
+    expect((await readTicket(orgId, ticketId))?.escalationNotifiedAt?.getTime()).toBe(NOW.getTime())
+  })
+
+  it('fix review Finding 2: the escalation_notified_at guard (IS NULL) protects an already-stamped ticket from a later digest', async () => {
+    const orgId = await newOrg()
+    await seedDevice(orgId)
+    const stampedAt = new Date('2026-09-09T10:00:00Z')
+    const ticketId = await seedTicket(orgId, { escalationNotifiedAt: stampedAt })
+    const id = await seedCollapsed(orgId, 'Already stamped', OLD_ENOUGH, { ticketId })
+    const { send } = createRecordingPush()
+
+    await runNotifyDigest(makeDeps(send))
+
+    expect((await readNotification(orgId, id))?.status).toBe('sent')
+    expect((await readTicket(orgId, ticketId))?.escalationNotifiedAt?.getTime()).toBe(stampedAt.getTime())
   })
 })

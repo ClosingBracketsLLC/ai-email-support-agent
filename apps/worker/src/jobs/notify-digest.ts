@@ -20,7 +20,7 @@ import { and, asc, eq, inArray, isNull, lt } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import { resolveSetting } from '@aesa/core'
-import { notificationDevices, notifications, orgSettings, withOrg, withPlatform, type Db } from '@aesa/db'
+import { notificationDevices, notifications, orgSettings, tickets, withOrg, withPlatform, type Db } from '@aesa/db'
 import { registerCron } from '@aesa/queue'
 import type { SendPush } from '../push.ts'
 
@@ -45,6 +45,9 @@ interface DueDigest {
   rowIds: string[]
   titles: string[]
   deviceTokens: string[]
+  /** Ticket ids from this batch's escalation-kind rows (fix review Finding 2) — stamped inside the
+   * SAME tx that marks the batch `sent`, same atomicity reasoning as notify.dispatch's rule 5. */
+  escalationTicketIds: string[]
 }
 
 /** One org's collapsed backlog older than its own `digest_minutes` setting, plus the devices to
@@ -59,7 +62,7 @@ async function loadDueDigest(db: Db, orgId: string, now: Date): Promise<DueDiges
     const cutoff = new Date(now.getTime() - digestMinutes * 60_000)
 
     const rows = await tx
-      .select({ id: notifications.id, title: notifications.title })
+      .select({ id: notifications.id, title: notifications.title, kind: notifications.kind, payload: notifications.payload })
       .from(notifications)
       .where(and(eq(notifications.orgId, orgId), eq(notifications.status, 'collapsed'), lt(notifications.createdAt, cutoff)))
       .orderBy(asc(notifications.createdAt))
@@ -70,12 +73,38 @@ async function loadDueDigest(db: Db, orgId: string, now: Date): Promise<DueDiges
       .from(notificationDevices)
       .where(and(eq(notificationDevices.orgId, orgId), isNull(notificationDevices.disabledAt)))
 
-    return { rowIds: rows.map((r) => r.id), titles: rows.map((r) => r.title), deviceTokens: deviceRows.map((d) => d.expoPushToken) }
+    const escalationTicketIds = [
+      ...new Set(
+        rows
+          .filter((r) => r.kind === 'escalation')
+          .map((r) => (r.payload as { ticketId?: string } | null)?.ticketId)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    ]
+
+    return {
+      rowIds: rows.map((r) => r.id),
+      titles: rows.map((r) => r.title),
+      deviceTokens: deviceRows.map((d) => d.expoPushToken),
+      escalationTicketIds,
+    }
   })
 }
 
-async function markSent(db: Db, orgId: string, rowIds: string[], now: Date): Promise<void> {
-  await withOrg(db, orgId, (tx) => tx.update(notifications).set({ status: 'sent', sentAt: now }).where(inArray(notifications.id, rowIds)))
+/** Marks the whole batch `sent` and — Finding 2 — stamps `escalation_notified_at` for every
+ * escalation-kind row's ticket, in the SAME tx: an org at the daily cap whose collapsed backlog
+ * includes an escalation must still get its ticket stamped once the digest actually paged the
+ * owner, exactly like notify.dispatch's own rule 5 does on its own success path. */
+async function markSentAndStampEscalations(db: Db, orgId: string, due: DueDigest, now: Date): Promise<void> {
+  await withOrg(db, orgId, async (tx) => {
+    await tx.update(notifications).set({ status: 'sent', sentAt: now }).where(inArray(notifications.id, due.rowIds))
+    if (due.escalationTicketIds.length > 0) {
+      await tx
+        .update(tickets)
+        .set({ escalationNotifiedAt: now })
+        .where(and(inArray(tickets.id, due.escalationTicketIds), isNull(tickets.escalationNotifiedAt)))
+    }
+  })
 }
 
 async function disableInvalidDevices(db: Db, orgId: string, tokens: string[], now: Date): Promise<void> {
@@ -93,7 +122,7 @@ async function runOneOrgDigest(deps: NotifyDigestDeps, orgId: string, now: Date)
 
   if (due.deviceTokens.length === 0) {
     // Nothing to push to — same "not an error" call as notify.dispatch's rule 3.
-    await markSent(deps.db, orgId, due.rowIds, now)
+    await markSentAndStampEscalations(deps.db, orgId, due, now)
     return
   }
 
@@ -109,7 +138,7 @@ async function runOneOrgDigest(deps: NotifyDigestDeps, orgId: string, now: Date)
     return
   }
 
-  await markSent(deps.db, orgId, due.rowIds, now)
+  await markSentAndStampEscalations(deps.db, orgId, due, now)
   // The digest itself never counts against push_sent (it IS the overflow channel) — only disable
   // whatever tokens Expo reported dead, same bookkeeping notify.dispatch does on its own success path.
   await disableInvalidDevices(deps.db, orgId, result.invalidTokens, now)
