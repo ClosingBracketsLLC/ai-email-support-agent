@@ -29,7 +29,7 @@ import {
   type Db, type OrgTx,
 } from '@aesa/db'
 import type { LlmProvider } from '@aesa/llm'
-import { defineJob, registerJob, type JobDefinition } from '@aesa/queue'
+import { defineJob, registerJob, JOB_NAMES, type JobDefinition } from '@aesa/queue'
 
 /** The usage_counters meter this job's spend guard reads and writes. */
 const TRIAGE_METER = 'triage_calls'
@@ -46,7 +46,7 @@ export type TicketTriagePayload = z.infer<typeof TicketTriagePayload>
  * definition and registers THAT.
  */
 export const ticketTriageJob: JobDefinition<TicketTriagePayload> = defineJob({
-  name: 'ticket.triage',
+  name: JOB_NAMES.ticketTriage,
   schema: TicketTriagePayload,
   queue: { expireInSeconds: 120, retryLimit: 2, retryBackoff: true },
   handler: async () => {

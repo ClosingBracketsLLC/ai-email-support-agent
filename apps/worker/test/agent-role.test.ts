@@ -18,6 +18,11 @@ function baseConfig(overrides: Partial<WorkerConfig> = {}): WorkerConfig {
     kekRing: null,
     logLevel: 'info',
     anthropicApiKey: null,
+    gmailOauth: null,
+    msOauth: null,
+    gmailPubsubTopic: null,
+    webhookPublicUrl: null,
+    platformSender: null,
     ...overrides,
   }
 }
