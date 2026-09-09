@@ -6,13 +6,55 @@
  * the same user who started the flow. The rest of the `mailboxes` router (addresses, health, …) is
  * Task 19's slice.
  */
+import { randomInt } from 'node:crypto'
 import { TRPCError } from '@trpc/server'
-import { eq } from 'drizzle-orm'
-import { ClaimConnectionInput, DisconnectInput, StartConnectInput } from '@aesa/contracts'
-import { audit, ensureDefaultCategories, getOrgBoxPublicKeyOrNull, mailboxConnections, oauthFlows } from '@aesa/db'
+import { and, count, eq } from 'drizzle-orm'
+import {
+  AddAddressInput, AdminConsentInfoInput, ClaimConnectionInput, ConsentAddressInput, DisconnectInput,
+  MAX_AGENTS_PER_DOMAIN, RequestGmailAccessInput, ResendVerificationInput, StartConnectInput, emailDomain,
+  type AgentStatus,
+} from '@aesa/contracts'
+import {
+  agentCategoryPolicies, agents, audit, categories, ensureDefaultCategories, getOrgBoxPublicKeyOrNull,
+  gmailAccessRequests, mailboxConnections, oauthFlows,
+} from '@aesa/db'
+import { hashToken } from '@aesa/crypto'
 import { JOB_NAMES } from '@aesa/queue'
 import { createFlow } from '../../connect/flows.ts'
-import { managerProcedure, router } from '../init.ts'
+import type { OutgoingMail } from '../../mail/transport.ts'
+import { managerProcedure, orgProcedure, router } from '../init.ts'
+
+const VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000
+
+/** RULING (Task 19 brief): a 6-digit numeric code, not `generateToken`'s own base64url token — the
+ * code has to survive being typed/read back out of an email subject/body and matched by the worker's
+ * sync-walk regex (`packages/mail/src/sync.ts`'s `VERIFICATION_CODE_RE = /\b(\d{6})\b/`). Hashed the
+ * same way either way: `hashToken('action', code)`, domain-separated from every other token kind. */
+function issueVerificationCode(): { code: string; hash: string; expiresAt: Date } {
+  const code = String(randomInt(0, 1_000_000)).padStart(6, '0')
+  return { code, hash: hashToken('action', code), expiresAt: new Date(Date.now() + VERIFICATION_TTL_MS) }
+}
+
+/**
+ * The code rides in the subject (so it survives even if the body is stripped) AND the body (belt and
+ * braces, since the worker's regex scans `subject + '\n' + bodyText`). This mail's `from` is whatever
+ * `deps.mail` sends as (`ApiConfig.mail.from`, i.e. this api's own `MAIL_FROM`) — the worker's sync
+ * walk only intercepts a code from `ctx.platformSender`, its OWN `MAIL_FROM` parsed the same way
+ * (`apps/worker/src/config.ts`). The two must be the SAME address in every real deployment, or a
+ * verification mail lands as an ordinary, unauthenticated customer message instead of being caught
+ * before ticketing (`packages/mail/src/sync.ts`'s `interceptVerification`).
+ */
+function verificationMail(address: string, code: string): OutgoingMail {
+  return {
+    to: address,
+    subject: `aesa address verification ${code}`,
+    text: `Someone added ${address} as a support address on your aesa workspace.\n\n` +
+      `Verification code: ${code}\n\n` +
+      `You don't need to reply or do anything with this code yourself — as soon as this address ` +
+      `receives any email carrying it, aesa's mailbox sync notices it automatically and activates the ` +
+      `address. This code expires in 24 hours.`,
+  }
+}
 
 type ClaimOutcome =
   | { kind: 'not_found' }
@@ -115,5 +157,188 @@ export const mailboxesRouter = router({
     // Task 15's worker job: provider revoke, push unsubscribe, mailbox_credentials delete — all best-effort.
     await ctx.deps.enqueue(JOB_NAMES.revokeMailbox, { orgId: ctx.orgId, connectionId: input.connectionId }, { entityId: input.connectionId })
     return { ok: true as const }
+  }),
+
+  /** Every connection this org has, its agents, and the Gmail-testing-mode 7-day reconnect proxy
+   * (`credentialAgeDays` — the connection's own `createdAt`, since a real credential age would need
+   * the worker-only `mailbox_credentials` table the api has no privilege on). */
+  list: orgProcedure.query(async ({ ctx }) => {
+    const { conns, agentRows } = await ctx.deps.api.withOrg(ctx.orgId, async (tx) => ({
+      conns: await tx.select().from(mailboxConnections).where(eq(mailboxConnections.orgId, ctx.orgId)),
+      agentRows: await tx.select().from(agents).where(eq(agents.orgId, ctx.orgId)).orderBy(agents.priority),
+    }))
+    const now = Date.now()
+    return {
+      connections: conns.map((c) => ({
+        id: c.id, provider: c.provider, emailAddress: c.emailAddress, status: c.status,
+        lastSyncAt: c.lastSyncAt, lastSuccessAt: c.lastSuccessAt, consecutiveFailures: c.consecutiveFailures,
+        pushExpiresAt: c.pushExpiresAt, connectedByUserId: c.connectedByUserId, connectedByMe: c.connectedByUserId === ctx.user.id,
+        credentialAgeDays: Math.floor((now - c.createdAt.getTime()) / 86_400_000),
+        agents: agentRows
+          .filter((a) => a.connectionId === c.id)
+          .map((a) => ({ id: a.id, address: a.address, status: a.status, priority: a.priority, displayName: a.displayName })),
+      })),
+    }
+  }),
+
+  /**
+   * The address/verification/consent surface (spec §2). Order matters: the domain limit is checked
+   * BEFORE anything is written (so a rejected call leaves no half-created agent), and the outgoing
+   * verification mail is sent AFTER the transaction commits — `withOrg` may never span network I/O,
+   * and `deps.mail.send` is a real network call under the Resend transport.
+   */
+  addAddress: managerProcedure.input(AddAddressInput).mutation(async ({ ctx, input }) => {
+    const result = await ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
+      const [conn] = await tx.select().from(mailboxConnections).where(eq(mailboxConnections.id, input.connectionId))
+      if (!conn) throw new TRPCError({ code: 'NOT_FOUND', message: 'mailbox connection not found' })
+      if (conn.status !== 'connected') throw new TRPCError({ code: 'PRECONDITION_FAILED', message: `mailbox connection is ${conn.status}, cannot add an address` })
+
+      // claimConnection (Task 17) already seeds the org's 8 default categories; idempotent (onConflictDoNothing)
+      // belt-and-braces here too, so this endpoint has its own seeded set to copy from regardless of ordering.
+      await ensureDefaultCategories(tx)
+
+      const domain = emailDomain(input.address)
+      const [activeInDomain] = await tx.select({ value: count() }).from(agents)
+        .where(and(eq(agents.orgId, ctx.orgId), eq(agents.domain, domain), eq(agents.status, 'active')))
+      if ((activeInDomain?.value ?? 0) >= MAX_AGENTS_PER_DOMAIN) {
+        throw new TRPCError({ code: 'FORBIDDEN', message: 'agent limit for domain' })
+      }
+
+      // Adding an address to a mailbox someone ELSE connected needs that person's one-tap consent
+      // (spec §2) — gating applies even to the primary address, which otherwise needs no verification
+      // at all: without this, a second manager could silently activate an agent on a mailbox they
+      // never proved they control.
+      const isPrimary = input.address === conn.emailAddress
+      const consentRequiredFromUserId = conn.connectedByUserId === ctx.user.id ? null : conn.connectedByUserId
+      const status: AgentStatus = isPrimary && !consentRequiredFromUserId ? 'active' : 'pending_verification'
+
+      let verificationCodeHash: string | null = null
+      let verificationExpiresAt: Date | null = null
+      let code: string | null = null
+      if (!isPrimary) {
+        const issued = issueVerificationCode()
+        code = issued.code
+        verificationCodeHash = issued.hash
+        verificationExpiresAt = issued.expiresAt
+      }
+
+      const [onConnection] = await tx.select({ value: count() }).from(agents).where(eq(agents.connectionId, input.connectionId))
+      const existingOnConnection = onConnection?.value ?? 0
+
+      const [agent] = await tx.insert(agents).values({
+        orgId: ctx.orgId,
+        connectionId: input.connectionId,
+        address: input.address,
+        domain,
+        displayName: input.address.split('@')[0]!,
+        personaPreset: 'support',
+        priority: existingOnConnection,
+        status,
+        replyFromAddress: input.replyFromConnection ? conn.emailAddress : null,
+        verificationCodeHash,
+        verificationExpiresAt,
+        consentRequiredFromUserId,
+      }).returning()
+
+      const orgCategories = await tx.select({ id: categories.id }).from(categories).where(eq(categories.orgId, ctx.orgId))
+      if (orgCategories.length > 0) {
+        await tx.insert(agentCategoryPolicies).values(
+          orgCategories.map((c) => ({ orgId: ctx.orgId, agentId: agent!.id, categoryId: c.id, mode: 'review' })),
+        )
+      }
+
+      await audit(tx, {
+        actor: ctx.actor, action: 'agent.address_added', entityType: 'agent', entityId: agent!.id,
+        detail: { address: input.address, isPrimary, status, consentRequired: consentRequiredFromUserId !== null },
+        ip: ctx.ip, userAgent: ctx.userAgent,
+      })
+
+      return { agentId: agent!.id, status, code }
+    })
+
+    if (result.code) await ctx.deps.mail.send(verificationMail(input.address, result.code))
+    return { agentId: result.agentId, status: result.status }
+  }),
+
+  /** Rotates the code — the old hash stops matching immediately, not just once the new mail arrives.
+   * NOT_FOUND for anything that isn't a still-pending alias agent (an active/disabled agent, or a
+   * pending PRIMARY agent that never had a code to begin with — that one is waiting on consent, not
+   * verification). */
+  resendVerification: managerProcedure.input(ResendVerificationInput).mutation(async ({ ctx, input }) => {
+    const result = await ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
+      const [agent] = await tx.select().from(agents).where(and(eq(agents.orgId, ctx.orgId), eq(agents.id, input.agentId)))
+      if (!agent || agent.status !== 'pending_verification' || !agent.verificationCodeHash) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'no pending verification for this agent' })
+      }
+      const issued = issueVerificationCode()
+      await tx.update(agents)
+        .set({ verificationCodeHash: issued.hash, verificationExpiresAt: issued.expiresAt })
+        .where(eq(agents.id, agent.id))
+      await audit(tx, { actor: ctx.actor, action: 'agent.verification_resent', entityType: 'agent', entityId: agent.id, ip: ctx.ip, userAgent: ctx.userAgent })
+      return { address: agent.address, code: issued.code }
+    })
+    await ctx.deps.mail.send(verificationMail(result.address, result.code))
+    return { ok: true as const }
+  }),
+
+  /**
+   * Only the user named in `consent_required_from_user_id` may decide this — `orgProcedure`, not
+   * `managerProcedure`: the deciding user is fixed by who connected the mailbox, not by the caller's
+   * current role (a demoted admin who still holds the pending consent is still the right person to
+   * ask). Reject deletes the agent outright — there is nothing else pending on it to clean up.
+   */
+  consentAddress: orgProcedure.input(ConsentAddressInput).mutation(async ({ ctx, input }) =>
+    ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
+      const [agent] = await tx.select().from(agents).where(and(eq(agents.orgId, ctx.orgId), eq(agents.id, input.agentId)))
+      if (!agent) throw new TRPCError({ code: 'NOT_FOUND', message: 'agent not found' })
+      if (!agent.consentRequiredFromUserId || agent.consentRequiredFromUserId !== ctx.user.id) {
+        throw new TRPCError({ code: 'FORBIDDEN', message: 'only the user whose consent is required may decide this' })
+      }
+
+      if (!input.approve) {
+        await tx.delete(agents).where(eq(agents.id, agent.id))
+        await audit(tx, { actor: ctx.actor, action: 'agent.consent_decided', entityType: 'agent', entityId: agent.id, detail: { approved: false }, ip: ctx.ip, userAgent: ctx.userAgent })
+        return { agentId: agent.id, deleted: true as const }
+      }
+
+      const [conn] = await tx.select({ emailAddress: mailboxConnections.emailAddress }).from(mailboxConnections).where(eq(mailboxConnections.id, agent.connectionId))
+      const status: AgentStatus = conn?.emailAddress === agent.address ? 'active' : 'pending_verification'
+      await tx.update(agents).set({ consentRequiredFromUserId: null, status }).where(eq(agents.id, agent.id))
+      await audit(tx, { actor: ctx.actor, action: 'agent.consent_decided', entityType: 'agent', entityId: agent.id, detail: { approved: true }, ip: ctx.ip, userAgent: ctx.userAgent })
+      return { agentId: agent.id, deleted: false as const, status }
+    }),
+  ),
+
+  /** Idempotent: the operator grants Gmail testing-mode access by hand (runbook), so a second request
+   * for the same address is a no-op, not an error. */
+  requestGmailAccess: managerProcedure.input(RequestGmailAccessInput).mutation(async ({ ctx, input }) => {
+    const email = input.email.toLowerCase()
+    await ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
+      await tx.insert(gmailAccessRequests).values({ orgId: ctx.orgId, email })
+        .onConflictDoNothing({ target: [gmailAccessRequests.orgId, gmailAccessRequests.email] })
+      await audit(tx, { actor: ctx.actor, action: 'mailbox.gmail_access_requested', entityType: 'gmail_access_request', entityId: email, ip: ctx.ip, userAgent: ctx.userAgent })
+    })
+    return { requested: true as const }
+  }),
+
+  /**
+   * Microsoft's admin-consent endpoint (the AADSTS65001 recovery path — connect/routes.ts's callback
+   * already classifies that error as `admin_consent_required`): `GET
+   * /{tenant}/adminconsent?client_id=...&redirect_uri=...`, no `state` (Microsoft's docs list it as
+   * optional; there is no return leg here to correlate one against — the owner just mails this link
+   * to their admin, who opens it separately). Same `common` tenant the mailbox OAuth adapter itself
+   * authorizes against (`packages/mail/src/adapters/graph/oauth.ts`).
+   */
+  adminConsentInfo: managerProcedure.input(AdminConsentInfoInput).query(async ({ ctx, input }) => {
+    if (input.connectionId) {
+      const [conn] = await ctx.deps.api.withOrg(ctx.orgId, (tx) => tx.select({ id: mailboxConnections.id }).from(mailboxConnections).where(eq(mailboxConnections.id, input.connectionId!)))
+      if (!conn) throw new TRPCError({ code: 'NOT_FOUND', message: 'mailbox connection not found' })
+    }
+    if (!ctx.deps.config.msOauth) throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'microsoft mailbox oauth is not configured' })
+
+    const url = new URL('https://login.microsoftonline.com/common/adminconsent')
+    url.searchParams.set('client_id', ctx.deps.config.msOauth.clientId)
+    url.searchParams.set('redirect_uri', `${ctx.deps.config.appBaseUrl}/connect/microsoft/callback`)
+    return { adminConsentUrl: url.toString() }
   }),
 })

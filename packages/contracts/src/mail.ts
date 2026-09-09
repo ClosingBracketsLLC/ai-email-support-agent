@@ -31,6 +31,11 @@ export type ConsentAddressInput = z.infer<typeof ConsentAddressInput>
 export const RequestGmailAccessInput = z.object({ email: z.email().max(254) })
 export type RequestGmailAccessInput = z.infer<typeof RequestGmailAccessInput>
 
+/** `connectionId` is accepted for a future audit trail (which flow the owner was looking at) but not
+ * required — the admin-consent URL itself is static, built from config alone. */
+export const AdminConsentInfoInput = z.object({ connectionId: z.uuid().optional() })
+export type AdminConsentInfoInput = z.infer<typeof AdminConsentInfoInput>
+
 export function emailDomain(address: string): string {
   const parts = address.split('@')
   if (parts.length !== 2 || !parts[0] || !parts[1]) {

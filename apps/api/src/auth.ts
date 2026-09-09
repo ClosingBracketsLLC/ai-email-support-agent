@@ -60,6 +60,15 @@ export function createAuth({ db, config, mail, logger, audit }: AuthDeps) {
       },
     },
     trustedOrigins: config.trustedOrigins,
+    // orgProcedure (trpc/init.ts) costs two round trips per call — getSession (context.ts) plus its
+    // own getActiveMember — before a single application query runs. Better Auth's session cookie
+    // cache (1.7.3's `session.cookieCache`, verified against @better-auth/core's init-options.d.mts)
+    // signs a short-lived copy of the session into the cookie itself, so getSession skips its own
+    // database round trip while the cache is fresh; getActiveMember still hits the database (it isn't
+    // cached), so this halves the two round trips rather than eliminating them. 60s, not the 5-minute
+    // default: short enough that a role change or session revocation during that window is a minor,
+    // bounded staleness, not a real authorization gap.
+    session: { cookieCache: { enabled: true, maxAge: 60 } },
     rateLimit: {
       enabled: config.authRateLimit,
       window: 60, max: 60,

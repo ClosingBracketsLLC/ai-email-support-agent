@@ -73,10 +73,25 @@ describe('Better Auth on Fastify', () => {
 describe('/meta', () => {
   it('reports which social providers are configured', async () => {
     const off = buildServer(stubDeps())
-    expect((await off.inject({ method: 'GET', url: '/meta' })).json()).toEqual({ providers: { google: false, microsoft: false } })
+    expect((await off.inject({ method: 'GET', url: '/meta' })).json()).toEqual({
+      providers: { google: false, microsoft: false },
+      mail: { gmail: false, microsoft: false },
+    })
     await off.close()
     const on = buildServer(stubDeps({ GOOGLE_CLIENT_ID: 'g', GOOGLE_CLIENT_SECRET: 's' }))
-    expect((await on.inject({ method: 'GET', url: '/meta' })).json()).toEqual({ providers: { google: true, microsoft: false } })
+    expect((await on.inject({ method: 'GET', url: '/meta' })).json()).toEqual({
+      providers: { google: true, microsoft: false },
+      mail: { gmail: false, microsoft: false },
+    })
+    await on.close()
+  })
+
+  it('reports mailbox OAuth (gmail/microsoft mail access) independently of the sign-in providers above', async () => {
+    const on = buildServer(stubDeps({ GMAIL_OAUTH_CLIENT_ID: 'g', GMAIL_OAUTH_CLIENT_SECRET: 's', MS_OAUTH_CLIENT_ID: 'm', MS_OAUTH_CLIENT_SECRET: 's' }))
+    expect((await on.inject({ method: 'GET', url: '/meta' })).json()).toEqual({
+      providers: { google: false, microsoft: false },
+      mail: { gmail: true, microsoft: true },
+    })
     await on.close()
   })
 })

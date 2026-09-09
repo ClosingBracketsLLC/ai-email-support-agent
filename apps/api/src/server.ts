@@ -100,7 +100,12 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       },
     })
 
-    routes.get('/meta', async () => ({ providers: { google: deps.config.google !== null, microsoft: deps.config.microsoft !== null } }))
+    routes.get('/meta', async () => ({
+      providers: { google: deps.config.google !== null, microsoft: deps.config.microsoft !== null },
+      // Mailbox OAuth (Gmail/Graph mail access), distinct from the sign-in providers above — the app
+      // uses this to decide which "connect a mailbox" options to offer.
+      mail: { gmail: deps.config.gmailOauth !== null, microsoft: deps.config.msOauth !== null },
+    }))
 
     routes.get('/healthz', async (_req, reply) => {
       const h = await deps.api.health()

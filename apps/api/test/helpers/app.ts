@@ -1,13 +1,14 @@
 import type { AddressInfo } from 'node:net'
 import type { FastifyInstance } from 'fastify'
-import { audit } from '@aesa/db'
+import type { MailProvider } from '@aesa/contracts'
+import { audit, mailboxConnections } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase } from '@aesa/db/testing'
 import type pino from 'pino'
 import { expect } from 'vitest'
 import { createAuth } from '../../src/auth.ts'
 import { loadConfig } from '../../src/config.ts'
-import { createApiFacade, type EnqueueFn, type ServerDeps } from '../../src/deps.ts'
+import { createApiFacade, type ApiFacade, type EnqueueFn, type ServerDeps } from '../../src/deps.ts'
 import { createAppLogger } from '../../src/logging.ts'
 import { createDevSink, type DevSink } from '../../src/mail/transport.ts'
 import { buildServer } from '../../src/server.ts'
@@ -76,6 +77,20 @@ export async function signInWithOtp(app: FastifyInstance, mail: DevSink, email: 
   const first = (Array.isArray(raw) ? raw : [raw]).find((c) => c?.includes('session_token'))
   expect(first).toBeDefined()
   return { cookie: first!.split(';')[0]!, user: res.json().user as { id: string; email: string; name: string } }
+}
+
+/** Inserts an already-`connected` mailbox connection directly, bypassing the real OAuth dance
+ * (connect-flow.test.ts already covers that end to end) — every mailboxes/agents/inbox router suite
+ * needs a connected mailbox to exist before it can add an address, list agents, or seed tickets. */
+export async function insertConnectedMailbox(
+  api: ApiFacade, orgId: string, connectedByUserId: string, emailAddress: string, provider: MailProvider = 'gmail',
+): Promise<string> {
+  const [conn] = await api.withOrg(orgId, (tx) =>
+    tx.insert(mailboxConnections).values({
+      orgId, provider, providerAccountId: `acct-${emailAddress}`, emailAddress, status: 'connected', connectedByUserId,
+    }).returning({ id: mailboxConnections.id }),
+  )
+  return conn!.id
 }
 
 /** Binds to a random port for suites that need real HTTP (the tRPC client). */
