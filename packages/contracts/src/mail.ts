@@ -36,5 +36,5 @@ export function emailDomain(address: string): string {
   if (parts.length !== 2 || !parts[0] || !parts[1]) {
     throw new TypeError('not an email address')
   }
-  return parts[1]
+  return parts[1].toLowerCase()
 }

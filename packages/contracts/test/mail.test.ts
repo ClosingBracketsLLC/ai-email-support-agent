@@ -11,4 +11,7 @@ describe('mail contracts', () => {
   it('rejects unknown providers', () => {
     expect(StartConnectInput.safeParse({ provider: 'yahoo', platform: 'web' }).success).toBe(false)
   })
+  it('lowercases domain in emailDomain directly', () => {
+    expect(emailDomain('x@Acme.COM')).toBe('acme.com')
+  })
 })
