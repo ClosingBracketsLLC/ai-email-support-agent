@@ -19,7 +19,11 @@ const rawDbImports = {
 const appImports = {
   paths: [
     ...rawDbImports.paths,
-    ...['@aesa/db', '@aesa/core', '@aesa/crypto', '@aesa/queue', '@aesa/api', 'drizzle-orm', 'fastify', 'better-auth/node'].map((name) => ({ name, message: APP_MESSAGE, allowTypeImports: true })),
+    ...[
+      '@aesa/db', '@aesa/core', '@aesa/crypto', '@aesa/queue', '@aesa/api',
+      '@aesa/mail', '@aesa/llm', '@aesa/agent', '@aesa/test-kit',
+      'drizzle-orm', 'fastify', 'better-auth/node',
+    ].map((name) => ({ name, message: APP_MESSAGE, allowTypeImports: true })),
   ],
   patterns: [
     ...rawDbImports.patterns,

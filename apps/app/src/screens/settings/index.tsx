@@ -47,8 +47,8 @@ export function SettingsIndexScreen() {
       <ListRow title="Workspace profile" subtitle="Website, tone, links the agent may share" onPress={() => router.push('/settings/workspace')} testID="settings-workspace" />
       <ListRow title="Team" subtitle="Invite teammates, change roles" onPress={() => router.push('/settings/team')} testID="settings-team" />
       <ListRow title="Notifications" subtitle="Push on this device" onPress={() => router.push('/settings/notifications')} testID="settings-notifications" />
-      <ListRow title="Mailboxes" subtitle="Connect Gmail or Microsoft 365" badge="Phase 2" />
-      <ListRow title="Agents" subtitle="Personas, signatures, per-agent guidance" badge="Phase 2" />
+      <ListRow title="Mailboxes" subtitle="Connect Gmail or Microsoft 365" onPress={() => router.push('/settings/mailboxes')} testID="settings-mailboxes" />
+      <ListRow title="Agents" subtitle="Personas, signatures, per-agent guidance" onPress={() => router.push('/settings/agents')} testID="settings-agents" />
       <ListRow title="Autopilot" subtitle="Off / Review / Auto per category" badge="Phase 5" />
       <ListRow title="AI" subtitle="Managed AI or your own provider" badge="Phase 6" />
       <ListRow title="Billing" subtitle="Plan, domains, usage" badge="Phase 7" />

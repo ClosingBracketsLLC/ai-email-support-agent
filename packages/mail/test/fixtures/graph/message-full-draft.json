@@ -1,0 +1,28 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v1.0/me/messages/msg-draft-1",
+    "query": {
+      "$select": "internetMessageHeaders,from,toRecipients,ccRecipients,subject,conversationId,receivedDateTime,hasAttachments,isDraft,parentFolderId,body",
+      "$expand": "attachments($select=name,contentType,size)"
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "id": "msg-draft-1",
+      "conversationId": "thread-draft-1",
+      "subject": "Draft in progress",
+      "receivedDateTime": "2025-09-06T09:00:00.000Z",
+      "hasAttachments": false,
+      "isDraft": true,
+      "parentFolderId": "folder-inbox-id",
+      "from": { "emailAddress": { "address": "support@acme.test" } },
+      "toRecipients": [{ "emailAddress": { "address": "jane@example.com" } }],
+      "ccRecipients": [],
+      "internetMessageHeaders": [{ "name": "Message-ID", "value": "<graph-draft-1@outlook.com>" }],
+      "body": { "contentType": "text", "content": "draft content" },
+      "attachments": []
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "request": {
+    "method": "POST",
+    "path": "/v1.0/me/messages/draft-1/send",
+    "query": {}
+  },
+  "response": {
+    "status": 202,
+    "body": null
+  }
+}

@@ -1,5 +1,5 @@
 import type PgBoss from 'pg-boss'
-import type { z } from 'zod'
+import { ZodError, type z } from 'zod'
 import { JOB_SIGNAL_MARGIN_SECONDS } from '@aesa/core'
 import { createQueueRetrying } from './pg-boss.ts'
 
@@ -51,7 +51,19 @@ export async function registerJob<T extends { orgId: string }>(boss: PgBoss, def
     // (schema validation or the handler) fails every job in the batch, including siblings that already
     // completed. There is no per-job isolation without manual complete/fail bookkeeping — see batchSize doc.
     for (const job of jobs) {
-      const data = def.schema.parse(job.data)                                    // invalid payload → job fails loudly
+      let data: T
+      try {
+        data = def.schema.parse(job.data)
+      } catch (err) {
+        if (!(err instanceof ZodError)) throw err
+        // A schema-invalid payload can never succeed by retrying it. boss.fail() is NOT permanent here:
+        // pg-boss's failJobs SQL re-inserts the row as 'retry' whenever retry_count < retry_limit, so a
+        // freshly-sent job (retry_count 0) would just be retried — and fail identically — retryLimit times
+        // before finally landing on 'failed'. deleteJob removes it outright, in one step, on first sight.
+        console.error(`[queue] job ${def.name} ${job.id} dropped: schema-invalid payload`, err.issues.slice(0, 5))
+        await boss.deleteJob(def.name, job.id)
+        continue
+      }
       const controller = new AbortController()
       const deadlineMs = (def.queue.expireInSeconds - JOB_SIGNAL_MARGIN_SECONDS) * 1000
       const timer = setTimeout(() => controller.abort(new Error(`job ${def.name} ${job.id} hit its deadline`)), deadlineMs)

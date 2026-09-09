@@ -1,0 +1,51 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/gmail/v1/users/me/history",
+    "query": { "startHistoryId": "100" }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "history": [
+        {
+          "id": "105",
+          "messages": [{ "id": "msg-a1", "threadId": "thread-a1" }],
+          "messagesAdded": [
+            {
+              "message": {
+                "id": "msg-a1",
+                "threadId": "thread-a1",
+                "labelIds": ["UNREAD", "INBOX"]
+              }
+            }
+          ]
+        },
+        {
+          "id": "110",
+          "messages": [{ "id": "msg-a1", "threadId": "thread-a1" }],
+          "labelsAdded": [
+            {
+              "message": { "id": "msg-a1", "threadId": "thread-a1", "labelIds": ["Label_2", "UNREAD", "INBOX"] },
+              "labelIds": ["Label_2"]
+            }
+          ]
+        },
+        {
+          "id": "115",
+          "messages": [{ "id": "msg-a2", "threadId": "thread-a2" }],
+          "messagesAdded": [
+            {
+              "message": {
+                "id": "msg-a2",
+                "threadId": "thread-a2",
+                "labelIds": ["UNREAD", "INBOX"]
+              }
+            }
+          ]
+        }
+      ],
+      "historyId": "115"
+    }
+  }
+}

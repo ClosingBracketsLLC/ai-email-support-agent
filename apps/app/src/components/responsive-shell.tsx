@@ -37,6 +37,11 @@ export function ResponsiveShell() {
           {TABS.map((t) => (
             <Tabs.Screen key={t.name} name={t.name} options={{ title: t.title, tabBarButtonTestID: `tab-${t.name}`, tabBarIcon: ({ color, focused }) => <Ionicons name={focused ? t.iconActive : t.icon} size={22} color={color} /> }} />
           ))}
+          {/* The ticket thread is reached only from an inbox row or a push tap (router.push), never from
+              a tab button — `href: null` keeps it out of the tab bar; `expo-router`'s `Tabs` otherwise
+              auto-registers every file in this directory as a tab. Hidden here too, on phones, so the
+              thread gets the full screen instead of a tab bar docked under it. */}
+          <Tabs.Screen name="ticket/[id]" options={{ href: null, tabBarStyle: { display: 'none' } }} />
         </Tabs>
       </View>
     </View>

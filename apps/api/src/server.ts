@@ -4,9 +4,12 @@ import rateLimit from '@fastify/rate-limit'
 import { fastifyTRPCPlugin, type FastifyTRPCPluginOptions } from '@trpc/server/adapters/fastify'
 import { fromNodeHeaders } from 'better-auth/node'
 import Fastify, { type FastifyBaseLogger, type FastifyError, type FastifyInstance } from 'fastify'
+import { registerConnectRoutes } from './connect/routes.ts'
 import type { ServerDeps } from './deps.ts'
 import { createContextFactory } from './trpc/context.ts'
 import { appRouter, type AppRouter } from './trpc/router.ts'
+import { registerGmailWebhook } from './webhooks/gmail.ts'
+import { registerMicrosoftWebhook } from './webhooks/microsoft.ts'
 
 export type { ServerDeps } from './deps.ts'
 
@@ -97,7 +100,12 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       },
     })
 
-    routes.get('/meta', async () => ({ providers: { google: deps.config.google !== null, microsoft: deps.config.microsoft !== null } }))
+    routes.get('/meta', async () => ({
+      providers: { google: deps.config.google !== null, microsoft: deps.config.microsoft !== null },
+      // Mailbox OAuth (Gmail/Graph mail access), distinct from the sign-in providers above — the app
+      // uses this to decide which "connect a mailbox" options to offer.
+      mail: { gmail: deps.config.gmailOauth !== null, microsoft: deps.config.msOauth !== null },
+    }))
 
     routes.get('/healthz', async (_req, reply) => {
       const h = await deps.api.health()
@@ -112,6 +120,18 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         return mail ? reply.send(mail) : reply.code(404).send({ statusCode: 404, error: 'Not Found' })
       })
     }
+
+    // The mailbox OAuth connect flow's two unauthenticated hops (connect/routes.ts) — mounted here, not
+    // on `app` directly, for the same reason every other plain route in this block is: only a route
+    // declared inside a register() actually gets wrapped by @fastify/rate-limit's onRoute-driven
+    // `global: true` mode (see this block's own opening comment).
+    registerConnectRoutes(routes, deps)
+
+    // Task 18: the Gmail Pub/Sub and Microsoft Graph inbound webhooks — same "why here, not on `app`"
+    // reasoning as registerConnectRoutes above (rate-limit's `global: true` onRoute hook). Neither
+    // carries a session; each has its own trust anchor (the OIDC bearer token, clientState) instead.
+    registerGmailWebhook(routes, deps)
+    registerMicrosoftWebhook(routes, deps)
   })
 
   app.register(fastifyTRPCPlugin, {

@@ -1,0 +1,11 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v1.0/me/mailFolders/inbox/messages/delta",
+    "query": { "$deltatoken": "expired-token-410" }
+  },
+  "response": {
+    "status": 410,
+    "body": { "error": { "code": "ResyncRequired", "message": "The delta token is no longer valid." } }
+  }
+}

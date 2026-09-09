@@ -1,5 +1,6 @@
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import { gzipSync } from 'node:zlib'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { isBlockedAddress } from '../src/ssrf/ranges.ts'
 import { resolvePublic } from '../src/ssrf/resolve-public.ts'
@@ -55,6 +56,10 @@ describe('pinnedFetch', () => {
  */
 describe('pinnedFetch transport (real sockets)', () => {
   const LARGE = 256 * 1024
+  // Highly repetitive so gzip crushes it — the point is a decoded size far larger than the wire size,
+  // so a content-length bug that trusts the origin's (compressed) header is easy to catch.
+  const GZIP_PAYLOAD = 'x'.repeat(1080)
+  const GZIPPED = gzipSync(GZIP_PAYLOAD)
   let server: Server
   let port = 0
 
@@ -63,6 +68,16 @@ describe('pinnedFetch transport (real sockets)', () => {
       if (req.url === '/small') return void res.writeHead(200, { 'content-type': 'text/plain' }).end('hello')
       if (req.url === '/large') return void res.writeHead(200, { 'content-type': 'application/octet-stream' }).end(Buffer.alloc(LARGE, 0x61))
       if (req.url === '/redirect') return void res.writeHead(302, { location: 'https://elsewhere.example/' }).end('go away')
+      // a HEAD response: the origin declares content-length: 42 (what a GET's body would be) but node
+      // sends no body bytes for a HEAD request, whatever is passed to end() — an empty wire body.
+      if (req.url === '/head') return void res.writeHead(200, { 'content-length': '42' }).end()
+      // an accurate content-length for the COMPRESSED wire bytes, alongside content-encoding: gzip —
+      // undici decodes the body before we ever see it, so this header must not survive verbatim.
+      if (req.url === '/gzip') {
+        return void res
+          .writeHead(200, { 'content-type': 'text/plain', 'content-encoding': 'gzip', 'content-length': String(GZIPPED.byteLength) })
+          .end(GZIPPED)
+      }
       res.writeHead(404).end()
     })
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
@@ -94,5 +109,18 @@ describe('pinnedFetch transport (real sockets)', () => {
 
   it('rejects a body over maxBodyBytes with code body_too_large', async () => {
     await expect(get('/large', { maxBodyBytes: 1024 })).rejects.toMatchObject({ code: 'body_too_large' })
+  })
+
+  it('preserves the origin content-length on a bodyless HEAD-style response', async () => {
+    // a HEAD response carries content-length: 42 with an empty body; the guard must not rewrite it to 0
+    const res = await get('/head', { method: 'HEAD' })
+    expect(res.headers.get('content-length')).toBe('42')
+  })
+
+  it('sets content-length to the DECODED size for a compressed body, ignoring the origin\'s wire-size header', async () => {
+    expect(GZIPPED.byteLength).toBeLessThan(GZIP_PAYLOAD.length)   // sanity: the fixture is actually compressed
+    const res = await get('/gzip')
+    expect(res.headers.get('content-length')).toBe(String(GZIP_PAYLOAD.length))
+    expect(await res.text()).toBe(GZIP_PAYLOAD)
   })
 })

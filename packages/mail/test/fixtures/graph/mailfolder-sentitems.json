@@ -1,0 +1,11 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v1.0/me/mailFolders/sentitems",
+    "query": { "$select": "id" }
+  },
+  "response": {
+    "status": 200,
+    "body": { "id": "folder-sent-id" }
+  }
+}

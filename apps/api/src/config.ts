@@ -1,3 +1,4 @@
+import { hkdfSync } from 'node:crypto'
 import { Secret } from '@aesa/crypto'
 import { z } from 'zod'
 
@@ -43,6 +44,15 @@ const EnvSchema = z.object({
   EMAIL_TRANSPORT: z.enum(['resend', 'devsink']).optional(),
   RESEND_API_KEY: z.string().optional(),
   MAIL_FROM: z.string().optional(),
+  /** Mailbox OAuth (Gmail/Graph mail access) — distinct from GOOGLE_/MICROSOFT_CLIENT_ID above, which are
+   * Better Auth's SSO login providers. */
+  GMAIL_OAUTH_CLIENT_ID: z.string().optional(),
+  GMAIL_OAUTH_CLIENT_SECRET: z.string().optional(),
+  MS_OAUTH_CLIENT_ID: z.string().optional(),
+  MS_OAUTH_CLIENT_SECRET: z.string().optional(),
+  /** Task 18 (Gmail Pub/Sub push webhook verification); parsed now, optional until that task lands. */
+  GMAIL_PUBSUB_AUDIENCE: z.string().optional(),
+  GMAIL_PUBSUB_SA_EMAIL: z.string().optional(),
 })
 
 export interface OAuthClient { clientId: string; clientSecret: Secret }
@@ -69,12 +79,36 @@ export interface ApiConfig {
   google: OAuthClient | null
   microsoft: OAuthClient | null
   mail: MailConfig
+  /** Gmail mailbox OAuth (GMAIL_OAUTH_CLIENT_ID/_SECRET) — the connect flow, not Better Auth's SSO login. */
+  gmailOauth: OAuthClient | null
+  /** Microsoft Graph mailbox OAuth (MS_OAUTH_CLIENT_ID/_SECRET). */
+  msOauth: OAuthClient | null
+  /** Task 18's Gmail Pub/Sub push webhook: the expected OIDC token audience. */
+  gmailPubsubAudience: string | null
+  /** Task 18's Gmail Pub/Sub push webhook: the expected OIDC token service-account email. */
+  gmailPubsubServiceAccount: string | null
+  /** HKDF-SHA256(BETTER_AUTH_SECRET, salt 'aesa', info 'oauth-flow-key', 32 bytes) — AES-GCM key for the
+   * connect flow's PKCE verifier ciphertext (packages/crypto's encrypt/decrypt). Never derived from a
+   * secret this api doesn't already hold, and never persisted anywhere itself. */
+  flowKey: Buffer
 }
 
-function oauthPair(name: 'GOOGLE' | 'MICROSOFT', id: string | undefined, secret: string | undefined): OAuthClient | null {
+function oauthPair(name: string, id: string | undefined, secret: string | undefined): OAuthClient | null {
   if (!id && !secret) return null
   if (!id || !secret) throw new Error(`${name}_CLIENT_ID and ${name}_CLIENT_SECRET must be set together`)
   return { clientId: id, clientSecret: new Secret(secret) }
+}
+
+/** Task 18: the Gmail Pub/Sub webhook is "armed" (routes.ts 404s otherwise) exactly when both are set —
+ * one without the other is a half-configured deploy, same all-or-none shape as oauthPair() above. */
+function gmailPubsubPair(audience: string | undefined, serviceAccount: string | undefined): { audience: string; serviceAccount: string } | null {
+  if (!audience && !serviceAccount) return null
+  if (!audience || !serviceAccount) throw new Error('GMAIL_PUBSUB_AUDIENCE and GMAIL_PUBSUB_SA_EMAIL must be set together')
+  return { audience, serviceAccount }
+}
+
+function deriveFlowKey(betterAuthSecret: string): Buffer {
+  return Buffer.from(hkdfSync('sha256', betterAuthSecret, 'aesa', 'oauth-flow-key', 32))
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv): ApiConfig {
@@ -114,6 +148,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): ApiConfig {
     throw new Error('AUTH_RATE_LIMIT=on requires TRUST_PROXY in production: Better Auth keys its limiter on x-forwarded-for and otherwise puts every client in one bucket')
   }
 
+  const gmailPubsub = gmailPubsubPair(d.GMAIL_PUBSUB_AUDIENCE, d.GMAIL_PUBSUB_SA_EMAIL)
+
   return {
     env: d.NODE_ENV, databaseUrl: d.DATABASE_URL, port: d.PORT, host: d.HOST, logLevel: d.LOG_LEVEL,
     appBaseUrl, appWebOrigin, webOrigins, trustedOrigins, trustProxy,
@@ -121,5 +157,10 @@ export function loadConfig(env: NodeJS.ProcessEnv): ApiConfig {
     google: oauthPair('GOOGLE', d.GOOGLE_CLIENT_ID, d.GOOGLE_CLIENT_SECRET),
     microsoft: oauthPair('MICROSOFT', d.MICROSOFT_CLIENT_ID, d.MICROSOFT_CLIENT_SECRET),
     mail,
+    gmailOauth: oauthPair('GMAIL_OAUTH', d.GMAIL_OAUTH_CLIENT_ID, d.GMAIL_OAUTH_CLIENT_SECRET),
+    msOauth: oauthPair('MS_OAUTH', d.MS_OAUTH_CLIENT_ID, d.MS_OAUTH_CLIENT_SECRET),
+    gmailPubsubAudience: gmailPubsub?.audience ?? null,
+    gmailPubsubServiceAccount: gmailPubsub?.serviceAccount ?? null,
+    flowKey: deriveFlowKey(d.BETTER_AUTH_SECRET),
   }
 }

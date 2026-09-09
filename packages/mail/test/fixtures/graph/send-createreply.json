@@ -1,0 +1,11 @@
+{
+  "request": {
+    "method": "POST",
+    "path": "/v1.0/me/messages/msg-reply-target-1/createReply",
+    "query": {}
+  },
+  "response": {
+    "status": 201,
+    "body": { "id": "draft-1", "conversationId": "thread-100", "isDraft": true }
+  }
+}

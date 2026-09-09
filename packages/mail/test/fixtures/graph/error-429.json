@@ -1,0 +1,12 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v1.0/me",
+    "query": { "$select": "mail,userPrincipalName" }
+  },
+  "response": {
+    "status": 429,
+    "headers": { "Retry-After": "45" },
+    "body": { "error": { "code": "TooManyRequests", "message": "Too many requests" } }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "request": {
+    "method": "PATCH",
+    "path": "/v1.0/me/messages/draft-1",
+    "query": {}
+  },
+  "response": {
+    "status": 200,
+    "body": { "id": "draft-1", "conversationId": "thread-100", "isDraft": true }
+  }
+}

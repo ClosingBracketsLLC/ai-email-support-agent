@@ -1,0 +1,96 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/gmail/v1/users/me/messages/msg-full-1",
+    "query": { "format": "full" }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "id": "msg-full-1",
+      "threadId": "thread-full-1",
+      "labelIds": ["IMPORTANT", "CATEGORY_PERSONAL", "INBOX"],
+      "internalDate": "1757000000000",
+      "sizeEstimate": 9000,
+      "historyId": "6120",
+      "payload": {
+        "partId": "",
+        "mimeType": "multipart/mixed",
+        "filename": "",
+        "headers": [
+          { "name": "Delivered-To", "value": "support@acme.test" },
+          { "name": "From", "value": "Jane Doe <jane@example.com>" },
+          { "name": "To", "value": "\"support@acme.test\" <support@acme.test>" },
+          { "name": "Cc", "value": "billing@example.com" },
+          { "name": "Subject", "value": "Re: Order #4521 double charge" },
+          { "name": "Message-ID", "value": "<CAExampleJane1@mail.gmail.com>" },
+          { "name": "In-Reply-To", "value": "<CAAcmeSupport1@mail.gmail.com>" },
+          { "name": "References", "value": "<CAAcmeRoot0@mail.gmail.com> <CAAcmeSupport1@mail.gmail.com>" },
+          {
+            "name": "Authentication-Results",
+            "value": "mx.google.com; dkim=pass header.i=@example.com header.s=selector1; spf=pass smtp.mailfrom=jane@example.com; dmarc=pass (p=NONE) header.from=example.com"
+          },
+          { "name": "Auto-Submitted", "value": "no" },
+          {
+            "name": "Authentication-Results",
+            "value": "relay.example.net; spf=fail smtp.mailfrom=someone@example.net; dmarc=fail"
+          },
+          { "name": "Content-Type", "value": "multipart/mixed; boundary=\"000-mixed-boundary\"" },
+          { "name": "MIME-Version", "value": "1.0" }
+        ],
+        "body": { "size": 0 },
+        "parts": [
+          {
+            "partId": "0",
+            "mimeType": "multipart/alternative",
+            "filename": "",
+            "headers": [{ "name": "Content-Type", "value": "multipart/alternative; boundary=\"000-alt-boundary\"" }],
+            "body": { "size": 0 },
+            "parts": [
+              {
+                "partId": "0.0",
+                "mimeType": "text/plain",
+                "filename": "",
+                "headers": [
+                  { "name": "Content-Type", "value": "text/plain; charset=\"ISO-8859-1\"" },
+                  { "name": "Content-Transfer-Encoding", "value": "8bit" }
+                ],
+                "body": {
+                  "size": 106,
+                  "data": "VGhhbmtzIGZvciB0aGUgdXBkYXRlIC0gbXkgY2FyZCBlbmRpbmcgNDExMSAxMTExIDExMTEgMTExMSB3YXMgY2hhcmdlZCB0d2ljZS4gQ2Fm6SBvcmRlciBub3QgcmVzb2x2ZWQgeWV0Lg"
+                }
+              },
+              {
+                "partId": "0.1",
+                "mimeType": "text/html",
+                "filename": "",
+                "headers": [
+                  { "name": "Content-Type", "value": "text/html; charset=\"UTF-8\"" },
+                  { "name": "Content-Transfer-Encoding", "value": "quoted-printable" }
+                ],
+                "body": {
+                  "size": 88,
+                  "data": "PGRpdj5UaGFua3MgZm9yIHRoZSB1cGRhdGUgLSBteSBjYXJkIGVuZGluZyA0MTExIDExMTEgMTExMSAxMTExIHdhcyBjaGFyZ2VkIHR3aWNlLjwvZGl2Pg"
+                }
+              }
+            ]
+          },
+          {
+            "partId": "1",
+            "mimeType": "application/pdf",
+            "filename": "receipt.pdf",
+            "headers": [
+              { "name": "Content-Type", "value": "application/pdf; name=\"receipt.pdf\"" },
+              { "name": "Content-Disposition", "value": "attachment; filename=\"receipt.pdf\"" },
+              { "name": "Content-Transfer-Encoding", "value": "base64" }
+            ],
+            "body": {
+              "attachmentId": "ANGjdJ_att1",
+              "size": 45210
+            }
+          }
+        ]
+      }
+    }
+  }
+}

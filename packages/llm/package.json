@@ -1,0 +1,9 @@
+{
+  "name": "@aesa/llm",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": { "typecheck": "tsc --noEmit", "test": "vitest run" },
+  "dependencies": { "@anthropic-ai/sdk": "^0.124.0", "@aesa/crypto": "workspace:*", "zod": "^4.0.0" },
+  "devDependencies": { "@types/node": "^22", "tsx": "^4.20.0", "typescript": "^5.9.2", "vitest": "^3.2.0" }
+}

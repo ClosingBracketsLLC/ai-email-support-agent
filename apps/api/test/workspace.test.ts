@@ -61,6 +61,18 @@ describe('workspace router', () => {
     expect(moves.map((m) => (m.detail as { to: string }).to)).toEqual(['knowledge', 'go_live', 'done'])
   })
 
+  it('the 6th workspace for one user surfaces organizationLimit as FORBIDDEN with the limit message, not a masked 500', async () => {
+    const { cookie } = await signInWithOtp(t.app, t.mail, 'sixer@example.com', 'Sixer')
+    const sixer = client(base, cookie)
+    for (let i = 0; i < 5; i++) {
+      await sixer.workspace.create.mutate({ businessName: `Sixer Org ${i}`, timezone: 'UTC' })
+    }
+    await expect(sixer.workspace.create.mutate({ businessName: 'One too many', timezone: 'UTC' })).rejects.toMatchObject({
+      data: { code: 'FORBIDDEN' },
+      message: 'You have reached the maximum number of organizations',
+    })
+  })
+
   it('isolation: another owner sees only their own workspace and cannot activate someone else’s organization', async () => {
     const b = client(base, (await signInWithOtp(t.app, t.mail, 'b@example.com', 'Bob')).cookie)
     const { orgId: orgB } = await b.workspace.create.mutate({ businessName: 'Bobcorp', timezone: 'UTC' })

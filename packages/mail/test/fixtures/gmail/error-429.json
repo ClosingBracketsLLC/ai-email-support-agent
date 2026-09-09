@@ -1,0 +1,19 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/gmail/v1/users/me/messages/msg-429-1",
+    "query": { "format": "full" }
+  },
+  "response": {
+    "status": 429,
+    "headers": { "Retry-After": "30" },
+    "body": {
+      "error": {
+        "code": 429,
+        "message": "Too many requests",
+        "errors": [{ "domain": "usageLimits", "reason": "rateLimitExceeded", "message": "Too many requests" }],
+        "status": "RESOURCE_EXHAUSTED"
+      }
+    }
+  }
+}

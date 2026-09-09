@@ -1,4 +1,4 @@
-import { boolean, index, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core'
+import { boolean, index, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core'
 
 const ts = (name: string) => timestamp(name, { withTimezone: true })
 const authId = () => uuid('id').primaryKey().defaultRandom()   // generateId: false → Postgres mints the id
@@ -64,7 +64,7 @@ export const organization = pgTable('organization', {
   logo: text('logo'),
   createdAt: ts('created_at').notNull().defaultNow(),
   metadata: text('metadata'),
-}, (t) => [uniqueIndex('organization_slug_uidx').on(t.slug)])
+})
 
 export const member = pgTable('member', {
   id: authId(),
