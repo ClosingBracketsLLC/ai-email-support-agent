@@ -45,8 +45,8 @@ import type { WorkerConfig } from '../config.ts'
 import { utcDayString } from '../date-utils.ts'
 import { errorMessage } from '../err-message.ts'
 import { resolveMailProvider } from '../mail-provider.ts'
-import { enqueueNotifyDispatch } from '../notify-stub.ts'
 import { notifyReauthRequired } from '../reauth-notify.ts'
+import { enqueueNotifyDispatch } from './notify-dispatch.ts'
 import { ticketTriageJob } from './ticket-triage.ts'
 
 /** A held lease shorter than the job's own poll cadence guarantees at most one live sync per

@@ -1,7 +1,7 @@
 import type PgBoss from 'pg-boss'
 import { notifications, withOrg, type Db } from '@aesa/db'
 import { utcDayString } from './date-utils.ts'
-import { enqueueNotifyDispatch } from './notify-stub.ts'
+import { enqueueNotifyDispatch } from './jobs/notify-dispatch.ts'
 
 /**
  * The `mailbox_reauth` notification path — day-deduped insert + `notify.dispatch` enqueue. Shared by

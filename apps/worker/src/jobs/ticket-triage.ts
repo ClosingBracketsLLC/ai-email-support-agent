@@ -58,7 +58,7 @@ export interface TicketTriageDeps {
   db: Db
   provider: LlmProvider
   logger: pino.Logger
-  /** Task 16 wires the real `notify.dispatch` enqueue; until then the worker's own wiring logs it. */
+  /** index.ts wires this to `enqueueNotifyDispatch` (`notify-dispatch.ts`, Task 16). */
   enqueueNotify: (orgId: string, notificationId: string) => Promise<void>
   now?: () => Date
 }

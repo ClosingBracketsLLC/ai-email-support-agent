@@ -16,8 +16,7 @@ export interface AgentRoleDeps {
   db: Db
   logger: pino.Logger
   config: WorkerConfig
-  /** Task 16 wires the real `notify.dispatch` enqueue; until then the caller supplies a stand-in
-   * (index.ts logs it) so an escalation notification row is never silently undelivered. */
+  /** index.ts wires this to `enqueueNotifyDispatch`, the real `notify.dispatch` enqueue (Task 16). */
   enqueueNotify: TicketTriageDeps['enqueueNotify']
 }
 

@@ -32,8 +32,8 @@ import {
 import { enqueue, fairSelectSql, registerCron } from '@aesa/queue'
 import { utcDayString } from '../date-utils.ts'
 import { errorMessage } from '../err-message.ts'
-import { enqueueNotifyDispatch } from '../notify-stub.ts'
 import { mailboxSyncJob } from './mailbox-sync.ts'
+import { enqueueNotifyDispatch } from './notify-dispatch.ts'
 import { ticketTriageJob } from './ticket-triage.ts'
 
 /** Per-sweep cap on (a)'s fair-select page — a bound, not a promise every due connection is served in
