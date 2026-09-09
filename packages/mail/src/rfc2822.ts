@@ -75,12 +75,10 @@ function chunkUtf8ByCodepoints(text: string, maxBytesPerChunk: number): string[]
  * wrapper), joined by CRLF + a single space per RFC 2822 header-folding syntax.
  */
 function encodeSubjectIfNeeded(subject: string): string {
-  // Check if subject contains only ASCII characters (after sanitization). The control-range
-  // lower bound is deliberate (full 7-bit ASCII, not just printable) — eslint's no-control-regex
-  // exists to catch accidental invisible characters in a pattern, not this kind of intentional
-  // range check.
-  // eslint-disable-next-line no-control-regex
-  const isAscii = /^[\x00-\x7F]*$/.test(subject)
+  // Check if subject contains only ASCII characters (after sanitization). UTF-8 encodes a code
+  // point in exactly 1 byte iff it's ASCII, so byte-length equals string-length iff every
+  // character is ASCII — same truth table as /^[\x00-\x7F]*$/ without the control-range regex.
+  const isAscii = Buffer.byteLength(subject, 'utf8') === subject.length
   if (isAscii) {
     return subject
   }
