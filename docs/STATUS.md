@@ -33,14 +33,22 @@ defines seven build phases; this file records where the build stands against the
 ### Phase 1 — accounts and the app shell (complete on branch `phase-1`; not yet merged)
 
 - Plan: `docs/superpowers/plans/2026-09-08-phase-1-accounts-and-app-shell.md` (14 tasks, executed
-  with subagent-driven development). Commits `ba7bde5..f3f8e71` (28 commits) on `phase-1`, branched
-  from `main` at `ab07316`, followed by this documentation commit. Gate on the branch: typecheck
-  and lint clean across all 8 packages/apps; `pnpm test` green with 221 tests (`@aesa/contracts` 8,
-  `@aesa/core` 30, `@aesa/crypto` 40, `@aesa/db` 33, `@aesa/queue` 14, `apps/api` 47, `apps/worker`
-  6, `apps/app` 43 across 13 jest suites — no database); `db:check` reports no drift; the Expo web
-  export produces 17 static routes (`/privacy` and `/terms` now included); the Playwright signup
-  smoke passes. Robert decides how and when `phase-1` lands on `main`
-  (`superpowers:finishing-a-development-branch`) — never push, merge or open a PR without him.
+  with subagent-driven development). Commits `ba7bde5..aac485c` on `phase-1`, branched from `main`
+  at `ab07316`: the plan, 14 task commits with their fix rounds, two documentation commits, and the
+  7-commit final fix wave `b0ff5d2..aac485c`, followed by the commit that added the review record.
+  Gate on the branch after the fix wave: typecheck and lint clean across all 8 packages/apps;
+  `pnpm test` green with 234 tests (`@aesa/contracts` 8, `@aesa/core` 30, `@aesa/crypto` 40,
+  `@aesa/db` 33, `@aesa/queue` 14, `apps/api` 60, `apps/worker` 6, `apps/app` 43 across 13 jest
+  suites — no database); `db:check` reports no drift; the Expo web export produces 17 static routes
+  (`/privacy` and `/terms` included); the Playwright signup smoke passes. Robert decides how and when
+  `phase-1` lands on `main` (`superpowers:finishing-a-development-branch`) — never push, merge or
+  open a PR without him.
+- Review: `docs/superpowers/reviews/2026-09-08-phase-1-final-review.md` — the whole-branch review
+  (verdict "with fixes": one Critical, the `/trpc` error surface returning raw messages and stacks;
+  five Important: no `/trpc` rate limit, `withPlatform` on the api facade, the untested CSRF guard,
+  `TRUST_PROXY` missing from the runbook, extra web origins half-wired), what the fix wave changed,
+  the scoped re-review that confirmed it, and the four residual minors parked with rulings (listed
+  under the Phase 2 carry-overs below).
 - What exists now: `@aesa/contracts` (zod inputs and enums shared by api, db and app); the Better
   Auth tables plus `notification_devices`; `audit()`; Better Auth + tRPC mounted in the api; the
   Expo app (`apps/app`) with sign-in (email one-time code, optional Google/Microsoft), the
@@ -153,6 +161,23 @@ Rulings the planner needs:
 Findings deferred during Phase 1 (from the task-review ledger and the still-open Phase 0 items).
 Fix each in the first Phase 2 task that touches the file, or record why it moves again.
 
+- Final-review residuals (parked with rulings in the review record): `pnpm-lock.yaml` grew by
+  roughly 300 lines during the fix wave with a second Expo toolchain variant resolved against
+  `typescript@5.9.3` next to the `6.0.3` one — run `pnpm dedupe`, re-export and re-run the smoke in
+  Phase 2's first task; `organizationLimit: 5` counts memberships rather than creations (an invitee
+  of five workspaces cannot create one) and the limit surfaces as the masked generic 500 — map
+  Better Auth `APIError`s to tRPC client codes and revisit the cap; the per-org invite throttle
+  records a slot before `createInvitation` succeeds and never evicts idle organizations; with
+  `AUTH_RATE_LIMIT=off` and `TRUST_PROXY=false` in production the global limiter keys on the proxy's
+  address (one bucket — the runbook's CIDR-list recommendation covers it). Also deferred from that
+  review: a network failure after a successful `workspace.create` invites a second organization on
+  retry (idempotency key or a "you already have a workspace" pre-check); a boot log line stating the
+  resolved `env` and mail transport; the web sidebar lost its `<a href>` semantics with
+  `router.push` (try `<Link href><View/></Link>` without `asChild`); a build-time assert that
+  `EXPO_PUBLIC_API_URL` is set for production profiles; decide the cookie topology before the first
+  deploy (`app.<domain>` + `api.<domain>` keeps `SameSite=Lax`; a cross-domain split needs
+  `AUTH_CROSS_SITE_COOKIES=true` and, later, CHIPS/`Partitioned`); enable Better Auth's
+  `session.cookieCache` once the inbox screens poll (`orgProcedure` costs two round trips per call).
 - `@aesa/contracts`: Task 1's own implementation report describes its RED-phase evidence as a
   paraphrase rather than a captured test-failure transcript — a reporting-hygiene note with no code
   impact.
