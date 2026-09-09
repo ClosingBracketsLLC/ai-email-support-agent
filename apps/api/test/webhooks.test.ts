@@ -126,6 +126,36 @@ describe('POST /webhooks/gmail', () => {
       expect(res.statusCode).toBe(200)
       expect(enqueueCalls.length).toBe(before)
     })
+
+    // Post-auth: Pub/Sub nacks any non-2xx and redelivers the SAME bytes with backoff for the whole
+    // retention window (default 7 days) — a deterministic decode failure would 400 forever instead of
+    // being the one-shot failure it actually is. Ack 200 + warn, same as microsoft.ts's 202-on-unparseable.
+    it('a body that fails the message/messageId/data shape check 200s (ack) and warns, without enqueuing', async () => {
+      const before = enqueueCalls.length
+      const res = await t.app.inject({
+        method: 'POST', url: '/webhooks/gmail',
+        headers: { authorization: 'Bearer good-token', 'content-type': 'application/json' },
+        payload: { notAMessage: true },
+      })
+      expect(res.statusCode).toBe(200)
+      expect(enqueueCalls.length).toBe(before)
+      expect(t.lines.some((l) => l.includes('webhooks.gmail_malformed_body'))).toBe(true)
+    })
+
+    it('data that fails to base64/JSON-decode or match the expected shape 200s (ack) and warns with the messageId, never the raw data', async () => {
+      const before = enqueueCalls.length
+      const res = await t.app.inject({
+        method: 'POST', url: '/webhooks/gmail',
+        headers: { authorization: 'Bearer good-token', 'content-type': 'application/json' },
+        payload: { message: { messageId: 'msg-bad-data', data: Buffer.from('not json at all').toString('base64') } },
+      })
+      expect(res.statusCode).toBe(200)
+      expect(enqueueCalls.length).toBe(before)
+      const warnLine = t.lines.find((l) => l.includes('webhooks.gmail_malformed_data'))
+      expect(warnLine).toBeDefined()
+      expect(warnLine).toContain('msg-bad-data')
+      expect(warnLine).not.toContain('not json at all')
+    })
   })
 
   it('unset GMAIL_PUBSUB_* config 404s — the endpoint is not armed', async () => {

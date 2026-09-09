@@ -6,9 +6,11 @@
  * `req.url.startsWith('/trpc')`) and outside Better Auth entirely.
  *
  * Every response is either 404 (the endpoint isn't armed — no GMAIL_PUBSUB_* configured), 403 (the
- * token failed verification or didn't identify the configured service account) or 200 (Pub/Sub only
- * backs off on 4xx/5xx; anything else it retries forever, so a disconnected mailbox or a replayed
- * messageId both have to ack with 200, not skip silently).
+ * token failed verification or didn't identify the configured service account) or 200. Pub/Sub nacks
+ * any non-2xx and redelivers the SAME bytes with backoff for the subscription's whole retention window
+ * (default 7 days) — so once the caller is proven to be the real subscription, a duplicate messageId,
+ * an unknown mailbox, AND a malformed body/data (which can only ever be our own bug, never something a
+ * redelivery will fix) all have to ack 200, not 400/skip silently forever.
  */
 import { createRemoteJWKSet, jwtVerify } from 'jose'
 import type { FastifyInstance } from 'fastify'
@@ -67,22 +69,37 @@ export function registerGmailWebhook(routes: FastifyInstance, deps: ServerDeps):
     let claims: GoogleClaims
     try {
       claims = await armed.verify(token)
-    } catch {
+    } catch (err) {
+      // Not fatal to log: the thrown error is jose's own (bad signature/issuer/audience), never the
+      // raw token — logging it is what makes an audience misconfiguration debuggable in production.
+      req.log.warn({ err }, 'webhooks.gmail_jwt_verify_failed')
       return reply.code(403).send({ statusCode: 403, error: 'Forbidden' })
     }
     if (claims.email !== armed.serviceAccount || claims.email_verified !== true) {
       return reply.code(403).send({ statusCode: 403, error: 'Forbidden' })
     }
 
+    // Everything below is POST-auth: the caller already proved it's the real Pub/Sub subscription, so a
+    // malformed body/data can only be OUR OWN bug or a stuck delivery — never an attacker fishing for a
+    // response code. `data` is immutable across Pub/Sub's redeliveries (same messageId, same bytes,
+    // retried with backoff for the subscription's whole retention window, default 7 days), so a 400 here
+    // would 400 forever instead of the one-shot failure it actually is. Ack 200 (warn, never log the raw
+    // body/data) instead — the same "never make the provider redeliver forever" reasoning as the
+    // duplicate-messageId and unknown-mailbox branches below, and the same pattern microsoft.ts uses for
+    // its own unparseable-batch case (202 there).
     const parsedBody = PushBody.safeParse(req.body)
-    if (!parsedBody.success) return reply.code(400).send({ statusCode: 400, error: 'Bad Request' })
+    if (!parsedBody.success) {
+      req.log.warn('webhooks.gmail_malformed_body')
+      return reply.code(200).send({ ok: true })
+    }
     const { messageId, data } = parsedBody.data.message
 
     let decoded: { emailAddress: string; historyId: string | number }
     try {
       decoded = PushData.parse(JSON.parse(Buffer.from(data, 'base64').toString('utf8')))
     } catch {
-      return reply.code(400).send({ statusCode: 400, error: 'Bad Request' })
+      req.log.warn({ messageId }, 'webhooks.gmail_malformed_data')
+      return reply.code(200).send({ ok: true })
     }
 
     // Dedupe on Pub/Sub's own messageId — a duplicate delivery acks with no further work, same as an
