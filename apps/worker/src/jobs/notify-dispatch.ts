@@ -122,12 +122,14 @@ export async function runNotifyDispatch(deps: NotifyDispatchDeps, payload: Notif
   const ready = await loadForDispatch(deps.db, orgId, notificationId, day, now)
   if (!ready) return
 
-  // Rule 4: push OUTSIDE any tx.
+  // Rule 4: push OUTSIDE any tx. `kind` is stamped onto `data` (controller ruling) so the app's
+  // push-tap routing (apps/app/src/lib/push-routing.ts) can read `data.kind` directly instead of
+  // inferring it from which payload field happens to be present.
   const result = await deps.push({
     to: ready.devices.map((d) => d.expoPushToken),
     title: ready.title,
     body: ready.body,
-    data: (ready.payload ?? {}) as Record<string, unknown>,
+    data: { kind: ready.kind, ...((ready.payload as Record<string, unknown> | null) ?? {}) },
   })
 
   if (!result.ok) {

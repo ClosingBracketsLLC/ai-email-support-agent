@@ -13,18 +13,23 @@ describe('pathForNotification', () => {
     expect(pathForNotification({ kind: 'digest' })).toBe('/inbox')
   })
 
-  // The worker's actual push data payload never sets `kind` at all (see this file's doc comment) —
-  // these are the shapes that are really on the wire today.
-  test('no kind, but a ticketId — infers escalation (today\'s actual escalation payload)', () => {
+  // The worker now stamps `kind` onto every push's `data` (notify-dispatch.ts / notify-digest.ts),
+  // but a push already sitting in a device's notification tray from before that change has neither
+  // — these are that backward-compatibility fallback's shapes, kept so an old, undelivered
+  // escalation/reauth push tapped after an app update still routes correctly.
+  test('no kind, but a ticketId — infers escalation (a pre-fix escalation payload)', () => {
     expect(pathForNotification({ ticketId: 't2' })).toBe('/ticket/t2')
   })
-  test('no kind, but a connectionId — infers mailbox_reauth (today\'s actual reauth payload)', () => {
+  test('no kind, but a connectionId — infers mailbox_reauth (a pre-fix reauth payload)', () => {
     expect(pathForNotification({ connectionId: 'c2' })).toBe('/settings/mailboxes')
   })
-  test('no data at all — falls back to the inbox (today\'s actual digest payload)', () => {
+  test('no data at all — falls back to the inbox (a pre-fix digest payload)', () => {
     expect(pathForNotification(undefined)).toBe('/inbox')
     expect(pathForNotification(null)).toBe('/inbox')
     expect(pathForNotification({})).toBe('/inbox')
+  })
+  test('ambiguous payload with no kind, both ticketId and connectionId present — ticketId wins (escalation is the more urgent event)', () => {
+    expect(pathForNotification({ ticketId: 'x', connectionId: 'y' })).toBe('/ticket/x')
   })
 })
 

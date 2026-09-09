@@ -131,6 +131,8 @@ async function runOneOrgDigest(deps: NotifyDigestDeps, orgId: string, now: Date)
     to: due.deviceTokens,
     title: `${count} update${count === 1 ? '' : 's'} waiting`,
     body: buildDigestBody(due.titles),
+    // Controller ruling: stamp `kind` so the app's push-tap routing can read `data.kind` directly.
+    data: { kind: 'digest' },
   })
 
   if (!result.ok) {

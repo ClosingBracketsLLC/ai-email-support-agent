@@ -7,13 +7,15 @@ import { setNextPath } from './next-path'
 /**
  * Maps a push notification's `data` payload to the screen it's about.
  *
- * `kind` is read first for forward compatibility, but as things stand today the worker's push
- * transport (apps/worker/src/jobs/notify-dispatch.ts, notify-digest.ts, reauth-notify.ts) never
- * actually stamps a `kind` field onto `data` — it forwards the `notifications` row's own `payload`
- * column verbatim (`{ ticketId }` for escalation, `{ connectionId }` for mailbox_reauth) and sends
- * no `data` at all for the digest push. So `kind` is almost always absent on the wire, and routing
- * falls back to whichever field actually survived — `ticketId` means escalation, `connectionId`
- * means mailbox_reauth, neither means digest.
+ * The worker stamps `kind` onto every push's `data` (apps/worker/src/jobs/notify-dispatch.ts,
+ * notify-digest.ts — `reauth-notify.ts`'s row flows through dispatch, so it inherits dispatch's
+ * stamp) — `kind` is read first and is the normal path for anything pushed after that change. The
+ * fallback below (infer the kind from whichever payload field is present — `ticketId` means
+ * escalation, `connectionId` means mailbox_reauth, neither means digest) only matters for a push
+ * that was already sitting in a device's notification tray, undelivered, from before the fix
+ * shipped; kept so tapping one of those doesn't route nowhere. If a payload somehow carries both
+ * (should not happen in practice — the two kinds are mutually exclusive on the wire), `ticketId`
+ * wins: an escalation is the more urgent event.
  */
 export function pathForNotification(data: Record<string, unknown> | undefined | null): string {
   const kind = typeof data?.kind === 'string' ? (data.kind as NotificationKind) : undefined
@@ -24,7 +26,7 @@ export function pathForNotification(data: Record<string, unknown> | undefined | 
   if (kind === 'mailbox_reauth') return '/settings/mailboxes'
   if (kind === 'digest') return '/inbox'
 
-  // No `kind` travelled on the wire (today's actual shape) — infer it from whichever field did.
+  // No `kind` on this payload (pre-fix push) — infer it from whichever field is present, ticketId first.
   if (ticketId) return `/ticket/${ticketId}`
   if (connectionId) return '/settings/mailboxes'
   return '/inbox'

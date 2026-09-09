@@ -126,7 +126,22 @@ describe('notify.dispatch', () => {
     expect(after?.sentAt?.getTime()).toBe(NOW.getTime())
     expect(await readMeter(orgId, TODAY, 'push_sent')).toBe(1)
     expect(calls).toHaveLength(1)
-    expect(calls[0]).toEqual({ to: [device.expoPushToken], title: 'Ticket flagged', body: 'Needs attention', data: { ticketId: 'abc' } })
+    // `data.kind` is the notification's own `kind` column (controller ruling) — `seedNotification`'s
+    // default here is 'mailbox_reauth' — stamped alongside whatever the row's own `payload` carried.
+    expect(calls[0]).toEqual({ to: [device.expoPushToken], title: 'Ticket flagged', body: 'Needs attention', data: { kind: 'mailbox_reauth', ticketId: 'abc' } })
+  })
+
+  it("controller ruling: an 'escalation' notification's push data carries kind: 'escalation' alongside its payload", async () => {
+    const orgId = await newOrg()
+    const device = await seedDevice(orgId)
+    const ticketId = await seedTicket(orgId)
+    const notificationId = await seedNotification(orgId, { kind: 'escalation', payload: { ticketId } })
+    const { send, calls } = createStubPush({ ok: true, invalidTokens: [] })
+
+    await runNotifyDispatch(makeDeps(send), { orgId, notificationId })
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toEqual({ to: [device.expoPushToken], title: 'Reconnect your mailbox', body: 'Body text', data: { kind: 'escalation', ticketId } })
   })
 
   it('rule 1: a notification not pending is a no-op (idempotent re-delivery) — no push, no meter change', async () => {

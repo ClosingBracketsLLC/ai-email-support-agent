@@ -131,8 +131,13 @@ describe('notify.digest', () => {
     expect(callA?.title).toBe('2 updates waiting')
     expect(callA?.body).toContain('A ticket one')
     expect(callA?.body).toContain('A ticket two')
+    // Controller ruling: the digest push stamps `data: { kind: 'digest' }` — unlike notify.dispatch,
+    // there is no single underlying `notifications.kind` to forward (a digest folds many rows
+    // together), so this is a fixed literal, not derived from any of the collapsed rows' own kinds.
+    expect(callA?.data).toEqual({ kind: 'digest' })
     expect(callB?.title).toBe('1 update waiting')
     expect(callB?.body).toContain('B ticket one')
+    expect(callB?.data).toEqual({ kind: 'digest' })
 
     expect(await readStatuses(orgA, [a1, a2])).toEqual(['sent', 'sent'])
     expect(await readStatuses(orgB, [b1])).toEqual(['sent'])
