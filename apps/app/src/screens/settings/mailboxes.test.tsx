@@ -18,8 +18,14 @@ let mockConnections: Connection[] = []
 const mockResendCalls: unknown[] = []
 const mockDisconnectCalls: unknown[] = []
 const mockConsentCalls: unknown[] = []
+// `<ConnectMailboxCard>` renders unconditionally now (review fix, Important 2 — it used to be
+// gated on an empty connection list), so this screen's own mock of `@/lib/trpc` must satisfy that
+// component's needs too: `fetchMeta`, `useTRPCClient`, and the `requestGmailAccess`/
+// `adminConsentInfo` corners of `mailboxes` it reads (same shape as connect-card.test.tsx's mock).
+const mockMeta = { providers: { google: false, microsoft: false }, mail: { gmail: true, microsoft: true } }
 
 jest.mock('@/lib/trpc', () => ({
+  fetchMeta: () => Promise.resolve(mockMeta),
   useTRPC: () => ({
     mailboxes: {
       list: {
@@ -29,6 +35,14 @@ jest.mock('@/lib/trpc', () => ({
       resendVerification: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => { mockResendCalls.push(v); return Promise.resolve({ ok: true }) }, ...o }) },
       disconnect: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => { mockDisconnectCalls.push(v); return Promise.resolve({ ok: true }) }, ...o }) },
       consentAddress: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => { mockConsentCalls.push(v); return Promise.resolve({ agentId: 'a1', deleted: false, status: 'active' }) }, ...o }) },
+      requestGmailAccess: { mutationOptions: (o: object) => ({ mutationFn: () => Promise.resolve({ requested: true }), ...o }) },
+      adminConsentInfo: { queryOptions: () => ({ queryKey: ['mailboxes', 'adminConsentInfo'], queryFn: () => Promise.resolve({ adminConsentUrl: 'https://example.test/adminconsent' }) }) },
+    },
+  }),
+  useTRPCClient: () => ({
+    mailboxes: {
+      startConnect: { mutate: () => Promise.reject(new Error('not exercised in this suite')) },
+      claimConnection: { mutate: () => Promise.reject(new Error('not exercised in this suite')) },
     },
   }),
 }))
@@ -142,6 +156,33 @@ test('disconnect needs a second tap to confirm', async () => {
   await act(async () => { await Promise.resolve() })
 })
 
-// The empty-state ("no connections yet") path renders <ConnectMailboxCard>, which reads /meta via a
-// real fetch and the vanilla tRPC client (useTRPCClient) — deliberately not exercised here to keep
-// this suite free of network calls; that component has no test file of its own per the brief.
+test('the empty state shows "Connect a mailbox" with no connection list above it', async () => {
+  mockConnections = []
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('connect-card')).toBeTruthy())
+  expect(screen.getByText('Connect a mailbox')).toBeTruthy()
+  expect(screen.queryByText('Mailboxes')).toBeNull()
+})
+
+test('a non-empty list still shows the connect card below it, retitled "Connect another mailbox" (review fix, Important 2 — reauth/reconnect banners used to dead-end with no action)', async () => {
+  mockConnections = [baseConnection()]
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('connection-conn1')).toBeTruthy())
+  await waitFor(() => expect(screen.getByTestId('connect-card')).toBeTruthy())
+  expect(screen.getByText('Mailboxes')).toBeTruthy()
+  expect(screen.getByText('Connect another mailbox')).toBeTruthy()
+  expect(screen.queryByText('Connect a mailbox')).toBeNull()
+})
+
+test('a reauth_required connection still shows the connect card so reconnecting has somewhere to go', async () => {
+  mockConnections = [baseConnection({ status: 'reauth_required' })]
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('connection-conn1')).toBeTruthy())
+  expect(screen.getByText('Reauth needed')).toBeTruthy()
+  await waitFor(() => expect(screen.getByTestId('connect-card')).toBeTruthy())
+  expect(screen.getByText('Connect another mailbox')).toBeTruthy()
+})
+
+// <ConnectMailboxCard> reads /meta via a real fetch and the vanilla tRPC client (useTRPCClient) —
+// this suite's mock of both (above) is deliberately minimal since none of these tests press its
+// buttons; the state machine those buttons drive has its own dedicated suite, connect-card.test.tsx.

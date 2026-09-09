@@ -22,6 +22,7 @@ import { hashToken } from '@aesa/crypto'
 import { JOB_NAMES } from '@aesa/queue'
 import { createFlow } from '../../connect/flows.ts'
 import type { OutgoingMail } from '../../mail/transport.ts'
+import { isUniqueViolation } from '../../pg-error.ts'
 import { managerProcedure, orgProcedure, router } from '../init.ts'
 
 const VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000
@@ -242,20 +243,29 @@ export const mailboxesRouter = router({
       const [onConnection] = await tx.select({ value: count() }).from(agents).where(eq(agents.connectionId, input.connectionId))
       const existingOnConnection = onConnection?.value ?? 0
 
-      const [agent] = await tx.insert(agents).values({
-        orgId: ctx.orgId,
-        connectionId: input.connectionId,
-        address: input.address,
-        domain,
-        displayName: input.address.split('@')[0]!,
-        personaPreset: 'support',
-        priority: existingOnConnection,
-        status,
-        replyFromAddress: input.replyFromConnection ? conn.emailAddress : null,
-        verificationCodeHash,
-        verificationExpiresAt,
-        consentRequiredFromUserId,
-      }).returning()
+      // `agents_org_address_uidx` (orgId, address) is the backstop against a race — two concurrent
+      // addAddress calls for the same address in this org — that the code above never checks for
+      // directly. Caught here rather than left to surface as a raw, unhandled unique-violation.
+      let agent: typeof agents.$inferSelect | undefined
+      try {
+        ;[agent] = await tx.insert(agents).values({
+          orgId: ctx.orgId,
+          connectionId: input.connectionId,
+          address: input.address,
+          domain,
+          displayName: input.address.split('@')[0]!,
+          personaPreset: 'support',
+          priority: existingOnConnection,
+          status,
+          replyFromAddress: input.replyFromConnection ? conn.emailAddress : null,
+          verificationCodeHash,
+          verificationExpiresAt,
+          consentRequiredFromUserId,
+        }).returning()
+      } catch (err) {
+        if (isUniqueViolation(err)) throw new TRPCError({ code: 'CONFLICT', message: 'address already has an agent' })
+        throw err
+      }
 
       const orgCategories = await tx.select({ id: categories.id }).from(categories).where(eq(categories.orgId, ctx.orgId))
       if (orgCategories.length > 0) {

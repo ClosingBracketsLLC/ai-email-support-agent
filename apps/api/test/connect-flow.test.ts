@@ -363,3 +363,98 @@ describe('mailbox connect flow', () => {
     expect(flow).toMatchObject({ status: 'failed', failureReason: 'access_denied' })
   })
 })
+
+/**
+ * `enqueue(JOB_NAMES.storeCredentials, …)` returning `null` (final-review Important, I5): a singleton
+ * dedupe collision means the connection is left `pending_claim` with NO `mailbox_credentials` row and
+ * no way to ever get one from this flow. Its own `describe` (a fresh app/org per test) so this
+ * suite's null-returning enqueue stub can't affect connect-flow.test.ts's own shared, order-dependent
+ * chain above.
+ */
+describe('mailbox connect flow: storeCredentials enqueue_failed recovery', () => {
+  function createNullingEnqueue(): { fn: EnqueueFn; calls: EnqueueCall[] } {
+    const calls: EnqueueCall[] = []
+    const fn: EnqueueFn = async (name, data, opts) => {
+      calls.push({ name, data, opts })
+      return name === JOB_NAMES.storeCredentials ? null : `job-${calls.length}`
+    }
+    return { fn, calls }
+  }
+
+  it('fresh connect: a null storeCredentials enqueue fails the flow and deletes the just-created connection row (it has no tickets yet)', async () => {
+    const { fn, calls } = createNullingEnqueue()
+    const providerOverrides: { gmail?: MailboxProvider } = {}
+    const t2 = await createTestApi(GMAIL_ENV, { enqueue: fn, mailProviders: providerOverrides })
+    try {
+      const base2 = await listen(t2.app)
+      const signed = await signInWithOtp(t2.app, t2.mail, 'owner-enqfail-fresh@example.com', 'Fresh')
+      const c = client(base2, signed.cookie)
+      const { orgId: orgId2 } = await c.workspace.create.mutate({ businessName: 'Acme', timezone: 'UTC' })
+      await t2.api.withOrg(orgId2, (tx) => provisionOrgKeys(tx, ring))
+
+      providerOverrides.gmail = fakeGmailProvider(fixedExchange({
+        tokens: { refreshToken: 'rt-enqfail', accessToken: 'at-enqfail', accessTokenExpiresAt: null },
+        emailAddress: 'support@enqfail-fresh.test',
+        providerAccountId: 'acct-enqfail-fresh',
+      }))
+      const started = await c.mailboxes.startConnect.mutate({ provider: 'gmail', platform: 'web' })
+      const state = new URL(started.url).searchParams.get('state')!
+      const res = await t2.app.inject({ method: 'GET', url: `/connect/gmail/callback?code=fake-code&state=${encodeURIComponent(state)}` })
+      expect(res.statusCode).toBe(200)
+      expect(res.body).not.toContain('Connected as')
+
+      const rows = await t2.api.withOrg(orgId2, (tx) => tx.select().from(mailboxConnections).where(eq(mailboxConnections.orgId, orgId2)))
+      expect(rows).toHaveLength(0)
+
+      const [flow] = await t2.api.withOrg(orgId2, (tx) => tx.select().from(oauthFlows).where(eq(oauthFlows.id, started.flowId)))
+      expect(flow).toMatchObject({ status: 'failed', failureReason: 'enqueue_failed' })
+
+      expect(calls.some((call) => call.name === JOB_NAMES.storeCredentials)).toBe(true)
+    } finally {
+      await t2.close()
+    }
+  })
+
+  it('reconnect: a null storeCredentials enqueue fails the flow and reverts the EXISTING connection to reauth_required (never deletes it)', async () => {
+    const { fn, calls } = createNullingEnqueue()
+    const providerOverrides: { gmail?: MailboxProvider } = {}
+    const t2 = await createTestApi(GMAIL_ENV, { enqueue: fn, mailProviders: providerOverrides })
+    try {
+      const base2 = await listen(t2.app)
+      const signed = await signInWithOtp(t2.app, t2.mail, 'owner-enqfail-reconnect@example.com', 'Reconnect')
+      const c = client(base2, signed.cookie)
+      const { orgId: orgId2 } = await c.workspace.create.mutate({ businessName: 'Acme', timezone: 'UTC' })
+      await t2.api.withOrg(orgId2, (tx) => provisionOrgKeys(tx, ring))
+
+      // A pre-existing connection this reconnect attempt targets — 'reauth_required', the real-world
+      // trigger for a user re-running the connect flow on the same address.
+      const [existing] = await t2.api.withOrg(orgId2, (tx) =>
+        tx.insert(mailboxConnections).values({
+          orgId: orgId2, provider: 'gmail', providerAccountId: 'acct-enqfail-reconnect-old', emailAddress: 'support@enqfail-reconnect.test',
+          status: 'reauth_required', connectedByUserId: signed.user.id,
+        }).returning())
+
+      providerOverrides.gmail = fakeGmailProvider(fixedExchange({
+        tokens: { refreshToken: 'rt-enqfail-2', accessToken: 'at-enqfail-2', accessTokenExpiresAt: null },
+        emailAddress: 'support@enqfail-reconnect.test',
+        providerAccountId: 'acct-enqfail-reconnect-new',
+      }))
+      const started = await c.mailboxes.startConnect.mutate({ provider: 'gmail', platform: 'web' })
+      const state = new URL(started.url).searchParams.get('state')!
+      const res = await t2.app.inject({ method: 'GET', url: `/connect/gmail/callback?code=fake-code&state=${encodeURIComponent(state)}` })
+      expect(res.statusCode).toBe(200)
+      expect(res.body).not.toContain('Connected as')
+
+      const [after] = await t2.api.withOrg(orgId2, (tx) => tx.select().from(mailboxConnections).where(eq(mailboxConnections.id, existing!.id)))
+      expect(after).toBeDefined()
+      expect(after?.status).toBe('reauth_required')
+
+      const [flow] = await t2.api.withOrg(orgId2, (tx) => tx.select().from(oauthFlows).where(eq(oauthFlows.id, started.flowId)))
+      expect(flow).toMatchObject({ status: 'failed', failureReason: 'enqueue_failed', connectionId: existing!.id })
+
+      expect(calls.some((call) => call.name === JOB_NAMES.storeCredentials)).toBe(true)
+    } finally {
+      await t2.close()
+    }
+  })
+})

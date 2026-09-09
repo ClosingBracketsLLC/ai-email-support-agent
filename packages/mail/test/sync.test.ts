@@ -1026,6 +1026,24 @@ describe('runSync — the provider-agnostic walk (gmail mode)', () => {
     const ticket = (await ticketsFor(f.connectionId))[0]!
     expect(ticket.isAutomated).toBe(true)
   })
+
+  it('22. a DRAFT-labelled message produces zero tickets and zero messages (spec verify item: draft churn zero rows)', async () => {
+    const f = await makeFixture()
+    await runSync(f.deps) // seed-on-null
+
+    f.mailbox.receiveInbound({
+      from: `jane-${rand()}@example.com`,
+      to: [f.addresses[0]!],
+      subject: 'Draft revision',
+      bodyText: 'autosaved',
+      labelIds: ['DRAFT'],
+    })
+    const result = await runSync(f.deps)
+
+    expect(result.insertedMessages).toBe(0)
+    expect(await ticketsFor(f.connectionId)).toHaveLength(0)
+    expect(await messagesFor(f.connectionId)).toHaveLength(0)
+  })
 })
 
 describe('16. runSync — graph mode smoke', () => {

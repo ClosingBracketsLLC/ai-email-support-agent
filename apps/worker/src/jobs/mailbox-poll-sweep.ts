@@ -105,21 +105,46 @@ export async function runMailboxPollSweep(boss: PgBoss, deps: MailboxPollSweepDe
     const due = (await tx.execute<{ id: string; org_id: string }>(dueQuery)).rows
     for (const row of due) pending.push({ kind: 'sync', orgId: row.org_id, entityId: row.id })
 
-    // (b) pending_claim connections older than 10 minutes: delete credentials + connection, audit.
-    // No provider revoke here — the sealed tokens were never opened; revocation-by-deletion is the
-    // recorded ruling (Task 15 brief).
+    // (b) pending_claim connections stale by UPDATED_AT, not created_at (final-review Critical): the
+    // same-org reconnect branch in connect/routes.ts flips an EXISTING connection back to
+    // pending_claim without resetting created_at, and updatedAt()'s $onUpdate bumps updated_at on
+    // that very write — keying on created_at would make a freshly reconnected row deletable on the
+    // very next sweep. A stale row that already has tickets (a prior 'connected' stint that ingested
+    // mail, now mid-reconnect) is NEVER deleted: tickets.connection_id -> mailbox_connections.id is
+    // ON DELETE NO ACTION, so deleting it here would abort this entire withPlatform transaction —
+    // every other sub-sweep in the same pass, platform-wide, every 2 minutes (retryLimit 0, so that
+    // pass is simply lost). It is reverted to reauth_required instead, so the owner sees it needs
+    // attention rather than silently losing it (and its tickets) outright. A row with no tickets is
+    // still the harmless "never claimed" case and is deleted exactly as before. Each row's handling
+    // runs inside its own SAVEPOINT (tx.transaction()) wrapped in its own try/catch, so one row's
+    // failure can never abort this sub-sweep's own remaining rows OR the sub-sweeps around it.
     const claimCutoff = new Date(now.getTime() - CLAIM_EXPIRY_MINUTES * 60_000)
     const expiredClaims = await tx
       .select({ id: mailboxConnections.id, orgId: mailboxConnections.orgId })
       .from(mailboxConnections)
-      .where(and(eq(mailboxConnections.status, 'pending_claim'), lt(mailboxConnections.createdAt, claimCutoff)))
+      .where(and(eq(mailboxConnections.status, 'pending_claim'), lt(mailboxConnections.updatedAt, claimCutoff)))
     for (const c of expiredClaims) {
-      await tx.delete(mailboxCredentials).where(eq(mailboxCredentials.connectionId, c.id))
-      await tx.delete(mailboxConnections).where(eq(mailboxConnections.id, c.id))
-      await tx.insert(auditLog).values({
-        orgId: c.orgId, actor: 'system:cron:mailbox.poll-sweep', action: 'mailbox.claim_expired',
-        entityType: 'mailbox_connection', entityId: c.id, detail: {},
-      })
+      try {
+        await tx.transaction(async (tx2) => {
+          const [ticketRow] = await tx2.select({ id: tickets.id }).from(tickets).where(eq(tickets.connectionId, c.id)).limit(1)
+          if (ticketRow) {
+            await tx2.update(mailboxConnections).set({ status: 'reauth_required' }).where(eq(mailboxConnections.id, c.id))
+            await tx2.insert(auditLog).values({
+              orgId: c.orgId, actor: 'system:cron:mailbox.poll-sweep', action: 'mailbox.claim_expired_reverted',
+              entityType: 'mailbox_connection', entityId: c.id, detail: {},
+            })
+            return
+          }
+          await tx2.delete(mailboxCredentials).where(eq(mailboxCredentials.connectionId, c.id))
+          await tx2.delete(mailboxConnections).where(eq(mailboxConnections.id, c.id))
+          await tx2.insert(auditLog).values({
+            orgId: c.orgId, actor: 'system:cron:mailbox.poll-sweep', action: 'mailbox.claim_expired',
+            entityType: 'mailbox_connection', entityId: c.id, detail: {},
+          })
+        })
+      } catch (err) {
+        deps.logger.warn({ connectionId: c.id, error: errorMessage(err) }, 'mailbox.poll_sweep_claim_expiry_failed')
+      }
     }
 
     // (c) oauth_flows past expiry -> expired; expired rows older than 24h -> deleted.

@@ -79,9 +79,7 @@ export function MailboxesScreen() {
 
   return (
     <Screen testID="mailboxes">
-      {connections.length === 0 ? (
-        <ConnectMailboxCard onConnected={(id, address) => setAddingTo({ id, address })} />
-      ) : (
+      {connections.length > 0 ? (
         <>
           <Heading>Mailboxes</Heading>
           {connections.map((conn) => (
@@ -124,7 +122,16 @@ export function MailboxesScreen() {
           </Card>
           ))}
         </>
-      )}
+      ) : null}
+
+      {/* Always rendered, never gated on an empty connection list (review fix, Important 2): a
+          reauth-required badge or a claim-expired push has nowhere to send the owner without this —
+          "Connect another mailbox" once at least one connection already exists, so reconnecting an
+          existing mailbox and adding a brand-new one are the same action. */}
+      <ConnectMailboxCard
+        heading={connections.length === 0 ? 'Connect a mailbox' : 'Connect another mailbox'}
+        onConnected={(id, address) => setAddingTo({ id, address })}
+      />
 
       {addingTo ? (
         <AddressSheet connectionId={addingTo.id} connectionAddress={addingTo.address} onDone={() => { setAddingTo(null); refresh() }} />

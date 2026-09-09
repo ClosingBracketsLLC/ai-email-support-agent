@@ -79,6 +79,18 @@ describe('mailboxes router: addresses, verification, consent, gmail access', () 
     expect(agent?.replyFromAddress).toBeNull()
   })
 
+  it('addAddress with an address that already has an agent on this connection is CONFLICT, not a raw unique-violation (final-review promoted minor)', async () => {
+    const { client: c, orgId, connectionId } = await setupOrgWithMailbox('owner-dupe@example.com', 'support@dupe.test')
+    await c.mailboxes.addAddress.mutate({ connectionId, address: 'support@dupe.test', replyFromConnection: false })
+    await expect(c.mailboxes.addAddress.mutate({ connectionId, address: 'support@dupe.test', replyFromConnection: false }))
+      .rejects.toMatchObject({ data: { code: 'CONFLICT' }, message: 'address already has an agent' })
+
+    // The failed second attempt left exactly the ONE agent the first call created — the caught
+    // unique-violation aborted its own insert, not the connection's other rows.
+    const rows = await t.api.withOrg(orgId, (tx) => tx.select().from(agents).where(eq(agents.address, 'support@dupe.test')))
+    expect(rows).toHaveLength(1)
+  })
+
   it('a 4th active agent on one domain is FORBIDDEN ("agent limit for domain")', async () => {
     const signed = await signInWithOtp(t.app, t.mail, 'owner-domain@example.com', 'Owner')
     const c = client(base, signed.cookie)

@@ -53,11 +53,15 @@ function errorMessage(err: unknown): string | undefined {
  */
 export function ConnectMailboxCard({
   onConnected,
+  heading = 'Connect a mailbox',
   pollIntervalMs = CLAIM_POLL_INTERVAL_MS,
   pollTimeoutMs = CLAIM_POLL_TIMEOUT_MS,
   provisionRetryMs = PROVISION_RETRY_MS,
 }: {
   onConnected: (connectionId: string, emailAddress: string) => void
+  /** Overridable so the settings Mailboxes screen can say "Connect another mailbox" once at least
+   * one connection already exists (review fix, Important 2) — the onboarding step keeps the default. */
+  heading?: string
   /** Test-only timing overrides — defaults are the real production values (2 s / 5 min / 1 s). A
    * unit test drives the claim-poll and provisioning-retry state machine with real timers at tiny
    * values instead of `jest.useFakeTimers()`: verified empirically that React 19's `act()` deadlocks
@@ -221,7 +225,7 @@ export function ConnectMailboxCard({
 
   return (
     <Card testID="connect-card">
-      <Heading>Connect a mailbox</Heading>
+      <Heading>{heading}</Heading>
       {/* Controller ruling (e2e, providerless deployments): a workspace with no mail provider
           configured at all shows this instead of silently rendering an empty card. */}
       {noProvidersConfigured ? (

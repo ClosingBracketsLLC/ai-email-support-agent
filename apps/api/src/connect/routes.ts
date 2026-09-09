@@ -17,10 +17,11 @@ import { and, eq, ne } from 'drizzle-orm'
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { MAIL_PROVIDERS, type MailProvider } from '@aesa/contracts'
-import { getOrgBoxPublicKeyOrNull, mailboxConnections, oauthFlows } from '@aesa/db'
+import { audit, getOrgBoxPublicKeyOrNull, mailboxConnections, oauthFlows } from '@aesa/db'
 import { gmailProvider, graphProvider, sealTokens, type MailboxProvider, type TokenSet } from '@aesa/mail'
 import { JOB_NAMES } from '@aesa/queue'
 import type { ServerDeps } from '../deps.ts'
+import { isUniqueViolation } from '../pg-error.ts'
 import { consumeFlow, failPendingFlow, prepareAuthorization } from './flows.ts'
 
 function isMailProvider(v: string): v is MailProvider {
@@ -46,15 +47,6 @@ function htmlPage(message: string, opts: { metaRefresh?: string } = {}): string 
   return `<!doctype html><html><head><meta charset="utf-8">${refresh}<title>aesa</title></head><body><p>${escapeHtml(message)}</p></body></html>`
 }
 
-/** Postgres unique_violation, surfaced through drizzle's DrizzleQueryError (`.cause` holds the raw pg
- * error, which node-postgres attaches `.code` to) — same duck-typing src/logging.ts already uses to
- * read a wrapped error's code. */
-function isUniqueViolation(err: unknown): boolean {
-  const cause = (err as { cause?: unknown } | null)?.cause
-  const code = (cause as { code?: unknown } | null)?.code
-  return code === '23505'
-}
-
 const GENERIC_RETRY_MESSAGE = 'Something went wrong. Please try again from the app.'
 
 type ExchangeResult = { tokens: TokenSet; emailAddress: string; providerAccountId: string }
@@ -71,7 +63,7 @@ async function tryExchangeCode(adapter: MailboxProvider, params: Parameters<Mail
 
 type ConnectOutcome =
   | { kind: 'failed'; reason: 'keys_missing' | 'already_connected_elsewhere' }
-  | { kind: 'connected'; connectionId: string; emailAddress: string; boxPublicKey: Buffer }
+  | { kind: 'connected'; connectionId: string; emailAddress: string; boxPublicKey: Buffer; wasReconnect: boolean }
 
 export function registerConnectRoutes(routes: FastifyInstance, deps: ServerDeps): void {
   routes.get<{ Params: { provider: string }; Querystring: { state?: string } }>(
@@ -208,7 +200,7 @@ export function registerConnectRoutes(routes: FastifyInstance, deps: ServerDeps)
       }
 
       await tx.update(oauthFlows).set({ connectionId }).where(eq(oauthFlows.id, consumed.flowId))
-      return { kind: 'connected', connectionId, emailAddress, boxPublicKey }
+      return { kind: 'connected', connectionId, emailAddress, boxPublicKey, wasReconnect: Boolean(existing) }
     })
 
     if (outcome.kind === 'failed') {
@@ -222,11 +214,40 @@ export function registerConnectRoutes(routes: FastifyInstance, deps: ServerDeps)
     // that table at all (migration 0006's REVOKE). Seal the fresh tokens to the org's box public key and
     // hand the sealed blob to the worker, which owns the only write path.
     const sealed = await sealTokens(outcome.boxPublicKey, exchanged.tokens)
-    await deps.enqueue(
+    const jobId = await deps.enqueue(
       JOB_NAMES.storeCredentials,
       { orgId: consumed.orgId, connectionId: outcome.connectionId, sealed: sealed.toString('base64') },
       { entityId: outcome.connectionId },
     )
+
+    // `enqueue()` returns null on a singleton dedupe collision (final-review Important) — the
+    // connection is `pending_claim` right now and would otherwise stay that way forever with NO
+    // `mailbox_credentials` row: `claimConnection` has no way to tell "no credentials job ever ran"
+    // from "still in flight", so it would happily flip an uncredentialed connection to 'connected'.
+    // Recovery differs by path: a RECONNECT touched a connection that worked before this attempt, so
+    // it goes to `reauth_required` (still visible, still retryable) rather than being torn down; a
+    // FRESH connect created this row moments ago in the transaction above, still `pending_claim` with
+    // no possible tickets yet (mailbox.sync never touches an unclaimed row), so it is safe to delete
+    // outright and let a retry start clean.
+    if (jobId === null) {
+      await deps.api.withOrg(consumed.orgId, async (tx) => {
+        await tx.update(oauthFlows).set({ status: 'failed', failureReason: 'enqueue_failed' }).where(eq(oauthFlows.id, consumed.flowId))
+        if (outcome.wasReconnect) {
+          await tx.update(mailboxConnections).set({ status: 'reauth_required' }).where(eq(mailboxConnections.id, outcome.connectionId))
+          await audit(tx, {
+            actor: 'system:connect_callback', action: 'mailbox.claim_enqueue_failed_reverted',
+            entityType: 'mailbox_connection', entityId: outcome.connectionId,
+          })
+        } else {
+          await tx.delete(mailboxConnections).where(eq(mailboxConnections.id, outcome.connectionId))
+          await audit(tx, {
+            actor: 'system:connect_callback', action: 'mailbox.claim_enqueue_failed_deleted',
+            entityType: 'mailbox_connection', entityId: outcome.connectionId,
+          })
+        }
+      })
+      return reply.send(htmlPage(GENERIC_RETRY_MESSAGE))
+    }
 
     const successMessage = `Connected as ${outcome.emailAddress}. Return to the app to finish.`
     if (consumed.platform === 'web') {

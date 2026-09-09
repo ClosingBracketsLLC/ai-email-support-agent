@@ -68,7 +68,12 @@ export type MailboxSyncPayload = z.infer<typeof MailboxSyncPayload>
 export const mailboxSyncJob: JobDefinition<MailboxSyncPayload> = defineJob({
   name: JOB_NAMES.mailboxSync,
   schema: MailboxSyncPayload,
-  queue: { expireInSeconds: 300, retryLimit: 3, retryBackoff: true },
+  // No retryLimit/retryBackoff: the handler below always catches and returns normally (never
+  // rethrows), so pg-boss never sees a failed job to retry — this queue config would be dead
+  // weight. The real retry layer is consecutive_failures/backoff_until on mailbox_connections
+  // (step 5 below) plus mailbox.poll-sweep's (a), which re-polls any connection backoff_until has
+  // cleared for (final-review Important).
+  queue: { expireInSeconds: 300 },
   handler: async () => {
     throw new Error('mailbox.sync: this definition has no bound deps — register it through registerMailboxSync(boss, deps)')
   },

@@ -143,9 +143,63 @@ describe('mailbox.poll-sweep', () => {
     for (const id of [...aIds, ...bIds]) expect(ownOrder).toContain(id)
   })
 
-  it('(b) an expired pending_claim connection has its credentials and connection row deleted, and is audited', async () => {
+  it('(b) a pending_claim row with a FRESH updated_at (a just-reconnected connection) is never deleted even though created_at is old and a ticket is attached — the sweep completes and other sub-sweeps in the same pass still run (final-review Critical, plan defect)', async () => {
     const orgId = await newOrg()
-    const connectionId = await seedConnection(orgId, { status: 'pending_claim', createdAt: new Date(NOW.getTime() - 15 * 60_000) })
+    const connectionId = await seedConnection(orgId, {
+      status: 'pending_claim',
+      createdAt: new Date(NOW.getTime() - 15 * 60_000),   // old — would have been picked up by the OLD (buggy) createdAt-keyed query
+      updatedAt: new Date(NOW.getTime() - 60_000),         // fresh — the reconnect write that flipped status also bumped this
+    })
+    await withOrg(app.db, orgId, (tx) => tx.insert(tickets).values({ orgId, connectionId, providerThreadId: `thread-${rand()}` }))
+    // A different sub-sweep's row in the SAME pass — proves the (b) row above never aborts the one
+    // withPlatform transaction every sub-sweep shares.
+    const [notif] = await withOrg(app.db, orgId, (tx) =>
+      tx.insert(notifications).values({ orgId, kind: 'escalation', title: 't', body: 'b', dedupeKey: `dk-${rand()}`, createdAt: new Date(NOW.getTime() - 15 * 60_000) }).returning())
+
+    await runMailboxPollSweep(boss, makeDeps())
+
+    const after = await readConnection(orgId, connectionId)
+    expect(after?.status).toBe('pending_claim')
+    const audits = await withPlatform(app.db, 'test:audit', (tx) => tx.select().from(auditLog).where(eq(auditLog.entityId, connectionId)))
+    expect(audits).toHaveLength(0)
+    const notifJobs = await notifyDispatchJobs()
+    expect(notifJobs.some((j) => (j.data as { notificationId?: string }).notificationId === notif!.id)).toBe(true)
+  })
+
+  it("(b) a pending_claim row stale by updated_at WITH a ticket attached is reverted to reauth_required, never deleted — deleting it would abort the whole sweep via tickets' ON DELETE NO ACTION FK", async () => {
+    const orgId = await newOrg()
+    const connectionId = await seedConnection(orgId, {
+      status: 'pending_claim',
+      createdAt: new Date(NOW.getTime() - 15 * 60_000),
+      updatedAt: new Date(NOW.getTime() - 15 * 60_000),
+    })
+    await withPlatform(app.db, 'test:seed-cred', (tx) =>
+      tx.insert(mailboxCredentials).values({ connectionId, orgId, refreshTokenCiphertext: Buffer.from('sealed'), encryption: 'sealed' }))
+    await withOrg(app.db, orgId, (tx) => tx.insert(tickets).values({ orgId, connectionId, providerThreadId: `thread-${rand()}` }))
+    const [notif] = await withOrg(app.db, orgId, (tx) =>
+      tx.insert(notifications).values({ orgId, kind: 'escalation', title: 't', body: 'b', dedupeKey: `dk-${rand()}`, createdAt: new Date(NOW.getTime() - 15 * 60_000) }).returning())
+
+    await runMailboxPollSweep(boss, makeDeps())
+
+    const after = await readConnection(orgId, connectionId)
+    expect(after?.status).toBe('reauth_required')
+    const credRows = await withPlatform(app.db, 'test:read-cred', (tx) => tx.select().from(mailboxCredentials).where(eq(mailboxCredentials.connectionId, connectionId)))
+    expect(credRows).toHaveLength(1) // untouched: a row with tickets is reverted, never deleted
+    const audits = await withPlatform(app.db, 'test:audit', (tx) => tx.select().from(auditLog).where(eq(auditLog.entityId, connectionId)))
+    expect(audits.some((a) => a.action === 'mailbox.claim_expired_reverted')).toBe(true)
+    // The other sub-sweep in the SAME pass still committed — proof the revert's SAVEPOINT never
+    // aborted the shared withPlatform transaction.
+    const notifJobs = await notifyDispatchJobs()
+    expect(notifJobs.some((j) => (j.data as { notificationId?: string }).notificationId === notif!.id)).toBe(true)
+  })
+
+  it('(b) a pending_claim row stale by updated_at with NO tickets has its credentials and connection row deleted, and is audited', async () => {
+    const orgId = await newOrg()
+    const connectionId = await seedConnection(orgId, {
+      status: 'pending_claim',
+      createdAt: new Date(NOW.getTime() - 15 * 60_000),
+      updatedAt: new Date(NOW.getTime() - 15 * 60_000),
+    })
     await withPlatform(app.db, 'test:seed-cred', (tx) =>
       tx.insert(mailboxCredentials).values({ connectionId, orgId, refreshTokenCiphertext: Buffer.from('sealed'), encryption: 'sealed' }))
 
