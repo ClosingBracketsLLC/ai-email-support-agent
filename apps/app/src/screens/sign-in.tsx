@@ -33,9 +33,11 @@ export function SignInScreen() {
   }
 
   async function social(provider: 'google' | 'microsoft') {
-    setError(null)
+    if (busy) return
+    setBusy(true); setError(null)
     const callbackURL = Platform.OS === 'web' ? `${window.location.origin}/post-auth` : '/post-auth'
     const { error } = await authClient.signIn.social({ provider, callbackURL })
+    setBusy(false)
     if (error) setError(`${provider === 'google' ? 'Google' : 'Microsoft'} sign-in did not complete.`)
   }
 
