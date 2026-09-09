@@ -386,6 +386,13 @@ export function createMockMailbox(opts: MockMailboxOptions): MockMailbox {
       // graph: models only the two-phase createReply -> PATCH -> send OBSERVABLE result — a SENT
       // message whose markerDraftId is the input's extra header. `existingDraftId` (crash re-entry)
       // is echoed back rather than a fresh id generated, matching "skip re-creation".
+      //
+      // `replyToProviderMessageId` is Graph's reply target (createReply operates on a MESSAGE id,
+      // not a thread id) — required UNLESS a crash re-entry already has a persisted draft to resume
+      // (`existingDraftId`), matching the real adapter's (Task 10) validation.
+      if (!r.replyToProviderMessageId && !r.existingDraftId) {
+        throw new MailApiError('replyToProviderMessageId required', 400)
+      }
       const providerDraftId = r.existingDraftId ?? `mock-draft-${(subCounter += 1)}`
       const msg = storeMessage({
         threadId: r.threadId,
@@ -436,14 +443,17 @@ export function createMockMailbox(opts: MockMailboxOptions): MockMailbox {
         if (msg.threadId !== threadId) continue
         candidates.push(msg)
       }
-      // A safety valve, not a slice (doge-buddy's recovery scan, ported): a thread with more
-      // candidates than the caller is willing to scan throws rather than silently missing a
-      // marker and risking a duplicate send.
-      if (candidates.length > scanLimit) {
-        throw new MailApiError('thread too busy', 429)
-      }
-      for (const msg of [...candidates].reverse()) {
+      // Newest-first, examining at most `scanLimit` candidates (doge-buddy's recovery scan,
+      // ported, generalized here into the port itself): a marker among the newest `scanLimit`
+      // messages resolves even on an otherwise-oversized thread — only a MISS that still has
+      // unexamined older candidates is refused, since returning null there could send a duplicate.
+      const newestFirst = [...candidates].reverse()
+      const examined = newestFirst.slice(0, scanLimit)
+      for (const msg of examined) {
         if (msg.markerDraftId === draftId) return msg.id
+      }
+      if (newestFirst.length > scanLimit) {
+        throw new MailApiError('thread too busy', 429)
       }
       return null
     },

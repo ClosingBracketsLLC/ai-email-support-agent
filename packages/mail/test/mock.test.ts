@@ -273,7 +273,12 @@ describe('createMockMailbox: gmail mode', () => {
     expect(ids.map((m) => m.id)).toEqual([first.id, reply.id])
   })
 
-  it('findSentByMarker: walks the thread newest-first and finds the matching marker', async () => {
+  // findSentByMarker's three branches (controller ruling): (1) marker found within the newest
+  // `scanLimit` candidates -> resolves, even on an oversized thread; (2) not found within
+  // `scanLimit` AND older candidates remain unexamined -> throws MailApiError(429), refusing to
+  // guess; (3) every candidate examined (thread size <= scanLimit) and no match -> resolves null.
+
+  it('findSentByMarker: branch 3 — walks the thread newest-first and finds the matching marker, null when absent and fully scanned', async () => {
     const mailbox = createMockMailbox({ mode: 'gmail', selfAddress: SELF })
     const inbound = mailbox.receiveInbound({ from: 'jane@example.com', subject: 'Help', bodyText: 'help me' })
     await mailbox.sendReply({
@@ -295,6 +300,7 @@ describe('createMockMailbox: gmail mode', () => {
       extraHeaders: { [MARKER_HEADER]: 'draft-2' },
     })
 
+    // scanLimit (50) comfortably covers the whole (3-message) thread — branch 3 territory.
     const found = await mailbox.findSentByMarker(inbound.threadId, 'draft-2', 50)
     expect(found).toBe(second.id)
 
@@ -302,7 +308,63 @@ describe('createMockMailbox: gmail mode', () => {
     expect(notFound).toBeNull()
   })
 
-  it('findSentByMarker: throws MailApiError(429) when the thread exceeds scanLimit', async () => {
+  it('findSentByMarker: branch 1 — oversized thread, marker among the newest scanLimit messages resolves without throwing', async () => {
+    const mailbox = createMockMailbox({ mode: 'gmail', selfAddress: SELF })
+    const threadId = 'oversized-thread-hit'
+    // Five older inbound messages, then a marked reply as the NEWEST message on the thread.
+    for (let i = 0; i < 5; i += 1) {
+      mailbox.receiveInbound({ from: 'jane@example.com', to: [SELF], subject: 'Help', bodyText: `msg ${i}`, threadId })
+    }
+    const reply = await mailbox.sendReply({
+      threadId,
+      to: 'jane@example.com',
+      subject: 'Help',
+      inReplyTo: '<x@mail.example.com>',
+      references: '<x@mail.example.com>',
+      bodyText: 'On it',
+      extraHeaders: { [MARKER_HEADER]: 'draft-hit' },
+    })
+
+    // 6 total candidates > scanLimit (3), but the marker is the newest — found before the scan
+    // ever needs to look past the limit, so this must NOT throw.
+    const found = await mailbox.findSentByMarker(threadId, 'draft-hit', 3)
+    expect(found).toBe(reply.id)
+  })
+
+  it('findSentByMarker: branch 2 — oversized thread, no marker within the first scanLimit and older candidates remain, throws MailApiError(429)', async () => {
+    const mailbox = createMockMailbox({ mode: 'gmail', selfAddress: SELF })
+    const threadId = 'oversized-thread-miss'
+    // The marked reply is the OLDEST message — buried outside the newest-3 scan window by five
+    // later messages. The marker genuinely exists on the thread; the scan still must refuse rather
+    // than guess, because it never got to examine that candidate.
+    const buried = await mailbox.sendReply({
+      threadId,
+      to: 'jane@example.com',
+      subject: 'Help',
+      inReplyTo: '<x@mail.example.com>',
+      references: '<x@mail.example.com>',
+      bodyText: 'first reply',
+      extraHeaders: { [MARKER_HEADER]: 'draft-buried' },
+    })
+    for (let i = 0; i < 5; i += 1) {
+      mailbox.receiveInbound({ from: 'jane@example.com', to: [SELF], subject: 'Help', bodyText: `follow-up ${i}`, threadId })
+    }
+
+    let caught: unknown
+    try {
+      await mailbox.findSentByMarker(threadId, 'draft-buried', 3)
+    } catch (e) {
+      caught = e
+    }
+
+    expect(caught).toBeInstanceOf(MailApiError)
+    expect((caught as MailApiError).status).toBe(429)
+    // Sanity: the marker really was on the thread, just outside the scan window — this is the
+    // "refuse to guess" case, not a "marker doesn't exist" case.
+    expect(buried.threadId).toBe(threadId)
+  })
+
+  it('findSentByMarker: branch 2 — oversized thread with no marker anywhere still throws (not merely a "not found")', async () => {
     const mailbox = createMockMailbox({ mode: 'gmail', selfAddress: SELF })
     const threadId = 'busy-thread'
     for (let i = 0; i < 5; i += 1) {
@@ -410,6 +472,38 @@ describe('createMockMailbox: graph mode', () => {
     })
 
     expect(reply.providerDraftId).toBe('persisted-draft-id')
+  })
+
+  it('sendReply: throws MailApiError(400) when both replyToProviderMessageId and existingDraftId are absent', async () => {
+    const mailbox = createMockMailbox({ mode: 'graph', selfAddress: SELF })
+    const inbound = mailbox.receiveInbound({ from: 'jane@example.com', subject: 'Help', bodyText: 'help me' })
+
+    await expect(
+      mailbox.sendReply({
+        threadId: inbound.threadId,
+        to: 'jane@example.com',
+        subject: 'Help',
+        inReplyTo: '<x@mail.example.com>',
+        references: '<x@mail.example.com>',
+        bodyText: 'On it!',
+      }),
+    ).rejects.toMatchObject({ name: 'MailApiError', status: 400 })
+  })
+
+  it('sendReply: gmail mode ignores a missing replyToProviderMessageId (graph-only requirement)', async () => {
+    const mailbox = createMockMailbox({ mode: 'gmail', selfAddress: SELF })
+    const inbound = mailbox.receiveInbound({ from: 'jane@example.com', subject: 'Help', bodyText: 'help me' })
+
+    await expect(
+      mailbox.sendReply({
+        threadId: inbound.threadId,
+        to: 'jane@example.com',
+        subject: 'Help',
+        inReplyTo: '<x@mail.example.com>',
+        references: '<x@mail.example.com>',
+        bodyText: 'On it!',
+      }),
+    ).resolves.toMatchObject({ threadId: inbound.threadId })
   })
 
   it('subscribe: 3-day expiry; renew extends it', async () => {
