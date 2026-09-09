@@ -127,21 +127,27 @@ defines seven build phases; this file records where the build stands against the
 - Plan: `docs/superpowers/plans/2026-09-08-phase-2-mailboxes-ingest-triage.md` (23 tasks, executed
   with subagent-driven development). Commits `f5210cc..345b3b4` on `phase-2`, branched from
   `phase-1` at `1b0fc34` (Phase 1 still unmerged at branch time — Robert's call): the plan, 23 task
-  commits with their fix rounds, followed by this task's own commit adding the E2E suite, the
-  external-setup runbook, and this record. Execution ledger:
+  commits with their fix rounds, followed by the E2E suite/external-setup runbook/status commit
+  (`abedbc1`), a package-count/docstring fix (`024cf80`), the whole-branch final-review fix wave
+  (`0015a74` — one Critical plan defect plus 4 Important and 1 promoted-minor finding; see the
+  residuals addendum below), and this documentation commit closing it out. Execution ledger:
   `.superpowers/sdd/2026-09-08-phase-2-mailboxes-ingest-triage/progress.md` (per-task implementer/
-  review/fix-round log; authoritative for anything not distilled below). Gate on the branch after
-  this task: typecheck and lint clean across all 12 packages/apps; `pnpm test` green with **807
-  tests** (`@aesa/contracts` 12, `@aesa/core` 30, `@aesa/crypto` 42, `@aesa/agent` 9, `@aesa/llm` 26,
-  `@aesa/db` 46, `@aesa/queue` 15, `@aesa/mail` 226, `@aesa/test-kit` 43 [39 run + 4 conditional
-  skips], `apps/api` 132, `apps/worker` 122 [including this task's 8-scenario `e2e-phase2.test.ts`],
-  `apps/app` 104 jest — no database); `db:check` reports no drift; the Expo web export produces 21
-  static routes; the Playwright signup smoke passes (ends at the gated mailbox step, per Task 20's
-  ruling below — the spec does not mark that step skippable providerless). Robert decides how and
-  when `phase-2` lands on `main`.
-- Review: `docs/superpowers/reviews/2026-09-09-phase-2-final-review.md` — forthcoming. The
-  whole-branch review and its fix wave happen after this task, per `superpowers:subagent-driven-
-  development`; this record will be updated once it lands.
+  review/fix-round log; authoritative for anything not distilled below); the fix wave's own report is
+  `.superpowers/sdd/2026-09-08-phase-2-mailboxes-ingest-triage/final-fix-report.md`. Gate on the
+  branch after the fix wave: typecheck and lint clean across all 12 packages/apps; `pnpm test` green
+  with **816 tests** (`@aesa/contracts` 12, `@aesa/core` 30, `@aesa/crypto` 42, `@aesa/agent` 9,
+  `@aesa/llm` 26, `@aesa/db` 46, `@aesa/queue` 15, `@aesa/mail` 227, `@aesa/test-kit` 43 [39 run + 4
+  conditional skips], `apps/api` 135, `apps/worker` 124 [including the 8-scenario
+  `e2e-phase2.test.ts`], `apps/app` 107 jest — no database); `db:check` reports no drift; the Expo
+  web export produces 21 static routes; the Playwright signup smoke passes (ends at the gated
+  mailbox step, per Task 20's ruling below — the spec does not mark that step skippable
+  providerless). Robert decides how and when `phase-2` lands on `main`.
+- Review: `docs/superpowers/reviews/2026-09-09-phase-2-final-review.md` — record still to be
+  committed (per `superpowers:subagent-driven-development`, the review record is written
+  separately from its own fix wave). Its findings — one Critical plan defect (C1) and four
+  Important (I2–I5) plus one promoted minor — are already resolved by this fix wave (`0015a74`);
+  see the residuals addendum below and the fix report at
+  `.superpowers/sdd/2026-09-08-phase-2-mailboxes-ingest-triage/final-fix-report.md`.
 - What exists now: `@aesa/mail` (the provider-agnostic mailbox port — Gmail + Microsoft Graph
   adapters, credential lease/refresh, rfc2822/address/body/threading ports, the sync walk,
   `MockMailbox`, the send limiter); `@aesa/test-kit` (fixture recorder + conformance suite);
@@ -242,13 +248,35 @@ defines seven build phases; this file records where the build stands against the
   will be triaged into a residuals list in the forthcoming final review record
   (`docs/superpowers/reviews/2026-09-09-phase-2-final-review.md`). Nothing parked is believed to
   block the mock-tier gate or the live verification walk.
+- **Final fix-wave residuals addendum** (`0015a74`, after the whole-branch review closed): the
+  review's one Critical plan defect and four Important findings are fixed — C1 (mailbox.poll-sweep's
+  sub-sweep (b) keyed claim-expiry on `created_at`, which a same-org reconnect never resets, so a
+  reconnected row was deletable immediately, and deleting a row that already has tickets aborted the
+  entire platform-wide sweep via `tickets`' `ON DELETE NO ACTION` FK — now keyed on `updated_at`, a
+  ticketed row reverts to `reauth_required` instead of being deleted, and each row's handling runs in
+  its own SAVEPOINT so one row can never abort the sub-sweeps around it); I2 (the settings Mailboxes
+  screen hid `ConnectMailboxCard` once any connection existed, so a reauth banner or claim-expired
+  push had nowhere to send the owner — the card now always renders, retitled "Connect another
+  mailbox"); I3 (no sync-level test for the spec's "draft churn zero rows" verify item — added to
+  `packages/mail/test/sync.test.ts`); I4 (`mailbox.sync`'s `retryLimit`/`retryBackoff` was dead
+  config since the handler never rethrows — removed); I5 (a `null` return from
+  `enqueue(storeCredentials)` left a `pending_claim` connection with no credentials row and no way to
+  recover — now reverted to `reauth_required` on a reconnect or deleted outright on a fresh connect,
+  with the flow marked failed either way). One promoted minor also landed:
+  `mailboxes.addAddress`'s uncaught `agents` unique-violation now surfaces as `CONFLICT` instead of a
+  raw 500 (`isUniqueViolation` moved to a shared `apps/api/src/pg-error.ts`). Full detail and the
+  gate numbers this wave re-ran: `.superpowers/sdd/2026-09-08-phase-2-mailboxes-ingest-triage/
+  final-fix-report.md`. The review's own remaining findings — not must-fix for this wave — are
+  carried into Phase 3 below (DMARC first-match re-exam, claim-time notification email,
+  `push_subscription_id` index, `use-gate` `setActive` regression test, malformed-cursor degraded
+  marking).
 
 ## Next: Phase 3 — draft, review, send
 
 **Where to start.** Start with `superpowers:writing-plans` against the spec's *Build phases → Phase
 3* section, once Robert has decided how `phase-2` lands (never merge or push without him — see
 `superpowers:finishing-a-development-branch`). Run the local setup from `CLAUDE.md` and confirm the
-807-test baseline above before writing the plan.
+816-test baseline above before writing the plan.
 
 Rulings the Phase 3 planner needs, carried from this phase's execution:
 
@@ -282,6 +310,15 @@ Rulings the Phase 3 planner needs, carried from this phase's execution:
   - `packages/db/test/keys.test.ts` is still order-dependent (file untouched this phase).
   - The remaining `apps/app` accessibility/UX minors from Phase 1's residuals list, on screens this
     phase didn't touch, are still open.
+  - Promoted from the final review, not must-fix for the fix wave above: re-examine the DMARC
+    first-match semantics `autonomy.ts` will need once Phase 5 lands (this phase's own DMARC parser
+    is clause-anchored per the Task 6 ruling above, but autonomy's own first-match reasoning over
+    multiple `Authentication-Results` instances hasn't been checked against it yet); send a
+    claim-time notification email (today a claimed connection has no email trail, only the app's own
+    poll); add an index on `mailbox_connections.push_subscription_id` (poll-sweep's sub-sweep (a)
+    filters on it with no supporting index); a regression test for `use-gate`'s `setActive` path
+    (Phase 1's carry-over gate logic, never covered by a dedicated test); mark a ticket's inbox
+    listing as degraded (not merely silent) when a malformed keyset cursor is presented.
 
 ### Carry-overs resolved during Phase 2
 

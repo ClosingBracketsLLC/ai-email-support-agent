@@ -15,6 +15,14 @@ silently in both directions (platform mail starts landing as noise tickets, or v
 stop being recognized) with no error at boot in either app. See `CLAUDE.md`'s Commands section for
 the full Phase 2 env var list.
 
+**Diagnosing a verification code that "never arrives":** the drop above is logged at `info`, not
+`warn`/`error` (`packages/mail/src/sync.ts`'s `ctx.log('info', 'mailbox.platform_mail_skipped', {
+messageId })`, wired to the worker's logger) — grep the worker's log for
+`mailbox.platform_mail_skipped` around the time the code was sent. If it's there, the message DID
+reach the sync walk and got dropped as platform mail (most likely a `MAIL_FROM` mismatch between
+the two `.env` files, above); if it's absent, the message never reached the sync walk at all
+(check push/poll health on the connection instead).
+
 ## 1. Google Cloud (mail)
 
 One GCP project serves every tenant's Gmail connections (the spec's rate-limit design assumes a
@@ -168,3 +176,37 @@ credentials needed again.
    12 shipped 6 hand-authored fixtures as a placeholder, flagged in the ledger for exactly this
    swap) — diff the new fixture set against `packages/mail`'s existing hand-authored fixtures and
    delete the ones a recorded fixture now supersedes, rather than keeping both.
+
+## 6. Operator: breaking a hijacked mailbox lock
+
+`mailbox_connections_provider_email_uidx` (migration 0006) is a partial unique index on
+`(provider, email_address) WHERE status <> 'disabled'` — at most one non-disabled connection per
+address, org-wide, so an attacker who connects a mailbox they don't actually control (or a stale
+connection nobody ever disconnected) can permanently squat an address: the real owner's own
+reconnect attempt hits the same unique index and comes back `already_connected_elsewhere`
+(`connect/routes.ts`), with no self-service way to clear it — RLS means their org can't even see
+the squatting row to disconnect it themselves if it belongs to another org.
+
+The fix requires an operator to flip the squatting connection to `disabled` by hand, which frees
+the address for a fresh connect. Connect to the database as a role that can `SET ROLE
+aesa_platform` (the same cross-tenant escape hatch `withPlatform()` uses in code — see
+`packages/db/src/tenant.ts` and `scripts/db-init/001-roles.sql`) and run:
+
+```sql
+-- 1. Find the squatting connection (adjust provider/email to the address the victim is trying to
+--    reconnect):
+SET ROLE aesa_platform;
+SELECT id, org_id, status, connected_by_user_id, created_at, updated_at
+  FROM mailbox_connections
+  WHERE provider = '<gmail|microsoft>' AND email_address = '<address@example.com>' AND status <> 'disabled';
+
+-- 2. Disable it — this is the ONLY column that changes; nothing else about the row (its org's
+--    other connections, its agents, its tickets) is touched:
+UPDATE mailbox_connections SET status = 'disabled' WHERE id = '<connection-id-from-step-1>';
+```
+
+The address is claimable again immediately — the partial unique index no longer counts a
+`disabled` row. Confirm with the org (their own audit trail, or asking directly) that the
+connection really was hijacked/stale before disabling it — this is an irreversible-in-place action
+from that org's point of view (their agents on that connection stop working the moment it flips to
+`disabled`, same as a self-service disconnect).
