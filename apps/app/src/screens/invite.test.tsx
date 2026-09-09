@@ -11,6 +11,7 @@ jest.mock('expo-router', () => ({
 }))
 
 const mockGetInvitation = jest.fn()
+const mockAcceptInvitation = jest.fn()
 const mockSignOut = jest.fn()
 const mockSession = { user: { id: 'u1', email: 'me@example.com', name: 'Me' }, session: { activeOrganizationId: null } }
 
@@ -19,7 +20,7 @@ jest.mock('@/lib/auth-client', () => ({
     useSession: () => ({ data: mockSession, isPending: false, refetch: jest.fn() }),
     organization: {
       getInvitation: (...args: unknown[]) => mockGetInvitation(...args),
-      acceptInvitation: jest.fn(),
+      acceptInvitation: (...args: unknown[]) => mockAcceptInvitation(...args),
       setActive: jest.fn(),
     },
     updateUser: jest.fn(),
@@ -46,6 +47,7 @@ beforeEach(() => {
   mockSignOut.mockReset()
   mockSignOut.mockResolvedValue(undefined)
   mockGetInvitation.mockReset()
+  mockAcceptInvitation.mockReset()
 })
 afterEach(async () => { for (const teardown of teardowns.splice(0)) await teardown() })
 
@@ -70,18 +72,40 @@ test('any other getInvitation failure shows the generic not-found state, never t
   expect(screen.queryByTestId('invite-wrong-account')).toBeNull()
 })
 
+test('a non-recipient acceptInvitation refusal (e.g. a full organization) stays generic, with the server detail shown', async () => {
+  mockGetInvitation.mockResolvedValue({
+    data: {
+      id: 'inv1', email: 'me@example.com', role: 'member', expiresAt: new Date('2026-01-01'),
+      organizationId: 'org1', organizationName: 'Acme', organizationSlug: 'acme', inviterEmail: 'owner@example.com',
+    },
+    error: null,
+  })
+  mockAcceptInvitation.mockResolvedValue({ data: null, error: { status: 403, message: 'Organization membership limit reached' } })
+  await setup()
+
+  await waitFor(() => expect(screen.getByTestId('accept-invite')).toBeTruthy())
+  await fireEvent.press(screen.getByTestId('accept-invite'))
+
+  await waitFor(() => expect(screen.getByText('Could not accept the invitation.')).toBeTruthy())
+  expect(screen.getByTestId('invite-accept-detail')).toBeTruthy()
+  expect(screen.getByText('Organization membership limit reached')).toBeTruthy()
+  expect(screen.queryByTestId('invite-wrong-account')).toBeNull()
+})
+
 describe('isNotRecipient', () => {
-  test('true for a 403 status', () => {
-    expect(isNotRecipient({ status: 403 })).toBe(true)
+  test('true for the recipient-mismatch message', () => {
+    expect(isNotRecipient({ status: 403, message: 'You are not the recipient of the invitation' })).toBe(true)
   })
-  test('true when the message mentions "recipient" (case-insensitive), regardless of status', () => {
-    expect(isNotRecipient({ status: 400, message: 'You are not the RECIPIENT of the invitation' })).toBe(true)
+  test('true for the recipient-mismatch error code, regardless of message', () => {
+    expect(isNotRecipient({ code: 'YOU_ARE_NOT_THE_RECIPIENT_OF_THE_INVITATION' })).toBe(true)
   })
-  test('false for an unrelated error', () => {
-    expect(isNotRecipient({ status: 404, message: 'not found' })).toBe(false)
+  test('false for a membership-limit refusal, even though it is also a 403', () => {
+    expect(isNotRecipient({ status: 403, message: 'Organization membership limit reached' })).toBe(false)
+  })
+  test('false for an email-verification refusal, even though it is also a 403', () => {
+    expect(isNotRecipient({ status: 403, message: 'Email verification required before accepting or rejecting invitation' })).toBe(false)
   })
   test('false for no error', () => {
     expect(isNotRecipient(null)).toBe(false)
-    expect(isNotRecipient(undefined)).toBe(false)
   })
 })

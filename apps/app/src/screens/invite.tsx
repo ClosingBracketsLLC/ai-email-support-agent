@@ -17,12 +17,14 @@ import { authClient } from '@/lib/auth-client'
 interface InvitationView { id: string; email: string; role: string | null; expiresAt: Date; organizationId: string; organizationName: string; organizationSlug: string; inviterEmail: string }
 
 /**
- * getInvitation and acceptInvitation both refuse with a 403 ("You are not the recipient of the invitation")
- * when the signed-in session's email doesn't match the invitation's. The server never discloses the invited
- * address to the wrong account, so the app must not either — this identifies that refusal without it.
+ * getInvitation and acceptInvitation both use 403 for several unrelated refusals — a full organization
+ * (ORGANIZATION_MEMBERSHIP_LIMIT_REACHED) or an unverified email, not just a recipient mismatch — so status
+ * alone can't identify it. Only the recipient-mismatch signal itself (better-auth's error code, or "recipient"
+ * in the message) means the signed-in session's email doesn't match the invitation's; the server never
+ * discloses the invited address to the wrong account, so the app must not either.
  */
-export function isNotRecipient(error: { status?: number; message?: string } | null | undefined): boolean {
-  return error?.status === 403 || /recipient/i.test(error?.message ?? '')
+export function isNotRecipient(error: { status?: number; message?: string; code?: string } | null | undefined): boolean {
+  return error?.code === 'YOU_ARE_NOT_THE_RECIPIENT_OF_THE_INVITATION' || /recipient/i.test(error?.message ?? '')
 }
 
 export function InviteScreen() {
@@ -34,13 +36,14 @@ export function InviteScreen() {
     queryKey: ['invitation', id], enabled: Boolean(session && id), retry: false,
     queryFn: async () => {
       const { data, error } = await authClient.organization.getInvitation({ query: { id } })
-      if (error || !data) throw Object.assign(new Error(error?.message ?? 'not found'), { status: error?.status })
+      if (error || !data) throw Object.assign(new Error(error?.message ?? 'not found'), { status: error?.status, code: error?.code })
       return data as unknown as InvitationView
     },
   })
   const [yourName, setYourName] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [errorDetail, setErrorDetail] = useState<string | null>(null)
   const [wrongAccount, setWrongAccount] = useState(false)
 
   async function signOutAndRetry() {
@@ -53,7 +56,7 @@ export function InviteScreen() {
   if (!session) return <Redirect href={{ pathname: '/sign-in', params: { next: `/invite/${id}` } }} />
   if (invitation.isPending) return <Loading />
 
-  const invitationError = invitation.error as { status?: number; message?: string } | null
+  const invitationError = invitation.error as { status?: number; message?: string; code?: string } | null
   if (wrongAccount || isNotRecipient(invitationError)) {
     return (
       <Screen testID="invite-wrong-account">
@@ -68,13 +71,15 @@ export function InviteScreen() {
 
   async function accept() {
     if (busy) return
-    setBusy(true); setError(null)
+    setBusy(true); setError(null); setErrorDetail(null)
     if (!session?.user.name && yourName.trim()) await authClient.updateUser({ name: yourName.trim() })
     const { error } = await authClient.organization.acceptInvitation({ invitationId: id })
     if (error) {
       setBusy(false)
       if (isNotRecipient(error)) { setWrongAccount(true); return }
-      return setError('Could not accept the invitation.')
+      setError('Could not accept the invitation.')
+      setErrorDetail(error.message ?? null)
+      return
     }
     await authClient.organization.setActive({ organizationId: inv.organizationId })
     await refetch(); await queryClient.invalidateQueries()
@@ -87,6 +92,7 @@ export function InviteScreen() {
       <Muted>{inv.inviterEmail} invited you as {inv.role ?? 'member'}. Signed in as {session.user.email}.</Muted>
       {!session.user.name ? <TextField label="Your name" value={yourName} onChangeText={setYourName} autoComplete="name" /> : null}
       {error ? <Banner tone="error">{error}</Banner> : null}
+      {errorDetail ? <Muted testID="invite-accept-detail">{errorDetail}</Muted> : null}
       <Button label="Accept invitation" onPress={accept} loading={busy} testID="accept-invite" />
     </Screen>
   )
