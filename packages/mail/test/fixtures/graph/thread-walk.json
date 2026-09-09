@@ -1,0 +1,11 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v1.0/me/messages",
+    "query": { "$filter": "conversationId eq 'thread-in-1'", "$select": "id" }
+  },
+  "response": {
+    "status": 200,
+    "body": { "value": [{ "id": "msg-in-1" }] }
+  }
+}

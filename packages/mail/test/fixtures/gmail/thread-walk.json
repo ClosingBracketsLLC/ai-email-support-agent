@@ -1,0 +1,11 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/gmail/v1/users/me/threads/thread-a1",
+    "query": { "format": "minimal" }
+  },
+  "response": {
+    "status": 200,
+    "body": { "id": "thread-a1", "messages": [{ "id": "msg-a1", "threadId": "thread-a1" }] }
+  }
+}

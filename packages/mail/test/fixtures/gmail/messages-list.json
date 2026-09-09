@@ -1,0 +1,14 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/gmail/v1/users/me/messages",
+    "query": {
+      "q": "(to:support@acme.test OR cc:support@acme.test OR deliveredto:support@acme.test) newer_than:30d",
+      "includeSpamTrash": "true"
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": { "messages": [{ "id": "msg-a1", "threadId": "thread-a1" }], "resultSizeEstimate": 1 }
+  }
+}
