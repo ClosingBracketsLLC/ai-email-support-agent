@@ -11,6 +11,25 @@ describe('parseAuthResults', () => {
   ])('parseAuthResults(%j).dmarcPass === %s', (raw, want) => {
     expect(parseAuthResults(raw).dmarcPass).toBe(want)
   })
+
+  it('rejects a quoted-local-part forgery that fakes a dmarc=pass clause via an injected ";"', () => {
+    // smtp.mailfrom's quoted local part embeds a ";" that a flat clause-split-on-";" regex would
+    // misread as a real clause boundary, exposing a fake "dmarc=pass"@evil.example" clause. The
+    // real verdict — the last clause that genuinely BEGINS with "dmarc=" — is dmarc=fail.
+    const forged =
+      'mx.google.com; spf=pass (...) smtp.mailfrom="x;dmarc=pass"@evil.example; dmarc=fail (p=NONE)'
+    expect(parseAuthResults(forged).dmarcPass).toBe(false)
+  })
+
+  it('accepts a genuine dmarc=pass clause terminated by the params group', () => {
+    expect(
+      parseAuthResults('mx.google.com; dkim=pass; dmarc=pass (p=NONE) header.from=outlook.com').dmarcPass,
+    ).toBe(true)
+  })
+
+  it('does not treat "dmarc=passing" as a pass (result token must be exactly "pass")', () => {
+    expect(parseAuthResults('mx.google.com; dmarc=passing').dmarcPass).toBe(false)
+  })
 })
 
 describe('detectAutomated', () => {
