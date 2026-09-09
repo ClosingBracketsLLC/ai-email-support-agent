@@ -85,14 +85,13 @@ export async function fetchThroughPinnedDispatcher(url: URL, dispatcher: Dispatc
     }
     const body = Buffer.concat(chunks)
     await dispatcher.close()
-    // undici already decoded any content-encoding, so the upstream encoding/length headers would lie.
+    // undici already decoded any content-encoding, so an upstream content-length would describe the
+    // COMPRESSED wire size, not these decoded bytes — it must never be trusted once we actually have a
+    // body to measure. Only a genuinely bodyless response (HEAD, 204, 304, ...) gets a pass: 0 buffered
+    // bytes there does not mean the origin's declared length was wrong, since no body was ever read.
     const headers = new Headers([...res.headers])
     headers.delete('content-encoding')
-    // A HEAD response (or any origin that already sent content-length) carries a byte count for a body
-    // that was never transmitted — 0 buffered bytes here does not mean the origin's declared length was
-    // wrong, so only fill the header in when the origin left it out.
-    const method = (init.method ?? 'GET').toUpperCase()
-    if (method !== 'HEAD' && !headers.has('content-length')) headers.set('content-length', String(body.byteLength))
+    if (body.byteLength > 0 || !headers.has('content-length')) headers.set('content-length', String(body.byteLength))
     return new Response(body.byteLength === 0 ? null : body, { status: res.status, statusText: res.statusText, headers })
   } catch (err) {
     await dispatcher.destroy()
