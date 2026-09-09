@@ -131,7 +131,7 @@ defines seven build phases; this file records where the build stands against the
   external-setup runbook, and this record. Execution ledger:
   `.superpowers/sdd/2026-09-08-phase-2-mailboxes-ingest-triage/progress.md` (per-task implementer/
   review/fix-round log; authoritative for anything not distilled below). Gate on the branch after
-  this task: typecheck and lint clean across all 13 packages/apps; `pnpm test` green with **807
+  this task: typecheck and lint clean across all 12 packages/apps; `pnpm test` green with **807
   tests** (`@aesa/contracts` 12, `@aesa/core` 30, `@aesa/crypto` 42, `@aesa/agent` 9, `@aesa/llm` 26,
   `@aesa/db` 46, `@aesa/queue` 15, `@aesa/mail` 226, `@aesa/test-kit` 43 [39 run + 4 conditional
   skips], `apps/api` 132, `apps/worker` 122 [including this task's 8-scenario `e2e-phase2.test.ts`],
@@ -146,9 +146,9 @@ defines seven build phases; this file records where the build stands against the
   adapters, credential lease/refresh, rfc2822/address/body/threading ports, the sync walk,
   `MockMailbox`, the send limiter); `@aesa/test-kit` (fixture recorder + conformance suite);
   `@aesa/llm` (chat port, Anthropic adapter, `FakeProvider`); `@aesa/agent` (the triage prompt + one
-  model call); the ten new tables (`oauth_flows`, `mailbox_connections`, `mailbox_credentials`,
+  model call); the eleven new tables (`oauth_flows`, `mailbox_connections`, `mailbox_credentials`,
   `agents`, `categories`, `agent_category_policies`, `tickets`, `messages`, `webhook_events`,
-  `notifications`, plus `gmail_access_requests`); the mailbox connect flow (claim step, address
+  `notifications`, `gmail_access_requests`); the mailbox connect flow (claim step, address
   selection, alias round-trip verification, admin-consent and Gmail early-access branches); worker
   jobs `mailbox.sync`, `mailbox.poll-sweep`, `mailbox.renew-watch`, `mailbox.store-credentials`,
   `mailbox.revoke`, `ticket.triage`, `notify.dispatch`, `notify.digest`; app screens for connect

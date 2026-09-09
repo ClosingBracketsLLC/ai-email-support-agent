@@ -14,7 +14,8 @@
  * (`@aesa/llm`) stands in for the model call `ticket.triage` makes; a recording stub replaces
  * `notify.dispatch`'s `SendPush`. Scenario numbering follows task-23-brief.md's list; scenario 7's
  * api-level half (`claimConnection` cross-user) lives in Task 17's own tests — this file only proves
- * the mailbox.sync side: a connection sync never touches.
+ * the mailbox.sync side: a `pending_claim` connection is invisible to sync's own lease claim, so an
+ * unclaimed account-linking attempt never gets its mail touched at all.
  */
 import { randomBytes } from 'node:crypto'
 import { and, eq } from 'drizzle-orm'
