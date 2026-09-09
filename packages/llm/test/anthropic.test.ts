@@ -71,6 +71,27 @@ describe('createAnthropicProvider', () => {
     expect(inputSchema?.$schema).toBeUndefined()
   })
 
+  it('concatenates multiple SystemBlocks in order, joined with a blank line', async () => {
+    let capturedBody: Record<string, unknown> | undefined
+    const fetchFn = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return jsonResponse(anthropicMessage())
+    }) as unknown as typeof fetch
+
+    const provider = createAnthropicProvider({ apiKey: new Secret('sk-ant-test-key'), fetchFn })
+    await provider.chat(
+      baseRequest({
+        system: [
+          { id: 'first', text: 'First block.', stability: 'static' },
+          { id: 'second', text: 'Second block.', stability: 'agent' },
+          { id: 'third', text: 'Third block.', stability: 'volatile' },
+        ],
+      }),
+    )
+
+    expect(capturedBody?.system).toBe('First block.\n\nSecond block.\n\nThird block.')
+  })
+
   it('parses a valid tool_use response natively', async () => {
     const fetchFn = (async () => jsonResponse(anthropicMessage())) as unknown as typeof fetch
     const provider = createAnthropicProvider({ apiKey: new Secret('sk-ant-test-key'), fetchFn })
@@ -120,9 +141,10 @@ describe('createAnthropicProvider', () => {
     expect(result.parseStrategy).toBe('none')
   })
 
-  it('maps a 429 with a retry-after header to a retryable rate_limit LlmError in milliseconds', async () => {
-    const fetchFn = (async () =>
-      errorResponse('rate_limit_error', 'rate limited', { status: 429, headers: { 'retry-after': '7' } })) as unknown as typeof fetch
+  it('maps a 429 with a retry-after header to a retryable rate_limit LlmError in milliseconds, without the SDK retrying it itself', async () => {
+    const fetchFn = vi.fn(async () =>
+      errorResponse('rate_limit_error', 'rate limited', { status: 429, headers: { 'retry-after': '7' } }),
+    ) as unknown as typeof fetch
     const provider = createAnthropicProvider({ apiKey: new Secret('sk-ant-test-key'), fetchFn })
 
     await expect(provider.chat(baseRequest())).rejects.toMatchObject({
@@ -130,6 +152,10 @@ describe('createAnthropicProvider', () => {
       retryable: true,
       retryAfterMs: 7000,
     })
+    // maxRetries: 0 (client.ts): a 429 is exactly the status the SDK's own default retry policy
+    // would otherwise retry on. One fetch call proves that policy is actually off, not just that
+    // this adapter maps the eventual error correctly.
+    expect(fetchFn).toHaveBeenCalledTimes(1)
   })
 
   it('maps a 401 to a non-retryable auth LlmError', async () => {
@@ -156,11 +182,14 @@ describe('createAnthropicProvider', () => {
     await expect(provider.chat(baseRequest())).rejects.toMatchObject({ code: 'permanent', retryable: false })
   })
 
-  it('maps a 529 (overloaded) to a retryable transient LlmError', async () => {
-    const fetchFn = (async () => errorResponse('overloaded_error', 'overloaded', { status: 529 })) as unknown as typeof fetch
+  it('maps a 529 (overloaded) to a retryable transient LlmError, without the SDK retrying it itself', async () => {
+    const fetchFn = vi.fn(async () => errorResponse('overloaded_error', 'overloaded', { status: 529 })) as unknown as typeof fetch
     const provider = createAnthropicProvider({ apiKey: new Secret('sk-ant-test-key'), fetchFn })
 
     await expect(provider.chat(baseRequest())).rejects.toMatchObject({ code: 'transient', retryable: true })
+    // Same regression guard as the 429 case above: 529/5xx is the other bucket the SDK's default
+    // retry policy would otherwise retry — one fetch call proves maxRetries: 0 is actually wired.
+    expect(fetchFn).toHaveBeenCalledTimes(1)
   })
 
   it('maps a network failure (fetch rejects) to a retryable transient LlmError', async () => {
@@ -203,6 +232,49 @@ describe('createAnthropicProvider', () => {
     } catch (err) {
       const message = (err as LlmError).message
       expect(message).not.toContain('sk-ant-super-secret-token')
+    }
+  })
+
+  it('scrubs a Bearer tail that is not sk-shaped (exercises BEARER_PATTERN, not just the key pattern)', async () => {
+    const fetchFn = (async () =>
+      errorResponse('invalid_request_error', 'rejected header Authorization: Bearer zqx-TOKEN-9981', {
+        status: 400,
+      })) as unknown as typeof fetch
+    const provider = createAnthropicProvider({ apiKey: new Secret('sk-ant-test-key'), fetchFn })
+
+    try {
+      await provider.chat(baseRequest())
+      expect.unreachable('expected the call to reject')
+    } catch (err) {
+      const message = (err as LlmError).message
+      // Not sk-shaped, so API_KEY_PATTERN alone would let this straight through — only
+      // BEARER_PATTERN catches it. Deleting BEARER_PATTERN would make this test fail.
+      expect(message).not.toContain('zqx-TOKEN-9981')
+      expect(message).toContain('Bearer [redacted]')
+    }
+  })
+
+  it('scrubs both an sk- token and a Bearer tail out of a network-level throw (fetch rejects, never reaches the SDK HTTP-error mapper)', async () => {
+    const fetchFn = (async () => {
+      throw new TypeError('fetch failed: Authorization: Bearer sk-ant-supersecret at https://api.anthropic.com/v1/messages')
+    }) as unknown as typeof fetch
+    const provider = createAnthropicProvider({ apiKey: new Secret('sk-ant-test-key'), fetchFn })
+
+    try {
+      await provider.chat(baseRequest())
+      expect.unreachable('expected the call to reject')
+    } catch (err) {
+      expect(err).toBeInstanceOf(LlmError)
+      expect(err).toMatchObject({ code: 'transient', retryable: true })
+      const message = (err as LlmError).message
+      // The SDK collapses a raw fetch throw into APIConnectionError with the fixed message
+      // "Connection error." — the original TypeError (and whatever secret it carried) survives
+      // only on `.cause`. This asserts the adapter actually folds that cause text in (so there is
+      // real content to scrub here, not a vacuously secret-free message) AND scrubs it.
+      expect(message).toContain('fetch failed')
+      expect(message).not.toContain('sk-ant-supersecret')
+      expect(message).not.toContain('Bearer sk-ant-supersecret')
+      expect(message).toContain('[redacted]')
     }
   })
 

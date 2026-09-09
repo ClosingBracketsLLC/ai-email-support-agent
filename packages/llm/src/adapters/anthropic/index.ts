@@ -42,6 +42,21 @@ function parseRetryAfterMs(header: string | null | undefined): number | undefine
 }
 
 /**
+ * The SDK collapses every raw `fetch` failure into `Anthropic.APIConnectionError` with the fixed,
+ * uninformative message "Connection error." — the actual failure (including anything a lower
+ * layer put in ITS message, which could itself embed a secret, e.g. a proxy echoing back the
+ * request line) survives only on `err.cause`. Folding it in here, before scrubbing, is what makes
+ * this adapter's scrub cover a raw network throw and not just the SDK's own HTTP-error messages.
+ */
+function withCauseMessage(err: Error): string {
+  const cause = err.cause
+  if (cause instanceof Error && cause.message && cause.message !== err.message) {
+    return `${err.message}: ${cause.message}`
+  }
+  return err.message
+}
+
+/**
  * Maps every error this call can throw onto the shared `LlmError` taxonomy. Order matters: the
  * SDK's error classes form a hierarchy (`APIUserAbortError` and the 4xx classes all extend
  * `APIError`), so the specific classes are checked before the generic fallbacks.
@@ -64,7 +79,7 @@ function mapError(err: unknown): LlmError {
     return new LlmError(scrubSecrets(err.message || 'aborted'), 'transient', true)
   }
   if (err instanceof Anthropic.InternalServerError || err instanceof Anthropic.APIConnectionError) {
-    return new LlmError(scrubSecrets(err.message), 'transient', true)
+    return new LlmError(scrubSecrets(withCauseMessage(err)), 'transient', true)
   }
   if (err instanceof Anthropic.APIError) {
     return new LlmError(scrubSecrets(err.message), 'permanent', false)
