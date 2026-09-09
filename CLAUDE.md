@@ -21,7 +21,11 @@ brainstorm → spec → `superpowers:writing-plans` → `superpowers:subagent-dr
 implementer per task, task review, fix loop, whole-branch review) →
 `superpowers:finishing-a-development-branch`. The spec already fixes the scope of Phases 1–7, so a
 phase starts at `writing-plans`; brainstorm only when Robert changes the scope. Work on a branch
-off `main`; never push, merge, or open a PR without Robert.
+off `main`. Integration (standing flow, Robert 2026-09-09): a finished phase lands on `main`
+through a GitHub PR merged with a merge commit (never squash/rebase — STATUS.md and the review
+records cite branch SHAs), and the branch is deleted after merge. Opening and merging the PR still
+happens on Robert's go-ahead — never push, merge, or open a PR without him or a standing
+instruction from him in the session.
 
 ## Commands
 

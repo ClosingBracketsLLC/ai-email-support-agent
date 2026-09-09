@@ -30,7 +30,7 @@ defines seven build phases; this file records where the build stands against the
   (a `platform.heartbeat` cron proves the rails instead); the session role is set through libpq
   startup options rather than `SET ROLE`; `minio` is left out of `compose.yaml` until Phase 4.
 
-### Phase 1 — accounts and the app shell (complete on branch `phase-1`; not yet merged)
+### Phase 1 — accounts and the app shell (complete; merged into `main` via PR #1 on 2026-09-09)
 
 - Plan: `docs/superpowers/plans/2026-09-08-phase-1-accounts-and-app-shell.md` (14 tasks, executed
   with subagent-driven development). Commits `ba7bde5..aac485c` on `phase-1`, branched from `main`
@@ -40,9 +40,9 @@ defines seven build phases; this file records where the build stands against the
   `pnpm test` green with 234 tests (`@aesa/contracts` 8, `@aesa/core` 30, `@aesa/crypto` 40,
   `@aesa/db` 33, `@aesa/queue` 14, `apps/api` 60, `apps/worker` 6, `apps/app` 43 across 13 jest
   suites — no database); `db:check` reports no drift; the Expo web export produces 17 static routes
-  (`/privacy` and `/terms` included); the Playwright signup smoke passes. Robert decides how and when
-  `phase-1` lands on `main` (`superpowers:finishing-a-development-branch`) — never push, merge or
-  open a PR without him.
+  (`/privacy` and `/terms` included); the Playwright signup smoke passes. Merged into `main` by
+  merge commit `1a8ccec` (PR #1, Robert's 2026-09-09 instruction); the `phase-1` branch was deleted.
+  All branch SHAs cited here remain reachable from `main`.
 - Review: `docs/superpowers/reviews/2026-09-08-phase-1-final-review.md` — the whole-branch review
   (verdict "with fixes": one Critical, the `/trpc` error surface returning raw messages and stacks;
   five Important: no `/trpc` rate limit, `withPlatform` on the api facade, the untested CSRF guard,
@@ -122,18 +122,19 @@ defines seven build phases; this file records where the build stands against the
     sidebar's `Link asChild` crash and `useGate`'s post-sign-out stranding, both above — which is why
     it is a hard gate rather than a nice-to-have.
 
-### Phase 2 — mailboxes, agents, ingest, triage (complete on branch `phase-2`; not yet merged)
+### Phase 2 — mailboxes, agents, ingest, triage (complete; merged into `main` via PR #2 on 2026-09-09)
 
 - Plan: `docs/superpowers/plans/2026-09-08-phase-2-mailboxes-ingest-triage.md` (23 tasks, executed
-  with subagent-driven development). Commits `f5210cc..345b3b4` on `phase-2`, branched from
-  `phase-1` at `1b0fc34` (Phase 1 still unmerged at branch time — Robert's call): the plan, 23 task
-  commits with their fix rounds, followed by the E2E suite/external-setup runbook/status commit
-  (`abedbc1`), a package-count/docstring fix (`024cf80`), the whole-branch final-review fix wave
-  (`0015a74` — one Critical plan defect plus 4 Important and 1 promoted-minor finding; see the
-  residuals addendum below), and this documentation commit closing it out. Execution ledger:
-  `.superpowers/sdd/2026-09-08-phase-2-mailboxes-ingest-triage/progress.md` (per-task implementer/
-  review/fix-round log; authoritative for anything not distilled below); the fix wave's own report is
-  `.superpowers/sdd/2026-09-08-phase-2-mailboxes-ingest-triage/final-fix-report.md`. Gate on the
+  with subagent-driven development). Commits `f5210cc..48c656c` plus this merge-record commit on
+  `phase-2`, branched from `phase-1` at `1b0fc34` (Phase 1 unmerged at branch time; both phases
+  merged 2026-09-09 on Robert's instruction): the plan, 23 task commits with their fix rounds, the
+  E2E suite/external-setup runbook/status commit (`abedbc1`), a package-count/docstring fix
+  (`024cf80`), the whole-branch final-review fix wave (`0015a74` — one Critical plan defect plus 4
+  Important and 1 promoted-minor finding; see the residuals addendum below) with its docs commit
+  (`e00a339`), and the review-record commit (`48c656c`). The per-task execution ledger and fix-wave
+  report were ephemeral SDD workspace artifacts, deleted after the review record was committed (per
+  `superpowers:subagent-driven-development`); the review record and git history are the durable
+  account, and everything load-bearing from the ledger is distilled below. Gate on the
   branch after the fix wave: typecheck and lint clean across all 12 packages/apps; `pnpm test` green
   with **816 tests** (`@aesa/contracts` 12, `@aesa/core` 30, `@aesa/crypto` 42, `@aesa/agent` 9,
   `@aesa/llm` 26, `@aesa/db` 46, `@aesa/queue` 15, `@aesa/mail` 227, `@aesa/test-kit` 43 [39 run + 4
@@ -141,13 +142,14 @@ defines seven build phases; this file records where the build stands against the
   `e2e-phase2.test.ts`], `apps/app` 107 jest — no database); `db:check` reports no drift; the Expo
   web export produces 21 static routes; the Playwright signup smoke passes (ends at the gated
   mailbox step, per Task 20's ruling below — the spec does not mark that step skippable
-  providerless). Robert decides how and when `phase-2` lands on `main`.
-- Review: `docs/superpowers/reviews/2026-09-09-phase-2-final-review.md` — record still to be
-  committed (per `superpowers:subagent-driven-development`, the review record is written
-  separately from its own fix wave). Its findings — one Critical plan defect (C1) and four
-  Important (I2–I5) plus one promoted minor — are already resolved by this fix wave (`0015a74`);
-  see the residuals addendum below and the fix report at
-  `.superpowers/sdd/2026-09-08-phase-2-mailboxes-ingest-triage/final-fix-report.md`.
+  providerless). Merged into `main` by merge commit for PR #2 (Robert's 2026-09-09 instruction,
+  immediately after PR #1); the `phase-2` branch was deleted. Standing rule from that instruction:
+  **every phase branch lands on `main` through a GitHub PR with a merge commit** (SHAs stay
+  reachable), from here on.
+- Review: `docs/superpowers/reviews/2026-09-09-phase-2-final-review.md` (committed at `48c656c`) —
+  the whole-branch verdict ("with fixes"), the fix wave that resolved its findings — one Critical
+  plan defect (C1) and four Important (I2–I5) plus one promoted minor, all fixed in `0015a74` and
+  verified by a scoped re-review — the deferred-minors triage, and the Phase 3 carries.
 - What exists now: `@aesa/mail` (the provider-agnostic mailbox port — Gmail + Microsoft Graph
   adapters, credential lease/refresh, rfc2822/address/body/threading ports, the sync walk,
   `MockMailbox`, the send limiter); `@aesa/test-kit` (fixture recorder + conformance suite);
@@ -264,19 +266,22 @@ defines seven build phases; this file records where the build stands against the
   recover — now reverted to `reauth_required` on a reconnect or deleted outright on a fresh connect,
   with the flow marked failed either way). One promoted minor also landed:
   `mailboxes.addAddress`'s uncaught `agents` unique-violation now surfaces as `CONFLICT` instead of a
-  raw 500 (`isUniqueViolation` moved to a shared `apps/api/src/pg-error.ts`). Full detail and the
-  gate numbers this wave re-ran: `.superpowers/sdd/2026-09-08-phase-2-mailboxes-ingest-triage/
-  final-fix-report.md`. The review's own remaining findings — not must-fix for this wave — are
+  raw 500 (`isUniqueViolation` moved to a shared `apps/api/src/pg-error.ts`). Full detail lives in
+  the fix-wave commits themselves (`0015a74`, `e00a339`) and the review record (the ephemeral
+  fix-wave report was deleted with the SDD workspace). The review's own remaining findings — not
+  must-fix for this wave — are
   carried into Phase 3 below (DMARC first-match re-exam, claim-time notification email,
   `push_subscription_id` index, `use-gate` `setActive` regression test, malformed-cursor degraded
   marking).
 
 ## Next: Phase 3 — draft, review, send
 
-**Where to start.** Start with `superpowers:writing-plans` against the spec's *Build phases → Phase
-3* section, once Robert has decided how `phase-2` lands (never merge or push without him — see
-`superpowers:finishing-a-development-branch`). Run the local setup from `CLAUDE.md` and confirm the
-816-test baseline above before writing the plan.
+**Where to start.** Phases 1 and 2 are merged; `main` is the base. Check out `main`, pull, and
+branch `phase-3` off it. Start with `superpowers:writing-plans` against the spec's *Build phases →
+Phase 3* section. Run the local setup from `CLAUDE.md` and confirm the 816-test baseline above
+before writing the plan. When the phase is done, it lands on `main` through a GitHub PR with a
+merge commit (the standing flow from Robert's 2026-09-09 instruction) — opening and merging the PR
+still happens on his go-ahead per phase, or per any standing instruction he gives in that session.
 
 Rulings the Phase 3 planner needs, carried from this phase's execution:
 
