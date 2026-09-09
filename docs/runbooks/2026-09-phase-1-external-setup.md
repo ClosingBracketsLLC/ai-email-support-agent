@@ -7,8 +7,17 @@ api's public origin (e.g. `https://api.<product>.com`), `APP_WEB_ORIGIN` the web
 
 - `BETTER_AUTH_SECRET`: `openssl rand -base64 48`.
 - `APP_BASE_URL`, `APP_WEB_ORIGIN`, `EMAIL_TRANSPORT=resend`, `RESEND_API_KEY`, `MAIL_FROM` (see §4), `NODE_ENV=production`.
-- Add extra web origins (staging) to `AUTH_TRUSTED_ORIGINS` (comma-separated). If the web app and the api are
-  on different registrable domains, set `AUTH_CROSS_SITE_COOKIES=true` (cookies become `SameSite=None; Secure`).
+- Add extra web origins (staging) to `AUTH_TRUSTED_ORIGINS` (comma-separated). Every `http(s)` entry there is a
+  real web origin, not only a Better Auth trusted one: CORS and the `/trpc` CSRF guard accept it too, so a
+  documented staging web origin actually works end to end. If the web app and the api are on different
+  registrable domains, set `AUTH_CROSS_SITE_COOKIES=true` (cookies become `SameSite=None; Secure`).
+- `TRUST_PROXY`: prefer the CIDR/IP list of the proxy that sits directly in front of the api (e.g.
+  `10.0.0.0/8` for a VPC load balancer) over the bare `true`. Better Auth's `getIPFromHeader` returns null
+  for a multi-value `x-forwarded-for` when `trustedProxies` is unset, so an *appending* proxy (most load
+  balancers) would otherwise collapse every client into its rate limiter's single fallback bucket. Use
+  `TRUST_PROXY=true` only behind a proxy that *replaces* the header rather than appending to it.
+  `AUTH_RATE_LIMIT=on` (the default) requires one of these to be set in production — `loadConfig` refuses to
+  start otherwise.
 
 ## 2. Google sign-in (consent screen + brand verification)
 
