@@ -124,6 +124,15 @@ defines seven build phases; this file records where the build stands against the
 
 ## Next: Phase 2 — mailboxes, agents, ingest, triage
 
+**Where to start.** Branch `phase-1` is pushed to `origin` and ends at the commit that added this
+paragraph; it is Robert's call whether it merges into `main` locally or through a pull request. At the
+start of the next session run `git fetch origin && git log --oneline origin/main | grep -c "Phase 1 final review record"`:
+if it prints `1`, Phase 1 has landed — check out `main`, pull, and branch `phase-2` off it; if it
+prints `0`, Phase 1 is still unmerged — stop and ask Robert whether to merge first or to branch
+`phase-2` off `origin/phase-1`. Never merge or push on your own. Then run the local setup below
+before touching code: `pnpm install`, `pnpm db:up`, the `migrate` command from `CLAUDE.md`, and
+`pnpm typecheck && pnpm lint && pnpm test && pnpm db:check` to confirm the baseline (234 tests).
+
 Start with `superpowers:writing-plans` against the spec's *Build phases → Phase 2* section. Scope
 from the spec: `packages/mail` (port, Gmail + Microsoft Graph adapters, credentials with lease
 refresh, rfc2822/address/body/threading ports, sync, mock, limiter), `packages/test-kit`
