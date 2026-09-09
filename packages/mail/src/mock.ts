@@ -16,6 +16,9 @@
  *    and `sendReply`'s capture shape (gmail routes through the real `buildReplyRaw` for byte-exact
  *    header validation; graph models only the two-phase send's OBSERVABLE result — a SENT message
  *    carrying the marker).
+ * 2b. **Body scrubbing is shared with the adapters.** A `format: 'full'` fetch runs the stored body
+ *    through `scrubCardNumbers`, exactly as `normalizeGmailMessage`/`normalizeGraphMessage` do, so
+ *    no caller can observe through the mock a card number the real clients would have masked.
  * 3. **No labels API.** This port never mutates a real mailbox (no `modifyMessage`/`createLabel`
  *    equivalent), so there is only one 404 shape here (`MessageGoneError` from `getMessage`), not the
  *    reference's two. Spam is modeled by passing `labelIds: ['JUNK']` to `receiveInbound`, not by a
@@ -24,6 +27,7 @@
 import { MailApiError, CursorExpiredError, MessageGoneError } from './errors.ts'
 import { parseAddrSpecs, parseFirstAddrSpec } from './address.ts'
 import { buildReplyRaw } from './rfc2822.ts'
+import { scrubCardNumbers } from './scrub.ts'
 import { tokenizeReferences } from './threading.ts'
 import { MARKER_HEADER, type MailboxClient, type NormalizedMessage } from './types.ts'
 
@@ -53,6 +57,11 @@ export interface ReceiveInboundInput {
   inReplyTo?: string
   references?: string
   attachments?: { filename: string; mime: string; size: number }[]
+  /** Automated-mail headers, surfaced on both fetch formats exactly as both real adapters surface
+   * them (they are on the metadata header list). Default null — ordinary human mail. */
+  autoSubmitted?: string
+  precedence?: string
+  listId?: string
 }
 
 export interface MockMailbox extends MailboxClient {
@@ -105,6 +114,9 @@ interface StoredMessage {
   inReplyTo: string | null
   references: string | null
   authenticationResults: string | null
+  autoSubmitted: string | null
+  precedence: string | null
+  listId: string | null
   /** Value of `X-Aesa-Draft` when this message was produced by `sendReply` with that extra header;
    * null for inbound mail, owner hand-sends via `receiveOutbound`, and unmarked replies. */
   markerDraftId: string | null
@@ -216,6 +228,9 @@ export function createMockMailbox(opts: MockMailboxOptions): MockMailbox {
     inReplyTo?: string | null
     references?: string | null
     authenticationResults?: string | null
+    autoSubmitted?: string | null
+    precedence?: string | null
+    listId?: string | null
     markerDraftId?: string | null
     attachments?: { filename: string; mime: string; size: number }[]
   }): StoredMessage {
@@ -235,6 +250,9 @@ export function createMockMailbox(opts: MockMailboxOptions): MockMailbox {
       inReplyTo: input.inReplyTo ?? null,
       references: input.references ?? null,
       authenticationResults: input.authenticationResults ?? null,
+      autoSubmitted: input.autoSubmitted ?? null,
+      precedence: input.precedence ?? null,
+      listId: input.listId ?? null,
       markerDraftId: input.markerDraftId ?? null,
       attachments: (input.attachments ?? []).map((a) => ({ ...a })),
       gone: false,
@@ -256,15 +274,16 @@ export function createMockMailbox(opts: MockMailboxOptions): MockMailbox {
       inReplyTo: msg.inReplyTo,
       references: tokenizeReferences(msg.references),
       authenticationResults: msg.authenticationResults,
-      // Not modeled: ReceiveInboundInput carries no automated-mail signals (see brief's exact
-      // shape) — a mock that needs Auto-Submitted/Precedence/List-Id belongs to a later task that
-      // extends this input, not a silent guess here.
-      autoSubmitted: null,
-      precedence: null,
-      listId: null,
+      autoSubmitted: msg.autoSubmitted,
+      precedence: msg.precedence,
+      listId: msg.listId,
       internalDate: msg.internalDate,
       labelIds: [...msg.labelIds],
-      bodyText: format === 'metadata' ? null : msg.bodyText,
+      // Card scrubbing happens in BOTH real adapters' `normalize*Message` (they are the only place
+      // a body is ever materialized), so it happens here too: a caller must never be able to see a
+      // card number through the mock that it could not see through Gmail or Graph. Metadata fetches
+      // carry no body at all, so there is nothing to scrub on that path.
+      bodyText: format === 'metadata' || msg.bodyText === null ? null : scrubCardNumbers(msg.bodyText),
       hasAttachments: msg.attachments.length > 0,
       attachments: msg.attachments.map((a) => ({ ...a })),
       markerDraftId: msg.markerDraftId,
@@ -472,6 +491,9 @@ export function createMockMailbox(opts: MockMailboxOptions): MockMailbox {
         inReplyTo: m.inReplyTo ?? null,
         references: m.references ?? null,
         authenticationResults: m.authenticationResults ?? DEFAULT_AUTH_RESULTS,
+        autoSubmitted: m.autoSubmitted ?? null,
+        precedence: m.precedence ?? null,
+        listId: m.listId ?? null,
         attachments: m.attachments,
       })
       pushHistory([{ id: msg.id, threadId: msg.threadId }])
