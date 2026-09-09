@@ -220,6 +220,12 @@ importers:
 
   apps/worker:
     dependencies:
+      '@aesa/agent':
+        specifier: workspace:*
+        version: link:../../packages/agent
+      '@aesa/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
       '@aesa/core':
         specifier: workspace:*
         version: link:../../packages/core
@@ -229,6 +235,9 @@ importers:
       '@aesa/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@aesa/llm':
+        specifier: workspace:*
+        version: link:../../packages/llm
       '@aesa/queue':
         specifier: workspace:*
         version: link:../../packages/queue
@@ -257,6 +266,31 @@ importers:
       drizzle-orm:
         specifier: ^0.44.0
         version: 0.44.7(@types/pg@8.23.1)(kysely@0.29.5)(pg@8.23.0)
+      typescript:
+        specifier: ^5.9.2
+        version: 5.9.3
+      vitest:
+        specifier: ^3.2.0
+        version: 3.2.7(@types/node@22.20.1)(jsdom@20.0.3)(lightningcss@1.33.0)(terser@5.51.2)(tsx@4.23.13)(yaml@2.9.0)
+
+  packages/agent:
+    dependencies:
+      '@aesa/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+      '@aesa/llm':
+        specifier: workspace:*
+        version: link:../llm
+      zod:
+        specifier: ^4.0.0
+        version: 4.5.4
+    devDependencies:
+      '@types/node':
+        specifier: ^22
+        version: 22.20.1
+      tsx:
+        specifier: ^4.20.0
+        version: 4.23.13
       typescript:
         specifier: ^5.9.2
         version: 5.9.3

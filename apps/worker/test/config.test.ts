@@ -15,4 +15,16 @@ describe('worker config', () => {
     expect(config.kekRing?.active).toBe(1)
     expect(config.kekRing?.keys.get(1)?.length).toBe(32)
   })
+
+  it('reports no ANTHROPIC_API_KEY when unset, so boot never crashes on it alone', () => {
+    const config = loadConfig({ DATABASE_URL })
+    expect(config.anthropicApiKey).toBeNull()
+  })
+
+  it('wraps a present ANTHROPIC_API_KEY in a Secret that never leaks the raw value', () => {
+    const config = loadConfig({ DATABASE_URL, ANTHROPIC_API_KEY: 'sk-ant-test-key' })
+    expect(config.anthropicApiKey).not.toBeNull()
+    expect(config.anthropicApiKey?.expose()).toBe('sk-ant-test-key')
+    expect(String(config.anthropicApiKey)).toBe('[redacted]')
+  })
 })
