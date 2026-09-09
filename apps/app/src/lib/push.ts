@@ -1,6 +1,6 @@
 import Constants from 'expo-constants'
 import * as Device from 'expo-device'
-import type * as ExpoNotifications from 'expo-notifications'
+import * as Notifications from 'expo-notifications'
 import { Platform } from 'react-native'
 
 export type PushResult =
@@ -13,12 +13,6 @@ export type PushResult =
 export async function registerForPush({ ask }: { ask: boolean }): Promise<PushResult> {
   if (Platform.OS !== 'ios' && Platform.OS !== 'android') return { kind: 'unsupported' }
   if (!Device.isDevice) return { kind: 'unsupported' }
-  // Required lazily, not as a static top-level import: Babel hoists every import's require() above the whole
-  // module body, including a test file's own `const mockNotifications = {...}` that a jest.mock() factory
-  // closes over — so a top-level `import * as Notifications` would run before that const is assigned and
-  // permanently cache an empty mock. Reading it here, at call time, sees the fully-populated mock.
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const Notifications: typeof ExpoNotifications = require('expo-notifications')
   if (Platform.OS === 'android') {
     await Notifications.setNotificationChannelAsync('default', { name: 'Review needed', importance: Notifications.AndroidImportance.HIGH })
   }

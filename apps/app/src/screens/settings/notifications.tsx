@@ -19,14 +19,24 @@ export function NotificationsScreen() {
   const unregister = useMutation(trpc.devices.unregister.mutationOptions({ onSuccess: refresh }))
   const [state, setState] = useState<PushResult | null>(null)
   const [token, setToken] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
 
-  useEffect(() => { registerForPush({ ask: false }).then((r) => { setState(r); if (r.kind === 'ok') setToken(r.expoPushToken) }) }, [])
+  useEffect(() => {
+    registerForPush({ ask: false }).then((r) => { setState(r); if (r.kind === 'ok') setToken(r.expoPushToken) }).catch(() => setState(null))
+  }, [])
 
   async function enable() {
-    if (register.isPending) return
-    const r = await registerForPush({ ask: true })
-    setState(r)
-    if (r.kind === 'ok') { setToken(r.expoPushToken); register.mutate({ expoPushToken: r.expoPushToken, platform: r.platform, ...(r.deviceName ? { deviceName: r.deviceName } : {}) }) }
+    if (busy || register.isPending) return
+    setBusy(true)
+    try {
+      const r = await registerForPush({ ask: true })
+      setState(r)
+      if (r.kind === 'ok') { setToken(r.expoPushToken); register.mutate({ expoPushToken: r.expoPushToken, platform: r.platform, ...(r.deviceName ? { deviceName: r.deviceName } : {}) }) }
+    } catch {
+      setState(null)
+    } finally {
+      setBusy(false)
+    }
   }
 
   function stopNotifications() {
@@ -43,7 +53,7 @@ export function NotificationsScreen() {
           : state?.kind === 'no-project' ? <Body>This build is not linked to an EAS project yet, so push tokens cannot be issued.</Body>
           : state?.kind === 'unsupported' ? <Body>Push needs a development build on a real device.</Body>
           : <Body>Get a push when a draft is ready to review — never for routine sends.</Body>}
-        {Platform.OS !== 'web' && state?.kind !== 'ok' && state?.kind !== 'unsupported' ? <Button label="Enable push notifications" onPress={enable} loading={register.isPending} testID="enable-push" /> : null}
+        {Platform.OS !== 'web' && state?.kind !== 'ok' && state?.kind !== 'unsupported' ? <Button label="Enable push notifications" onPress={enable} loading={busy || register.isPending} testID="enable-push" /> : null}
         {state?.kind === 'ok' && token ? <Button variant="secondary" label="Stop notifications on this device" onPress={stopNotifications} loading={unregister.isPending} /> : null}
       </Card>
       {devices.data?.length ? <Heading>Registered devices</Heading> : null}
