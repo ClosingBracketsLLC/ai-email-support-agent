@@ -7,7 +7,7 @@ export default defineConfig({
   testDir: './e2e',
   timeout: 90_000,
   retries: process.env.CI ? 1 : 0,
-  reporter: process.env.CI ? 'github' : 'list',
+  reporter: process.env.CI ? [['github'], ['html', { open: 'never' }]] : 'list',
   use: { baseURL: WEB, trace: 'retain-on-failure', viewport: { width: 1280, height: 900 } },
   webServer: [
     {
