@@ -1,14 +1,14 @@
-import { render, screen } from '@testing-library/react-native'
-import type { ReactNode } from 'react'
+import { fireEvent, render, screen } from '@testing-library/react-native'
 import { ResponsiveShell } from './responsive-shell'
 
 let mockMounts = 0
 let mockUnmounts = 0
 let mockDims = { width: 400, height: 800, scale: 1, fontScale: 1 }
+const mockPush = jest.fn()
 
 jest.mock('expo-router', () => ({
-  Link: ({ children }: { children: ReactNode }) => children,
   usePathname: () => '/inbox',
+  useRouter: () => ({ push: mockPush }),
 }))
 
 jest.mock('expo-router/js-tabs', () => {
@@ -40,6 +40,7 @@ beforeEach(() => {
   mockMounts = 0
   mockUnmounts = 0
   mockDims = { width: 400, height: 800, scale: 1, fontScale: 1 }
+  mockPush.mockClear()
 })
 
 test('the Tabs navigator survives crossing the wide breakpoint — one instance throughout', async () => {
@@ -59,4 +60,13 @@ test('the Tabs navigator survives crossing the wide breakpoint — one instance 
   expect(mockMounts).toBe(1)
   expect(mockUnmounts).toBe(0)
   expect(screen.queryByTestId('nav-inbox')).toBeNull()
+})
+
+test('while wide, pressing a sidebar item navigates with router.push (Link asChild crashed on web)', async () => {
+  mockDims = { width: 1200, height: 800, scale: 1, fontScale: 1 }
+  await render(<ResponsiveShell />)
+
+  fireEvent.press(screen.getByTestId('nav-settings'))
+
+  expect(mockPush).toHaveBeenCalledWith('/settings')
 })

@@ -163,6 +163,25 @@ describe('useGate — the workspace lookup', () => {
     await act(() => { asError(result.current).retry() })
     await waitFor(() => expect(attempts).toBe(2))
   })
+
+  it('ignores a workspace error left over from before sign-out — the gate still sends a signed-out user to sign-in', async () => {
+    // A workspace.get in flight when the user signs out can resolve (401) after the session is already
+    // gone: react-query freezes that error on the now-disabled query rather than clearing it. Reproduce
+    // that by letting the error land while signed in, then flipping the session to signed-out underneath it.
+    mockUseSession.mockReturnValue({ data: { session: { activeOrganizationId: 'o1' } }, isPending: false, error: null, refetch: jest.fn() })
+    mockUseListOrganizations.mockReturnValue({ data: [], isPending: false })
+    mockWorkspaceQueryFn = () => Promise.reject({ data: { code: 'UNAUTHORIZED' } })
+
+    const { result, rerender } = await setupGate()
+
+    await waitFor(() => asError(result.current))
+
+    mockUseSession.mockReturnValue({ data: null, isPending: false, error: null, refetch: jest.fn() })
+    mockUseListOrganizations.mockReturnValue({ data: undefined, isPending: false })
+    await rerender(undefined)
+
+    await waitFor(() => expect(result.current.kind).toBe('sign-in'))
+  })
 })
 
 describe('useGate — a broken session lookup', () => {

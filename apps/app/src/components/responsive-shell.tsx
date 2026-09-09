@@ -1,5 +1,5 @@
 import Ionicons from '@expo/vector-icons/Ionicons'
-import { Link, usePathname } from 'expo-router'
+import { useRouter, usePathname } from 'expo-router'
 import { Tabs } from 'expo-router/js-tabs'
 import { Pressable, StyleSheet, Text, View, useWindowDimensions } from 'react-native'
 import { WIDE_BREAKPOINT, radius, spacing, typeScale, useColors } from '@/theme'
@@ -45,19 +45,19 @@ export function ResponsiveShell() {
 
 function Sidebar({ pathname }: { pathname: string }) {
   const c = useColors()
+  const router = useRouter()
   return (
     <View style={[styles.sidebar, { borderRightColor: c.border, backgroundColor: c.surface }]} accessibilityRole="menu">
       <Text style={[typeScale.heading, styles.brand, { color: c.text }]}>aesa</Text>
       {TABS.map((t) => {
         const active = pathname === t.href || pathname.startsWith(`${t.href}/`)
         return (
-          <Link key={t.name} href={t.href} asChild>
-            {/* asChild hands onPress to the child, so it must be pressable — a View would swallow the navigation */}
-            <Pressable accessibilityRole="menuitem" testID={`nav-${t.name}`} style={[styles.item, active && { backgroundColor: c.info }]}>
-              <Ionicons name={active ? t.iconActive : t.icon} size={20} color={active ? c.primary : c.muted} />
-              <Text style={[typeScale.body, { color: active ? c.primary : c.text }]}>{t.title}</Text>
-            </Pressable>
-          </Link>
+          // expo-router's `Link asChild` wrapping `Pressable` crashes on web ("Failed to set an indexed
+          // property [0] on 'CSSStyleDeclaration'") the first time it mounts — router.push avoids it.
+          <Pressable key={t.name} accessibilityRole="menuitem" testID={`nav-${t.name}`} onPress={() => router.push(t.href)} style={[styles.item, active && { backgroundColor: c.info }]}>
+            <Ionicons name={active ? t.iconActive : t.icon} size={20} color={active ? c.primary : c.muted} />
+            <Text style={[typeScale.body, { color: active ? c.primary : c.text }]}>{t.title}</Text>
+          </Pressable>
         )
       })}
     </View>

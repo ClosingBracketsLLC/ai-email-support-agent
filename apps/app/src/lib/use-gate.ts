@@ -63,7 +63,11 @@ export function useGate(): GateTarget {
   if (activateError && target.kind === 'activate' && target.orgId === activateError.orgId) {
     return { kind: 'error', message: activateError.message, retry: retryActivate }
   }
-  if (workspace.error && classifyWorkspaceError(workspace.error) === 'error') {
+  // Guarded the same way `workspace` is fed into resolveGate's input above: a workspace.get request in
+  // flight when the user signs out can resolve (401) after the session is already gone, leaving a stale
+  // error on a now-disabled query — react-query freezes it there rather than clearing it. Without this
+  // guard that stale error would override an already-correct sign-in target.
+  if (session && active && workspace.error && classifyWorkspaceError(workspace.error) === 'error') {
     return { kind: 'error', message: 'Could not load your workspace.', retry: () => void workspace.refetch() }
   }
   return target
