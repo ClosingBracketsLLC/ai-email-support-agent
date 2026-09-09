@@ -87,4 +87,11 @@ export const invitation = pgTable('invitation', {
 
 /** What `drizzleAdapter(db, { provider: 'pg', schema: authSchema })` receives — keys are Better Auth model names. */
 export const authSchema = { user, session, account, verification, organization, member, invitation } as const
+/**
+ * Feeds `RLS_EXEMPT` in `packages/db/test/rls.test.ts`: appending a table name here removes it from that
+ * test's RLS invariant (row-level security enabled+forced, the two `tenantPolicies()` policies) with no
+ * other signal that it happened. `member` and `invitation` are org-scoped data with no RLS net of their own —
+ * they must only ever be reached through Better Auth's own API (never a raw query), which is what actually
+ * enforces the org boundary for them (Phase 1 review, minor 12).
+ */
 export const AUTH_TABLES = ['user', 'session', 'account', 'verification', 'organization', 'member', 'invitation'] as const

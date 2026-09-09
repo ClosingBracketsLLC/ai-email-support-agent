@@ -178,19 +178,21 @@ Fix each in the first Phase 2 task that touches the file, or record why it moves
   before someone copies it into a deploy config); better-auth 1.7.3 declares a peer of
   `drizzle-orm ^0.45.2` against the workspace's pinned `^0.44.0` (pnpm warns only) — bump both
   together in a dedicated task since drizzle snapshots may shift; `AUTH_TRUSTED_ORIGINS` entries
-  aren't validated as http(s)/scheme URLs; Better Auth's in-memory rate limiter is per replica —
-  move to `rateLimit.storage: 'database'` or secondary storage before the api scales past one
-  instance; the error handler's `err.headers` copy only handles the plain-object `HeadersInit`
-  shape, not a real `Headers` instance; no test posts an empty or malformed JSON body to the auth
-  route, and the custom content-type parser also drops Fastify's `FST_ERR_CTP_INVALID_JSON` code on
-  malformed JSON (the manually thrown `Error` carries no `.code`); the team self-removal guard and
-  the admin/member role restriction have no tests; `devices.register` cannot clear a previously set
-  `deviceName` (an empty string is treated as omitted); the `export type { ServerDeps }` re-export
-  in `server.ts` has no consumer; the `ServerDeps` facade is a convention, not an enforcement —
-  Better Auth's own adapter (`auth.$context`/`auth.options.database`) still closes over the raw
-  `Db` handle; `createOrganizationWithFreshSlug`'s `throw` after the slug-retry loop is unreachable
-  (the 5th collision rethrows inside the `catch`); `auth.test.ts`'s console spies are restored
-  outside a `try`/`finally`.
+  aren't validated as http(s)/scheme URLs; Better Auth's in-memory rate limiter, the api's own
+  global `@fastify/rate-limit` (`config.rateLimit`/`API_RATE_LIMIT_PER_MINUTE`) and `team.invite`'s
+  per-org throttle are all in-memory and therefore per replica — move to shared/database storage
+  before the api scales past one instance; the error handler's `err.headers` copy only handles the
+  plain-object `HeadersInit` shape, not a real `Headers` instance; no test posts an empty or
+  malformed JSON body to the auth route, and the custom content-type parser also drops Fastify's
+  `FST_ERR_CTP_INVALID_JSON` code on malformed JSON (the manually thrown `Error` carries no
+  `.code`); `devices.register` cannot clear a previously set `deviceName` (an empty string is
+  treated as omitted); the `export type { ServerDeps }` re-export in `server.ts` has no consumer;
+  the `ServerDeps` facade (now `withOrg` only — Phase 1 final review, Important 3) is a convention,
+  not an enforcement — Better Auth's own adapter (`auth.$context`/`auth.options.database`) still
+  closes over the raw `Db` handle; hitting `organizationLimit` (a 6th workspace) surfaces to the
+  client as a masked generic 500 rather than a friendly error, since Better Auth's raw `APIError`
+  from `createOrganization` isn't translated to a specific `TRPCError` code; `auth.test.ts`'s
+  console spies are restored outside a `try`/`finally`.
 - `apps/app`: `team.remove` does not clear the removed user's `activeOrganizationId` in an open
   session on another device (the gate handles it as FORBIDDEN → create-workspace; a friendlier
   "you were removed" state is UX polish); the app still ships placeholder art; `ListRow`'s
