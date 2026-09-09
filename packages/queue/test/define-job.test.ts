@@ -4,7 +4,7 @@ import { z } from 'zod'
 import { JOB_SIGNAL_MARGIN_SECONDS } from '@aesa/core'
 import { defineJob, registerJob } from '../src/define-job.ts'
 import { enqueue } from '../src/enqueue.ts'
-import { deleteAllJobs, startTestBoss, uniqueName } from './helpers/boss.ts'
+import { deleteAllJobs, queryJobs, startTestBoss, uniqueName } from './helpers/boss.ts'
 
 describe('defineJob / enqueue', () => {
   it('refuses a schema without orgId at definition time', () => {
@@ -53,6 +53,34 @@ describe('defineJob / enqueue', () => {
         expect(seen.aborted).toBe(true)                                     // not the 8 s fallback
         expect(seen.elapsedMs).toBeGreaterThan((expireInSeconds - JOB_SIGNAL_MARGIN_SECONDS) * 1000 - 500)
         expect(seen.elapsedMs).toBeLessThan((expireInSeconds - JOB_SIGNAL_MARGIN_SECONDS) * 1000 + 1500)
+      } finally {
+        await deleteAllJobs(name)
+        await boss.deleteQueue(name)
+      }
+    }, 20_000)
+
+    it('fails a zod-invalid payload permanently instead of retrying it', async () => {
+      // boss.fail() is not an option here: pg-boss's fail SQL re-inserts a job with retry_count < retry_limit
+      // as 'retry', so a fresh job (retryLimit: 3) would be retried — and fail identically — up to 3 times
+      // before finally reaching 'failed'. registerJob instead deletes the job outright on the first sight of
+      // an invalid payload, so this asserts deletion (no row left, handler never invoked), not a 'failed' row.
+      const name = uniqueName('invalid')
+      const calls: unknown[] = []
+      const def = defineJob({
+        name,
+        schema: z.object({ orgId: z.uuid(), n: z.number() }),
+        queue: { expireInSeconds: 60, retryLimit: 3 },
+        handler: async ({ data }) => { calls.push(data) },
+      })
+      try {
+        await registerJob(boss, def, { pollingIntervalSeconds: 0.5 })
+        // bypass enqueue()'s validation: send a raw, schema-violating payload
+        await boss.send(name, { orgId: 'not-a-uuid', n: 'NaN' })
+        await vi.waitFor(async () => {
+          const rows = await queryJobs(name)
+          expect(rows).toHaveLength(0)
+        })
+        expect(calls).toHaveLength(0)
       } finally {
         await deleteAllJobs(name)
         await boss.deleteQueue(name)

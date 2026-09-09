@@ -88,7 +88,11 @@ export async function fetchThroughPinnedDispatcher(url: URL, dispatcher: Dispatc
     // undici already decoded any content-encoding, so the upstream encoding/length headers would lie.
     const headers = new Headers([...res.headers])
     headers.delete('content-encoding')
-    headers.set('content-length', String(body.byteLength))
+    // A HEAD response (or any origin that already sent content-length) carries a byte count for a body
+    // that was never transmitted — 0 buffered bytes here does not mean the origin's declared length was
+    // wrong, so only fill the header in when the origin left it out.
+    const method = (init.method ?? 'GET').toUpperCase()
+    if (method !== 'HEAD' && !headers.has('content-length')) headers.set('content-length', String(body.byteLength))
     return new Response(body.byteLength === 0 ? null : body, { status: res.status, statusText: res.statusText, headers })
   } catch (err) {
     await dispatcher.destroy()

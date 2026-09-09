@@ -63,6 +63,9 @@ describe('pinnedFetch transport (real sockets)', () => {
       if (req.url === '/small') return void res.writeHead(200, { 'content-type': 'text/plain' }).end('hello')
       if (req.url === '/large') return void res.writeHead(200, { 'content-type': 'application/octet-stream' }).end(Buffer.alloc(LARGE, 0x61))
       if (req.url === '/redirect') return void res.writeHead(302, { location: 'https://elsewhere.example/' }).end('go away')
+      // a HEAD response: the origin declares content-length: 42 (what a GET's body would be) but node
+      // sends no body bytes for a HEAD request, whatever is passed to end() — an empty wire body.
+      if (req.url === '/head') return void res.writeHead(200, { 'content-length': '42' }).end()
       res.writeHead(404).end()
     })
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
@@ -94,5 +97,11 @@ describe('pinnedFetch transport (real sockets)', () => {
 
   it('rejects a body over maxBodyBytes with code body_too_large', async () => {
     await expect(get('/large', { maxBodyBytes: 1024 })).rejects.toMatchObject({ code: 'body_too_large' })
+  })
+
+  it('preserves the origin content-length on a bodyless HEAD-style response', async () => {
+    // a HEAD response carries content-length: 42 with an empty body; the guard must not rewrite it to 0
+    const res = await get('/head', { method: 'HEAD' })
+    expect(res.headers.get('content-length')).toBe('42')
   })
 })

@@ -15,3 +15,15 @@ export async function deleteAllJobs(queueName: string): Promise<void> {
   await c.connect()
   try { await c.query('DELETE FROM pgboss_test.job WHERE name = $1', [queueName]) } finally { await c.end() }
 }
+
+/** Test-only: reads back a queue's job rows straight from pgboss_test, bypassing pg-boss's fetch/complete bookkeeping. */
+export async function queryJobs(queueName: string): Promise<{ state: string; retryCount: number }[]> {
+  const c = new pg.Client({ connectionString: DB_URL })
+  await c.connect()
+  try {
+    const { rows } = await c.query<{ state: string; retry_count: number }>('SELECT state, retry_count FROM pgboss_test.job WHERE name = $1', [queueName])
+    return rows.map((r) => ({ state: r.state, retryCount: r.retry_count }))
+  } finally {
+    await c.end()
+  }
+}
