@@ -52,6 +52,16 @@ describe('Better Auth on Fastify', () => {
     expect(no.headers['access-control-allow-origin']).toBeUndefined()
   })
 
+  it('caps user.name at 120 characters (databaseHooks.user.update.before)', async () => {
+    const { cookie } = await signInWithOtp(t.app, t.mail, 'longname@example.com', 'Robert')
+    const res = await t.app.inject({
+      method: 'POST', url: '/api/auth/update-user',
+      headers: { origin: WEB, cookie, 'content-type': 'application/json' },
+      payload: { name: 'x'.repeat(200) },
+    })
+    expect(res.statusCode).toBe(400)
+  })
+
   it('exposes the latest devsink mail for the Playwright smoke and 404s otherwise', async () => {
     await t.mail.send({ to: 'pw@example.com', subject: 'hello', text: 'world' })
     const hit = await t.app.inject({ method: 'GET', url: '/__dev/mail/latest?to=pw@example.com' })

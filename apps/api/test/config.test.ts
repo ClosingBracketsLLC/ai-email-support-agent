@@ -35,12 +35,18 @@ describe('api config', () => {
     const c = loadConfig({ ...BASE, NODE_ENV: 'production', RESEND_API_KEY: 're_x', MAIL_FROM: 'aesa <no-reply@mail.example.com>', AUTH_TRUSTED_ORIGINS: 'https://app.example.com, https://staging.example.com', TRUST_PROXY: 'true' })
     expect(c.mail.transport).toBe('resend')
     expect(c.trustedOrigins).toEqual(['http://localhost:8081', 'aesa://', 'https://app.example.com', 'https://staging.example.com'])
+    expect(c.webOrigins).toEqual(['http://localhost:8081', 'https://app.example.com', 'https://staging.example.com'])
   })
   it('strips trailing slashes from the origins before trusting them', () => {
     const c = loadConfig({ DATABASE_URL: 'postgres://x', APP_BASE_URL: 'http://localhost:3001/', APP_WEB_ORIGIN: 'http://localhost:8081/', BETTER_AUTH_SECRET: 's'.repeat(32), AUTH_TRUSTED_ORIGINS: 'https://app.example.com/' })
     expect(c.appBaseUrl).toBe('http://localhost:3001')
     expect(c.appWebOrigin).toBe('http://localhost:8081')
     expect(c.trustedOrigins).toEqual(['http://localhost:8081', 'aesa://', 'exp://', 'https://app.example.com'])
+    expect(c.webOrigins).toEqual(['http://localhost:8081', 'https://app.example.com'])
+  })
+  it('web origins are appWebOrigin plus every http(s) extra trusted origin; native/deep-link schemes are excluded', () => {
+    const c = loadConfig({ ...BASE, AUTH_TRUSTED_ORIGINS: 'https://staging.example.com, aesa://custom, exp://192.168.1.5:8081' })
+    expect(c.webOrigins).toEqual(['http://localhost:8081', 'https://staging.example.com'])
   })
   it('production with rate limiting on requires TRUST_PROXY, or Better Auth buckets every client together', () => {
     expect(() => loadConfig({ ...BASE, NODE_ENV: 'production', RESEND_API_KEY: 're_x', MAIL_FROM: 'aesa <no-reply@mail.example.com>' })).toThrow(/TRUST_PROXY/)
@@ -49,5 +55,10 @@ describe('api config', () => {
     expect(loadConfig(BASE).trustProxy).toBe(false)
     expect(loadConfig({ ...BASE, TRUST_PROXY: '10.0.0.0/8, 10.1.2.3' }).trustProxy).toEqual(['10.0.0.0/8', '10.1.2.3'])
     expect(loadConfig({ ...BASE, TRUST_PROXY: 'true' }).trustProxy).toBe(true)
+  })
+  it('defaults the global per-IP rate limit to 300/min; 0 disables it', () => {
+    expect(loadConfig(BASE).rateLimit).toBe(300)
+    expect(loadConfig({ ...BASE, API_RATE_LIMIT_PER_MINUTE: '0' }).rateLimit).toBe(0)
+    expect(loadConfig({ ...BASE, API_RATE_LIMIT_PER_MINUTE: '5' }).rateLimit).toBe(5)
   })
 })

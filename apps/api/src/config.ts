@@ -15,10 +15,17 @@ const EnvSchema = z.object({
   APP_BASE_URL: httpUrl('APP_BASE_URL'),
   /** Origin the Expo web app is served from: CORS allow-list, Better Auth trusted origin, invitation links. */
   APP_WEB_ORIGIN: httpUrl('APP_WEB_ORIGIN'),
-  /** Extra Better Auth trusted origins (comma-separated), e.g. a staging web origin. */
+  /**
+   * Extra Better Auth trusted origins (comma-separated), e.g. a staging web origin. Every http(s) entry
+   * also becomes a real web origin (config.webOrigins): CORS and the /trpc CSRF guard accept it, not
+   * only Better Auth's own routes (Phase 1 review, Important 6). Native/deep-link schemes (aesa://,
+   * exp://) are trusted by Better Auth but excluded from webOrigins — they never send a browser Origin.
+   */
   AUTH_TRUSTED_ORIGINS: z.string().optional(),
   BETTER_AUTH_SECRET: z.string().min(32, 'BETTER_AUTH_SECRET must be at least 32 characters'),
   AUTH_RATE_LIMIT: z.enum(['on', 'off']).default('on'),
+  /** Global request cap for the whole api (keyed by IP), independent of Better Auth's own /api/auth/* limiter. 0 disables it. */
+  API_RATE_LIMIT_PER_MINUTE: z.coerce.number().int().nonnegative().default(300),
   /** Set when the web app and the api live on different registrable domains (cookies need SameSite=None; Secure). */
   AUTH_CROSS_SITE_COOKIES: z.enum(['true', 'false']).default('false'),
   /**
@@ -49,9 +56,13 @@ export interface ApiConfig {
   logLevel: string
   appBaseUrl: string
   appWebOrigin: string
+  /** appWebOrigin plus every http(s) AUTH_TRUSTED_ORIGINS entry: what CORS and the /trpc CSRF guard accept. */
+  webOrigins: string[]
   trustedOrigins: string[]
   betterAuthSecret: Secret
   authRateLimit: boolean
+  /** Requests per minute per IP, global across the whole api. 0 disables the global limiter. */
+  rateLimit: number
   crossSiteCookies: boolean
   /** false: no proxy trusted. true: trust one hop's x-forwarded-for as-is. string[]: trust exactly these proxies. */
   trustProxy: boolean | string[]
@@ -92,6 +103,9 @@ export function loadConfig(env: NodeJS.ProcessEnv): ApiConfig {
   // aesa:// is the native deep-link scheme (OAuth callbacks land there); exp:// covers Expo Go in development.
   const extraOrigins = csv(d.AUTH_TRUSTED_ORIGINS).map((o) => o.startsWith('aesa://') || o.startsWith('exp://') ? o : o.replace(/\/+$/, ''))
   const trustedOrigins = [...new Set([appWebOrigin, 'aesa://', ...(production ? [] : ['exp://']), ...extraOrigins])]
+  // Only the http(s) extras are real web origins — a documented staging web origin must work with CORS and the
+  // /trpc guard, not only with Better Auth's own routes (Phase 1 review, Important 6).
+  const webOrigins = [...new Set([appWebOrigin, ...extraOrigins.filter((o) => o.startsWith('http://') || o.startsWith('https://'))])]
 
   const trustProxyRaw = d.TRUST_PROXY.trim()
   const trustProxy: boolean | string[] = trustProxyRaw === '' || trustProxyRaw === 'false' ? false : trustProxyRaw === 'true' ? true : csv(trustProxyRaw)
@@ -102,8 +116,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): ApiConfig {
 
   return {
     env: d.NODE_ENV, databaseUrl: d.DATABASE_URL, port: d.PORT, host: d.HOST, logLevel: d.LOG_LEVEL,
-    appBaseUrl, appWebOrigin, trustedOrigins, trustProxy,
-    betterAuthSecret: new Secret(d.BETTER_AUTH_SECRET), authRateLimit, crossSiteCookies: d.AUTH_CROSS_SITE_COOKIES === 'true',
+    appBaseUrl, appWebOrigin, webOrigins, trustedOrigins, trustProxy,
+    betterAuthSecret: new Secret(d.BETTER_AUTH_SECRET), authRateLimit, rateLimit: d.API_RATE_LIMIT_PER_MINUTE, crossSiteCookies: d.AUTH_CROSS_SITE_COOKIES === 'true',
     google: oauthPair('GOOGLE', d.GOOGLE_CLIENT_ID, d.GOOGLE_CLIENT_SECRET),
     microsoft: oauthPair('MICROSOFT', d.MICROSOFT_CLIENT_ID, d.MICROSOFT_CLIENT_SECRET),
     mail,

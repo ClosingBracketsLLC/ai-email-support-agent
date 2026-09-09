@@ -84,4 +84,24 @@ describe('team router', () => {
     expect(inA.map((r) => r.entityId)).toContain(invitationId)
     expect(inB).toHaveLength(0)
   })
+
+  it('throttles invitations per organization: 20 succeed, the 21st within the rolling hour is TOO_MANY_REQUESTS', async () => {
+    const owner2 = client(base, (await signInWithOtp(t.app, t.mail, 'throttle-owner@example.com', 'Throttle')).cookie)
+    await owner2.workspace.create.mutate({ businessName: 'Throttle Co', timezone: 'UTC' })
+    for (let i = 0; i < 20; i++) {
+      await owner2.team.invite.mutate({ email: `throttle-invitee-${i}@example.com`, role: 'member' })
+    }
+    await expect(owner2.team.invite.mutate({ email: 'throttle-invitee-20@example.com', role: 'member' })).rejects.toMatchObject({ data: { code: 'TOO_MANY_REQUESTS' } })
+  }, 20_000)
+
+  it('remove: the caller cannot remove their own membership', async () => {
+    await expect(owner.team.remove.mutate({ memberId: (await owner.team.list.query()).members[0]!.id })).rejects.toMatchObject({ data: { code: 'BAD_REQUEST' } })
+  })
+
+  it('changeRole and invite reject the owner role — zod only grants admin/member', async () => {
+    // Input validation runs before the resolver, so the memberId need not name a real membership.
+    const anyMemberId = (await owner.team.list.query()).members[0]!.id
+    await expect(owner.team.changeRole.mutate({ memberId: anyMemberId, role: 'owner' as never })).rejects.toMatchObject({ data: { code: 'BAD_REQUEST' } })
+    await expect(owner.team.invite.mutate({ email: 'owner-role@example.com', role: 'owner' as never })).rejects.toMatchObject({ data: { code: 'BAD_REQUEST' } })
+  })
 })

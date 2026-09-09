@@ -15,7 +15,7 @@ import { buildServer } from '../../src/server.ts'
 export const WEB = 'http://localhost:8081'
 export const TEST_ENV = {
   DATABASE_URL: 'postgres://unused', APP_BASE_URL: 'http://localhost:3001', APP_WEB_ORIGIN: WEB,
-  BETTER_AUTH_SECRET: 'test-secret-'.repeat(4), AUTH_RATE_LIMIT: 'off',
+  BETTER_AUTH_SECRET: 'test-secret-'.repeat(4), AUTH_RATE_LIMIT: 'off', API_RATE_LIMIT_PER_MINUTE: '0',
 } as const
 
 /** A complete api over a throwaway database; `close()` drops it. */
@@ -38,7 +38,6 @@ export function stubDeps(env: Partial<NodeJS.ProcessEnv> = {}, opts: { level?: s
   const auth = { handler: async () => new Response(null, { status: 404 }), api: {} } as unknown as ServerDeps['auth']
   const api: ServerDeps['api'] = {
     withOrg: async () => { throw new Error('no database in stubDeps') },
-    withPlatform: async () => { throw new Error('no database in stubDeps') },
     health: async () => ({ db: 'error', migrations: { count: 0, latest: null } }),
   }
   const logger = createAppLogger({ level: opts.level ?? 'silent', stream: opts.stream })

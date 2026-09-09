@@ -1,6 +1,7 @@
 import { expo } from '@better-auth/expo'
 import { betterAuth } from 'better-auth'
 import { drizzleAdapter } from 'better-auth/adapters/drizzle'
+import { APIError } from 'better-auth/api'
 import { emailOTP, organization } from 'better-auth/plugins'
 import { authSchema, type AuditEntry, type Db } from '@aesa/db'
 import type pino from 'pino'
@@ -17,6 +18,15 @@ export interface AuthDeps {
   logger: pino.Logger
   /** Writes an org-scoped audit row from a Better Auth hook (hooks run outside any request transaction). */
   audit: (orgId: string, entry: AuditEntry) => Promise<void>
+}
+
+/** team.invite builds an email subject from it (`${inviterName} invited you to ${orgName}`); Better Auth places no cap of its own (Phase 1 review, Important 2). */
+const MAX_USER_NAME_LENGTH = 120
+
+function rejectOversizedName(user: { name?: unknown }): void {
+  if (typeof user.name === 'string' && user.name.length > MAX_USER_NAME_LENGTH) {
+    throw new APIError('BAD_REQUEST', { message: 'name too long' })
+  }
 }
 
 export function createAuth({ db, config, mail, logger, audit }: AuthDeps) {
@@ -42,6 +52,12 @@ export function createAuth({ db, config, mail, logger, audit }: AuthDeps) {
       // here is dev/test, where Better Auth's own getIP() falls back to localhost.
       ...(Array.isArray(config.trustProxy) ? { ipAddress: { trustedProxies: config.trustProxy } } : {}),
       ...(config.crossSiteCookies ? { defaultCookieAttributes: { sameSite: 'none' as const, secure: true } } : {}),
+    },
+    databaseHooks: {
+      user: {
+        create: { before: async (user) => rejectOversizedName(user) },
+        update: { before: async (user) => rejectOversizedName(user) },
+      },
     },
     trustedOrigins: config.trustedOrigins,
     rateLimit: {
@@ -73,6 +89,9 @@ export function createAuth({ db, config, mail, logger, audit }: AuthDeps) {
       }),
       organization({
         creatorRole: 'owner',
+        // workspace.create (apps/api/src/trpc/routers/workspace.ts) is otherwise unbounded — a signed-in user
+        // could call it as many times as they like (Phase 1 review, Important 2).
+        organizationLimit: 5,
         disableOrganizationDeletion: true,   // deletion is a soft-delete + 30-day job (Phase 7)
         invitationExpiresIn: 48 * 60 * 60,
         cancelPendingInvitationsOnReInvite: true,

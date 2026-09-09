@@ -1,6 +1,6 @@
 import type pg from 'pg'
 import type pino from 'pino'
-import { withOrg, withPlatform, type Db, type OrgTx, type PlatformTx } from '@aesa/db'
+import { withOrg, type Db, type OrgTx } from '@aesa/db'
 import type { Auth } from './auth.ts'
 import type { ApiConfig } from './config.ts'
 import type { MailTransport } from './mail/transport.ts'
@@ -8,12 +8,14 @@ import type { MailTransport } from './mail/transport.ts'
 export interface HealthReport { db: 'ok' | 'error'; migrations: { count: number; latest: string | null } }
 
 /**
- * Everything a request handler may touch. No Db, no Pool (Phase 0 review I9): tenancy is enforced by
- * construction because the only data paths are withOrg (branded OrgTx) and withPlatform (audited).
+ * Everything a request handler may touch. No Db, no Pool (Phase 0 review I9), and no withPlatform: the
+ * spec says the api never holds aesa_platform, so the only data path here is withOrg (branded OrgTx).
+ * This is a convention, not an enforcement boundary — Better Auth's own adapter (auth.$context /
+ * auth.options.database) still closes over the raw Db handle passed to createAuth (Phase 1 review,
+ * Important 3).
  */
 export interface ApiFacade {
   withOrg<T>(orgId: string, fn: (tx: OrgTx) => Promise<T>): Promise<T>
-  withPlatform<T>(reason: string, fn: (tx: PlatformTx) => Promise<T>): Promise<T>
   health(): Promise<HealthReport>
 }
 
@@ -21,7 +23,6 @@ export interface ApiFacade {
 export function createApiFacade(handle: { db: Db; pool: pg.Pool }): ApiFacade {
   return {
     withOrg: (orgId, fn) => withOrg(handle.db, orgId, fn),
-    withPlatform: (reason, fn) => withPlatform(handle.db, reason, fn),
     async health() {
       try {
         await handle.pool.query('SELECT 1')
