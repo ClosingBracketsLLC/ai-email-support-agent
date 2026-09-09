@@ -21,8 +21,14 @@ export function createTrpcClient() {
   })
 }
 
-export async function fetchMeta(): Promise<{ providers: { google: boolean; microsoft: boolean } }> {
+export interface AppMeta {
+  providers: { google: boolean; microsoft: boolean }
+  /** Mailbox OAuth (Gmail/Graph mail access), distinct from `providers` above (Better Auth sign-in). */
+  mail: { gmail: boolean; microsoft: boolean }
+}
+
+export async function fetchMeta(): Promise<AppMeta> {
   const res = await fetch(`${API_URL}/meta`)
   if (!res.ok) throw new Error(`meta ${res.status}`)
-  return res.json() as Promise<{ providers: { google: boolean; microsoft: boolean } }>
+  return res.json() as Promise<AppMeta>
 }

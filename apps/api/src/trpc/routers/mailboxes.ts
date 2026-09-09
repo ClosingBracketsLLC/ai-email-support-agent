@@ -176,7 +176,14 @@ export const mailboxesRouter = router({
         credentialAgeDays: Math.floor((now - c.createdAt.getTime()) / 86_400_000),
         agents: agentRows
           .filter((a) => a.connectionId === c.id)
-          .map((a) => ({ id: a.id, address: a.address, status: a.status, priority: a.priority, displayName: a.displayName })),
+          .map((a) => ({
+            id: a.id, address: a.address, status: a.status, priority: a.priority, displayName: a.displayName,
+            // Task 20 (app): the settings Mailboxes screen needs to know which agents are waiting on
+            // THIS caller's one-tap consent (mailboxes.consentAddress) to render the approve/reject
+            // card — `consentRequiredFromUserId` itself is intentionally not exposed (it would leak
+            // another user's id to everyone else on the connection).
+            consentRequiredFromMe: a.consentRequiredFromUserId === ctx.user.id,
+          })),
       })),
     }
   }),

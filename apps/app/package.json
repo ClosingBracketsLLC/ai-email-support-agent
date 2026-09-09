@@ -29,6 +29,7 @@
     "@trpc/tanstack-react-query": "11.18.0",
     "better-auth": "1.7.3",
     "expo": "~57.0.21",
+    "expo-clipboard": "~57.0.1",
     "expo-constants": "~57.0.17",
     "expo-dev-client": "~57.0.18",
     "expo-device": "~57.0.1",
