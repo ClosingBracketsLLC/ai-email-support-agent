@@ -38,11 +38,19 @@ async function createOrganizationWithFreshSlug(auth: Auth, headers: Headers, nam
       if (!org) throw new TRPCError({ code: 'INTERNAL_SERVER_ERROR', message: 'organization was not created' })
       return { id: org.id }
     } catch (e) {
-      if (e instanceof APIError && attempt < 5 && /already exists|slug/i.test(e.message)) continue
+      // A collision on an earlier attempt retries with a fresh suffix; the 5th throws the friendly message
+      // instead of Better Auth's raw APIError (Phase 1 review, minor 11 — this used to be unreachable dead
+      // code after the loop, since every other path already threw).
+      if (e instanceof APIError && /already exists|slug/i.test(e.message)) {
+        if (attempt < 5) continue
+        throw new TRPCError({ code: 'INTERNAL_SERVER_ERROR', message: 'could not allocate a workspace slug' })
+      }
       throw e
     }
   }
-  throw new TRPCError({ code: 'INTERNAL_SERVER_ERROR', message: 'could not allocate a workspace slug' })
+  // Unreachable: every iteration above either returns or throws (the 5th collision throws inside the catch,
+  // above) — TypeScript can't see that a bounded for-loop always exits early, so it still needs this.
+  throw new Error('unreachable: createOrganizationWithFreshSlug fell through its retry loop')
 }
 
 export const workspaceRouter = router({
