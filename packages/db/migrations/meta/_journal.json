@@ -36,6 +36,20 @@
       "when": 1788888528996,
       "tag": "0004_force_rls_notification_devices",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1788937459242,
+      "tag": "0005_green_black_knight",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1788937466585,
+      "tag": "0006_mail_hardening",
+      "breakpoints": true
     }
   ]
 }

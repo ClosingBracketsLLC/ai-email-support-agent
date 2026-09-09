@@ -4,7 +4,7 @@ import { AUTH_TABLES, ORG_ID_PREDICATE_SQL } from '../src/index.ts'
 import { createTestDatabase } from './helpers/test-db.ts'
 
 /** Tables that legitimately carry no org_id. Every other ordinary table in `public` must be tenant-scoped. */
-const RLS_EXEMPT = ['platform_state', ...AUTH_TABLES]   // Better Auth tables are not tenant data (ruling, STATUS.md)
+const RLS_EXEMPT = ['platform_state', 'webhook_events', ...AUTH_TABLES]   // Better Auth tables are not tenant data (ruling, STATUS.md)
 
 /** pg renders a policy expression with its own casts and parentheses; compare the shape, not the formatting. */
 const normalize = (predicate: string) => predicate.toLowerCase().replaceAll('::text', '').replace(/[()\s]/g, '')
@@ -35,7 +35,10 @@ describe('row-level security', () => {
     )
     // A superset check, so a new tenant table extends the loop instead of failing this line.
     expect(tables.rows.map((t) => t.relname))
-      .toEqual(expect.arrayContaining(['audit_log', 'notification_devices', 'org_data_keys', 'org_settings', 'usage_counters', 'workspaces']))
+      .toEqual(expect.arrayContaining([
+        'audit_log', 'notification_devices', 'org_data_keys', 'org_settings', 'usage_counters', 'workspaces',
+        'oauth_flows', 'mailbox_connections', 'mailbox_credentials', 'gmail_access_requests',
+      ]))
 
     for (const t of tables.rows) {
       expect({ table: t.relname, rls: t.relrowsecurity, forced: t.relforcerowsecurity })
