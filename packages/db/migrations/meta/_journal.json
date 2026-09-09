@@ -50,6 +50,20 @@
       "when": 1788937466585,
       "tag": "0006_mail_hardening",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1788938804708,
+      "tag": "0007_redundant_lady_mastermind",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1788938900000,
+      "tag": "0008_support_hardening",
+      "breakpoints": true
     }
   ]
 }
