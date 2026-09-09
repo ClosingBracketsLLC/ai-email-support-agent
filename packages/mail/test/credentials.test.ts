@@ -297,4 +297,140 @@ describe('credentials: sealed → DEK, lease refresh', () => {
     const row = await readCredentialRow(connectionId)
     expect(row.refreshLockUntil).toBeNull()
   })
+
+  it("post-lease re-read: a worker that completes a full cycle between B's read and B's claim leaves B returning its fresh token without calling refresh", async () => {
+    const connectionId = await createConnection()
+    await seedDekCredential(connectionId, {
+      refreshToken: 'pre-lease-refresh',
+      accessToken: 'pre-lease-access',
+      accessTokenExpiresAt: new Date(Date.now() + EXPIRED_MS), // stale, so B's initial (pre-lease) check does not short-circuit
+    })
+
+    const refresh = vi.fn(async () => { throw new Error('must not be called: the claimed row is already fresh') })
+    const beforeLeaseClaim = vi.fn(async () => {
+      // Model worker A completing a full refresh cycle in the gap between B's initial read and B's
+      // own lease-claim attempt: A's write lands here, including clearing the lock A held.
+      const { dek } = await withOrg(app.db, orgId, (tx) => loadOrgDek(tx, ring))
+      const aad = `${orgId}:mailbox_credentials:${connectionId}`
+      await withPlatform(app.db, 'test:concurrent-full-cycle', (tx) =>
+        tx
+          .update(mailboxCredentials)
+          .set({
+            refreshTokenCiphertext: encrypt(dek, Buffer.from('a-rotated-refresh', 'utf8'), aad),
+            accessTokenCiphertext: encrypt(dek, Buffer.from('a-fresh-access', 'utf8'), aad),
+            accessTokenExpiresAt: new Date(Date.now() + FRESH_MS),
+            refreshTokenHash: hashToken('refresh', 'a-rotated-refresh'),
+            refreshLockUntil: null,
+          })
+          .where(eq(mailboxCredentials.connectionId, connectionId)),
+      )
+    })
+
+    const token = await getAccessToken(baseDeps({ provider: { refresh }, beforeLeaseClaim }), orgId, connectionId, JOB_NAME)
+
+    expect(token).toBe('a-fresh-access')
+    expect(refresh).not.toHaveBeenCalled()
+    expect(beforeLeaseClaim).toHaveBeenCalledTimes(1)
+
+    // B still won the (unneeded) lease claim, since A's lock was already clear — B must release it.
+    const row = await readCredentialRow(connectionId)
+    expect(row.refreshLockUntil).toBeNull()
+    expect(row.refreshTokenHash).toBe(hashToken('refresh', 'a-rotated-refresh')) // A's write, untouched by B
+  })
+
+  it('persist fence: a stale holder that still succeeds after someone else rotated first does not clobber the winner', async () => {
+    const connectionId = await createConnection()
+    await seedDekCredential(connectionId, {
+      refreshToken: 'fence-refresh',
+      accessToken: 'fence-stale-access',
+      accessTokenExpiresAt: new Date(Date.now() + EXPIRED_MS),
+    })
+
+    const refresh = vi.fn(async (p: { refreshToken: string }) => {
+      expect(p.refreshToken).toBe('fence-refresh')
+      // Model another worker (C) independently completing its own rotation of the SAME pre-refresh
+      // token while this call is "in flight" (e.g. this call ran past its own lease's 60s window).
+      const { dek } = await withOrg(app.db, orgId, (tx) => loadOrgDek(tx, ring))
+      const aad = `${orgId}:mailbox_credentials:${connectionId}`
+      await withPlatform(app.db, 'test:fence-race', (tx) =>
+        tx
+          .update(mailboxCredentials)
+          .set({
+            refreshTokenCiphertext: encrypt(dek, Buffer.from('winner-refresh', 'utf8'), aad),
+            accessTokenCiphertext: encrypt(dek, Buffer.from('winner-access', 'utf8'), aad),
+            accessTokenExpiresAt: new Date(Date.now() + FRESH_MS),
+            refreshTokenHash: hashToken('refresh', 'winner-refresh'),
+            refreshLockUntil: null,
+          })
+          .where(eq(mailboxCredentials.connectionId, connectionId)),
+      )
+      // This call still "succeeds" from the provider's point of view — it just loses the persist race.
+      return { refreshToken: 'b-own-refresh', accessToken: 'b-own-access', accessTokenExpiresAt: new Date(Date.now() + FRESH_MS) } satisfies TokenSet
+    })
+
+    const token = await getAccessToken(baseDeps({ provider: { refresh } }), orgId, connectionId, JOB_NAME)
+
+    expect(token).toBe('winner-access') // NOT b-own-access
+    expect(refresh).toHaveBeenCalledTimes(1)
+
+    const row = await readCredentialRow(connectionId)
+    expect(row.refreshTokenHash).toBe(hashToken('refresh', 'winner-refresh')) // the stale holder's persist was a no-op
+  })
+
+  it('an empty returned refresh token is refused rather than persisted, and the lease is released', async () => {
+    const connectionId = await createConnection()
+    await seedDekCredential(connectionId, {
+      refreshToken: 'guarded-refresh',
+      accessToken: 'guarded-stale-access',
+      accessTokenExpiresAt: new Date(Date.now() + EXPIRED_MS),
+    })
+
+    const refresh = vi.fn(async () => ({ refreshToken: '', accessToken: 'new-access', accessTokenExpiresAt: new Date(Date.now() + FRESH_MS) }) satisfies TokenSet)
+
+    await expect(getAccessToken(baseDeps({ provider: { refresh } }), orgId, connectionId, JOB_NAME)).rejects.toThrow(/empty refresh token/)
+
+    const row = await readCredentialRow(connectionId)
+    expect(row.refreshLockUntil).toBeNull()
+    const { dek } = await withOrg(app.db, orgId, (tx) => loadOrgDek(tx, ring))
+    const aad = `${orgId}:mailbox_credentials:${connectionId}`
+    expect(decrypt(dek, row.refreshTokenCiphertext, aad).toString('utf8')).toBe('guarded-refresh') // untouched
+  })
+
+  it('caps the stale-hash retry at one: a second consecutive stale-hash failure rethrows without flipping status', async () => {
+    const connectionId = await createConnection()
+    await seedDekCredential(connectionId, {
+      refreshToken: 'r0',
+      accessToken: null,
+      accessTokenExpiresAt: null,
+    })
+
+    let call = 0
+    const refresh = vi.fn(async () => {
+      call += 1
+      // Every attempt rotates the hash out from under itself and fails — every attempt is "stale"
+      // from its own point of view, so the retry cap (not the current-hash branch) is what stops this.
+      const { dek } = await withOrg(app.db, orgId, (tx) => loadOrgDek(tx, ring))
+      const aad = `${orgId}:mailbox_credentials:${connectionId}`
+      await withPlatform(app.db, `test:rotate-${call}`, (tx) =>
+        tx
+          .update(mailboxCredentials)
+          .set({
+            refreshTokenCiphertext: encrypt(dek, Buffer.from(`r${call}`, 'utf8'), aad),
+            refreshTokenHash: hashToken('refresh', `r${call}`),
+            refreshLockUntil: null,
+            accessTokenCiphertext: null,
+            accessTokenExpiresAt: null,
+          })
+          .where(eq(mailboxCredentials.connectionId, connectionId)),
+      )
+      throw new ProviderAuthError()
+    })
+
+    await expect(getAccessToken(baseDeps({ provider: { refresh } }), orgId, connectionId, JOB_NAME)).rejects.toBeInstanceOf(ProviderAuthError)
+
+    expect(refresh).toHaveBeenCalledTimes(2) // one attempt + one retry, then give up
+
+    const connection = await readConnection(connectionId)
+    expect(connection.status).toBe('connected') // never flipped: both failures were judged stale, not current
+  })
 })

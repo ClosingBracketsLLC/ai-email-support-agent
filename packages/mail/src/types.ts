@@ -91,7 +91,9 @@ export interface MailboxProvider {
     code: string
     codeVerifier: string
   }): Promise<{ tokens: TokenSet; emailAddress: string; providerAccountId: string }>
-  refresh(p: { clientId: string; clientSecret: string; refreshToken: string }): Promise<TokenSet> // microsoft rotates the refresh token
+  // microsoft rotates the refresh token. `signal` is optional: a well-behaved adapter aborts its own
+  // fetch on it, bounding a slow/hung call under the caller's lease (credentials.ts's getAccessToken).
+  refresh(p: { clientId: string; clientSecret: string; refreshToken: string; signal?: AbortSignal }): Promise<TokenSet>
   revoke(p: { clientId: string; clientSecret: string; refreshToken: string }): Promise<void>
   client(accessToken: string, selfAddress: string): MailboxClient
 }
