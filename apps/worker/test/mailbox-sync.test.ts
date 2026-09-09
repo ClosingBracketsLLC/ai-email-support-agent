@@ -243,6 +243,66 @@ describe('mailbox.sync', () => {
     expect(match).toBeDefined()
   })
 
+  it('a missing OAuth pair for the connection\'s provider (the !oauth throw) still clears the lease and writes consecutive_failures/backoff, no crash', async () => {
+    const { connectionId } = await createConnection() // provider: 'gmail'
+    // No credential seeded at all — the !oauth throw fires before getAccessToken is ever reached,
+    // so there is nothing for it to read. index.ts registers mailbox.sync without gating on which
+    // OAuth pairs are configured (a deployment may support only one provider), so a connection whose
+    // provider has no configured pair is production-reachable, not just a test artifact.
+    const deps = makeDeps({ config: baseConfig({ gmailOauth: null }) })
+
+    await expect(runMailboxSync(boss, deps, { orgId, connectionId })).resolves.toBeUndefined()
+
+    const after = await readConnection(connectionId)
+    expect(after.pollLeaseUntil).toBeNull()
+    expect(after.consecutiveFailures).toBe(1)
+    expect(after.backoffUntil).not.toBeNull()
+    expect(after.backoffUntil!.getTime()).toBeGreaterThan(Date.now())
+  })
+
+  it('mid-walk ProviderAuthError (a 401 from any adapter call, not just getAccessToken) still runs Step 6 for messages already committed before it', async () => {
+    const { connectionId, selfAddress } = await createConnection()
+    await seedFreshCredential(connectionId)
+    const mailbox: MockMailbox = createMockMailbox({ mode: 'gmail', selfAddress })
+    const seedDeps = makeDeps({ clientFactory: () => mailbox })
+    await runMailboxSync(boss, seedDeps, { orgId, connectionId }) // seed the cursor
+
+    // Two messages land in the same poll; the client throws ProviderAuthError fetching the SECOND
+    // one, after the first has already been fully ingested (ticket created, message inserted,
+    // onNewInboundTicket already fired into runMailboxSync's collected array) by runSync's own
+    // per-message transaction.
+    mailbox.receiveInbound({ from: 'customer1@example.test', to: [selfAddress], subject: 'Order 1', bodyText: 'Where is my order?' })
+    const msg2 = mailbox.receiveInbound({ from: 'customer2@example.test', to: [selfAddress], subject: 'Order 2', bodyText: 'Refund please' })
+    const wrappedClient = {
+      ...mailbox,
+      getMessage: async (id: string, opts: { format: 'metadata' | 'full' }) => {
+        if (id === msg2.id) throw new ProviderAuthError('token rejected mid-walk')
+        return mailbox.getMessage(id, opts)
+      },
+    }
+    const deps = makeDeps({ clientFactory: () => wrappedClient })
+
+    await expect(runMailboxSync(boss, deps, { orgId, connectionId })).resolves.toBeUndefined()
+
+    // msg1's ticket exists and was enqueued for triage — the fix under test.
+    const ticketRows = await withOrg(app.db, orgId, (tx) => tx.select().from(tickets).where(eq(tickets.connectionId, connectionId)))
+    expect(ticketRows).toHaveLength(1) // msg2 never got far enough to open a second ticket
+    const jobs = await queryJobs(JOB_NAMES.ticketTriage)
+    const match = jobs.find((j) => (j.data as { ticketId?: string }).ticketId === ticketRows[0]!.id)
+    expect(match).toBeDefined()
+    expect((match!.data as { orgId?: string }).orgId).toBe(orgId)
+
+    // AND the reauth handling itself still ran: notification exists, no failure bump.
+    const after = await readConnection(connectionId)
+    expect(after.consecutiveFailures).toBe(0)
+    expect(after.pollLeaseUntil).toBeNull()
+    const day = new Date().toISOString().slice(0, 10)
+    const rows = await notificationsFor(`reauth:${connectionId}:${day}`)
+    expect(rows).toHaveLength(1)
+    const notifyJobs = await queryJobs(JOB_NAMES.notifyDispatch)
+    expect(notifyJobs.some((j) => (j.data as { notificationId?: string }).notificationId === rows[0]!.id)).toBe(true)
+  })
+
   it('a generic (non-auth, non-rate-limit) getAccessToken failure still clears the lease and writes consecutive_failures/backoff (Important 4)', async () => {
     const { connectionId } = await createConnection()
     await seedExpiredCredential(connectionId)

@@ -8,21 +8,27 @@
  * Six steps, per the task brief:
  *  1. CAS-claim the poll lease (`poll_lease_until`, 90 s) — a held lease (another worker mid-sync, or a
  *     crash that hasn't hit the lease's own expiry yet) means this run has nothing to do.
- *  2. `getAccessToken` (Task 8; audited platform read). A `ProviderAuthError` means Task 8 already
- *     flipped the connection to `reauth_required` (only when the hash it tried was still current) —
- *     this job's only remaining work is telling the owner, once per UTC day.
+ *  2. `getAccessToken` (Task 8; audited platform read) OR any later call `runSync`'s adapters make —
+ *     a `ProviderAuthError` from EITHER means Task 8 already flipped the connection to
+ *     `reauth_required` (only when the hash it tried was still current); either way this job still
+ *     owes step 6 for whatever committed before the 401, plus telling the owner, once per UTC day.
  *  3. Acquire the mail limiter (per-connection + process-wide gates) before ANY provider call.
  *  4. `runSync`, collecting its two callbacks into local arrays — `SyncResult`'s own arrays are
  *     reporting-only (the file header on `@aesa/mail/sync.ts` is explicit: consuming both double-
- *     enqueues), so this is the ONLY place those ids are read.
+ *     enqueues), so this is the ONLY place those ids are read. A 401 from any adapter call mid-walk
+ *     surfaces here as `ProviderAuthError`, same as step 2's — `runSync` has already committed
+ *     whatever messages it got through before the 401, each with its own callback already fired.
  *  5. Release the limiter; write health (lease clear, `last_sync_at`/`last_success_at`/
  *     `consecutive_failures`/`backoff_until`) in one `withOrg` tx. A `ProviderRateLimitError` is NOT a
  *     failure — the connection's health is left alone and this job re-enqueues itself after the
- *     provider's own `Retry-After`.
+ *     provider's own `Retry-After`; neither is `ProviderAuthError` (the connection's `reauth_required`
+ *     status IS the health signal).
  *  6. Post-commit (so a queue outage never rolls back real mailbox state): `ticket.triage` per new
  *     inbound ticket, and an `escalation` notification (+ `notify.dispatch`) per tripwired ticket. These
- *     run regardless of the run's overall outcome — a run that fails PARTWAY through may have already
- *     committed several messages, each with its own callback already fired.
+ *     run UNCONDITIONALLY on every outcome, reauth included — a run that fails, rate-limits, or hits a
+ *     401 PARTWAY through may have already committed several messages, each with its own callback
+ *     already fired, and skipping this step would strand them (see the loop's own comment below for
+ *     the concrete failure mode this closes).
  */
 import { and, eq, isNull, lt, or, sql } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
@@ -241,18 +247,25 @@ export async function runMailboxSync(boss: PgBoss, deps: MailboxSyncDeps, payloa
       .where(eq(mailboxConnections.id, payload.connectionId))
   })
 
-  if (outcome === 'reauth') {
-    await notifyReauthRequired(boss, deps.db, payload.orgId, payload.connectionId, now)
-    return
-  }
-
-  // Step 6: post-commit, regardless of outcome — a run that failed or got rate-limited partway
-  // through may have already committed several messages, each with its callback already fired.
+  // Step 6: post-commit, REGARDLESS of outcome — including 'reauth'. `runSync`'s adapters throw
+  // ProviderAuthError on a 401 from ANY call mid-walk, not just the getAccessToken leg above, so a
+  // walk that got 15 messages in before the 401 has already committed those 15 (each callback
+  // already fired into the arrays below) — skipping this loop on a reauth outcome would strand a
+  // customer reply on an already-`triaged` ticket forever: the insert gate means the message's
+  // callback never re-fires on a later poll, and mailbox.poll-sweep's (d) only rescues `status='new'`,
+  // never a re-triage. (fix review, second round: an earlier version of this function returned
+  // before this loop on 'reauth' — a run that failed or got rate-limited partway through has the
+  // exact same "already-committed messages" shape, so it was never conditioned on THOSE outcomes.)
   for (const ticketId of newInboundIds) {
     await enqueue(boss, ticketTriageJob, { orgId: payload.orgId, ticketId }, { entityId: ticketId, debounceSeconds: 10 })
   }
   for (const ticketId of tripwiredIds) {
     await insertEscalation(boss, deps, payload.orgId, ticketId, now)
+  }
+
+  if (outcome === 'reauth') {
+    await notifyReauthRequired(boss, deps.db, payload.orgId, payload.connectionId, now)
+    return
   }
 
   if (outcome === 'rate_limited') {
