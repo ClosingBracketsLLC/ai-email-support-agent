@@ -196,6 +196,19 @@ function escalationCopy(reason: NeedsOwnerReason): { title: string; body: string
   }
 }
 
+/**
+ * Day-scoped, not lifetime-scoped (controller ruling, fix review): `escalation:${ticketId}` alone
+ * would mean the FIRST escalation ever notified for this ticket permanently wins the unique index —
+ * a ticket that gets resolved and later re-escalates (a second `triage_failed`, a fresh angry
+ * follow-up after a reopen, …) would then insert nothing and page nobody. Scoping by UTC day makes
+ * the dedupe "at most one push per ticket per day", same pattern the cap path already uses, while
+ * `escalation_notified_at` (cleared on every transition INTO `needs_owner`) stays the authoritative
+ * "has this escalation episode been notified" stamp — this key only governs the notification row.
+ */
+function escalationDedupeKey(ticketId: string, day: string): string {
+  return `escalation:${ticketId}:${day}`
+}
+
 /** `ON CONFLICT (dedupe_key) DO NOTHING` — a second escalation for the same dedupe key (e.g. the
  * same ticket capped twice in one UTC day) is a silent no-op: no duplicate row, no second page. */
 async function insertEscalationNotification(
@@ -247,7 +260,11 @@ export async function runTicketTriage(deps: TicketTriageDeps, payload: TicketTri
   // Rule 2: automated short-circuit (pre-LLM) — sync already classified this at ingest.
   if (ticket.isAutomated === true) {
     await withOrg(deps.db, orgId, async (tx) => {
-      const written = await guardedWrite(tx, ticketId, ticket.status, { status: 'resolved' })
+      // needsOwnerReason: null — same always-written hygiene as the rule-6 verdict write (fix
+      // review Finding 1): a ticket reaching this short-circuit was selected as new/triaged, so it
+      // should carry no reason, but must not leave a stale one behind from a prior needs_owner
+      // episode that some other (future) mutation moved it out of without clearing the column.
+      const written = await guardedWrite(tx, ticketId, ticket.status, { status: 'resolved', needsOwnerReason: null })
       if (!written) return
       await audit(tx, { actor: 'system:ticket.triage', action: 'ticket.auto_reply_dropped', entityType: 'ticket', entityId: ticketId, detail: {} })
     })
@@ -262,7 +279,10 @@ export async function runTicketTriage(deps: TicketTriageDeps, payload: TicketTri
     const always = resolveSetting('support.spam_shortcircuit.always', { org: settings })
     if (atCap || always) {
       await withOrg(deps.db, orgId, async (tx) => {
-        const written = await guardedWrite(tx, ticketId, ticket.status, { status: 'resolved', isSpam: true, lastTriagedAt: now, triageFailureCount: 0 })
+        // needsOwnerReason: null — see the rule-2 comment above; same reasoning applies here.
+        const written = await guardedWrite(tx, ticketId, ticket.status, {
+          status: 'resolved', isSpam: true, lastTriagedAt: now, triageFailureCount: 0, needsOwnerReason: null,
+        })
         if (!written) return
         await audit(tx, { actor: 'system:ticket.triage', action: 'ticket.spam_shortcircuit', entityType: 'ticket', entityId: ticketId, detail: {} })
       })
@@ -321,7 +341,7 @@ export async function runTicketTriage(deps: TicketTriageDeps, payload: TicketTri
         status: 'needs_owner', needsOwnerReason: 'triage_failed', triageFailureCount: failures, escalationNotifiedAt: null,
       })
       if (!written) return undefined
-      return insertEscalationNotification(tx, orgId, ticketId, `escalation:${ticketId}`, 'triage_failed')
+      return insertEscalationNotification(tx, orgId, ticketId, escalationDedupeKey(ticketId, day), 'triage_failed')
     })
     if (notificationId) await deps.enqueueNotify(orgId, notificationId)
     return
@@ -355,7 +375,7 @@ export async function runTicketTriage(deps: TicketTriageDeps, payload: TicketTri
 
     let notifId: string | undefined
     if (outcome.status === 'needs_owner') {
-      notifId = await insertEscalationNotification(tx, orgId, ticketId, `escalation:${ticketId}`, outcome.reason)
+      notifId = await insertEscalationNotification(tx, orgId, ticketId, escalationDedupeKey(ticketId, day), outcome.reason)
     }
     await audit(tx, {
       actor: 'system:ticket.triage', action: 'ticket.triaged', entityType: 'ticket', entityId: ticketId,

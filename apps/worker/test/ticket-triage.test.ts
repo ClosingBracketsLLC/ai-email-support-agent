@@ -199,14 +199,16 @@ describe('runTicketTriage', () => {
     expect((await getTicket(ticketId)).status).toBe('triaged')
   })
 
-  it('2. an automated ticket resolves without spending a call (pre-LLM short-circuit)', async () => {
-    const ticketId = await seedTicket({ isAutomated: true })
+  it('2. an automated ticket resolves without spending a call (pre-LLM short-circuit), and clears a stale needs_owner_reason', async () => {
+    const ticketId = await seedTicket({ isAutomated: true, needsOwnerReason: 'triage_flags' })
     const provider = createFakeProvider([{ error: new LlmError('must not be called', 'permanent', false) }])
     const { deps } = makeDeps(provider)
 
     await runTicketTriage(deps, { orgId, ticketId }, new AbortController().signal)
 
-    expect((await getTicket(ticketId)).status).toBe('resolved')
+    const ticket = await getTicket(ticketId)
+    expect(ticket.status).toBe('resolved')
+    expect(ticket.needsOwnerReason).toBeNull()
     expect(provider.calls).toHaveLength(0)
     expect(await readUsageCounter(TODAY)).toBe(0)
     const audits = await auditRowsFor(ticketId, 'ticket.auto_reply_dropped')
@@ -214,9 +216,9 @@ describe('runTicketTriage', () => {
     expect(audits[0]!.actor).toBe('system:ticket.triage')
   })
 
-  it('3. a spam-flagged ticket resolves without a model call once support.spam_shortcircuit.always is set', async () => {
+  it('3. a spam-flagged ticket resolves without a model call once support.spam_shortcircuit.always is set, and clears a stale needs_owner_reason', async () => {
     await setOrgSetting('support.spam_shortcircuit.always', true)
-    const ticketId = await seedTicket({ spamFlagged: true })
+    const ticketId = await seedTicket({ spamFlagged: true, needsOwnerReason: 'sentiment_angry' })
     const provider = createFakeProvider([{ error: new LlmError('must not be called', 'permanent', false) }])
     const { deps } = makeDeps(provider)
 
@@ -225,6 +227,7 @@ describe('runTicketTriage', () => {
     const ticket = await getTicket(ticketId)
     expect(ticket.status).toBe('resolved')
     expect(ticket.isSpam).toBe(true)
+    expect(ticket.needsOwnerReason).toBeNull()
     expect(provider.calls).toHaveLength(0)
     expect(await readUsageCounter(TODAY)).toBe(0)
     expect(await auditRowsFor(ticketId, 'ticket.spam_shortcircuit')).toHaveLength(1)
@@ -354,7 +357,7 @@ describe('runTicketTriage', () => {
     expect(ticket.needsOwnerReason).toBe('triage_flags')
     expect(ticket.escalationNotifiedAt).toBeNull()
 
-    const dedupeKey = `escalation:${ticketId}`
+    const dedupeKey = `escalation:${ticketId}:${TODAY}`
     const rows = await notificationsFor(dedupeKey)
     expect(rows).toHaveLength(1)
     expect(notified).toEqual([{ orgId, notificationId: rows[0]!.id }])
@@ -430,10 +433,44 @@ describe('runTicketTriage', () => {
     expect(ticket.needsOwnerReason).toBe('triage_failed')
     expect(ticket.triageFailureCount).toBe(2)
 
-    const dedupeKey = `escalation:${ticketId}`
+    const dedupeKey = `escalation:${ticketId}:${TODAY}`
     const rows = await notificationsFor(dedupeKey)
     expect(rows).toHaveLength(1)
     expect(notified).toEqual([{ orgId, notificationId: rows[0]!.id }])
+  })
+
+  it('7c. a ticket that resolves after paging can re-escalate on a LATER UTC day and pushes a second notification', async () => {
+    // Controller ruling (fix review): the escalation dedupe key is scoped to the UTC day, not the
+    // ticket's whole lifetime — otherwise the FIRST-ever escalation for a ticket would permanently
+    // win the unique index and a genuine re-escalation later would page nobody.
+    const ticketId = await seedTicket()
+    const provider = createFakeProvider([
+      { parsed: { ...BASE_VERDICT, escalationFlags: ['legal_threat'] } },
+      { parsed: { ...BASE_VERDICT, escalationFlags: ['legal_threat'] } },
+    ])
+    const { deps, notified } = makeDeps(provider)
+
+    await runTicketTriage(deps, { orgId, ticketId }, new AbortController().signal)
+    expect((await getTicket(ticketId)).status).toBe('needs_owner')
+    expect(notified).toHaveLength(1)
+
+    // The owner resolves it (paged, handled), and later a fresh inbound reopens it — both out of
+    // this job's scope; done directly here to set up a genuine re-escalation.
+    await withOrg(app.db, orgId, (tx) => tx.update(tickets).set({ status: 'resolved' }).where(eq(tickets.id, ticketId)))
+    await withOrg(app.db, orgId, (tx) => tx.update(tickets).set({ status: 'new' }).where(eq(tickets.id, ticketId)))
+
+    const nextDay = '2026-09-10'
+    const deps2: TicketTriageDeps = { ...deps, now: () => new Date(`${nextDay}T09:00:00Z`) }
+    await runTicketTriage(deps2, { orgId, ticketId }, new AbortController().signal)
+
+    expect((await getTicket(ticketId)).status).toBe('needs_owner')
+    expect(notified).toHaveLength(2) // a SECOND enqueueNotify — the day-scoped key doesn't collide
+
+    const firstDayRows = await notificationsFor(`escalation:${ticketId}:${TODAY}`)
+    const secondDayRows = await notificationsFor(`escalation:${ticketId}:${nextDay}`)
+    expect(firstDayRows).toHaveLength(1)
+    expect(secondDayRows).toHaveLength(1)
+    expect(notified.map((n) => n.notificationId).sort()).toEqual([firstDayRows[0]!.id, secondDayRows[0]!.id].sort())
   })
 
   it('7b. an unparsable verdict (parsed: null) counts as a failed attempt, same as a thrown LlmError', async () => {
