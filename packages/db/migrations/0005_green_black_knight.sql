@@ -63,7 +63,7 @@ CREATE TABLE "oauth_flows" (
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "oauth_flows_provider_check" CHECK ("oauth_flows"."provider" IN ('gmail','microsoft')),
 	CONSTRAINT "oauth_flows_platform_check" CHECK ("oauth_flows"."platform" IN ('native','web')),
-	CONSTRAINT "oauth_flows_status_check" CHECK ("oauth_flows"."status" IN ('pending','consumed','failed'))
+	CONSTRAINT "oauth_flows_status_check" CHECK ("oauth_flows"."status" IN ('pending','consumed','failed','expired'))
 );
 --> statement-breakpoint
 ALTER TABLE "oauth_flows" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint

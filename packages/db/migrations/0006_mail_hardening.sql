@@ -46,6 +46,25 @@ AS $$
   LIMIT 1
 $$;
 --> statement-breakpoint
+-- ACL first, ownership transfer second — deliberately in this order. By default every newly created
+-- function grants PUBLIC execute; lock that down and grant the api role while the migration is still
+-- running AS the function owner (aesa_owner), because REVOKE/GRANT issued by a non-owner, non-superuser
+-- role are silently downgraded to a no-op WARNING instead of an error (confirmed on PG 17.11: doing this
+-- after the OWNER TO transfer below left `has_function_privilege('public', ..., 'EXECUTE') = true` —
+-- every role in the cluster could resolve provider/email -> org_id cross-org). aesa_owner is only a
+-- WITH INHERIT FALSE *member* of aesa_platform, not the owner, so once ownership moves to aesa_platform
+-- aesa_owner is no longer eligible to change these functions' ACL — or to CREATE OR REPLACE them; any
+-- future migration touching resolve_mailbox_connection/resolve_mailbox_subscription must
+-- `SET ROLE aesa_platform` first (and RESET ROLE after), which is exactly why this REVOKE/GRANT pair
+-- runs before the ownership transfer, not after.
+REVOKE ALL ON FUNCTION resolve_mailbox_connection(text, text) FROM PUBLIC;
+--> statement-breakpoint
+REVOKE ALL ON FUNCTION resolve_mailbox_subscription(text) FROM PUBLIC;
+--> statement-breakpoint
+GRANT EXECUTE ON FUNCTION resolve_mailbox_connection(text, text) TO "aesa_app";
+--> statement-breakpoint
+GRANT EXECUTE ON FUNCTION resolve_mailbox_subscription(text) TO "aesa_app";
+--> statement-breakpoint
 -- Deviation from the brief: SECURITY DEFINER runs the function body AS ITS OWNER for every purpose,
 -- including row-level security. migrations run under role=aesa_owner (see client.ts), and aesa_owner is
 -- the table owner — but mailbox_connections has FORCE ROW LEVEL SECURITY, which (per tenant.test.ts's
@@ -54,7 +73,9 @@ $$;
 -- see zero rows — silently defeating the whole point of the resolver. Re-own both functions to
 -- aesa_platform (aesa_owner is already a WITH INHERIT FALSE member of it, so it may transfer ownership)
 -- so the body runs under "..._platform_all USING (true)" — the api's only cross-org bypass, deliberately
--- scoped to exactly these two lookups instead of full aesa_platform membership.
+-- scoped to exactly these two lookups instead of full aesa_platform membership. ALTER OWNER rewrites the
+-- ACL's grantor but preserves the explicit entries set above (PUBLIC revoked, aesa_app granted) — it
+-- would only reset to PUBLIC-default if the ACL had never been explicitly touched.
 --
 -- ALTER ... OWNER TO on a schema object additionally requires the NEW owner to hold CREATE on the
 -- containing schema (not just USAGE, which is all migration 0002 granted aesa_platform) — grant it only
@@ -66,11 +87,3 @@ ALTER FUNCTION resolve_mailbox_connection(text, text) OWNER TO "aesa_platform";
 ALTER FUNCTION resolve_mailbox_subscription(text) OWNER TO "aesa_platform";
 --> statement-breakpoint
 REVOKE CREATE ON SCHEMA public FROM "aesa_platform";
---> statement-breakpoint
-REVOKE ALL ON FUNCTION resolve_mailbox_connection(text, text) FROM PUBLIC;
---> statement-breakpoint
-REVOKE ALL ON FUNCTION resolve_mailbox_subscription(text) FROM PUBLIC;
---> statement-breakpoint
-GRANT EXECUTE ON FUNCTION resolve_mailbox_connection(text, text) TO "aesa_app";
---> statement-breakpoint
-GRANT EXECUTE ON FUNCTION resolve_mailbox_subscription(text) TO "aesa_app";

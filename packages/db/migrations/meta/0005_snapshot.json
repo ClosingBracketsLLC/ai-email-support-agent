@@ -1832,7 +1832,7 @@
         },
         "oauth_flows_status_check": {
           "name": "oauth_flows_status_check",
-          "value": "\"oauth_flows\".\"status\" IN ('pending','consumed','failed')"
+          "value": "\"oauth_flows\".\"status\" IN ('pending','consumed','failed','expired')"
         }
       },
       "isRLSEnabled": false

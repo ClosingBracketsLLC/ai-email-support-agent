@@ -155,4 +155,21 @@ describe('SECURITY DEFINER resolvers', () => {
     const none = await appDb.pool.query(`SELECT * FROM resolve_mailbox_subscription($1)`, ['no-such-sub'])
     expect(none.rows).toEqual([])
   })
+
+  // regression: 0006 originally issued REVOKE ALL ... FROM PUBLIC / GRANT EXECUTE ... TO aesa_app AFTER
+  // ALTER FUNCTION ... OWNER TO aesa_platform. aesa_owner (the migration role) is only a WITH INHERIT
+  // FALSE *member* of aesa_platform, not the owner post-transfer, so Postgres silently downgrades those
+  // statements to a no-op WARNING instead of erroring — PUBLIC kept EXECUTE and every role in the cluster
+  // could resolve provider/email -> org_id cross-org. Asserting the aesa_app side alone proves nothing
+  // (it was already true either way); the PUBLIC assertion is the one that actually catches the bug.
+  it('locks the resolvers down to aesa_app only — PUBLIC has no EXECUTE', async () => {
+    for (const sig of ['resolve_mailbox_connection(text,text)', 'resolve_mailbox_subscription(text)']) {
+      const priv = await admin.query<{ public_exec: boolean; app_exec: boolean }>(
+        `SELECT has_function_privilege('public', $1, 'EXECUTE') AS public_exec,
+                has_function_privilege('aesa_app', $1, 'EXECUTE') AS app_exec`,
+        [sig],
+      )
+      expect({ sig, ...priv.rows[0] }).toEqual({ sig, public_exec: false, app_exec: true })
+    }
+  })
 })

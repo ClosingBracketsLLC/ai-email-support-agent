@@ -17,7 +17,7 @@ export const oauthFlows = pgTable('oauth_flows', {
   nonceHash: text('nonce_hash').notNull(),
   pkceCiphertext: bytea('pkce_ciphertext').notNull(),         // AES-GCM under the api's flow key (HKDF of BETTER_AUTH_SECRET)
   platform: text('platform').notNull(),                       // 'native' | 'web'
-  status: text('status').notNull().default('pending'),        // pending | consumed | failed
+  status: text('status').notNull().default('pending'),        // pending | consumed | failed | expired
   failureReason: text('failure_reason'),                      // e.g. 'admin_consent_required'
   connectionId: uuid('connection_id'),                        // set by the callback on success
   expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
@@ -25,7 +25,7 @@ export const oauthFlows = pgTable('oauth_flows', {
 }, (t) => [
   check('oauth_flows_provider_check', sql`${t.provider} IN ('gmail','microsoft')`),
   check('oauth_flows_platform_check', sql`${t.platform} IN ('native','web')`),
-  check('oauth_flows_status_check', sql`${t.status} IN ('pending','consumed','failed')`),
+  check('oauth_flows_status_check', sql`${t.status} IN ('pending','consumed','failed','expired')`),
   uniqueIndex('oauth_flows_nonce_hash_uidx').on(t.nonceHash),
   index('oauth_flows_org_idx').on(t.orgId, t.createdAt),
   ...tenantPolicies(t.orgId, 'oauth_flows'),
@@ -60,7 +60,8 @@ export const mailboxConnections = pgTable('mailbox_connections', {
   ...tenantPolicies(t.orgId, 'mailbox_connections'),
 ])
 
-/** Token columns are platform-role-only: aesa_app may INSERT (the api's sealed write) and nothing else (migration 0006). */
+/** Token columns are platform-role-only: the api never touches this table — sealed blobs reach the worker
+ *  through a job payload; platform role only (migration 0006 REVOKEs aesa_app's default DML entirely). */
 export const mailboxCredentials = pgTable('mailbox_credentials', {
   connectionId: uuid('connection_id').primaryKey().references(() => mailboxConnections.id, { onDelete: 'cascade' }),
   orgId: orgId(),
