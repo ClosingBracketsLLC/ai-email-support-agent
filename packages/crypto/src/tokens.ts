@@ -1,7 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 
 /** Every stored hash is domain-separated by kind ('action:' + token, …) so kinds can never satisfy each other's lookups. */
-export type TokenKind = 'action' | 'login' | 'session' | 'oauth_nonce'
+export type TokenKind = 'action' | 'login' | 'session' | 'oauth_nonce' | 'refresh'
 
 export function hashToken(kind: TokenKind, token: string): string {
   return createHash('sha256').update(`${kind}:${token}`).digest('hex')
