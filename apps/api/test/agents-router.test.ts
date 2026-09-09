@@ -32,10 +32,21 @@ describe('agents router', () => {
     expect(res.agents).toEqual([
       expect.objectContaining({
         id: agentId, connectionId, address: 'support@agentslist.test', domain: 'agentslist.test',
-        replyFromAddress: null, displayName: 'support', signature: '', personaPreset: 'support',
+        replyFromAddress: null, connectionEmailAddress: 'support@agentslist.test', displayName: 'support', signature: '', personaPreset: 'support',
         personaText: '', guidanceExtra: '', priority: 0, status: 'active', autoSendDelayMin: 2,
       }),
     ])
+  })
+
+  it("agents.list returns connectionEmailAddress — the connection's own address, not necessarily the agent's own (review fix, Important 1: the app needs this to make the reply-from choice actually settable)", async () => {
+    const { client: c, connectionId, agentId } = await setupOrgWithActiveAgent('owner-replyfrom@example.com', 'support@replyfrom.test')
+    const added = await c.mailboxes.addAddress.mutate({ connectionId, address: 'alias@replyfrom.test', replyFromConnection: true })
+
+    const res = await c.agents.list.query()
+    expect(res.agents.find((a) => a.id === agentId)).toMatchObject({ address: 'support@replyfrom.test', connectionEmailAddress: 'support@replyfrom.test' })
+    expect(res.agents.find((a) => a.id === added.agentId)).toMatchObject({
+      address: 'alias@replyfrom.test', connectionEmailAddress: 'support@replyfrom.test', replyFromAddress: 'support@replyfrom.test',
+    })
   })
 
   it('agents.update changes persona and priority, auditing the new values', async () => {

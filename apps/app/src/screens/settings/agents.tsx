@@ -56,12 +56,16 @@ export function AgentsScreen() {
     setSwapping(true)
     setError(null)
     try {
+      // Two separate calls, not one transaction — if the first succeeds and the second fails, the
+      // server is left with a duplicate priority. `invalidateQueries` runs in `finally` regardless
+      // (review fix, Important 2), so the list always resyncs to whatever actually landed rather than
+      // showing the stale pre-swap order; the catch path also warns that the swap may be incomplete.
       await update.mutateAsync({ agentId: a.id, priority: b.priority })
       await update.mutateAsync({ agentId: b.id, priority: a.priority })
-      await queryClient.invalidateQueries({ queryKey: trpc.agents.list.queryKey() })
     } catch {
-      setError('Could not reorder. Try again.')
+      setError('Could not finish reordering — it may have partially applied. Refreshed the list below.')
     } finally {
+      await queryClient.invalidateQueries({ queryKey: trpc.agents.list.queryKey() })
       setSwapping(false)
     }
   }

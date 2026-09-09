@@ -9,7 +9,7 @@ const AGENT_ID = '11111111-1111-4111-8111-111111111111'
 const CONNECTION_ID = '22222222-2222-4222-8222-222222222222'
 
 type Agent = {
-  id: string; connectionId: string; address: string; replyFromAddress: string | null; domain: string
+  id: string; connectionId: string; address: string; replyFromAddress: string | null; connectionEmailAddress: string; domain: string
   displayName: string; signature: string; personaPreset: string; personaText: string; guidanceExtra: string
   priority: number; status: 'pending_verification' | 'active' | 'disabled'; autoSendDelayMin: number
 }
@@ -43,7 +43,7 @@ jest.mock('@/lib/trpc', () => ({
 
 function baseAgent(overrides: Partial<Agent> = {}): Agent {
   return {
-    id: AGENT_ID, connectionId: CONNECTION_ID, address: 'support@acme.com', replyFromAddress: null, domain: 'acme.com',
+    id: AGENT_ID, connectionId: CONNECTION_ID, address: 'support@acme.com', replyFromAddress: null, connectionEmailAddress: 'support@acme.com', domain: 'acme.com',
     displayName: 'Support', signature: '', personaPreset: 'support', personaText: '', guidanceExtra: '',
     priority: 0, status: 'active', autoSendDelayMin: 2,
     ...overrides,
@@ -180,15 +180,45 @@ test('a pending-verification agent has no status toggle at all — it is untouch
   expect(screen.queryByTestId('agent-toggle-status')).toBeNull()
 })
 
-test('the reply-from radios appear only when replyFromAddress is set, with the disabled option explained', async () => {
-  mockAgents = [baseAgent({ replyFromAddress: 'support@acme.com', address: 'sales@acme.com' })]
+test('the reply-from radios appear only when replyFromAddress is set, "reply from connection" selected by default', async () => {
+  mockAgents = [baseAgent({ replyFromAddress: 'support@acme.com', address: 'sales@acme.com', connectionEmailAddress: 'support@acme.com' })]
   await setup()
   await waitFor(() => expect(screen.getByTestId('reply-from')).toBeTruthy())
 
   expect(screen.getByText('Reply as sales@acme.com')).toBeTruthy()
   expect(screen.getByText('Set up Send-as with your provider first')).toBeTruthy()
   expect(screen.getByText('Reply from support@acme.com')).toBeTruthy()
-  expect(screen.getByTestId('reply-as-own').props.accessibilityState.disabled).toBe(true)
+  expect(screen.getByTestId('reply-from-connection').props.accessibilityState.checked).toBe(true)
+  expect(screen.getByTestId('reply-as-own').props.accessibilityState.checked).toBe(false)
+})
+
+test('selecting "reply as own address" marks replyFromAddress dirty and saves null (review fix, Important 1)', async () => {
+  mockAgents = [baseAgent({ replyFromAddress: 'support@acme.com', address: 'sales@acme.com', connectionEmailAddress: 'support@acme.com' })]
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('reply-from')).toBeTruthy())
+  expect(saveDisabled()).toBe(true) // nothing dirty yet
+
+  await fireEvent.press(screen.getByTestId('reply-as-own'))
+  expect(screen.getByTestId('reply-as-own').props.accessibilityState.checked).toBe(true)
+  expect(screen.getByTestId('reply-from-connection').props.accessibilityState.checked).toBe(false)
+  expect(saveDisabled()).toBe(false)
+
+  await fireEvent.press(screen.getByTestId('agent-save'))
+  await waitFor(() => expect(mockUpdateCalls).toEqual([{ agentId: AGENT_ID, replyFromAddress: null }]))
+  await act(async () => { await Promise.resolve() })
+})
+
+test('switching back to "reply from connection" saves the connection address', async () => {
+  mockAgents = [baseAgent({ replyFromAddress: 'support@acme.com', address: 'sales@acme.com', connectionEmailAddress: 'support@acme.com' })]
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('reply-from')).toBeTruthy())
+
+  await fireEvent.press(screen.getByTestId('reply-as-own'))
+  await fireEvent.press(screen.getByTestId('reply-from-connection'))
+  await fireEvent.press(screen.getByTestId('agent-save'))
+
+  await waitFor(() => expect(mockUpdateCalls).toEqual([{ agentId: AGENT_ID, replyFromAddress: 'support@acme.com' }]))
+  await act(async () => { await Promise.resolve() })
 })
 
 test('no reply-from card when replyFromAddress is null', async () => {

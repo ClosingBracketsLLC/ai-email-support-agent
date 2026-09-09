@@ -35,7 +35,7 @@ function toPersonaPreset(value: string): PersonaPreset {
   return (PERSONA_PRESETS as readonly string[]).includes(value) ? (value as PersonaPreset) : 'support'
 }
 
-type DirtyKey = 'displayName' | 'signature' | 'personaPreset' | 'personaText' | 'guidanceExtra'
+type DirtyKey = 'displayName' | 'signature' | 'personaPreset' | 'personaText' | 'guidanceExtra' | 'replyFromAddress'
 
 /** Persona presets, signature, reply-from display (priority reorder lives on the list screen), and
  * disable/enable. Save sends only the dirty keys (Task 21 brief); status changes are their own
@@ -54,6 +54,9 @@ export function AgentEditScreen() {
   const [personaPreset, setPersonaPreset] = useState<PersonaPreset>('support')
   const [personaText, setPersonaText] = useState('')
   const [guidanceExtra, setGuidanceExtra] = useState('')
+  // true = "reply from the connection's own address" (agent.replyFromAddress is that address);
+  // false = "reply as the agent's own address" (agent.replyFromAddress is null).
+  const [replyFromConnection, setReplyFromConnection] = useState(false)
   const [dirtyKeys, setDirtyKeys] = useState<Set<DirtyKey>>(new Set())
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
@@ -74,7 +77,8 @@ export function AgentEditScreen() {
     setPersonaPreset(toPersonaPreset(agent.personaPreset))
     setPersonaText(agent.personaText)
     setGuidanceExtra(agent.guidanceExtra)
-  }, [dirty, agent?.displayName, agent?.signature, agent?.personaPreset, agent?.personaText, agent?.guidanceExtra])
+    setReplyFromConnection(agent.replyFromAddress !== null)
+  }, [dirty, agent?.displayName, agent?.signature, agent?.personaPreset, agent?.personaText, agent?.guidanceExtra, agent?.replyFromAddress])
 
   function markDirty(key: DirtyKey) {
     editVersion.current += 1
@@ -86,6 +90,7 @@ export function AgentEditScreen() {
   function onPersonaPresetChange(p: PersonaPreset) { markDirty('personaPreset'); setPersonaPreset(p) }
   function onPersonaTextChange(v: string) { markDirty('personaText'); setPersonaText(v) }
   function onGuidanceChange(v: string) { markDirty('guidanceExtra'); setGuidanceExtra(v) }
+  function onReplyFromChange(useConnection: boolean) { markDirty('replyFromAddress'); setReplyFromConnection(useConnection) }
 
   const patch: Partial<UpdateAgentInput> = {}
   if (dirtyKeys.has('displayName')) patch.displayName = displayName.trim()
@@ -93,6 +98,9 @@ export function AgentEditScreen() {
   if (dirtyKeys.has('personaPreset')) patch.personaPreset = personaPreset
   if (dirtyKeys.has('personaText')) patch.personaText = personaText
   if (dirtyKeys.has('guidanceExtra')) patch.guidanceExtra = guidanceExtra
+  // NULL = sends as its own address; non-null = replies come from the connection's address (schema
+  // comment on `agents.reply_from_address`) — the only two valid values for an alias agent.
+  if (dirtyKeys.has('replyFromAddress') && agent) patch.replyFromAddress = replyFromConnection ? agent.connectionEmailAddress : null
   const parsed = agent ? UpdateAgentInput.safeParse({ agentId: agent.id, ...patch }) : null
 
   const save = useMutation(trpc.agents.update.mutationOptions({
@@ -171,18 +179,21 @@ export function AgentEditScreen() {
         <Card testID="reply-from">
           <Muted>Reply-from address</Muted>
           <View style={styles.radios}>
+            {/* Trusts the owner's own report about provider-side Send-as (same trust model as
+                address-sheet.tsx's identical pair) — review fix, Important 1: these used to be
+                hard-disabled with a no-op onPress, so once set the choice was locked forever. */}
             <Pressable
-              role="radio" accessibilityState={{ checked: false, disabled: true }} disabled onPress={() => {}} testID="reply-as-own"
-              style={[styles.radioBox, { borderColor: c.border, backgroundColor: c.bg, opacity: 0.6 }]}
+              role="radio" accessibilityState={{ checked: !replyFromConnection }} onPress={() => onReplyFromChange(false)} testID="reply-as-own"
+              style={[styles.radioBox, { borderColor: !replyFromConnection ? c.primary : c.border, backgroundColor: !replyFromConnection ? c.info : c.bg }]}
             >
               <Text style={[typeScale.body, { color: c.text }]}>Reply as {agent.address}</Text>
               <Text style={[typeScale.caption, { color: c.muted }]}>Set up Send-as with your provider first</Text>
             </Pressable>
             <Pressable
-              role="radio" accessibilityState={{ checked: true, disabled: true }} disabled onPress={() => {}} testID="reply-from-connection"
-              style={[styles.radioBox, { borderColor: c.primary, backgroundColor: c.info }]}
+              role="radio" accessibilityState={{ checked: replyFromConnection }} onPress={() => onReplyFromChange(true)} testID="reply-from-connection"
+              style={[styles.radioBox, { borderColor: replyFromConnection ? c.primary : c.border, backgroundColor: replyFromConnection ? c.info : c.bg }]}
             >
-              <Text style={[typeScale.body, { color: c.text }]}>Reply from {agent.replyFromAddress}</Text>
+              <Text style={[typeScale.body, { color: c.text }]}>Reply from {agent.connectionEmailAddress}</Text>
             </Pressable>
           </View>
         </Card>

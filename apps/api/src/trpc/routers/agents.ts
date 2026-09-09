@@ -6,7 +6,7 @@
 import { TRPCError } from '@trpc/server'
 import { and, asc, eq } from 'drizzle-orm'
 import { AgentIdInput, UpdateAgentInput } from '@aesa/contracts'
-import { agentCategoryPolicies, agents, audit, categories } from '@aesa/db'
+import { agentCategoryPolicies, agents, audit, categories, mailboxConnections } from '@aesa/db'
 import { managerProcedure, orgProcedure, router } from '../init.ts'
 
 /** Owner-authored free text (personaText/guidanceExtra/signature can run to thousands of characters) —
@@ -21,15 +21,23 @@ function auditValue(key: keyof UpdateAgentInput, value: unknown): unknown {
 const UPDATABLE_KEYS = ['displayName', 'signature', 'personaPreset', 'personaText', 'guidanceExtra', 'priority', 'replyFromAddress', 'status'] as const
 
 export const agentsRouter = router({
+  /**
+   * `connectionEmailAddress` (one join, no leak — same org's own connection) lets the app render and
+   * set `replyFromAddress` without a second round-trip: an alias agent's only two valid values are
+   * `null` (sends as itself) and this connection's own address (review fix, Important 1 — the reply-
+   * from radios were previously display-only with no way to actually flip the choice).
+   */
   list: orgProcedure.query(async ({ ctx }) => {
     const rows = await ctx.deps.api.withOrg(ctx.orgId, (tx) =>
       tx.select({
         id: agents.id, connectionId: agents.connectionId, address: agents.address, replyFromAddress: agents.replyFromAddress,
+        connectionEmailAddress: mailboxConnections.emailAddress,
         domain: agents.domain, displayName: agents.displayName, signature: agents.signature, personaPreset: agents.personaPreset,
         personaText: agents.personaText, guidanceExtra: agents.guidanceExtra, priority: agents.priority, status: agents.status,
         autoSendDelayMin: agents.autoSendDelayMin,
       })
         .from(agents)
+        .innerJoin(mailboxConnections, eq(mailboxConnections.id, agents.connectionId))
         .where(eq(agents.orgId, ctx.orgId))
         .orderBy(asc(agents.connectionId), asc(agents.priority)),
     )
