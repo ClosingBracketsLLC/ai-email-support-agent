@@ -1,19 +1,23 @@
 /**
- * `mailbox.renew-watch` against Postgres, with a fake `MailboxProvider` (`providerFactory`) standing in
- * for both `getAccessToken`'s `.refresh` and the client's `subscribe`/`renewSubscription` — no real
- * network. Every connection here seeds a FRESH access token so `getAccessToken` never calls `.refresh`.
+ * `mailbox.renew-watch` against Postgres + a real (test) pg-boss, with a fake `MailboxProvider`
+ * (`providerFactory`) standing in for both `getAccessToken`'s `.refresh` and the client's
+ * `subscribe`/`renewSubscription` — no real network. Every connection here seeds a FRESH access
+ * token so `getAccessToken` never calls `.refresh`.
  */
 import { randomBytes } from 'node:crypto'
-import { eq } from 'drizzle-orm'
+import { eq, inArray } from 'drizzle-orm'
+import type PgBoss from 'pg-boss'
 import pino, { type Logger } from 'pino'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import { encrypt, hashToken, hashesEqual, loadKekRing, type KekRing } from '@aesa/crypto'
-import { loadOrgDek, mailboxConnections, mailboxCredentials, provisionOrgKeys, user, withOrg, withPlatform, workspaces } from '@aesa/db'
+import { loadOrgDek, mailboxConnections, mailboxCredentials, notifications, provisionOrgKeys, user, withOrg, withPlatform, workspaces } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
-import type { MailboxClient, MailboxProvider } from '@aesa/mail'
+import { ProviderAuthError, type MailboxClient, type MailboxProvider } from '@aesa/mail'
+import { JOB_NAMES } from '@aesa/queue'
 import type { WorkerConfig } from '../src/config.ts'
 import { runMailboxRenewWatch, type MailboxRenewWatchDeps } from '../src/jobs/mailbox-renew-watch.ts'
+import { deleteJobsForOrgs, queryJobs, startTestBoss } from './helpers/boss.ts'
 
 const rand = () => randomBytes(4).toString('hex')
 
@@ -30,13 +34,21 @@ function baseConfig(overrides: Partial<WorkerConfig> = {}): WorkerConfig {
 describe('mailbox.renew-watch', () => {
   let t: Awaited<ReturnType<typeof createTestDatabase>>
   let app: ReturnType<typeof createDb>
+  let boss: PgBoss
   let orgId: string
   let userId: string
   const ring: KekRing = loadKekRing({ AESA_KEK_V1: randomBytes(32).toString('base64'), AESA_KEK_ACTIVE: '1' })
+  // `runMailboxRenewWatch` scans EVERY 'connected' connection across every org (it's a cron with no
+  // org filter) — a connection a test leaves with pushSubscriptionId still null (a failed subscribe,
+  // or a test that returns before touching it) would otherwise linger as a candidate for every LATER
+  // test in this file. Disable each test's own connections afterward so they never leak forward.
+  let createdConnectionIds: string[] = []
 
   beforeAll(async () => {
     t = await createTestDatabase()
     app = createDb(t.url)
+    boss = await startTestBoss()
+    await boss.createQueue(JOB_NAMES.notifyDispatch)
     orgId = await createTestOrganization(app)
     await withOrg(app.db, orgId, (tx) => tx.insert(workspaces).values({ orgId, businessName: 'Acme', timezone: 'UTC' }))
     await withOrg(app.db, orgId, (tx) => provisionOrgKeys(tx, ring))
@@ -44,8 +56,17 @@ describe('mailbox.renew-watch', () => {
     userId = u!.id
   })
   afterAll(async () => {
+    // Scoped to this file's own org — see test/helpers/boss.ts's deleteJobsForOrgs doc comment.
+    await deleteJobsForOrgs(JOB_NAMES.notifyDispatch, [orgId])
+    await boss.stop({ graceful: false, wait: true })
     await app.pool.end()
     await t.drop()
+  })
+  afterEach(async () => {
+    if (createdConnectionIds.length === 0) return
+    await withOrg(app.db, orgId, (tx) =>
+      tx.update(mailboxConnections).set({ status: 'disabled' }).where(inArray(mailboxConnections.id, createdConnectionIds)))
+    createdConnectionIds = []
   })
 
   async function createConnection(provider: 'gmail' | 'microsoft', overrides: Partial<typeof mailboxConnections.$inferInsert> = {}): Promise<string> {
@@ -58,6 +79,7 @@ describe('mailbox.renew-watch', () => {
         })
         .returning(),
     )
+    createdConnectionIds.push(conn!.id)
     return conn!.id
   }
 
@@ -78,12 +100,33 @@ describe('mailbox.renew-watch', () => {
     )
   }
 
+  /** An EXPIRED access token — getAccessToken must claim the refresh lease and call `.refresh()`. */
+  async function seedExpiredCredential(connectionId: string): Promise<void> {
+    const { dek, version } = await withOrg(app.db, orgId, (tx) => loadOrgDek(tx, ring))
+    const refreshToken = `refresh-${rand()}`
+    const aad = `${orgId}:mailbox_credentials:${connectionId}`
+    await withPlatform(app.db, 'test:seed-expired', (tx) =>
+      tx.insert(mailboxCredentials).values({
+        connectionId, orgId,
+        refreshTokenCiphertext: encrypt(dek, Buffer.from(refreshToken, 'utf8'), aad),
+        accessTokenCiphertext: encrypt(dek, Buffer.from('stale-token', 'utf8'), aad),
+        accessTokenExpiresAt: new Date(Date.now() - 3_600_000),
+        refreshTokenHash: hashToken('refresh', refreshToken),
+        encryption: 'dek', dataKeyVersion: version,
+      }),
+    )
+  }
+
   async function readConnection(connectionId: string) {
     const [row] = await withOrg(app.db, orgId, (tx) => tx.select().from(mailboxConnections).where(eq(mailboxConnections.id, connectionId)))
     return row!
   }
 
-  function fakeProvider(client: Partial<MailboxClient>): MailboxProvider {
+  async function notificationsFor(dedupeKey: string) {
+    return withOrg(app.db, orgId, (tx) => tx.select().from(notifications).where(eq(notifications.dedupeKey, dedupeKey)))
+  }
+
+  function fakeProvider(client: Partial<MailboxClient>, overrides: Partial<MailboxProvider> = {}): MailboxProvider {
     return {
       kind: 'gmail',
       authorizationUrl: () => { throw new Error('unexpected') },
@@ -91,6 +134,7 @@ describe('mailbox.renew-watch', () => {
       refresh: () => { throw new Error('unexpected refresh call') },
       revoke: async () => {},
       client: () => client as MailboxClient,
+      ...overrides,
     }
   }
 
@@ -111,7 +155,7 @@ describe('mailbox.renew-watch', () => {
     }
     const deps = makeDeps({ providerFactory: () => fakeProvider(client) })
 
-    await runMailboxRenewWatch(deps)
+    await runMailboxRenewWatch(boss, deps)
 
     expect(seenClientState).toBeDefined()
     const after = await readConnection(connectionId)
@@ -131,7 +175,7 @@ describe('mailbox.renew-watch', () => {
     }
     const deps = makeDeps({ providerFactory: () => fakeProvider(client) })
 
-    await runMailboxRenewWatch(deps)
+    await runMailboxRenewWatch(boss, deps)
 
     expect(seenTopic).toBe('projects/p/topics/t')
     const after = await readConnection(connectionId)
@@ -151,7 +195,7 @@ describe('mailbox.renew-watch', () => {
     }
     const deps = makeDeps({ providerFactory: () => fakeProvider(client) })
 
-    await runMailboxRenewWatch(deps)
+    await runMailboxRenewWatch(boss, deps)
 
     expect(renewedId).toBe('graph-sub-old')
     const after = await readConnection(connectionId)
@@ -169,7 +213,7 @@ describe('mailbox.renew-watch', () => {
     }
     const deps = makeDeps({ providerFactory: () => fakeProvider(client) })
 
-    await runMailboxRenewWatch(deps)
+    await runMailboxRenewWatch(boss, deps)
 
     expect(touched).toBe(false)
     const after = await readConnection(connectionId)
@@ -184,7 +228,7 @@ describe('mailbox.renew-watch', () => {
     const logger = { warn: (...args: unknown[]) => warnings.push(args), info: () => {} } as unknown as Logger
     const deps = makeDeps({ providerFactory: () => fakeProvider(client), logger })
 
-    await expect(runMailboxRenewWatch(deps)).resolves.toBeUndefined()
+    await expect(runMailboxRenewWatch(boss, deps)).resolves.toBeUndefined()
 
     expect(warnings.length).toBeGreaterThan(0)
     const after = await readConnection(connectionId)
@@ -200,10 +244,40 @@ describe('mailbox.renew-watch', () => {
       providerFactory: () => fakeProvider({ subscribe: async () => { called = true; throw new Error('must not be called') } }),
     })
 
-    await runMailboxRenewWatch(deps)
+    await runMailboxRenewWatch(boss, deps)
 
     expect(called).toBe(false)
     const after = await readConnection(connectionId)
     expect(after.pushSubscriptionId).toBeNull()
+  })
+
+  it('getAccessToken throwing ProviderAuthError inserts a mailbox_reauth notification and enqueues notify.dispatch, without bumping consecutive_failures (Important 3)', async () => {
+    const connectionId = await createConnection('microsoft')
+    await seedExpiredCredential(connectionId)
+    const now = new Date()
+    let subscribeCalled = false
+    const deps = makeDeps({
+      now: () => now,
+      providerFactory: () => fakeProvider(
+        { subscribe: async () => { subscribeCalled = true; throw new Error('must not be called') } },
+        { refresh: async () => { throw new ProviderAuthError('refresh token rejected') } },
+      ),
+    })
+
+    await expect(runMailboxRenewWatch(boss, deps)).resolves.toBeUndefined()
+
+    expect(subscribeCalled).toBe(false)
+    const after = await readConnection(connectionId)
+    expect(after.status).toBe('reauth_required') // Task 8's own flip (the hash tried was current)
+    expect(after.consecutiveFailures).toBe(0) // NOT a generic failure — no backoff-style bump
+
+    const day = now.toISOString().slice(0, 10)
+    const rows = await notificationsFor(`reauth:${connectionId}:${day}`)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.kind).toBe('mailbox_reauth')
+
+    const notifyJobs = await queryJobs(JOB_NAMES.notifyDispatch)
+    const match = notifyJobs.find((j) => (j.data as { notificationId?: string }).notificationId === rows[0]!.id)
+    expect(match).toBeDefined()
   })
 })

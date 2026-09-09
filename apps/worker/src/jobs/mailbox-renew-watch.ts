@@ -11,11 +11,12 @@ import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import { generateToken, type KekRing } from '@aesa/crypto'
 import { mailboxConnections, withOrg, withPlatform, type Db } from '@aesa/db'
-import { getAccessToken, type MailboxClient, type MailboxProvider } from '@aesa/mail'
+import { getAccessToken, ProviderAuthError, type MailboxClient, type MailboxProvider } from '@aesa/mail'
 import { registerCron } from '@aesa/queue'
 import type { WorkerConfig } from '../config.ts'
 import { errorMessage } from '../err-message.ts'
 import { resolveMailProvider } from '../mail-provider.ts'
+import { notifyReauthRequired } from '../reauth-notify.ts'
 
 const RENEW_WINDOW_MS = 36 * 60 * 60 * 1000
 
@@ -32,7 +33,7 @@ export interface MailboxRenewWatchDeps {
   now?: () => Date
 }
 
-export async function runMailboxRenewWatch(deps: MailboxRenewWatchDeps): Promise<void> {
+export async function runMailboxRenewWatch(boss: PgBoss, deps: MailboxRenewWatchDeps): Promise<void> {
   const now = deps.now?.() ?? new Date()
   const providers: ('gmail' | 'microsoft')[] = []
   if (deps.config.gmailPubsubTopic) providers.push('gmail')
@@ -101,6 +102,21 @@ export async function runMailboxRenewWatch(deps: MailboxRenewWatchDeps): Promise
         )
       }
     } catch (err) {
+      if (err instanceof ProviderAuthError) {
+        // Task 8 already flipped this connection to reauth_required (only when the hash it tried was
+        // still current). Once reauth_required, the connection is excluded from BOTH mailbox.sync's
+        // lease claim (status must be 'connected') and mailbox.poll-sweep's (a) selection — this is
+        // the only place left that can ever tell the owner about it (fix review, Important 3), so
+        // route it through the same day-deduped notification mailbox.sync uses rather than just
+        // bumping consecutive_failures (which nothing would ever act on for a reauth_required row).
+        deps.logger.warn({ connectionId: c.id, provider }, 'mailbox.renew_watch_reauth_required')
+        try {
+          await notifyReauthRequired(boss, deps.db, c.orgId, c.id, now)
+        } catch (notifyErr) {
+          deps.logger.warn({ connectionId: c.id, error: errorMessage(notifyErr) }, 'mailbox.renew_watch_reauth_notify_failed')
+        }
+        continue
+      }
       deps.logger.warn({ connectionId: c.id, provider, error: errorMessage(err) }, 'mailbox.renew_watch_failed')
       try {
         await withOrg(deps.db, c.orgId, (tx) =>
@@ -119,7 +135,7 @@ export async function registerMailboxRenewWatch(boss: PgBoss, deps: MailboxRenew
     'mailbox.renew-watch',
     '17 * * * *',
     async () => {
-      await runMailboxRenewWatch(deps)
+      await runMailboxRenewWatch(boss, deps)
     },
     { policy: 'singleton', singletonKey: 'mailbox.renew-watch', retryLimit: 0, expireInSeconds: 600 },
   )

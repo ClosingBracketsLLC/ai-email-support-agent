@@ -188,6 +188,33 @@ describe('runTicketTriage', () => {
     expect(provider.calls).toHaveLength(0)
   })
 
+  it('1c. needs_owner/triage_cap IS selectable — mailbox.poll-sweep re-entry lands the verdict through the legal needs_owner -> triaged edge', async () => {
+    const ticketId = await seedTicket({ status: 'needs_owner', needsOwnerReason: 'triage_cap' })
+    const provider = verdictProvider(BASE_VERDICT)
+    const { deps } = makeDeps(provider)
+
+    await runTicketTriage(deps, { orgId, ticketId }, new AbortController().signal)
+
+    expect(provider.calls).toHaveLength(1)
+    const ticket = await getTicket(ticketId)
+    expect(ticket.status).toBe('triaged')
+    expect(ticket.needsOwnerReason).toBeNull()
+  })
+
+  it('1d. every OTHER needs_owner reason stays non-selectable', async () => {
+    const provider = createFakeProvider([{ error: new LlmError('must not be called', 'permanent', false) }])
+    const { deps } = makeDeps(provider)
+
+    for (const reason of ['tripwire', 'triage_flags', 'sentiment_angry', 'triage_failed'] as const) {
+      const ticketId = await seedTicket({ status: 'needs_owner', needsOwnerReason: reason })
+      await runTicketTriage(deps, { orgId, ticketId }, new AbortController().signal)
+      const ticket = await getTicket(ticketId)
+      expect(ticket.status).toBe('needs_owner')
+      expect(ticket.needsOwnerReason).toBe(reason)
+    }
+    expect(provider.calls).toHaveLength(0)
+  })
+
   it('1b. a triaged ticket with a genuinely new inbound IS selectable and proceeds to the model', async () => {
     const ticketId = await seedTicket({ status: 'triaged', lastInboundAt: new Date('2026-09-05T00:00:00Z'), lastTriagedAt: new Date('2026-09-01T00:00:00Z') })
     const provider = verdictProvider(BASE_VERDICT)

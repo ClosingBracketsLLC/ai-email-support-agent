@@ -100,17 +100,47 @@ describe('mailbox.poll-sweep', () => {
     expect(connectionIds).not.toContain(healthy)
   })
 
-  it('(a) fair-select interleaves two orgs with three due connections each', async () => {
+  it('(a) fair-select interleaves two orgs with three due connections each (asserts ORDER, not just membership)', async () => {
     const orgA = await newOrg()
     const orgB = await newOrg()
-    const aIds = await Promise.all([1, 2, 3].map(() => seedConnection(orgA, { lastSyncAt: new Date(NOW.getTime() - 40 * 60_000) })))
-    const bIds = await Promise.all([1, 2, 3].map(() => seedConnection(orgB, { lastSyncAt: new Date(NOW.getTime() - 40 * 60_000) })))
+    const aIds = await Promise.all([1, 2, 3].map((n) => seedConnection(orgA, { lastSyncAt: new Date(NOW.getTime() - n * 60_000 - 40 * 60_000) })))
+    const bIds = await Promise.all([1, 2, 3].map((n) => seedConnection(orgB, { lastSyncAt: new Date(NOW.getTime() - n * 60_000 - 40 * 60_000) })))
 
-    await runMailboxPollSweep(boss, makeDeps())
+    // Spy on the underlying boss.send to capture the ORDER mailbox.sync was actually enqueued in —
+    // queryJobs' plain SELECT carries no ordering guarantee, so reading rows back afterward could
+    // pass under a plain ORDER BY (a real regression) just as easily as under fair-select. The
+    // sweep enqueues sequentially (`for (const item of pending) { await enqueue(...) }`), so the send
+    // order IS the order fairSelectSql produced.
+    const originalSend = boss.send.bind(boss)
+    const sendOrder: string[] = []
+    boss.send = (async (name: string, data: unknown, opts?: unknown) => {
+      if (name === JOB_NAMES.mailboxSync) sendOrder.push((data as { connectionId: string }).connectionId)
+      return originalSend(name as never, data as never, opts as never)
+    }) as typeof boss.send
 
-    const jobs = await mailboxSyncJobs()
-    const enqueued = new Set(jobs.map((j) => (j.data as { connectionId?: string }).connectionId))
-    for (const id of [...aIds, ...bIds]) expect(enqueued.has(id)).toBe(true)
+    try {
+      await runMailboxPollSweep(boss, makeDeps())
+    } finally {
+      boss.send = originalSend
+    }
+
+    // Earlier tests in this file leave their OWN due connections lingering as candidates for every
+    // later sweep too (this cron intentionally scans every org, with no per-test cleanup) — filter
+    // sendOrder down to just this test's own six ids before asserting on order/length.
+    const aSet = new Set(aIds)
+    const bSet = new Set(bIds)
+    const ownOrder = sendOrder.filter((id) => aSet.has(id) || bSet.has(id))
+
+    expect(ownOrder).toHaveLength(6)
+    // Fair round-robin: one connection from EACH org before either org gets a second — same
+    // assertion style as packages/queue/test/fair-select.test.ts's own "round-robins ... before
+    // taking a second row from any" check, just for two orgs instead of three.
+    const firstTwo = ownOrder.slice(0, 2)
+    expect(firstTwo.some((id) => aSet.has(id))).toBe(true)
+    expect(firstTwo.some((id) => bSet.has(id))).toBe(true)
+    // And every id shows up exactly once, confirming no org's row was skipped or duplicated.
+    expect(new Set(ownOrder).size).toBe(6)
+    for (const id of [...aIds, ...bIds]) expect(ownOrder).toContain(id)
   })
 
   it('(b) an expired pending_claim connection has its credentials and connection row deleted, and is audited', async () => {
@@ -167,7 +197,7 @@ describe('mailbox.poll-sweep', () => {
     expect(jobs.some((j) => (j.data as { ticketId?: string }).ticketId === ticket!.id)).toBe(true)
   })
 
-  it('(e) a needs_owner/triage_cap ticket from a previous UTC day is reset to new and re-enqueued', async () => {
+  it('(e) a needs_owner/triage_cap ticket from a previous UTC day is enqueued WITHOUT any status write (needs_owner -> new is not a legal ticketTransitions edge)', async () => {
     const orgId = await newOrg()
     const connectionId = await seedConnection(orgId)
     const [ticket] = await withOrg(app.db, orgId, (tx) =>
@@ -175,20 +205,25 @@ describe('mailbox.poll-sweep', () => {
         .insert(tickets)
         .values({
           orgId, connectionId, providerThreadId: `thread-${rand()}`, status: 'needs_owner', needsOwnerReason: 'triage_cap',
-          lastTriagedAt: new Date('2026-09-08T10:00:00Z'),
+          lastTriagedAt: new Date('2026-09-08T10:00:00Z'), updatedAt: new Date('2026-09-08T10:00:00Z'),
         })
         .returning())
 
     await runMailboxPollSweep(boss, makeDeps())
 
+    // The sweep itself must NEVER mutate the ticket row — it only enqueues ticket.triage, which
+    // (now that isSelectable accepts needs_owner/triage_cap) is what actually lands the verdict
+    // through the legal needs_owner -> triaged/resolved edge.
     const [after] = await withOrg(app.db, orgId, (tx) => tx.select().from(tickets).where(eq(tickets.id, ticket!.id)))
-    expect(after?.status).toBe('new')
-    expect(after?.needsOwnerReason).toBeNull()
+    expect(after?.status).toBe('needs_owner')
+    expect(after?.needsOwnerReason).toBe('triage_cap')
     const jobs = await ticketTriageJobs()
-    expect(jobs.some((j) => (j.data as { ticketId?: string }).ticketId === ticket!.id)).toBe(true)
+    const match = jobs.find((j) => (j.data as { ticketId?: string }).ticketId === ticket!.id)
+    expect(match).toBeDefined()
+    expect((match!.data as { orgId?: string }).orgId).toBe(orgId)
   })
 
-  it('(e) a same-day triage_cap ticket is left untouched', async () => {
+  it('(e) a same-day triage_cap ticket is neither written NOR enqueued', async () => {
     const orgId = await newOrg()
     const connectionId = await seedConnection(orgId)
     const [ticket] = await withOrg(app.db, orgId, (tx) =>

@@ -12,15 +12,16 @@
  * reached it yet, or its last subscribe attempt failed — has no signal but this sweep, so it must be
  * polled every cycle regardless of the reason.
  *
- * (e)'s literal text ("needs_owner/triage_cap from a previous UTC day -> enqueue ticket.triage") would
- * be a no-op as written: `runTicketTriage`'s own `isSelectable` gate explicitly excludes `needs_owner`
- * (Task 14, rule 1) — a needs_owner ticket, capped or not, is never selected by the job it enqueues.
- * The spec's own framing ("the backstop re-enqueues after midnight") only makes sense if the sweep
- * first makes the ticket selectable again, so this implements the reset AS PART OF the re-entry: reset
- * status new + needsOwnerReason null (a UPDATE ... RETURNING, itself the guard against a race with a
- * concurrent owner action — a ticket a human already moved out of needs_owner/triage_cap since the
- * cutoff no longer matches the WHERE and is left alone), THEN enqueue ticket.triage for the rows that
- * were actually reset.
+ * (e) is ENQUEUE ONLY — a plain SELECT, no write. An earlier revision of this file had this sweep
+ * reset the ticket to `new` before enqueueing (on the theory that `runTicketTriage`'s `isSelectable`
+ * gate excludes `needs_owner` outright); a `needs_owner -> new` write is not a legal edge in
+ * `@aesa/core`'s `ticketTransitions` matrix (`needs_owner` only leads to `triaged`/`resolved`/
+ * `waiting_on_customer`), and this platform-role sweep has no `OrgTx` to audit it through even if it
+ * were. The fix is on the OTHER side: `runTicketTriage`'s `isSelectable` now accepts
+ * `needs_owner`+`needsOwnerReason: 'triage_cap'` as selectable (and no other needs_owner reason), so
+ * re-selecting the SAME row this sweep found lets the verdict land through the legal
+ * `needs_owner -> triaged/resolved` edges; a still-capped day just re-caps in place via triage's own
+ * same-status guarded write.
  */
 import { and, eq, lt, sql } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
@@ -134,11 +135,16 @@ export async function runMailboxPollSweep(boss: PgBoss, deps: MailboxPollSweepDe
       .where(and(eq(tickets.status, 'new'), lt(tickets.lastInboundAt, newCutoff)))
     for (const t of stuckNew) pending.push({ kind: 'triage', orgId: t.orgId, entityId: t.id })
 
-    // (e) triage-cap re-entry — see file header. Reset THEN enqueue, guarded by the RETURNING set.
+    // (e) triage-cap re-entry — see file header. ENQUEUE ONLY: needs_owner -> new is not a legal
+    // edge in @aesa/core's ticketTransitions matrix, and this sweep runs as the platform role with
+    // no audit trail for a ticket-status write anyway. ticket.triage itself now accepts
+    // needs_owner/triage_cap as selectable (its own guarded write lands the verdict through the
+    // legal needs_owner -> triaged/resolved edges); a still-capped day just re-caps in place via the
+    // same-status guarded write, so this sweep never needs to touch the row at all.
     const todayStart = new Date(`${utcDayString(now)}T00:00:00.000Z`)
     const capRows = await tx
-      .update(tickets)
-      .set({ status: 'new', needsOwnerReason: null })
+      .select({ id: tickets.id, orgId: tickets.orgId })
+      .from(tickets)
       .where(
         and(
           eq(tickets.status, 'needs_owner'),
@@ -146,7 +152,6 @@ export async function runMailboxPollSweep(boss: PgBoss, deps: MailboxPollSweepDe
           sql`COALESCE(${tickets.lastTriagedAt}, ${tickets.updatedAt}) < ${todayStart}`,
         ),
       )
-      .returning({ id: tickets.id, orgId: tickets.orgId })
     for (const t of capRows) pending.push({ kind: 'triage', orgId: t.orgId, entityId: t.id })
 
     // (f) webhook_events retention.

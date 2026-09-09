@@ -40,6 +40,7 @@ import { utcDayString } from '../date-utils.ts'
 import { errorMessage } from '../err-message.ts'
 import { resolveMailProvider } from '../mail-provider.ts'
 import { enqueueNotifyDispatch } from '../notify-stub.ts'
+import { notifyReauthRequired } from '../reauth-notify.ts'
 import { ticketTriageJob } from './ticket-triage.ts'
 
 /** A held lease shorter than the job's own poll cadence guarantees at most one live sync per
@@ -106,31 +107,6 @@ async function claimLease(db: Db, orgId: string, connectionId: string): Promise<
   return rows[0]
 }
 
-async function clearLease(db: Db, orgId: string, connectionId: string): Promise<void> {
-  await withOrg(db, orgId, (tx) => tx.update(mailboxConnections).set({ pollLeaseUntil: null }).where(eq(mailboxConnections.id, connectionId)))
-}
-
-/** Step 2's failure path: insert the (day-deduped) reauth notification and enqueue its dispatch. */
-async function handleReauth(boss: PgBoss, deps: MailboxSyncDeps, orgId: string, connectionId: string, now: Date): Promise<void> {
-  const dedupeKey = `reauth:${connectionId}:${utcDayString(now)}`
-  const notificationId = await withOrg(deps.db, orgId, async (tx) => {
-    const [row] = await tx
-      .insert(notifications)
-      .values({
-        orgId,
-        kind: 'mailbox_reauth',
-        title: 'Reconnect your mailbox',
-        body: 'We could not refresh access to your mailbox. Reconnect it to keep receiving support email.',
-        dedupeKey,
-        payload: { connectionId },
-      })
-      .onConflictDoNothing({ target: notifications.dedupeKey })
-      .returning({ id: notifications.id })
-    return row?.id
-  })
-  if (notificationId) await enqueueNotifyDispatch(boss, orgId, notificationId)
-}
-
 /** Step 6's tripwire branch: insert the (day-deduped) escalation notification and enqueue its dispatch. */
 async function insertEscalation(boss: PgBoss, deps: MailboxSyncDeps, orgId: string, ticketId: string, now: Date): Promise<void> {
   const dedupeKey = `escalation:${ticketId}:${utcDayString(now)}`
@@ -162,34 +138,32 @@ export async function runMailboxSync(boss: PgBoss, deps: MailboxSyncDeps, payloa
     return
   }
   const provider = connRow.provider as 'gmail' | 'microsoft'
-  const providerObj = (deps.providerFactory ?? resolveMailProvider)(provider)
 
-  const oauth = provider === 'gmail' ? deps.config.gmailOauth : deps.config.msOauth
-  if (!oauth) throw new Error(`mailbox.sync: no OAuth client configured for provider ${provider}`)
-
-  let accessToken: string
+  // EVERYTHING from here on — resolving the provider, getAccessToken, acquiring the limiter, running
+  // the sync walk — runs inside ONE try/finally so any failure (a missing OAuth pair, a non-auth
+  // getAccessToken error, a runSync throw) is caught by the SAME outcome bookkeeping below and goes
+  // through the SAME health-write. Letting any of these propagate past this point would leak the
+  // 90s lease and skip the consecutive_failures/backoff write — a later pg-boss retry would then find
+  // the lease still held, log a contended claim, and "succeed" having done nothing, silently masking
+  // the real failure (fix review, Important 4).
+  const newInboundIds: string[] = []
+  const tripwiredIds: string[] = []
+  let outcome: 'success' | 'failure' | 'rate_limited' | 'reauth' = 'success'
+  let retryAfterMs: number | null = null
+  let release: (() => void) | undefined
   try {
-    accessToken = await getAccessToken(
+    const providerObj = (deps.providerFactory ?? resolveMailProvider)(provider)
+    const oauth = provider === 'gmail' ? deps.config.gmailOauth : deps.config.msOauth
+    if (!oauth) throw new Error(`mailbox.sync: no OAuth client configured for provider ${provider}`)
+
+    const accessToken = await getAccessToken(
       { db: deps.db, ring: deps.ring, provider: providerObj, clientId: oauth.clientId, clientSecret: oauth.clientSecret.expose() },
       payload.orgId,
       payload.connectionId,
       JOB_NAMES.mailboxSync,
     )
-  } catch (err) {
-    if (err instanceof ProviderAuthError) {
-      await clearLease(deps.db, payload.orgId, payload.connectionId)
-      await handleReauth(boss, deps, payload.orgId, payload.connectionId, now)
-      return
-    }
-    throw err
-  }
 
-  const release = await deps.limiter.acquire(payload.connectionId)
-  const newInboundIds: string[] = []
-  const tripwiredIds: string[] = []
-  let outcome: 'success' | 'failure' | 'rate_limited' = 'success'
-  let retryAfterMs: number | null = null
-  try {
+    release = await deps.limiter.acquire(payload.connectionId)
     const client = deps.clientFactory
       ? deps.clientFactory(provider, accessToken, connRow.emailAddress)
       : providerObj.client(accessToken, connRow.emailAddress)
@@ -214,7 +188,11 @@ export async function runMailboxSync(boss: PgBoss, deps: MailboxSyncDeps, payloa
       log: (level, msg, ctx) => deps.logger[level](ctx ?? {}, msg),
     })
   } catch (err) {
-    if (err instanceof ProviderRateLimitError) {
+    if (err instanceof ProviderAuthError) {
+      // Task 8 already flipped the connection to reauth_required (only when the hash it tried was
+      // still current) — this run's own remaining job is telling the owner, once per UTC day.
+      outcome = 'reauth'
+    } else if (err instanceof ProviderRateLimitError) {
       outcome = 'rate_limited'
       retryAfterMs = err.retryAfterMs
     } else {
@@ -222,12 +200,12 @@ export async function runMailboxSync(boss: PgBoss, deps: MailboxSyncDeps, payloa
       deps.logger.warn({ connectionId: payload.connectionId, error: errorMessage(err) }, 'mailbox.sync_failed')
     }
   } finally {
-    release()
+    release?.()
   }
 
-  // Step 5: one withOrg tx clears the lease and, except on a rate limit, writes health.
+  // Step 5: one withOrg tx clears the lease and, except on a rate limit or a reauth, writes health.
   await withOrg(deps.db, payload.orgId, async (tx) => {
-    if (outcome === 'rate_limited') {
+    if (outcome === 'rate_limited' || outcome === 'reauth') {
       await tx.update(mailboxConnections).set({ pollLeaseUntil: null }).where(eq(mailboxConnections.id, payload.connectionId))
       return
     }
@@ -262,6 +240,11 @@ export async function runMailboxSync(boss: PgBoss, deps: MailboxSyncDeps, payloa
       })
       .where(eq(mailboxConnections.id, payload.connectionId))
   })
+
+  if (outcome === 'reauth') {
+    await notifyReauthRequired(boss, deps.db, payload.orgId, payload.connectionId, now)
+    return
+  }
 
   // Step 6: post-commit, regardless of outcome — a run that failed or got rate-limited partway
   // through may have already committed several messages, each with its callback already fired.

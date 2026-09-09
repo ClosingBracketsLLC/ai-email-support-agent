@@ -84,10 +84,18 @@ interface SelectedTicket {
   triageFailureCount: number
 }
 
-/** `new`, or `triaged` with a genuinely new inbound since the last verdict. `needs_owner` (the
- * tripwire's queue) is never selectable — this WHERE is the only thing that makes that true. */
-function isSelectable(t: { status: string; lastInboundAt: Date | null; lastTriagedAt: Date | null }): boolean {
+/**
+ * `new`, or `triaged` with a genuinely new inbound since the last verdict, or `needs_owner` with
+ * `needsOwnerReason: 'triage_cap'` — the ONE needs_owner reason this job may re-select (Task 15's
+ * poll-sweep re-entry: `needs_owner -> new` is not a legal edge in `@aesa/core`'s `ticketTransitions`
+ * matrix, so the sweep only enqueues; re-selecting the ticket here and landing the verdict through
+ * `needs_owner -> triaged/resolved` — both legal — is what actually re-runs it). Every OTHER
+ * needs_owner reason (the tripwire's queue, `triage_flags`, `sentiment_angry`, `triage_failed`) is
+ * never selectable — an owner-facing escalation must never be silently re-triaged out from under them.
+ */
+function isSelectable(t: { status: string; needsOwnerReason: string | null; lastInboundAt: Date | null; lastTriagedAt: Date | null }): boolean {
   if (t.status === 'new') return true
+  if (t.status === 'needs_owner') return t.needsOwnerReason === 'triage_cap'
   if (t.status !== 'triaged' || !t.lastInboundAt) return false
   return !t.lastTriagedAt || t.lastInboundAt > t.lastTriagedAt
 }
@@ -122,6 +130,7 @@ async function loadContext(db: Db, orgId: string, ticketId: string, day: string)
         isAutomated: tickets.isAutomated,
         spamFlagged: tickets.spamFlagged,
         triageFailureCount: tickets.triageFailureCount,
+        needsOwnerReason: tickets.needsOwnerReason,
         lastInboundAt: tickets.lastInboundAt,
         lastTriagedAt: tickets.lastTriagedAt,
       })

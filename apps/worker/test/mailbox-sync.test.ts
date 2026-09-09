@@ -243,6 +243,89 @@ describe('mailbox.sync', () => {
     expect(match).toBeDefined()
   })
 
+  it('a generic (non-auth, non-rate-limit) getAccessToken failure still clears the lease and writes consecutive_failures/backoff (Important 4)', async () => {
+    const { connectionId } = await createConnection()
+    await seedExpiredCredential(connectionId)
+    const failingProvider: MailboxProvider = {
+      kind: 'gmail',
+      authorizationUrl: () => { throw new Error('unexpected') },
+      exchangeCode: () => { throw new Error('unexpected') },
+      refresh: async () => { throw new Error('network exploded') },
+      revoke: async () => {},
+      client: () => { throw new Error('must not build a client on a getAccessToken failure') },
+    }
+    const deps = makeDeps({ providerFactory: () => failingProvider })
+
+    // Before the fix: this throw happened AFTER claimLease but BEFORE the health/finally block, so
+    // it propagated straight out of runMailboxSync — leaking the 90s lease and skipping the
+    // consecutive_failures/backoff write entirely (fix review, Important 4).
+    await expect(runMailboxSync(boss, deps, { orgId, connectionId })).resolves.toBeUndefined()
+
+    const after = await readConnection(connectionId)
+    expect(after.pollLeaseUntil).toBeNull()
+    expect(after.consecutiveFailures).toBe(1)
+    expect(after.backoffUntil).not.toBeNull()
+    expect(after.backoffUntil!.getTime()).toBeGreaterThan(Date.now())
+  })
+
+  it('heal ruling: a connection flipped to reauth_required mid-run (another worker\'s slower attempt) heals to connected on a successful run', async () => {
+    const { connectionId, selfAddress } = await createConnection()
+    await seedFreshCredential(connectionId)
+    const mailbox: MockMailbox = createMockMailbox({ mode: 'gmail', selfAddress })
+    const seedDeps = makeDeps({ clientFactory: () => mailbox })
+    await runMailboxSync(boss, seedDeps, { orgId, connectionId }) // seed the cursor
+
+    // Simulate the race the Task 8 carry-over ruling exists for: by the time THIS run reaches the
+    // walk (already past its own getAccessToken call, lease already claimed while status was still
+    // 'connected'), another worker's slower attempt flips the row to reauth_required.
+    let flipped = false
+    const wrappedClient = {
+      ...mailbox,
+      listChanges: async (cursor: unknown, pageToken?: string) => {
+        if (!flipped) {
+          flipped = true
+          await withOrg(app.db, orgId, (tx) => tx.update(mailboxConnections).set({ status: 'reauth_required' }).where(eq(mailboxConnections.id, connectionId)))
+        }
+        return mailbox.listChanges(cursor, pageToken)
+      },
+    }
+    const healDeps = makeDeps({ clientFactory: () => wrappedClient })
+
+    await runMailboxSync(boss, healDeps, { orgId, connectionId })
+
+    expect(flipped).toBe(true)
+    const after = await readConnection(connectionId)
+    expect(after.status).toBe('connected') // healed — this run's own getAccessToken proved the credential works
+    expect(after.lastSuccessAt).not.toBeNull()
+  })
+
+  it('heal ruling companion: an intentional disconnect (status disabled) mid-run is NEVER overridden by the success write', async () => {
+    const { connectionId, selfAddress } = await createConnection()
+    await seedFreshCredential(connectionId)
+    const mailbox: MockMailbox = createMockMailbox({ mode: 'gmail', selfAddress })
+    const seedDeps = makeDeps({ clientFactory: () => mailbox })
+    await runMailboxSync(boss, seedDeps, { orgId, connectionId }) // seed the cursor
+
+    let flipped = false
+    const wrappedClient = {
+      ...mailbox,
+      listChanges: async (cursor: unknown, pageToken?: string) => {
+        if (!flipped) {
+          flipped = true
+          await withOrg(app.db, orgId, (tx) => tx.update(mailboxConnections).set({ status: 'disabled' }).where(eq(mailboxConnections.id, connectionId)))
+        }
+        return mailbox.listChanges(cursor, pageToken)
+      },
+    }
+    const disconnectDeps = makeDeps({ clientFactory: () => wrappedClient })
+
+    await runMailboxSync(boss, disconnectDeps, { orgId, connectionId })
+
+    expect(flipped).toBe(true)
+    const after = await readConnection(connectionId)
+    expect(after.status).toBe('disabled') // the user's disconnect wins — only reauth_required heals
+  })
+
   it('a ProviderRateLimitError from runSync re-enqueues itself and does not count as a failure', async () => {
     const { connectionId, selfAddress } = await createConnection()
     await seedFreshCredential(connectionId)

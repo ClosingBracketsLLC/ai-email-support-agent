@@ -21,13 +21,19 @@ const { db, pool } = createDb(config.databaseUrl, { role: 'app' })
 const boss = await startBoss(config.databaseUrl)
 logger.info({ roles: [...config.roles], kekActive: config.kekRing?.active ?? null }, 'worker up')
 
-// Task 16 registers notify.dispatch's real handler; every role that can create a notification row
-// (ticket.triage's escalations here, mailbox.sync/mailbox.poll-sweep once the sync role is active)
-// sends to it through notify-stub.ts's enqueue-only stand-in — so the queue must exist before ANY
-// role's first send. pg-boss 10's insertJob SQL INNER JOINs the new job row against the queue table
-// and returns zero rows (no error, `boss.send` resolves `null`) when the named queue does not exist
-// yet, so create it unconditionally at boot regardless of which roles this replica runs.
+// pg-boss 10's insertJob SQL INNER JOINs the new job row against the queue table and returns zero
+// rows (no error, `boss.send` resolves `null`) when the named queue does not exist yet. That isn't
+// only notify.dispatch's problem (Task 16 hasn't registered it yet): ticket.triage's and
+// mailbox.sync's OWN queues are today created only by their config/role-gated `registerJob` calls
+// below — a `WORKER_ROLES=sync` replica with no ANTHROPIC_API_KEY never runs `registerTicketTriage`
+// on this process, and mailbox.poll-sweep's (d)/(e) enqueue `ticket.triage` regardless; the same gap
+// hits mailbox.sync on a `sync`-role replica missing the KEK ring or MAIL_FROM, which
+// mailbox.poll-sweep's (a) enqueues into unconditionally too. Create all three unconditionally at
+// boot, before any role-gated registration, so a send never silently no-ops on a role-partitioned
+// or under-configured replica.
 await createQueueRetrying(boss, JOB_NAMES.notifyDispatch)
+await createQueueRetrying(boss, JOB_NAMES.ticketTriage)
+await createQueueRetrying(boss, JOB_NAMES.mailboxSync)
 
 if (config.roles.has('cron')) await registerPlatformHeartbeat(boss, db)
 

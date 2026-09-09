@@ -176,6 +176,24 @@ describe('mailbox_credentials jobs', () => {
       await expect(runRevokeMailbox(deps, { orgId, connectionId: missingId })).resolves.toBeUndefined()
     })
 
+    it('reads a SEALED credentials row correctly (the common connect-then-disconnect path: never synced, never migrated to dek)', async () => {
+      const connectionId = await createConnection({ pushSubscriptionId: 'sub-sealed' })
+      const sealed = await sealTokens(boxPublicKey, { refreshToken: 'refresh-sealed', accessToken: 'access-sealed', accessTokenExpiresAt: null })
+      await withPlatform(app.db, 'test:seed-sealed', (tx) =>
+        tx.insert(mailboxCredentials).values({ connectionId, orgId, refreshTokenCiphertext: sealed, encryption: 'sealed' }))
+      const { provider, revokeCalls, unsubscribeCalls } = fakeProvider()
+      const deps: RevokeMailboxDeps = { db: app.db, ring, config: baseConfig(), logger: silentLogger, providerFactory: () => provider }
+
+      await runRevokeMailbox(deps, { orgId, connectionId })
+
+      expect(revokeCalls).toEqual([expect.objectContaining({ refreshToken: 'refresh-sealed' })])
+      expect(unsubscribeCalls).toEqual(['sub-sealed'])
+      expect(await readCredentialRow(connectionId)).toBeUndefined()
+      const audits = await withPlatform(app.db, 'test:audit-sealed', (tx) =>
+        tx.select().from(auditLog).where(and(eq(auditLog.entityId, connectionId), eq(auditLog.action, 'mailbox.revoked'))))
+      expect(audits).toHaveLength(1)
+    })
+
     it("a network failure on provider.revoke does not block local cleanup", async () => {
       const connectionId = await createConnection()
       await seedDekCredential(connectionId, 'refresh-fail', 'access-fail')
