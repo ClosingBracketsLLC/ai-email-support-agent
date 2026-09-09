@@ -1,0 +1,32 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v1.0/me/messages/msg-meta-1",
+    "query": {
+      "$select": "internetMessageHeaders,from,toRecipients,ccRecipients,subject,conversationId,receivedDateTime,hasAttachments,isDraft,parentFolderId"
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "id": "msg-meta-1",
+      "conversationId": "thread-meta-1",
+      "subject": "Re: Order #4521 hasn't shipped",
+      "receivedDateTime": "2025-08-25T13:41:40.000Z",
+      "hasAttachments": false,
+      "isDraft": false,
+      "parentFolderId": "folder-sent-id",
+      "from": { "emailAddress": { "name": "Acme Support", "address": "Support@Acme.test" } },
+      "toRecipients": [{ "emailAddress": { "name": "Jane", "address": "Jane@Example.com" } }],
+      "ccRecipients": [],
+      "internetMessageHeaders": [
+        { "name": "Message-ID", "value": "<graph-marker1@outlook.com>" },
+        { "name": "In-Reply-To", "value": "<graph-abc123@outlook.com>" },
+        { "name": "References", "value": "<graph-original-999@outlook.com> <graph-abc123@outlook.com>" },
+        { "name": "Auto-Submitted", "value": "no" },
+        { "name": "Delivered-To", "value": "support@acme.test" },
+        { "name": "X-Aesa-Draft", "value": "9f1c2b34-graph-marker" }
+      ]
+    }
+  }
+}

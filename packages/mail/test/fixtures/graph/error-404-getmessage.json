@@ -1,0 +1,14 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v1.0/me/messages/gone-1",
+    "query": {
+      "$select": "internetMessageHeaders,from,toRecipients,ccRecipients,subject,conversationId,receivedDateTime,hasAttachments,isDraft,parentFolderId,body",
+      "$expand": "attachments($select=name,contentType,size)"
+    }
+  },
+  "response": {
+    "status": 404,
+    "body": { "error": { "code": "ErrorItemNotFound", "message": "The specified object was not found." } }
+  }
+}

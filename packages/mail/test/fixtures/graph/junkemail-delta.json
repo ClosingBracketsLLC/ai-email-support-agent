@@ -1,0 +1,14 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v1.0/me/mailFolders/junkemail/messages/delta",
+    "query": { "$deltatoken": "seed-junk" }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "value": [{ "id": "msg-junk-1", "conversationId": "thread-junk-1" }],
+      "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/mailFolders/junkemail/messages/delta?$deltatoken=new-junk"
+    }
+  }
+}

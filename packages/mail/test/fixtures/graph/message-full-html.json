@@ -1,0 +1,38 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v1.0/me/messages/msg-full-1",
+    "query": {
+      "$select": "internetMessageHeaders,from,toRecipients,ccRecipients,subject,conversationId,receivedDateTime,hasAttachments,isDraft,parentFolderId,body",
+      "$expand": "attachments($select=name,contentType,size)"
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "id": "msg-full-1",
+      "conversationId": "thread-full-1",
+      "subject": "Re: Order #4521 double charge",
+      "receivedDateTime": "2025-09-05T10:00:00.000Z",
+      "hasAttachments": true,
+      "isDraft": false,
+      "parentFolderId": "folder-junk-id",
+      "from": { "emailAddress": { "address": "jane@example.com" } },
+      "toRecipients": [{ "emailAddress": { "address": "support@acme.test" } }],
+      "ccRecipients": [{ "emailAddress": { "address": "Billing@Example.com" } }],
+      "internetMessageHeaders": [
+        { "name": "Message-ID", "value": "<graph-full-1@outlook.com>" },
+        { "name": "In-Reply-To", "value": "<graph-support-1@outlook.com>" },
+        { "name": "References", "value": "<graph-root-0@outlook.com> <graph-support-1@outlook.com>" },
+        { "name": "Authentication-Results", "value": "mx.outlook.com; dmarc=pass; spf=pass" },
+        { "name": "Authentication-Results", "value": "relay.example.net; dmarc=fail" },
+        { "name": "Auto-Submitted", "value": "no" }
+      ],
+      "body": {
+        "contentType": "html",
+        "content": "<p>Thanks for the update - my card ending 4111 1111 1111 1111 was charged twice.</p>"
+      },
+      "attachments": [{ "name": "receipt.pdf", "contentType": "application/pdf", "size": 45210 }]
+    }
+  }
+}

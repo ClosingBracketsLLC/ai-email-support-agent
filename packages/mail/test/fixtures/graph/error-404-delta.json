@@ -1,0 +1,11 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v1.0/me/mailFolders/inbox/messages/delta",
+    "query": { "$deltatoken": "expired-token-404" }
+  },
+  "response": {
+    "status": 404,
+    "body": { "error": { "code": "SyncStateNotFound", "message": "The sync state generation is not found." } }
+  }
+}

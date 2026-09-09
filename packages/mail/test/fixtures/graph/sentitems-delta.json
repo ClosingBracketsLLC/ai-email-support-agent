@@ -1,0 +1,14 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/v1.0/me/mailFolders/sentitems/messages/delta",
+    "query": { "$deltatoken": "seed-sent" }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "value": [{ "id": "msg-sent-1", "conversationId": "thread-sent-1" }],
+      "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/mailFolders/sentitems/messages/delta?$deltatoken=new-sent"
+    }
+  }
+}
