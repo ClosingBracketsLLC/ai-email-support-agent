@@ -11,16 +11,24 @@ Requires Node >= 22, pnpm 10, Docker.
     pnpm install
     pnpm db:up                                   # Postgres 17 + pgvector on :5434
     DATABASE_URL=postgres://aesa:aesa@localhost:5434/aesa_dev pnpm --filter @aesa/db migrate
+    cp apps/api/.env.example apps/api/.env      # set BETTER_AUTH_SECRET (openssl rand -base64 48)
+    pnpm --filter @aesa/api dev                  # http://localhost:3001 — codes: /__dev/mail/latest?to=<email>
+    cp apps/app/.env.example apps/app/.env
+    pnpm --filter @aesa/app dev                  # Expo: press w for web (http://localhost:8081), i / a for simulators
+    pnpm e2e                                     # Playwright smoke (export the web app first: pnpm --filter @aesa/app export:web)
     pnpm typecheck && pnpm lint && pnpm test && pnpm db:check
 
-Layout: `apps/api` (Fastify), `apps/worker` (pg-boss), `packages/{db,crypto,core,queue}`.
+Layout: `apps/api` (Fastify + Better Auth + tRPC), `apps/worker` (pg-boss), `apps/app` (Expo),
+`packages/{contracts,db,crypto,core,queue}`.
 Ports: the api listens on 3001 (`PORT`; `HOST` defaults to `0.0.0.0`), the worker binds no port, Postgres
-is on 5434. `APP_BASE_URL` is parsed by the api but has no consumer until Phase 1.
+is on 5434. `APP_BASE_URL` is the api's public origin (Better Auth baseURL, OAuth redirect URIs);
+`APP_WEB_ORIGIN` is the Expo web origin (CORS, trusted origin, invitation links).
 Design spec: `docs/superpowers/specs/2026-09-07-ai-email-support-agent-design.md`.
 
 ## Database roles
 
 - pg-boss owns the `pgboss` schema and creates it itself on first `boss.start()`; locally the connection user is a superuser so this just works, but in production the worker's connection user must be granted `CREATE` on the database (or have the `pgboss` schema pre-created and owned by it) so pg-boss can bootstrap its tables.
+- Better Auth's seven tables are not tenant tables (no RLS; `aesa_app` has DML); the api reaches them only through Better Auth's adapter.
 
 One `DATABASE_URL` (the cluster admin locally; the migration owner in production). Every pool
 connection *starts* in a role, set by the server from the libpq startup options: `aesa_owner` for

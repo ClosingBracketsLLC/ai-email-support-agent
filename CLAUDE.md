@@ -33,6 +33,10 @@ off `main`; never push, merge, or open a PR without Robert.
     pnpm --filter @aesa/db generate               # after a schema change; commit the migration BEFORE running db:check
     pnpm --filter @aesa/api dev                   # copy apps/api/.env.example to apps/api/.env first
     pnpm --filter @aesa/worker dev                # copy apps/worker/.env.example to apps/worker/.env first
+    pnpm --filter @aesa/app dev                   # copy apps/app/.env.example to .env first; EXPO_PUBLIC_API_URL must be the LAN address for a physical phone
+    pnpm --filter @aesa/app export:web            # Expo web export (server output)
+    pnpm --filter @aesa/app test                  # jest, no database
+    pnpm e2e                                      # Playwright signup smoke against the api and the served web export
 
 - The database must be running for every suite except `@aesa/core` and `@aesa/crypto`. Tests read
   `DATABASE_URL` from the real environment (default `postgres://aesa:aesa@localhost:5434/aesa_dev`)
@@ -54,6 +58,7 @@ off `main`; never push, merge, or open a PR without Robert.
 
 ## Layout
 
+- `packages/contracts` — zod inputs and enums shared by api, db and app; zod only, no Node imports.
 - `packages/db` — drizzle schema (`src/schema/`), SQL migrations, `createDb` (session role set through
   libpq startup options), `withOrg` / `withPlatform`, per-org data keys, `createTestDatabase`.
 - `packages/crypto` — `Secret`, domain-separated token hashing, AES-256-GCM envelope with a KEK ring,
@@ -65,8 +70,9 @@ off `main`; never push, merge, or open a PR without Robert.
 - `apps/api` — Fastify skeleton: `/healthz`, config, scrubbed error handler, log redaction. The api
   never holds the KEK, never calls a model, never touches mail.
 - `apps/worker` — `WORKER_ROLES` partition, KEK ring, `jobs/` (a `platform.heartbeat` cron so far).
-- `apps/app` — the Expo universal app (package `@aesa/app`), added in Phase 1; `pnpm-workspace.yaml`
-  already covers `apps/*`.
+- `apps/app` — the Expo universal app (`@aesa/app`, SDK 57, Expo Router, `web.output` server):
+  `src/app` routes only, `src/screens` bodies, `src/lib` clients and the session gate, `src/components`
+  primitives; jest-expo + RNTL for units, Playwright for the signup smoke.
 
 ## Rules that hold here (most are test-enforced; do not work around them)
 
@@ -92,10 +98,19 @@ off `main`; never push, merge, or open a PR without Robert.
   `JOB_SIGNAL_MARGIN_SECONDS` (owned by `@aesa/core`).
 - **Secrets.** Never logged, never returned by an API. `Secret` serializes as `[redacted]`; the api
   error handler strips SQL parameters and redacts URLs before anything reaches a log or a client.
+- **App bundle.** `apps/app` never imports `@aesa/db`, `@aesa/core`, `@aesa/crypto`, `@aesa/queue`,
+  `drizzle-orm` or `node:*` as values, and `@aesa/api` only as `import type` (ESLint block for
+  `apps/app/**`). Share types through `@aesa/contracts`.
+- **Auth tables.** Better Auth's `user`/`session`/`account`/`verification`/`organization`/`member`/
+  `invitation` are `RLS_EXEMPT` with uuid ids minted by Postgres (`generateId: false`); the api
+  reaches them only through Better Auth; tRPC's `orgProcedure` derives `orgId` from the session's
+  active organization plus `getActiveMember`, never from input.
+- **Audit.** Tenant-side audit rows go through `audit(tx, entry)` with actor `user:<id>` |
+  `agent:<run_id>` | `system:<job>`; every tRPC mutation writes one.
 - **Toolchain.** TypeScript strict NodeNext ESM with explicit `.ts` imports, `tsx` at runtime (no
   build step), runtime dependencies in `dependencies`, vitest, zod 4. This covers the server
-  packages and `apps/api` / `apps/worker`; `apps/app` will extend `expo/tsconfig.base` instead
-  (bundler resolution, JSX, extensionless imports) and is built by EAS, and the ESLint TypeScript
-  block must add `**/*.tsx` when it lands.
+  packages and `apps/api` / `apps/worker`; `apps/app` extends `expo/tsconfig.base` instead
+  (bundler resolution, JSX, extensionless imports) with `allowImportingTsExtensions`, `noEmit` and
+  `types: ["node", "jest"]`, and is built by EAS; the root ESLint TypeScript block covers `**/*.tsx`.
 - **Commits** end with the trailer `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`
   (a convention, not a check).
