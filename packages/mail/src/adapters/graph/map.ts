@@ -27,16 +27,6 @@ export const FOLDER_LABELS: Record<FolderKey, string[]> = {
   junkemail: ['JUNK'],
 }
 
-/** `GET /me/mailFolders?$select=id,displayName` returns each top-level folder's real display
- * name — the well-known "special folder name" shortcuts (`inbox`/`sentitems`/`junkemail`, usable
- * in a path) are not what comes back on the LISTING call, so folder-id resolution goes through
- * this display-name table instead. */
-export const DISPLAY_NAME_TO_FOLDER: Record<string, FolderKey> = {
-  inbox: 'inbox',
-  'sent items': 'sentitems',
-  'junk email': 'junkemail',
-}
-
 /** Selected once per `getMessage` call (both formats select the same fields except `body`, which
  * `metadata` omits entirely per the brief — "$select WITHOUT body -> bodyText null"). */
 export const GET_MESSAGE_SELECT_FIELDS = [

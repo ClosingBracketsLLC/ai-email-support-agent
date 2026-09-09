@@ -3,7 +3,9 @@ import { describe, expect, it, vi } from 'vitest'
 import { FOLDER_LABELS, graphProvider } from '../src/adapters/graph/index.ts'
 import { CursorExpiredError, MailApiError, MessageGoneError, ProviderAuthError } from '../src/errors.ts'
 
-import mailFoldersFixture from './fixtures/graph/mailfolders.json' with { type: 'json' }
+import mailFolderInboxFixture from './fixtures/graph/mailfolder-inbox.json' with { type: 'json' }
+import mailFolderSentitemsFixture from './fixtures/graph/mailfolder-sentitems.json' with { type: 'json' }
+import mailFolderJunkemailFixture from './fixtures/graph/mailfolder-junkemail.json' with { type: 'json' }
 import messageMetadataFixture from './fixtures/graph/message-metadata.json' with { type: 'json' }
 import messageFullHtmlFixture from './fixtures/graph/message-full-html.json' with { type: 'json' }
 import messageFullDraftFixture from './fixtures/graph/message-full-draft.json' with { type: 'json' }
@@ -361,7 +363,14 @@ describe('graphProvider', () => {
 
   describe('client: getMessage', () => {
     it('metadata: $select excludes body and $expand entirely, bodyText is null, folder resolves to SENT', async () => {
-      const fetchFn = vi.fn(fixtureFetch({ folders: mailFoldersFixture, msg: messageMetadataFixture }))
+      const fetchFn = vi.fn(
+        fixtureFetch({
+          folderInbox: mailFolderInboxFixture,
+          folderSent: mailFolderSentitemsFixture,
+          folderJunk: mailFolderJunkemailFixture,
+          msg: messageMetadataFixture,
+        }),
+      )
       const client = graphProvider(fetchFn).client('tok-1', SELF_ADDRESS)
       const msg = await client.getMessage('msg-meta-1', { format: 'metadata' })
 
@@ -394,7 +403,14 @@ describe('graphProvider', () => {
     })
 
     it('full (html body): folder resolves to JUNK, html body converted to text and scrubbed, topmost Authentication-Results wins', async () => {
-      const fetchFn = vi.fn(fixtureFetch({ folders: mailFoldersFixture, msg: messageFullHtmlFixture }))
+      const fetchFn = vi.fn(
+        fixtureFetch({
+          folderInbox: mailFolderInboxFixture,
+          folderSent: mailFolderSentitemsFixture,
+          folderJunk: mailFolderJunkemailFixture,
+          msg: messageFullHtmlFixture,
+        }),
+      )
       const client = graphProvider(fetchFn).client('tok-1', SELF_ADDRESS)
       const msg = await client.getMessage('msg-full-1', { format: 'full' })
 
@@ -421,7 +437,14 @@ describe('graphProvider', () => {
     })
 
     it('isDraft:true overrides the folder mapping to [\'DRAFT\'] regardless of which folder it physically lives in', async () => {
-      const fetchFn = vi.fn(fixtureFetch({ folders: mailFoldersFixture, msg: messageFullDraftFixture }))
+      const fetchFn = vi.fn(
+        fixtureFetch({
+          folderInbox: mailFolderInboxFixture,
+          folderSent: mailFolderSentitemsFixture,
+          folderJunk: mailFolderJunkemailFixture,
+          msg: messageFullDraftFixture,
+        }),
+      )
       const client = graphProvider(fetchFn).client('tok-1', SELF_ADDRESS)
       const msg = await client.getMessage('msg-draft-1', { format: 'full' })
       expect(msg.labelIds).toEqual(['DRAFT'])
@@ -436,7 +459,9 @@ describe('graphProvider', () => {
     it('an unresolvable parentFolderId (custom folder outside the three synced ones) maps to an empty labelIds', async () => {
       const fetchFn = vi.fn(async (url: string | URL) => {
         const u = new URL(String(url))
-        if (u.pathname === '/v1.0/me/mailFolders') return new Response(JSON.stringify(mailFoldersFixture.response.body), { status: 200 })
+        if (u.pathname === '/v1.0/me/mailFolders/inbox') return new Response(JSON.stringify({ id: 'folder-inbox-id' }), { status: 200 })
+        if (u.pathname === '/v1.0/me/mailFolders/sentitems') return new Response(JSON.stringify({ id: 'folder-sent-id' }), { status: 200 })
+        if (u.pathname === '/v1.0/me/mailFolders/junkemail') return new Response(JSON.stringify({ id: 'folder-junk-id' }), { status: 200 })
         return new Response(
           JSON.stringify({ id: 'msg-x', conversationId: 'thread-x', isDraft: false, parentFolderId: 'folder-other-id', internetMessageHeaders: [] }),
           { status: 200 },
@@ -445,6 +470,48 @@ describe('graphProvider', () => {
       const client = graphProvider(fetchFn).client('tok-1', SELF_ADDRESS)
       const msg = await client.getMessage('msg-x', { format: 'metadata' })
       expect(msg.labelIds).toEqual([])
+    })
+
+    it('resolves a folder purely by ALIAS (GET /me/mailFolders/sentitems), with no displayName in play, and a parentFolderId matching that resolved id maps to [\'SENT\']', async () => {
+      const calledPaths: string[] = []
+      const fetchFn = vi.fn(async (url: string | URL) => {
+        const u = new URL(String(url))
+        calledPaths.push(u.pathname)
+        // Each folder-resolution response carries ONLY {id} — no `displayName` field exists
+        // anywhere in this stub, proving resolution needs none.
+        if (u.pathname === '/v1.0/me/mailFolders/inbox') {
+          expect(u.searchParams.get('$select')).toBe('id')
+          return new Response(JSON.stringify({ id: 'locale-inbox-id' }), { status: 200 })
+        }
+        if (u.pathname === '/v1.0/me/mailFolders/sentitems') {
+          expect(u.searchParams.get('$select')).toBe('id')
+          return new Response(JSON.stringify({ id: 'locale-sent-id' }), { status: 200 })
+        }
+        if (u.pathname === '/v1.0/me/mailFolders/junkemail') {
+          expect(u.searchParams.get('$select')).toBe('id')
+          return new Response(JSON.stringify({ id: 'locale-junk-id' }), { status: 200 })
+        }
+        // The message itself lives in the folder Graph resolved for "sentitems" — its
+        // `displayName` (in a non-English locale, e.g. "Éléments envoyés") never enters this test
+        // at all, since nothing here ever reads or compares it.
+        return new Response(
+          JSON.stringify({
+            id: 'msg-locale-1',
+            conversationId: 'thread-locale-1',
+            isDraft: false,
+            parentFolderId: 'locale-sent-id',
+            internetMessageHeaders: [],
+          }),
+          { status: 200 },
+        )
+      }) as unknown as typeof fetch
+
+      const client = graphProvider(fetchFn).client('tok-1', SELF_ADDRESS)
+      const msg = await client.getMessage('msg-locale-1', { format: 'metadata' })
+      expect(msg.labelIds).toEqual(['SENT'])
+      expect(calledPaths).toContain('/v1.0/me/mailFolders/inbox')
+      expect(calledPaths).toContain('/v1.0/me/mailFolders/sentitems')
+      expect(calledPaths).toContain('/v1.0/me/mailFolders/junkemail')
     })
   })
 
@@ -494,7 +561,7 @@ describe('graphProvider', () => {
       expect(sendInit?.body).toBeUndefined()
     })
 
-    it('omits singleValueExtendedProperties entirely when no marker header is given', async () => {
+    it('omits singleValueExtendedProperties when no marker header is given, but still stamps `from` with selfAddress (the fallback)', async () => {
       const fetchFn = vi.fn(fixtureFetch({ createReply: sendCreateReplyFixture, patch: sendPatchFixture, send: sendSendFixture }))
       const client = graphProvider(fetchFn).client('tok-1', SELF_ADDRESS)
       await client.sendReply({
@@ -509,7 +576,27 @@ describe('graphProvider', () => {
       const [, patchInit] = fetchFn.mock.calls[1]!
       const patchBody = JSON.parse(String(patchInit?.body)) as Record<string, unknown>
       expect(patchBody.singleValueExtendedProperties).toBeUndefined()
-      expect(patchBody.from).toBeUndefined()
+      // `CreateGraphClientOptions.selfAddress` docstring promises this is stamped as `from`
+      // whenever the input doesn't override it — no `r.from` was given here, so it must fall back.
+      expect(patchBody.from).toEqual({ emailAddress: { address: SELF_ADDRESS } })
+    })
+
+    it('an explicit `from` on the input overrides the selfAddress fallback', async () => {
+      const fetchFn = vi.fn(fixtureFetch({ createReply: sendCreateReplyFixture, patch: sendPatchFixture, send: sendSendFixture }))
+      const client = graphProvider(fetchFn).client('tok-1', SELF_ADDRESS)
+      await client.sendReply({
+        threadId: 't',
+        to: 'jane@example.com',
+        subject: 'x',
+        inReplyTo: '<a@b>',
+        references: '<a@b>',
+        bodyText: 'hi',
+        from: 'sales@acme.test',
+        replyToProviderMessageId: 'msg-reply-target-1',
+      })
+      const [, patchInit] = fetchFn.mock.calls[1]!
+      const patchBody = JSON.parse(String(patchInit?.body)) as Record<string, unknown>
+      expect(patchBody.from).toEqual({ emailAddress: { address: 'sales@acme.test' } })
     })
 
     it('re-entry: existingDraftId + isDraft:false (already sent by a previous, interrupted attempt) returns without sending again', async () => {

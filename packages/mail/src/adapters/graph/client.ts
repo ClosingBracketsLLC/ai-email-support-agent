@@ -19,7 +19,7 @@
  */
 import { CursorExpiredError, MailApiError, MessageGoneError, ProviderAuthError, ProviderRateLimitError } from '../../errors.ts'
 import { MARKER_HEADER, type ChangeRecord, type ListChangesResult, type MailboxClient, type NormalizedMessage } from '../../types.ts'
-import { DISPLAY_NAME_TO_FOLDER, FOLDER_KEYS, FOLDER_LABELS, GET_MESSAGE_SELECT_FIELDS, normalizeGraphMessage, type FolderKey, type RawGraphMessage } from './map.ts'
+import { FOLDER_KEYS, FOLDER_LABELS, GET_MESSAGE_SELECT_FIELDS, normalizeGraphMessage, type FolderKey, type RawGraphMessage } from './map.ts'
 
 const GRAPH_ROOT = 'https://graph.microsoft.com/v1.0'
 
@@ -111,10 +111,12 @@ export interface CreateGraphClientOptions {
 }
 
 export function createGraphClient(opts: CreateGraphClientOptions): MailboxClient {
-  const { accessToken, fetchFn = globalThis.fetch } = opts
+  const { accessToken, selfAddress, fetchFn = globalThis.fetch } = opts
 
-  /** Memoized folder-id -> label lookup, fetched once per client instance (brief: "fetched once
-   * per client via GET /me/mailFolders?$select=id,displayName and cached"). */
+  /** Memoized folder-id -> label lookup, fetched once per client instance by resolving each of
+   * the three well-known folders individually by ALIAS (`/me/mailFolders/{inbox|sentitems|
+   * junkemail}`) — see `getFolderIdMap` below for why this replaced an earlier displayName-based
+   * listing. */
   let folderIdMapPromise: Promise<Map<string, FolderKey>> | null = null
 
   /**
@@ -204,16 +206,26 @@ export function createGraphClient(opts: CreateGraphClientOptions): MailboxClient
     }
   }
 
+  /**
+   * Resolves each of the three well-known folders by its Graph ALIAS
+   * (`/me/mailFolders/{inbox|sentitems|junkemail}` — a fixed, locale-independent path segment
+   * Graph itself resolves, not a display name) rather than listing `/me/mailFolders` and matching
+   * on `displayName`. Two problems with the displayName approach this replaces: (1) `displayName`
+   * is LOCALIZED — a German or Japanese mailbox's Inbox is not named "Inbox", so every message in
+   * a non-English-locale mailbox silently resolved to `labelIds: []` (breaking SENT/JUNK
+   * detection — direction and spam flagging); (2) `/me/mailFolders` is Graph's TOP-LEVEL folder
+   * listing, itself paginated (`@odata.nextLink`) with no pagination handled here, so a mailbox
+   * with enough top-level folders to spill past the first page could drop a tracked folder even in
+   * an English-locale mailbox. Three individual by-alias GETs sidesteps both: no displayName
+   * comparison, no listing to paginate.
+   */
   async function getFolderIdMap(): Promise<Map<string, FolderKey>> {
     if (!folderIdMapPromise) {
       folderIdMapPromise = (async () => {
-        const raw = (await request('GET', '/me/mailFolders', [['$select', 'id,displayName']], 'other')) as {
-          value?: { id: string; displayName: string }[]
-        }
         const map = new Map<string, FolderKey>()
-        for (const folder of raw.value ?? []) {
-          const key = DISPLAY_NAME_TO_FOLDER[folder.displayName.toLowerCase()]
-          if (key) map.set(folder.id, key)
+        for (const folder of FOLDER_KEYS) {
+          const raw = (await request('GET', `/me/mailFolders/${folder}`, [['$select', 'id']], 'other')) as { id: string }
+          map.set(raw.id, folder)
         }
         return map
       })()
@@ -411,7 +423,9 @@ export function createGraphClient(opts: CreateGraphClientOptions): MailboxClient
       const markerValue = r.extraHeaders?.[MARKER_HEADER]
       const patchBody: Record<string, unknown> = {
         body: { contentType: 'text', content: r.bodyText },
-        ...(r.from ? { from: { emailAddress: { address: r.from } } } : {}),
+        // `r.from` overrides; otherwise this stamps the mailbox's own address, exactly like the
+        // Gmail client's `from: r.from ?? selfAddress` (`buildReplyRaw`'s `from` argument).
+        from: { emailAddress: { address: r.from ?? selfAddress } },
         // Stamps the crash-recovery marker as a genuine custom internet header via Graph's
         // singleValueLegacyExtendedProperty mechanism (PS_INTERNET_HEADERS namespace,
         // `{00020386-0000-0000-C000-000000000046}` — see this task's report for why the GUID here
