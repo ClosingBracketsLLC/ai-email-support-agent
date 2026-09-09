@@ -40,17 +40,29 @@ export function TeamScreen() {
     setError(null)
     invite.mutate({ email: email.trim(), role })
   }
+  function handleChangeRole(memberId: string, r: 'admin' | 'member') {
+    if (changeRole.isPending) return
+    changeRole.mutate({ memberId, role: r })
+  }
+  function handleRemove(memberId: string) {
+    if (remove.isPending) return
+    remove.mutate({ memberId })
+  }
+  function handleCancel(invitationId: string) {
+    if (cancel.isPending) return
+    cancel.mutate({ invitationId })
+  }
 
   return (
     <Screen testID="team">
       <Heading>Members</Heading>
       {team.data.members.map((m) => (
         <MemberRow key={m.id} member={m} meUserId={session.user.id} canManage={canManage}
-          onChangeRole={(memberId, r) => changeRole.mutate({ memberId, role: r })} onRemove={(memberId) => remove.mutate({ memberId })} />
+          onChangeRole={handleChangeRole} onRemove={handleRemove} />
       ))}
       {team.data.invitations.length ? <Heading>Pending invitations</Heading> : null}
       {team.data.invitations.map((i) => (
-        <ListRow key={i.id} title={i.email} subtitle={`${i.role} · expires ${i.expiresAt.toLocaleDateString()}`} badge={canManage ? 'Cancel' : undefined} onPress={canManage ? () => cancel.mutate({ invitationId: i.id }) : undefined} testID={`invitation-${i.id}`} />
+        <ListRow key={i.id} title={i.email} subtitle={`${i.role} · expires ${i.expiresAt.toLocaleDateString()}`} badge={canManage ? 'Cancel' : undefined} onPress={canManage ? () => handleCancel(i.id) : undefined} testID={`invitation-${i.id}`} />
       ))}
       {canManage ? (
         <Card testID="invite-form">

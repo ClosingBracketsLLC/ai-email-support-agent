@@ -1,6 +1,7 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useRouter } from 'expo-router'
 import { useState } from 'react'
+import { Banner } from '@/components/banner'
 import { Button } from '@/components/button'
 import { ListRow } from '@/components/list-row'
 import { Screen } from '@/components/screen'
@@ -16,12 +17,23 @@ export function SettingsIndexScreen() {
   const { data: organizations } = authClient.useListOrganizations()
   const ws = useQuery(trpc.workspace.get.queryOptions())
   const [switching, setSwitching] = useState<string | null>(null)
+  const [switchError, setSwitchError] = useState<string | null>(null)
 
   async function switchTo(orgId: string) {
+    if (switching) return
     setSwitching(orgId)
-    await authClient.organization.setActive({ organizationId: orgId })
-    await refetch(); await queryClient.invalidateQueries()
-    setSwitching(null); router.replace('/')
+    setSwitchError(null)
+    try {
+      const { error } = await authClient.organization.setActive({ organizationId: orgId })
+      if (error) throw new Error(error.message ?? 'switch failed')
+      await refetch()
+      await queryClient.invalidateQueries()
+      router.replace('/')
+    } catch {
+      setSwitchError('Could not switch workspace. Try again.')
+    } finally {
+      setSwitching(null)
+    }
   }
   async function signOut() {
     await authClient.signOut()
@@ -44,8 +56,9 @@ export function SettingsIndexScreen() {
         <>
           <Heading>Switch workspace</Heading>
           {organizations.filter((o) => o.id !== session?.session.activeOrganizationId).map((o) => (
-            <ListRow key={o.id} title={o.name} onPress={() => switchTo(o.id)} badge={switching === o.id ? '…' : undefined} />
+            <ListRow key={o.id} title={o.name} onPress={switching ? undefined : () => switchTo(o.id)} badge={switching === o.id ? '…' : undefined} />
           ))}
+          {switchError ? <Banner tone="error" testID="switch-error">{switchError}</Banner> : null}
         </>
       ) : null}
       <Heading>Account</Heading>
