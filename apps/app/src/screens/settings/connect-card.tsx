@@ -1,7 +1,7 @@
 import { useMutation, useQuery } from '@tanstack/react-query'
 import * as Clipboard from 'expo-clipboard'
 import * as WebBrowser from 'expo-web-browser'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Platform, StyleSheet, View } from 'react-native'
 import type { MailProvider } from '@aesa/contracts'
 import { Banner } from '@/components/banner'
@@ -29,8 +29,15 @@ type Phase =
   | { kind: 'waiting_for_admin' }
   | { kind: 'error'; message: string }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+/** Resolves early if `signal` aborts, so a cancelled poll doesn't sit out its own 2 s tick before
+ * actually stopping. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms)
+    if (!signal) return
+    if (signal.aborted) { clearTimeout(timer); resolve(); return }
+    signal.addEventListener('abort', () => { clearTimeout(timer); resolve() }, { once: true })
+  })
 }
 function errorCode(err: unknown): string | undefined {
   return (err as { data?: { code?: string } } | null)?.data?.code
@@ -44,7 +51,23 @@ function errorMessage(err: unknown): string | undefined {
  * happens in the system browser; the app never sees a token — only the connection id once
  * `claimConnection` resolves it as claimed by this same signed-in user).
  */
-export function ConnectMailboxCard({ onConnected }: { onConnected: (connectionId: string, emailAddress: string) => void }) {
+export function ConnectMailboxCard({
+  onConnected,
+  pollIntervalMs = CLAIM_POLL_INTERVAL_MS,
+  pollTimeoutMs = CLAIM_POLL_TIMEOUT_MS,
+  provisionRetryMs = PROVISION_RETRY_MS,
+}: {
+  onConnected: (connectionId: string, emailAddress: string) => void
+  /** Test-only timing overrides — defaults are the real production values (2 s / 5 min / 1 s). A
+   * unit test drives the claim-poll and provisioning-retry state machine with real timers at tiny
+   * values instead of `jest.useFakeTimers()`: verified empirically that React 19's `act()` deadlocks
+   * against fake timers here — `fireEvent.press`'s awaited `act()` call blocks on the click handler's
+   * full async chain (not just its synchronous prefix), and that chain can only progress once a fake
+   * timer is advanced, which the test cannot do until `fireEvent.press` itself returns. */
+  pollIntervalMs?: number
+  pollTimeoutMs?: number
+  provisionRetryMs?: number
+}) {
   const trpc = useTRPC()
   const trpcClient = useTRPCClient()
   const meta = useQuery({ queryKey: ['meta'], queryFn: fetchMeta, staleTime: Infinity })
@@ -56,35 +79,67 @@ export function ConnectMailboxCard({ onConnected }: { onConnected: (connectionId
 
   const busy = phase.kind === 'connecting'
 
+  // Review fix, Important 2: the claim-poll loop has no natural end while a flow stays "not ready" —
+  // an unmount (navigating away) or a second `connect()` call must stop the PREVIOUS run's timers and
+  // stop it from ever calling `setPhase` again on a stale closure. One controller per in-flight
+  // connect attempt; every `setPhase` inside `connect`/`pollClaim` goes through `setPhaseSafe`, which
+  // is a no-op once its own controller has been aborted.
+  const controllerRef = useRef<AbortController | null>(null)
+  useEffect(() => () => controllerRef.current?.abort(), [])
+
   async function connect(provider: MailProvider) {
     if (busy) return
-    setPhase({ kind: 'connecting', provider })
+    controllerRef.current?.abort()
+    const controller = new AbortController()
+    controllerRef.current = controller
+    const { signal } = controller
+    const setPhaseSafe = (next: Phase) => { if (!signal.aborted) setPhase(next) }
+
+    setPhaseSafe({ kind: 'connecting', provider })
     const platform: 'native' | 'web' = Platform.OS === 'web' ? 'web' : 'native'
+
+    // Review fix, Important 1: browsers tie popup permission to the synchronous input-handler call
+    // stack. Opening the tab/window AFTER an `await` (the `startConnect` round trip below) lets it be
+    // silently blocked — the poll would then run for 5 minutes against a window that never opened. So
+    // on web this opens a blank window HERE, before any await, and only points it at the real URL once
+    // `startConnect` resolves.
+    let webWindow: Window | null = null
+    if (Platform.OS === 'web' && typeof window !== 'undefined') {
+      webWindow = window.open('', '_blank')
+      if (!webWindow) {
+        setPhaseSafe({ kind: 'error', message: 'Your browser blocked the popup. Allow popups for this site and try again.' })
+        return
+      }
+    }
 
     let flow: { url: string; flowId: string } | undefined
     for (let attempt = 0; attempt < PROVISION_MAX_ATTEMPTS; attempt++) {
+      if (signal.aborted) { webWindow?.close(); return }
       try {
         flow = await trpcClient.mailboxes.startConnect.mutate({ provider, platform })
         break
       } catch (err) {
         const stillProvisioning = errorCode(err) === 'PRECONDITION_FAILED' && errorMessage(err) === 'provisioning'
         if (stillProvisioning && attempt < PROVISION_MAX_ATTEMPTS - 1) {
-          await sleep(PROVISION_RETRY_MS)
+          await sleep(provisionRetryMs, signal)
           continue
         }
-        setPhase({ kind: 'error', message: 'Try again in a moment' })
+        webWindow?.close()
+        setPhaseSafe({ kind: 'error', message: 'Try again in a moment' })
         return
       }
     }
+    if (signal.aborted) { webWindow?.close(); return }
     if (!flow) {
-      setPhase({ kind: 'error', message: 'Try again in a moment' })
+      webWindow?.close()
+      setPhaseSafe({ kind: 'error', message: 'Try again in a moment' })
       return
     }
 
-    let closeBrowser = () => { /* no-op until the browser actually opens below */ }
+    let closeBrowser = () => { /* no-op until the branch below assigns a real closer */ }
     if (Platform.OS === 'web') {
-      const win = typeof window !== 'undefined' ? window.open(flow.url, '_blank') : null
-      closeBrowser = () => win?.close()
+      if (webWindow) webWindow.location.href = flow.url
+      closeBrowser = () => webWindow?.close()
     } else {
       WebBrowser.openAuthSessionAsync(flow.url).catch(() => { /* driven by claim polling below, not this promise */ })
       closeBrowser = () => {
@@ -92,29 +147,32 @@ export function ConnectMailboxCard({ onConnected }: { onConnected: (connectionId
       }
     }
 
-    await pollClaim(flow.flowId, closeBrowser)
+    await pollClaim(flow.flowId, closeBrowser, signal, setPhaseSafe)
   }
 
-  async function pollClaim(flowId: string, closeBrowser: () => void): Promise<void> {
-    const deadline = Date.now() + CLAIM_POLL_TIMEOUT_MS
+  async function pollClaim(flowId: string, closeBrowser: () => void, signal: AbortSignal, setPhaseSafe: (next: Phase) => void): Promise<void> {
+    const deadline = Date.now() + pollTimeoutMs
     while (Date.now() < deadline) {
+      if (signal.aborted) return
       try {
         const result = await trpcClient.mailboxes.claimConnection.mutate({ flowId })
+        if (signal.aborted) return
         closeBrowser()
-        setPhase({ kind: 'idle' })
+        setPhaseSafe({ kind: 'idle' })
         onConnected(result.connectionId, result.emailAddress)
         return
       } catch (err) {
+        if (signal.aborted) return
         const code = errorCode(err)
         const message = errorMessage(err)
         if (code === 'FORBIDDEN') {
           closeBrowser()
-          setPhase({ kind: 'error', message: 'This connection was started by a different signed-in user.' })
+          setPhaseSafe({ kind: 'error', message: 'This connection was started by a different signed-in user.' })
           return
         }
         if (code === 'PRECONDITION_FAILED' && message === 'admin_consent_required') {
           closeBrowser()
-          setPhase({ kind: 'waiting_for_admin' })
+          setPhaseSafe({ kind: 'waiting_for_admin' })
           return
         }
         // 'connect flow not ready' means the system browser hop hasn't finished yet — keep polling.
@@ -122,14 +180,15 @@ export function ConnectMailboxCard({ onConnected }: { onConnected: (connectionId
         // invalid_email, not_found, not_connectable) is terminal.
         if (!(code === 'PRECONDITION_FAILED' && message === 'connect flow not ready')) {
           closeBrowser()
-          setPhase({ kind: 'error', message: 'Could not connect. Try again.' })
+          setPhaseSafe({ kind: 'error', message: 'Could not connect. Try again.' })
           return
         }
       }
-      await sleep(CLAIM_POLL_INTERVAL_MS)
+      await sleep(pollIntervalMs, signal)
+      if (signal.aborted) return
     }
     closeBrowser()
-    setPhase({ kind: 'error', message: 'Could not connect in time. Try again.' })
+    setPhaseSafe({ kind: 'error', message: 'Could not connect in time. Try again.' })
   }
 
   function submitGmailAccess() {
@@ -158,9 +217,16 @@ export function ConnectMailboxCard({ onConnected }: { onConnected: (connectionId
     )
   }
 
+  const noProvidersConfigured = meta.data ? !meta.data.mail.gmail && !meta.data.mail.microsoft : false
+
   return (
     <Card testID="connect-card">
       <Heading>Connect a mailbox</Heading>
+      {/* Controller ruling (e2e, providerless deployments): a workspace with no mail provider
+          configured at all shows this instead of silently rendering an empty card. */}
+      {noProvidersConfigured ? (
+        <Muted testID="no-mail-providers">No mailbox providers are configured for this workspace yet. Ask your workspace admin to set one up.</Muted>
+      ) : null}
       {meta.data?.mail.gmail ? (
         <View style={styles.provider} testID="provider-gmail">
           <Muted>{SCOPE_COPY.gmail}</Muted>

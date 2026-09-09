@@ -1,5 +1,12 @@
 import { convert } from 'html-to-text'
-import { decode as iconvDecode, encodingExists as iconvEncodingExists } from 'iconv-lite'
+// Default import, not `import { decode, encodingExists } from 'iconv-lite'`: iconv-lite's CJS build
+// assigns its API onto `module.exports` via a comma-list `var` declaration
+// (`var bomHandling = require(...), iconv = module.exports;`) that Node's cjs-module-lexer doesn't
+// recognize, so a named import throws `SyntaxError: does not provide an export named 'decode'` under
+// real Node ESM (tsx's `src/index.ts` entrypoint; vitest's own transform never exercises this path,
+// which is why every existing test suite passed while `pnpm --filter @aesa/api start`/`pnpm e2e` were
+// actually broken). The default import always resolves to the whole CJS `module.exports` object.
+import iconv from 'iconv-lite'
 
 /** Minimal shape of a Gmail API MIME part header — enough to read Content-Type. */
 interface MimeHeader {
@@ -60,8 +67,8 @@ const CHARSET_RE = /charset="?([\w.-]+)"?/i
 export function decodePartBytes(dataBase64Url: string, contentTypeHeader: string | null): string {
   const buffer = Buffer.from(dataBase64Url, 'base64url')
   const charset = contentTypeHeader?.match(CHARSET_RE)?.[1]
-  if (charset && iconvEncodingExists(charset)) {
-    return iconvDecode(buffer, charset)
+  if (charset && iconv.encodingExists(charset)) {
+    return iconv.decode(buffer, charset)
   }
   return buffer.toString('utf8')
 }

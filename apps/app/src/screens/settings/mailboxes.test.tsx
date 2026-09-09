@@ -8,7 +8,7 @@ type Connection = {
   status: 'pending_claim' | 'connected' | 'reauth_required' | 'disabled'
   lastSyncAt: Date | null; lastSuccessAt: Date | null; consecutiveFailures: number
   pushExpiresAt: Date | null; connectedByUserId: string; connectedByMe: boolean; credentialAgeDays: number
-  agents: { id: string; address: string; status: 'pending_verification' | 'active' | 'disabled'; priority: number; displayName: string; consentRequiredFromMe: boolean }[]
+  agents: { id: string; address: string; status: 'pending_verification' | 'active' | 'disabled'; priority: number; displayName: string; consentRequiredFromMe: boolean; consentPending: boolean }[]
 }
 
 // Every variable the jest.mock() factory below closes over must be prefixed `mock` (case-insensitive)
@@ -66,7 +66,7 @@ afterEach(async () => { for (const teardown of teardowns.splice(0)) await teardo
 
 test('a pending agent shows a "waiting for code" chip and a working resend action', async () => {
   mockConnections = [baseConnection({
-    agents: [{ id: 'agent1', address: 'support@acme.com', status: 'pending_verification', priority: 0, displayName: 'support', consentRequiredFromMe: false }],
+    agents: [{ id: 'agent1', address: 'support@acme.com', status: 'pending_verification', priority: 0, displayName: 'support', consentRequiredFromMe: false, consentPending: false }],
   })]
   await setup()
 
@@ -78,18 +78,31 @@ test('a pending agent shows a "waiting for code" chip and a working resend actio
   await act(async () => { await Promise.resolve() }) // flush the onSuccess refetch inside act
 })
 
-test('a consent-gated agent shows the approve/reject card instead of a resend action', async () => {
+test('the consent holder sees the approve/reject card, never a resend action (no code exists while gated)', async () => {
   mockConnections = [baseConnection({
-    agents: [{ id: 'agent2', address: 'sales@acme.com', status: 'pending_verification', priority: 1, displayName: 'sales', consentRequiredFromMe: true }],
+    agents: [{ id: 'agent2', address: 'sales@acme.com', status: 'pending_verification', priority: 1, displayName: 'sales', consentRequiredFromMe: true, consentPending: true }],
   })]
   await setup()
 
   await waitFor(() => expect(screen.getByTestId('consent-agent2')).toBeTruthy())
   expect(screen.queryByTestId('resend-agent2')).toBeNull()
+  expect(screen.queryByTestId('consent-pending-agent2')).toBeNull()
 
   await fireEvent.press(screen.getByTestId('consent-approve-agent2'))
   await waitFor(() => expect(mockConsentCalls).toEqual([{ agentId: 'agent2', approve: true }]))
   await act(async () => { await Promise.resolve() }) // flush the onSuccess refetch inside act
+})
+
+test('a third viewer — neither the adder nor the consent holder — sees a neutral waiting line, not resend or the approve/reject card (review fix, Important 3)', async () => {
+  mockConnections = [baseConnection({
+    agents: [{ id: 'agent3', address: 'billing@acme.com', status: 'pending_verification', priority: 2, displayName: 'billing', consentRequiredFromMe: false, consentPending: true }],
+  })]
+  await setup()
+
+  await waitFor(() => expect(screen.getByTestId('consent-pending-agent3')).toBeTruthy())
+  expect(screen.getByText("Waiting for a teammate's approval before this address can be verified.")).toBeTruthy()
+  expect(screen.queryByTestId('resend-agent3')).toBeNull()
+  expect(screen.queryByTestId('consent-agent3')).toBeNull()
 })
 
 test('the gmail day-5 reconnect banner appears at credentialAgeDays 5 (Google Testing-mode 7-day expiry), not before', async () => {

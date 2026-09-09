@@ -181,8 +181,13 @@ export const mailboxesRouter = router({
             // Task 20 (app): the settings Mailboxes screen needs to know which agents are waiting on
             // THIS caller's one-tap consent (mailboxes.consentAddress) to render the approve/reject
             // card — `consentRequiredFromUserId` itself is intentionally not exposed (it would leak
-            // another user's id to everyone else on the connection).
+            // another user's id to everyone else on the connection). `consentPending` (task review
+            // fix) is the role-neutral counterpart: true for EVERY viewer while the gate is open, not
+            // just the one who must decide it — a consent-gated agent has no verification code yet
+            // (`addAddress`/task 19's fix withholds it), so any viewer who isn't the decider must never
+            // see "Resend code" (it would 404) and instead gets a plain "waiting on approval" line.
             consentRequiredFromMe: a.consentRequiredFromUserId === ctx.user.id,
+            consentPending: a.consentRequiredFromUserId !== null,
           })),
       })),
     }

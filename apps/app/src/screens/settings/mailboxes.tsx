@@ -96,7 +96,11 @@ export function MailboxesScreen() {
             {conn.agents.map((agent) => (
               <View key={agent.id} style={styles.agentRow} testID={`agent-${agent.id}`}>
                 <ListRow title={agent.address} subtitle={agent.displayName} badge={label(AGENT_STATUS_LABEL, agent.status)} />
-                {agent.status === 'pending_verification' && !agent.consentRequiredFromMe ? (
+                {/* A consent-gated agent has no verification code yet (task 19's fix withholds it until
+                    the gate clears), so Resend must never show for one — it would just 404. Gated on
+                    `consentPending` (every viewer sees this the same way), not `consentRequiredFromMe`
+                    (only the decider sees that one) — review fix, Important 3. */}
+                {agent.status === 'pending_verification' && !agent.consentPending ? (
                   <Button variant="secondary" label="Resend code" onPress={() => handleResend(agent.id)} loading={resend.isPending} testID={`resend-${agent.id}`} />
                 ) : null}
                 {agent.consentRequiredFromMe ? (
@@ -105,6 +109,8 @@ export function MailboxesScreen() {
                     <Button label="Approve" onPress={() => handleConsent(agent.id, true)} loading={consent.isPending} testID={`consent-approve-${agent.id}`} />
                     <Button variant="danger" label="Reject" onPress={() => handleConsent(agent.id, false)} loading={consent.isPending} testID={`consent-reject-${agent.id}`} />
                   </Card>
+                ) : agent.consentPending ? (
+                  <Muted testID={`consent-pending-${agent.id}`}>Waiting for a teammate's approval before this address can be verified.</Muted>
                 ) : null}
               </View>
             ))}

@@ -23,7 +23,12 @@ export function CreateWorkspaceScreen() {
   const create = useMutation(trpc.workspace.create.mutationOptions({
     onSuccess: async () => {
       if (yourName.trim() && yourName.trim() !== session?.user.name) await authClient.updateUser({ name: yourName.trim() })
-      await refetch()
+      // `disableCookieCache`: workspace.create just activated a brand-new organization server-side
+      // (Better Auth's own session cookie cache, `session.cookieCache.maxAge` in apps/api/src/auth.ts,
+      // is 60s) — a plain `refetch()` would happily return the STILL-cached pre-creation session (no
+      // active org yet) for up to a minute, and the gate would bounce straight back to this same
+      // screen. Bypassing the cache for this one read is what actually makes the new org visible.
+      await refetch({ query: { disableCookieCache: true } })
       await queryClient.invalidateQueries()
       router.replace('/onboarding/profile')
     },

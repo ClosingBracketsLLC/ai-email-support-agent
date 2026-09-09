@@ -38,7 +38,7 @@ describe('mailboxes router: addresses, verification, consent, gmail access', () 
       connectedByMe: true, credentialAgeDays: 0,
     })
     expect(res.connections[0]!.agents).toEqual([
-      { id: added.agentId, address: 'support@list.test', status: 'active', priority: 0, displayName: 'support', consentRequiredFromMe: false },
+      { id: added.agentId, address: 'support@list.test', status: 'active', priority: 0, displayName: 'support', consentRequiredFromMe: false, consentPending: false },
     ])
   })
 
