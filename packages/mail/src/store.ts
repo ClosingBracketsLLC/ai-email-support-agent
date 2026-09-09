@@ -251,13 +251,26 @@ export async function applyTripwire(tx: OrgTx, ticketId: string, keyword: string
 
 /**
  * The flood bound's lookup: null means "create the ticket normally". Non-null is the sender's NEWEST
- * ticket, which this message joins instead of opening yet another one — the message itself is never
- * dropped, so the reopen and the tripwire still run on it.
+ * ticket ON THIS CONNECTION, which this message joins instead of opening yet another one — the
+ * message itself is never dropped, so the reopen and the tripwire still run on it.
  *
- * Scoped by `customer_email` across the organization (not per connection): a sender who floods two
- * connected mailboxes at once is one flood, and the bound exists to protect one owner's attention.
+ * The two scopes differ deliberately:
+ *
+ * - The **count** is organization-wide. A sender who floods two connected mailboxes at once is one
+ *   flood, and the bound exists to protect one owner's attention, not one mailbox's.
+ * - The **target** is connection-scoped. A ticket carries `connection_id` and its thread belongs to
+ *   that mailbox; folding a message that arrived on connection B onto a ticket living on connection
+ *   A would leave the ticket holding a message the agent cannot reply into (a reply goes out through
+ *   the ticket's own connection and thread). When the sender's newest ticket is on another
+ *   connection, this returns null and the caller opens a normal ticket here — still bounded, because
+ *   from the sixth ticket onward every further message on THIS connection folds onto it.
  */
-export async function findFloodFoldTarget(tx: OrgTx, now: Date, customerEmail: string | null): Promise<TicketRef | null> {
+export async function findFloodFoldTarget(
+  tx: OrgTx,
+  connectionId: string,
+  now: Date,
+  customerEmail: string | null,
+): Promise<TicketRef | null> {
   if (!customerEmail) return null
 
   const midnight = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))
@@ -270,7 +283,7 @@ export async function findFloodFoldTarget(tx: OrgTx, now: Date, customerEmail: s
   const [newest] = await tx
     .select({ id: tickets.id, status: tickets.status })
     .from(tickets)
-    .where(eq(tickets.customerEmail, customerEmail))
+    .where(and(eq(tickets.customerEmail, customerEmail), eq(tickets.connectionId, connectionId)))
     .orderBy(desc(tickets.createdAt))
     .limit(1)
   return newest ?? null

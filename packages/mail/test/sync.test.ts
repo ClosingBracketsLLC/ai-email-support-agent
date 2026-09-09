@@ -548,6 +548,47 @@ describe('runSync — the provider-agnostic walk (gmail mode)', () => {
     expect(after.some((r) => r.subject === 'Unauthenticated')).toBe(true)
   })
 
+  /**
+   * Ruling I2: the flood COUNT is organization-wide, but the fold TARGET must live on the
+   * connection the message arrived on. A ticket's thread belongs to its own mailbox, so folding a
+   * message from connection B onto a ticket on connection A would leave the agent holding a message
+   * it cannot reply into.
+   */
+  it('10b. a sender at the cap on another connection opens a normal ticket here, then folds within it', async () => {
+    const a = await makeFixture()
+    const b = await makeFixture()
+    await runSync(a.deps)
+    await runSync(b.deps)
+
+    const flooder = `cross-${rand()}@example.com`
+    for (let i = 0; i < 5; i += 1) {
+      await seedTicket(a.connectionId, {
+        providerThreadId: `cross-thread-${rand()}`,
+        customerEmail: flooder,
+        createdAt: new Date(utcMidnight() + (i + 1) * 60_000),
+      })
+    }
+
+    // Org-wide the sender is already at the cap, but their newest ticket is on connection A.
+    b.mailbox.receiveInbound({ from: flooder, to: [b.addresses[0]!], subject: 'First on B', bodyText: 'hi' })
+    await runSync(b.deps)
+
+    expect(await ticketsFor(a.connectionId)).toHaveLength(5) // A is untouched
+    const onB = await ticketsFor(b.connectionId)
+    expect(onB).toHaveLength(1)
+    expect((await messagesFor(b.connectionId))[0]!.ticketId).toBe(onB[0]!.id)
+
+    // ...and the bound still holds here: every further NEW thread from that sender on this
+    // connection now folds onto the ticket it just opened.
+    b.mailbox.receiveInbound({ from: flooder, to: [b.addresses[0]!], subject: 'Second on B', bodyText: 'again' })
+    await runSync(b.deps)
+
+    expect(await ticketsFor(b.connectionId)).toHaveLength(1)
+    const msgs = await messagesFor(b.connectionId)
+    expect(msgs).toHaveLength(2)
+    expect(msgs.every((m) => m.ticketId === onB[0]!.id)).toBe(true)
+  })
+
   it('11. a spoofed From claiming the self address with no SENT label is inbound', async () => {
     const f = await makeFixture()
     await runSync(f.deps)
@@ -749,7 +790,15 @@ describe('runSync — the provider-agnostic walk (gmail mode)', () => {
     expect(audits[0]!.entityType).toBe('agent')
   })
 
-  it('15b. verification mail carrying the WRONG code is routed as ordinary mail', async () => {
+  /**
+   * DO NOT "fix" this back to the brief. The brief's scenario 15 says a wrong code is "routed
+   * normally (ticket created)"; that wording is SUPERSEDED by the controller ruling on task-11
+   * review finding C1: platform mail is never customer mail, so ANY inbound whose From is the
+   * platform sender is dropped outright — no ticket, no message row — whatever it contained.
+   * Ticketing it would put our own sign-in codes and verification mail (and any forgery of them)
+   * into the owner's support queue for the agent to answer.
+   */
+  it('15b. verification mail carrying the WRONG code is dropped, not ticketed (ruling C1)', async () => {
     const address = `alias-${rand()}@acme.test`
     const f = await makeFixture({ agents: [{ address, status: 'pending_verification', codeHash: hashToken('action', '482913') }] })
     await runSync(f.deps)
@@ -763,12 +812,40 @@ describe('runSync — the provider-agnostic walk (gmail mode)', () => {
     })
     const result = await runSync(f.deps)
 
-    expect(result.insertedMessages).toBe(1)
-    expect(await ticketsFor(f.connectionId)).toHaveLength(1)
+    expect(result.insertedMessages).toBe(0)
+    expect(await ticketsFor(f.connectionId)).toHaveLength(0)
+    expect(await messagesFor(f.connectionId)).toHaveLength(0)
 
+    // The agent is untouched: a wrong code neither activates it nor spends its hash.
     const [agent] = await withOrg(app.db, orgId, (tx) => tx.select().from(agents).where(eq(agents.id, agentId)))
     expect(agent!.status).toBe('pending_verification')
-    expect(agent!.verificationCodeHash).not.toBeNull()
+    expect(agent!.verificationCodeHash).toBe(hashToken('action', '482913'))
+  })
+
+  it('15c. platform mail re-walked after the agent went active is dropped too (ruling C1)', async () => {
+    const address = `alias-${rand()}@acme.test`
+    const f = await makeFixture({ agents: [{ address, status: 'pending_verification', codeHash: hashToken('action', '482913') }] })
+    await runSync(f.deps)
+    const seeded = await connectionCursor(f.connectionId)
+
+    f.mailbox.receiveInbound({
+      from: PLATFORM_SENDER,
+      to: [address],
+      subject: 'Verify this address',
+      bodyText: 'Your code is 482913.',
+    })
+    await runSync(f.deps)
+    expect((await withOrg(app.db, orgId, (tx) => tx.select().from(agents).where(eq(agents.id, f.agentIds[0]!))))[0]!.status).toBe('active')
+
+    // The verification mail is never inserted, so a rewind (or a resync) re-walks it against an
+    // agent that is now active and whose hash is spent — the interception declines, and C1 is the
+    // only thing standing between that mail and a "Verify this address" support ticket.
+    await setCursor(f.connectionId, seeded)
+    const replay = await runSync(f.deps)
+
+    expect(replay.insertedMessages).toBe(0)
+    expect(await ticketsFor(f.connectionId)).toHaveLength(0)
+    expect(await messagesFor(f.connectionId)).toHaveLength(0)
   })
 
   it('17. a junk-foldered inbound flags the ticket as provider spam', async () => {
@@ -809,6 +886,87 @@ describe('runSync — the provider-agnostic walk (gmail mode)', () => {
     expect(msg.attachments).toEqual([{ filename: 'receipt.pdf', mime: 'application/pdf', size: 2048 }])
     expect(msg.bodyText).toBe('My card [card removed] was charged twice.')
     expect(msg.bodyText).not.toContain('4242')
+  })
+
+  /**
+   * Ruling I1: the pre-fetch ticket lookup is only the "may we read this body?" gate. A network
+   * round trip sits between it and the write, and a concurrent triage run can move the ticket
+   * new → triaged across it — so ticket identity, `priorStatus` and the flood-fold decision are all
+   * re-derived inside the write transaction.
+   */
+  it('20. a ticket flipped to triaged during the full fetch still gets its re-triage enqueue', async () => {
+    const f = await makeFixture()
+    await runSync(f.deps)
+    const customer = `jane-${rand()}@example.com`
+    const { threadId } = f.mailbox.receiveInbound({ from: customer, to: [f.addresses[0]!], subject: 'Hi', bodyText: 'hello' })
+    await runSync(f.deps)
+    const ticketId = (await ticketsFor(f.connectionId))[0]!.id
+    f.newInbound.length = 0
+
+    f.mailbox.receiveInbound({ from: customer, to: [f.addresses[0]!], subject: 'Re: Hi', bodyText: 'one more thing', threadId })
+
+    // Triage lands between the metadata fetch (which saw `new`) and the write transaction.
+    let flipped = false
+    const client = {
+      ...f.mailbox,
+      getMessage: async (id: string, opts: { format: 'metadata' | 'full' }) => {
+        if (opts.format === 'full' && !flipped) {
+          flipped = true
+          await patchTicket(ticketId, { status: 'triaged', lastTriagedAt: new Date() })
+        }
+        return f.mailbox.getMessage(id, opts)
+      },
+    }
+    const result = await runSync({ ...f.deps, client })
+
+    expect(flipped).toBe(true)
+    expect(result.insertedMessages).toBe(1)
+    // Read from the IN-TRANSACTION lookup, not the stale pre-fetch row: the customer said something
+    // new after the last verdict, so the ticket must be re-triaged.
+    expect(f.newInbound).toEqual([ticketId])
+    expect(result.newInboundTicketIds).toEqual([ticketId])
+
+    const ticket = (await ticketsFor(f.connectionId))[0]!
+    expect(ticket.status).toBe('triaged') // 'triaged' is not reopen-eligible, so the status stands
+    expect(ticket.inboundCount).toBe(2)
+  })
+
+  /**
+   * Ruling I3: the callbacks are the sole delivery mechanism, and they run post-commit — so a
+   * throwing one has nothing to roll back and must never abort the walk. Letting it propagate would
+   * turn one failed enqueue into a batch-wide outage for every later message.
+   */
+  it('21. a throwing post-commit callback is logged and never costs later messages their effects', async () => {
+    const f = await makeFixture()
+    await runSync(f.deps)
+    for (let i = 0; i < 3; i += 1) {
+      f.mailbox.receiveInbound({ from: `cb-${i}-${rand()}@example.com`, to: [f.addresses[0]!], subject: `Callback ${i}`, bodyText: 'x' })
+    }
+
+    const logs: { level: string; msg: string; ctx?: Record<string, unknown> }[] = []
+    const delivered: string[] = []
+    let calls = 0
+    const result = await runSync({
+      ...f.deps,
+      onNewInboundTicket: (id) => {
+        calls += 1
+        if (calls === 1) throw new Error('queue unavailable')
+        delivered.push(id)
+      },
+      log: (level, msg, ctx) => logs.push({ level, msg, ctx }),
+    })
+
+    expect(calls).toBe(3)
+    expect(delivered).toHaveLength(2)
+    expect(result.insertedMessages).toBe(3)
+    expect(await ticketsFor(f.connectionId)).toHaveLength(3)
+    expect(await messagesFor(f.connectionId)).toHaveLength(3)
+    // Reporting-only: the arrays record what the walk decided, including the delivery that failed.
+    expect(result.newInboundTicketIds).toHaveLength(3)
+
+    const warned = logs.filter((l) => l.level === 'warn' && l.msg === 'mailbox.sync_callback_failed')
+    expect(warned).toHaveLength(1)
+    expect(warned[0]!.ctx).toMatchObject({ hook: 'onNewInboundTicket', error: 'queue unavailable' })
   })
 
   it('19. automated-mail headers mark the ticket is_automated without a triage pass', async () => {

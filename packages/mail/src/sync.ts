@@ -73,14 +73,29 @@ export interface SyncDeps {
   /** MAIL_FROM: the only sender an address-verification code is ever honoured from. */
   platformSender: string
   tripwireExtras: readonly string[]
-  /** Post-commit, gated on the insert: the worker enqueues `ticket.triage`. */
+  /**
+   * Post-commit, gated on the insert: the worker enqueues `ticket.triage`.
+   *
+   * These two callbacks are the SOLE delivery mechanism — `SyncResult`'s arrays report what the walk
+   * decided, they do not re-deliver it, so a caller that acts on both double-enqueues. A callback
+   * that throws is caught and logged rather than allowed to abort the walk (one bad enqueue must not
+   * cost every later message in the batch its effects); the poll sweep's stuck-`new` re-enqueue is
+   * the reconciliation net for the delivery that was lost.
+   */
   onNewInboundTicket(ticketId: string): void
-  /** Post-commit, gated on the insert: the worker writes the escalation notification. */
+  /** Post-commit, gated on the insert: the worker writes the escalation notification. Same
+   * delivery and failure contract as `onNewInboundTicket`. */
   onTripwire(ticketId: string): void
   now?: () => Date
   log?: (level: 'info' | 'warn', msg: string, ctx?: Record<string, unknown>) => void
 }
 
+/**
+ * REPORTING ONLY. Every array below records what this run decided, for logging, tests and health
+ * metrics; the work itself was already delivered through `SyncDeps`' callbacks. Acting on these as
+ * if they were a work queue enqueues everything twice. An id stays reported even when its callback
+ * threw — the walk determined the ticket needs triage, and the failure is in the log, not here.
+ */
 export interface SyncResult {
   /** Message rows this run actually inserted (both directions) — re-seen messages never count. */
   insertedMessages: number
@@ -353,7 +368,11 @@ async function ingestMessageId(ctx: SyncContext, messageId: string): Promise<voi
   // Thread id first, then the RFC 2822 chain. A provider thread id is not a reliable conversation
   // key across the spam boundary (see `findTicketByReferences`), and a reply that names a message
   // we already hold belongs to that message's ticket whatever thread it arrived under.
-  const existing: TicketRef | null = await withOrg(
+  //
+  // This lookup answers ONE question — may we read this body? — and is deliberately not carried any
+  // further: everything downstream re-resolves the ticket inside the write transaction, because a
+  // network fetch sits between here and there and a concurrent triage can move the ticket under us.
+  const knownBeforeFetch = await withOrg(
     deps.db,
     deps.orgId,
     async (tx) =>
@@ -361,7 +380,7 @@ async function ingestMessageId(ctx: SyncContext, messageId: string): Promise<voi
       (await findTicketByReferences(tx, deps.connectionId, referenceTokens(meta))),
   )
   // Unrouted AND unknown: the product may not read this mail, so it never gets a full fetch.
-  if (!routed && !existing) return
+  if (!routed && !knownBeforeFetch) return
 
   const full = await getMessageOrSkip(deps.client, messageId, 'full')
   if (!full) return
@@ -373,17 +392,37 @@ async function ingestMessageId(ctx: SyncContext, messageId: string): Promise<voi
   // spoofed message claiming our own address is inbound — which is exactly what we want, since it
   // then goes through DMARC-gated handling rather than being trusted as our own reply.
   const direction: 'inbound' | 'outbound' = full.labelIds.includes('SENT') ? 'outbound' : 'inbound'
+
+  // Platform mail is NEVER customer mail. Anything inbound claiming our own MAIL_FROM is dropped
+  // outright — no ticket, no message row — whatever it turned out to contain. It reaches this point
+  // only when the interception above declined it: the address was already verified, the code was
+  // wrong, or the code had been spent. Ticketing those would put our own sign-in codes and
+  // verification mail (and any forgery of them) into the owner's support queue for the agent to
+  // answer. The check sits HERE and not before the full fetch because a valid code may live in the
+  // body, and after the interception so a good code still activates the agent.
+  if (direction === 'inbound' && full.fromAddr === ctx.platformSender) {
+    ctx.log('info', 'mailbox.platform_mail_skipped', { messageId: full.id })
+    return
+  }
+
   const dmarcPass = parseAuthResults(full.authenticationResults).dmarcPass
 
   const outcome = await withOrg(deps.db, deps.orgId, async (tx): Promise<MessageOutcome> => {
-    let ticket: TicketRef | null = existing
+    // Re-resolved INSIDE the transaction, not carried over from the pre-fetch gate above. The full
+    // fetch is a network round trip, and across it a triage run can move this ticket new → triaged;
+    // reusing the stale row would report a stale `priorStatus` and silently drop the re-triage
+    // enqueue this message is supposed to cause. Ticket identity, `priorStatus` and the flood-fold
+    // decision all derive from THIS read.
+    let ticket: TicketRef | null =
+      (await findTicketByThread(tx, deps.connectionId, full.threadId)) ??
+      (await findTicketByReferences(tx, deps.connectionId, referenceTokens(full)))
     let created = false
 
     // Per-sender flood bound. Inbound only (an outbound-first thread is the owner mailing out) and
     // DMARC-pass only: folding unauthenticated mail onto a real customer's ticket would let an
     // attacker inject text into someone else's conversation just by forging their From.
     if (!ticket && direction === 'inbound' && dmarcPass) {
-      ticket = await findFloodFoldTarget(tx, ctx.now(), full.fromAddr)
+      ticket = await findFloodFoldTarget(tx, deps.connectionId, ctx.now(), full.fromAddr)
     }
     if (!ticket) {
       const opened = await createTicketIfAbsent(tx, {
@@ -456,12 +495,27 @@ async function ingestMessageId(ctx: SyncContext, messageId: string): Promise<voi
   if (outcome.created || outcome.reopened || outcome.priorStatus === 'triaged') {
     if (!ctx.newInboundTicketIds.has(outcome.ticketId)) {
       ctx.newInboundTicketIds.add(outcome.ticketId)
-      deps.onNewInboundTicket(outcome.ticketId)
+      deliver(ctx, 'onNewInboundTicket', outcome.ticketId)
     }
   }
   if (outcome.tripwired) {
     ctx.result.tripwiredTicketIds.push(outcome.ticketId)
-    deps.onTripwire(outcome.ticketId)
+    deliver(ctx, 'onTripwire', outcome.ticketId)
+  }
+}
+
+/**
+ * Fires one post-commit callback in isolation. The message's own writes are already committed, so a
+ * throwing callback has nothing left to roll back — letting it propagate would only abort the walk
+ * and cost every LATER message in the batch its effects too, turning one failed enqueue into a
+ * batch-wide outage. The failure is logged and the walk continues; the poll sweep's stuck-`new`
+ * re-enqueue is what eventually reconciles the ticket whose delivery was lost.
+ */
+function deliver(ctx: SyncContext, hook: 'onNewInboundTicket' | 'onTripwire', ticketId: string): void {
+  try {
+    ctx.deps[hook](ticketId)
+  } catch (err) {
+    ctx.log('warn', 'mailbox.sync_callback_failed', { hook, ticketId, error: err instanceof Error ? err.message : String(err) })
   }
 }
 
