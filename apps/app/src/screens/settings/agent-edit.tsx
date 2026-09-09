@@ -175,13 +175,19 @@ export function AgentEditScreen() {
         <Muted testID="guidance-extra-counter">{`${guidanceExtra.length}/${MAX_FREEFORM}`}</Muted>
       </View>
 
-      {agent.replyFromAddress !== null ? (
+      {agent.address !== agent.connectionEmailAddress ? (
         <Card testID="reply-from">
           <Muted>Reply-from address</Muted>
           <View style={styles.radios}>
             {/* Trusts the owner's own report about provider-side Send-as (same trust model as
                 address-sheet.tsx's identical pair) — review fix, Important 1: these used to be
-                hard-disabled with a no-op onPress, so once set the choice was locked forever. */}
+                hard-disabled with a no-op onPress, so once set the choice was locked forever.
+                Visibility is keyed on "is this an alias" (address !== the connection's own address),
+                not on the current replyFromAddress value — supplementary ruling: gating on
+                `replyFromAddress !== null` re-created the same lock in the opposite direction, since
+                choosing "reply as own" (null) would make the block vanish with no way back. A
+                primary-address agent (address === connectionEmailAddress) never shows this at all —
+                its reply-from is inherently itself. */}
             <Pressable
               role="radio" accessibilityState={{ checked: !replyFromConnection }} onPress={() => onReplyFromChange(false)} testID="reply-as-own"
               style={[styles.radioBox, { borderColor: !replyFromConnection ? c.primary : c.border, backgroundColor: !replyFromConnection ? c.info : c.bg }]}

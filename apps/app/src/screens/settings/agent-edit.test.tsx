@@ -180,7 +180,7 @@ test('a pending-verification agent has no status toggle at all — it is untouch
   expect(screen.queryByTestId('agent-toggle-status')).toBeNull()
 })
 
-test('the reply-from radios appear only when replyFromAddress is set, "reply from connection" selected by default', async () => {
+test('the reply-from radios appear for an alias agent (address !== connectionEmailAddress), "reply from connection" selected when replyFromAddress is set', async () => {
   mockAgents = [baseAgent({ replyFromAddress: 'support@acme.com', address: 'sales@acme.com', connectionEmailAddress: 'support@acme.com' })]
   await setup()
   await waitFor(() => expect(screen.getByTestId('reply-from')).toBeTruthy())
@@ -190,6 +190,21 @@ test('the reply-from radios appear only when replyFromAddress is set, "reply fro
   expect(screen.getByText('Reply from support@acme.com')).toBeTruthy()
   expect(screen.getByTestId('reply-from-connection').props.accessibilityState.checked).toBe(true)
   expect(screen.getByTestId('reply-as-own').props.accessibilityState.checked).toBe(false)
+})
+
+test('a null-replyFromAddress alias still shows both radios, with "Reply as <address>" selected (supplementary ruling — visibility must not key off replyFromAddress itself, or flipping to null would lock the choice the other way)', async () => {
+  mockAgents = [baseAgent({ replyFromAddress: null, address: 'sales@acme.com', connectionEmailAddress: 'support@acme.com' })]
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('reply-from')).toBeTruthy())
+
+  expect(screen.getByTestId('reply-as-own').props.accessibilityState.checked).toBe(true)
+  expect(screen.getByTestId('reply-from-connection').props.accessibilityState.checked).toBe(false)
+
+  // And it's still switchable from here — selecting "reply from connection" saves the address.
+  await fireEvent.press(screen.getByTestId('reply-from-connection'))
+  await fireEvent.press(screen.getByTestId('agent-save'))
+  await waitFor(() => expect(mockUpdateCalls).toEqual([{ agentId: AGENT_ID, replyFromAddress: 'support@acme.com' }]))
+  await act(async () => { await Promise.resolve() })
 })
 
 test('selecting "reply as own address" marks replyFromAddress dirty and saves null (review fix, Important 1)', async () => {
@@ -221,8 +236,8 @@ test('switching back to "reply from connection" saves the connection address', a
   await act(async () => { await Promise.resolve() })
 })
 
-test('no reply-from card when replyFromAddress is null', async () => {
-  mockAgents = [baseAgent({ replyFromAddress: null })]
+test('no reply-from card for a primary-address agent (address === connectionEmailAddress) — its reply-from is inherently itself', async () => {
+  mockAgents = [baseAgent({ replyFromAddress: null, address: 'support@acme.com', connectionEmailAddress: 'support@acme.com' })]
   await setup()
   await waitFor(() => expect(screen.getByTestId('display-name')).toBeTruthy())
   expect(screen.queryByTestId('reply-from')).toBeNull()
