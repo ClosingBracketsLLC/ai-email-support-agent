@@ -53,8 +53,9 @@ off `main`; never push, merge, or open a PR without Robert.
   container (CI runs the same file with `psql`). `pnpm db:down` drops the volume, so the roles are
   recreated on the next `pnpm db:up`.
 - Ports: the api listens on 3001 (`PORT`, `HOST` defaults to `0.0.0.0`); the worker binds no port;
-  Postgres is on 5434 because doge-buddy already uses 5433. `APP_BASE_URL` is parsed by the api but
-  has no consumer yet; Phase 1 gives it its meaning.
+  Postgres is on 5434 because doge-buddy already uses 5433. `APP_BASE_URL` is the api's public
+  origin (Better Auth's `baseURL`; OAuth redirect URIs are `<APP_BASE_URL>/api/auth/callback/<provider>`);
+  `APP_WEB_ORIGIN` is the Expo web origin (CORS, trusted origin, invitation links).
 
 ## Layout
 
@@ -68,7 +69,9 @@ off `main`; never push, merge, or open a PR without Robert.
 - `packages/queue` — pg-boss wrappers (`startBoss`, `registerCron`), `defineJob` / `registerJob`,
   `enqueue`, `fairSelectSql`.
 - `apps/api` — Fastify skeleton: `/healthz`, config, scrubbed error handler, log redaction. The api
-  never holds the KEK, never calls a model, never touches mail.
+  never holds the KEK, never calls a model, never touches customer mail (it sends platform email —
+  sign-in codes, invitations — through the `MailTransport`; Resend in production, the devsink
+  elsewhere).
 - `apps/worker` — `WORKER_ROLES` partition, KEK ring, `jobs/` (a `platform.heartbeat` cron so far).
 - `apps/app` — the Expo universal app (`@aesa/app`, SDK 57, Expo Router, `web.output` server):
   `src/app` routes only, `src/screens` bodies, `src/lib` clients and the session gate, `src/components`

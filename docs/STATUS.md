@@ -79,7 +79,15 @@ defines seven build phases; this file records where the build stands against the
     until `createOrganization`/`setActive` runs, so "activate the user's first membership" lives in
     the app's gate, not the api. The same in-flight guard was then applied to every onboarding
     submit (create-workspace, sign-in, verify, `ProfileForm`) once Enter-key submits and rapid taps
-    were found to bypass the `Button` component's own loading guard.
+    were found to bypass the `Button` component's own loading guard. `ProfileForm` specifically
+    re-seeds its local state from a `workspace.get` refetch only while the form is pristine (no edit
+    since mount), clears that `dirty` flag only once the invalidation's refetch has actually landed
+    and only if the form's edit-version is unchanged (so a save typed mid-refetch is never silently
+    discarded), and its own save press is pending-guarded the same way. The Playwright smoke later
+    surfaced a fourth defect: after sign-out, an in-flight `workspace.get` could still resolve to its
+    cached error, so `useGate`'s error branch now fires only while `session && active` — a
+    signed-out user lands back on sign-in instead of being stranded on "Could not load your
+    workspace."
   - **shell**: `ResponsiveShell` renders one element tree with the sidebar conditional inside it, so
     crossing the responsive breakpoint no longer remounts (and resets) the tab navigator; the
     sidebar's `Link asChild` crashed on first real-browser mount
@@ -93,8 +101,18 @@ defines seven build phases; this file records where the build stands against the
     Auth's recipient-mismatch signal — not on any 403 — so the organization-membership-limit error
     and email-verification errors keep their own generic states instead of being misread as a wrong
     account.
+  - **push**: `push.ts` keeps its static `import * as Notifications from 'expo-notifications'` — the
+    brief's own test mock, not the production module, was the actual defect (a `jest.mock` factory
+    that closed over a test-file `const` returned `undefined` on the hoisted import); fixed with a
+    self-contained mock factory instead, so the repo keeps zero `eslint-disable` comments. The
+    Notifications screen's mount-time `registerForPush({ ask: false })` and `enable()` now catch
+    failures instead of leaving an unhandled rejection, and `enable()` has a local busy guard against
+    a double tap during the await window.
   - **CI**: the Playwright reporter is `[['github'], ['html', { open: 'never' }]]` — `'github'`
-    alone writes no `playwright-report/`, so the failure-artifact upload step was a silent no-op.
+    alone writes no `playwright-report/`, so the failure-artifact upload step was a silent no-op. The
+    smoke itself surfaced two real app defects that no unit test caught during Phase 1 — the
+    sidebar's `Link asChild` crash and `useGate`'s post-sign-out stranding, both above — which is why
+    it is a hard gate rather than a nice-to-have.
 
 ## Next: Phase 2 — mailboxes, agents, ingest, triage
 
@@ -135,11 +153,16 @@ Rulings the planner needs:
 Findings deferred during Phase 1 (from the task-review ledger and the still-open Phase 0 items).
 Fix each in the first Phase 2 task that touches the file, or record why it moves again.
 
+- `@aesa/contracts`: Task 1's own implementation report describes its RED-phase evidence as a
+  paraphrase rather than a captured test-failure transcript — a reporting-hygiene note with no code
+  impact.
 - `@aesa/db`: `organization.slug` still has both `.unique()` and a `uniqueIndex('organization_slug_uidx')`
   (copied verbatim from Better Auth's CLI output) — dropping the redundant one needs a new
   migration; `audit()` has no test for the default `detail`/`ip`/`userAgent` values or a boundary
   `user:` actor; `packages/db/test/keys.test.ts` cases are still order-dependent; `platform.access`
-  audit rows still have no retention rule (the heartbeat alone adds ~1,440 rows a day).
+  audit rows still have no retention rule (the heartbeat alone adds ~1,440 rows a day); an earlier
+  task report miscounted the RLS invariant's coverage as 8 tenant tables where the code and test
+  correctly cover 6 (14 total minus 8 `RLS_EXEMPT`) — a reporting-hygiene note, not a code defect.
 - `@aesa/crypto`: `packages/crypto/src/ssrf/pinned-fetch.ts` still rewrites `content-length` to the
   buffer size, turning a `HEAD` response's length into 0 — Phase 2's mailbox adapters are the first
   consumer that could notice.
@@ -150,28 +173,48 @@ Fix each in the first Phase 2 task that touches the file, or record why it moves
   production privilege boundary is documented but not exercised — `mailbox_credentials`'
   worker-only grants make this load-bearing, so do it in Phase 2; `apps/app/playwright.config.ts`
   spells out `expo serve --port 8081` instead of reusing the `serve:web` script.
-- `apps/api`: better-auth 1.7.3 declares a peer of `drizzle-orm ^0.45.2` against the workspace's
-  pinned `^0.44.0` (pnpm warns only) — bump both together in a dedicated task since drizzle
-  snapshots may shift; `AUTH_TRUSTED_ORIGINS` entries aren't validated as http(s)/scheme URLs;
-  Better Auth's in-memory rate limiter is per replica — move to `rateLimit.storage: 'database'` or
-  secondary storage before the api scales past one instance; the error handler's `err.headers`
-  copy only handles the plain-object `HeadersInit` shape, not a real `Headers` instance; no test
-  posts an empty or malformed JSON body to the auth route; the team self-removal guard and the
-  admin/member role restriction have no tests; `devices.register` cannot clear a previously set
-  `deviceName` (an empty string is treated as omitted).
+- `apps/api`: `.env.example` sets `EMAIL_TRANSPORT=devsink` even though that is the non-production
+  default (a deliberate documentation choice from the plan, not a defect, but worth a comment
+  before someone copies it into a deploy config); better-auth 1.7.3 declares a peer of
+  `drizzle-orm ^0.45.2` against the workspace's pinned `^0.44.0` (pnpm warns only) — bump both
+  together in a dedicated task since drizzle snapshots may shift; `AUTH_TRUSTED_ORIGINS` entries
+  aren't validated as http(s)/scheme URLs; Better Auth's in-memory rate limiter is per replica —
+  move to `rateLimit.storage: 'database'` or secondary storage before the api scales past one
+  instance; the error handler's `err.headers` copy only handles the plain-object `HeadersInit`
+  shape, not a real `Headers` instance; no test posts an empty or malformed JSON body to the auth
+  route, and the custom content-type parser also drops Fastify's `FST_ERR_CTP_INVALID_JSON` code on
+  malformed JSON (the manually thrown `Error` carries no `.code`); the team self-removal guard and
+  the admin/member role restriction have no tests; `devices.register` cannot clear a previously set
+  `deviceName` (an empty string is treated as omitted); the `export type { ServerDeps }` re-export
+  in `server.ts` has no consumer; the `ServerDeps` facade is a convention, not an enforcement —
+  Better Auth's own adapter (`auth.$context`/`auth.options.database`) still closes over the raw
+  `Db` handle; `createOrganizationWithFreshSlug`'s `throw` after the slug-retry loop is unreachable
+  (the 5th collision rethrows inside the `catch`); `auth.test.ts`'s console spies are restored
+  outside a `try`/`finally`.
 - `apps/app`: `team.remove` does not clear the removed user's `activeOrganizationId` in an open
   session on another device (the gate handles it as FORBIDDEN → create-workspace; a friendlier
   "you were removed" state is UX polish); the app still ships placeholder art; `ListRow`'s
   `accessibilityLabel` omits subtitle/badge, `TextField`'s error/hint text isn't associated with
   the input, and `Loading`'s `ActivityIndicator` has no `accessibilityLabel`; `verify.tsx` with no
   `email` param renders "code to ." and would submit an empty email instead of redirecting to
-  sign-in; TanStack Query's focus/online managers aren't wired to `AppState`/`NetInfo` on native (no
-  `refetchOnReconnect`); the team screen has no back-out from a primed "Confirm remove", the invite
-  role radios lack a `radiogroup` container, and a failed `team.list` spins forever with no retry;
-  an intermittent `act()` console error was seen once in six runs of `use-gate.test.tsx` (a flake to
+  sign-in; `(auth)/_layout` casts the deep-link path `as never` for typed routes, and that fix is
+  verified only by inspection (jest-expo does not exercise Strict Mode's double invocation);
+  TanStack Query's focus/online managers aren't wired to `AppState`/`NetInfo` on native (no
+  `refetchOnReconnect`); double-submit protection on sign-in/verify relies on `Button`'s `loading`
+  disabling presses (true today, per Task 8's test, but not independently tested here); `use-gate.ts`
+  computes a redundant `'missing' | undefined` classification that's discarded whenever the error is
+  real; `useAdvance` can fire a harmless duplicate navigation after `invalidateQueries` races
+  `[step].tsx`'s own mismatch redirect; `ProfileForm` validation and `create-workspace`'s
+  conditional name field have no unit tests beyond the Stepper test (the Playwright smoke covers
+  the flow); the state-based `isPending`/`busy` guards leave a sub-macrotask window (TanStack Query
+  notifies via `setTimeout(0)`) that a synchronous `useRef` flag would close; `sign-in.tsx`/
+  `verify.tsx` have no unit tests for their `busy` guards; the team screen has no back-out from a
+  primed "Confirm remove", the invite role radios lack a `radiogroup` container, and a failed
+  `team.list` spins forever with no retry; the sign-out case in `use-gate.test.tsx` also flips the
+  `organizations` mock, which is inert once the session is null (test tidiness only); an
+  intermittent `act()` console error was seen once in six runs of `use-gate.test.tsx` (a flake to
   pin down); `push.ts`'s Android-notification-channel branch and the registration hook/screen
-  remain untested beyond the two cases the brief specified; the deep-link double-render fix is
-  verified only by inspection (jest-expo does not exercise Strict Mode's double invocation).
+  remain untested beyond the two cases the brief specified.
 
 ## Later phases (see the spec for scope and verification)
 
