@@ -549,6 +549,11 @@ function referenceTokens(meta: NormalizedMessage): string[] {
  */
 async function interceptVerification(ctx: SyncContext, routed: AgentRow | null, full: NormalizedMessage): Promise<boolean> {
   if (!routed || routed.status !== 'pending_verification') return false
+  // Defense in depth (api review): the api never issues a code to a consent-gated agent, so this
+  // should be unreachable in practice — but a gated agent must never be allowed to self-verify by
+  // mail alone even if some future path leaves a stale hash on one. The consenting user's approval
+  // is a separate, required proof; a code cannot stand in for it.
+  if (routed.consentRequiredFromUserId) return false
   if (full.fromAddr !== ctx.platformSender) return false
   if (!routed.verificationCodeHash) return false
 

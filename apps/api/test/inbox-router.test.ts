@@ -48,32 +48,43 @@ describe('inbox router (read-only)', () => {
     expect(recent.tickets.map((tk) => tk.id).sort()).toEqual([fresh.id, resolved.id].sort())
   })
 
-  it('keyset-paginates: 25 seeded tickets, limit 20 → nextCursor, second page 5', async () => {
+  it('keyset-paginates 25 seeded tickets PLUS one never-replied (NULL last_inbound_at) ticket: limit 20 → nextCursor, second page 6, nothing skipped or duplicated', async () => {
     const signed = await signInWithOtp(t.app, t.mail, 'owner-paginate@example.com', 'Owner')
     const c = client(base, signed.cookie)
     const { orgId } = await c.workspace.create.mutate({ businessName: 'Acme', timezone: 'UTC' })
     const connectionId = await insertConnectedMailbox(t.api, orgId, signed.user.id, 'support@paginate.test')
 
     const baseTs = Date.parse('2026-01-01T00:00:00Z')
-    const created = []
+    const created: { id: string; sortKey: number }[] = []
     for (let i = 0; i < 25; i++) {
-      created.push(await insertTicket(orgId, connectionId, { status: 'new', lastInboundAt: new Date(baseTs + i * 60_000) }))
+      const lastInboundAt = new Date(baseTs + i * 60_000)
+      const row = await insertTicket(orgId, connectionId, { status: 'new', lastInboundAt })
+      created.push({ id: row.id, sortKey: lastInboundAt.getTime() })
     }
+    // A never-replied ticket — an owner-initiated thread with no customer reply yet, so
+    // last_inbound_at is NULL and the fallback sort key is created_at instead. Placed strictly
+    // between i=15 and i=16's timestamps so its rank in the merged 26-item order is predictable
+    // and non-trivial (neither first nor last).
+    const neverRepliedCreatedAt = new Date(baseTs + 15 * 60_000 + 30_000)
+    const neverReplied = await insertTicket(orgId, connectionId, { status: 'new', lastInboundAt: null, createdAt: neverRepliedCreatedAt })
+    created.push({ id: neverReplied.id, sortKey: neverRepliedCreatedAt.getTime() })
+
+    const expectedOrder = [...created].sort((a, b) => b.sortKey - a.sortKey).map((row) => row.id)
+    expect(expectedOrder).toHaveLength(26)
 
     const page1 = await c.inbox.list.query({ section: 'recent', limit: 20 })
     expect(page1.tickets).toHaveLength(20)
     expect(page1.nextCursor).toBeTruthy()
-    // Newest (highest lastInboundAt, i === 24) first — DESC order.
-    expect(page1.tickets[0]!.id).toBe(created[24]!.id)
-    expect(page1.tickets[19]!.id).toBe(created[5]!.id)
+    expect(page1.tickets.map((tk) => tk.id)).toEqual(expectedOrder.slice(0, 20))
+    expect(page1.tickets.map((tk) => tk.id)).toContain(neverReplied.id)
 
     const page2 = await c.inbox.list.query({ section: 'recent', limit: 20, cursor: page1.nextCursor! })
-    expect(page2.tickets).toHaveLength(5)
+    expect(page2.tickets).toHaveLength(6)
     expect(page2.nextCursor).toBeNull()
-    expect(page2.tickets.map((tk) => tk.id)).toEqual(created.slice(0, 5).reverse().map((tk) => tk.id))
+    expect(page2.tickets.map((tk) => tk.id)).toEqual(expectedOrder.slice(20))
 
-    const allIds = new Set([...page1.tickets.map((tk) => tk.id), ...page2.tickets.map((tk) => tk.id)])
-    expect(allIds.size).toBe(25)
+    const allIds = [...page1.tickets.map((tk) => tk.id), ...page2.tickets.map((tk) => tk.id)]
+    expect(new Set(allIds).size).toBe(26) // neither skipped nor duplicated across pages
   })
 
   it('inbox.ticket returns messages ordered ascending by sentAt; a cross-org id is NOT_FOUND', async () => {

@@ -46,6 +46,10 @@ export interface AgentRow {
   status: string
   priority: number
   verificationCodeHash: string | null
+  /** Non-null while the agent is gated on the connecting user's one-tap consent (spec §2) — a
+   * consent-gated agent cannot verify its address by mail alone, even holding a valid code, until
+   * that gate clears (`mailboxes.consentAddress`, api-side). */
+  consentRequiredFromUserId: string | null
 }
 
 export interface TicketRef {
@@ -70,6 +74,7 @@ export async function loadActiveAgents(tx: OrgTx, connectionId: string): Promise
       status: agents.status,
       priority: agents.priority,
       verificationCodeHash: agents.verificationCodeHash,
+      consentRequiredFromUserId: agents.consentRequiredFromUserId,
     })
     .from(agents)
     .where(and(eq(agents.connectionId, connectionId), ne(agents.status, 'disabled')))

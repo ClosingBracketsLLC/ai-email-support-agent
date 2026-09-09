@@ -46,6 +46,9 @@ interface AgentSpec {
   priority?: number
   status?: 'active' | 'pending_verification' | 'disabled'
   codeHash?: string | null
+  /** Non-null simulates an agent still gated on the connecting user's consent (api-side
+   * `mailboxes.addAddress`/`consentAddress`) — a real `user.id` FK, not an arbitrary string. */
+  consentRequiredFromUserId?: string | null
 }
 
 interface Fixture {
@@ -104,6 +107,7 @@ async function makeFixture(
             priority: s.priority ?? 0,
             status: s.status ?? 'active',
             verificationCodeHash: s.codeHash ?? null,
+            consentRequiredFromUserId: s.consentRequiredFromUserId ?? null,
           }
         }),
       )
@@ -846,6 +850,43 @@ describe('runSync — the provider-agnostic walk (gmail mode)', () => {
     expect(replay.insertedMessages).toBe(0)
     expect(await ticketsFor(f.connectionId)).toHaveLength(0)
     expect(await messagesFor(f.connectionId)).toHaveLength(0)
+  })
+
+  /**
+   * Defense in depth (api review, Task 19 fix wave): the api never issues a code to a consent-gated
+   * agent, so this hash+gate combination shouldn't arise from `mailboxes.addAddress`/`consentAddress`
+   * in practice — but `interceptVerification` must refuse to activate a gated agent by mail alone
+   * even if it somehow holds a matching hash. A code is proof of mailbox control, not a substitute
+   * for the connecting user's separate, required consent.
+   */
+  it('15d. a consent-gated pending agent is NOT verified by a matching code (defense in depth)', async () => {
+    const address = `alias-${rand()}@acme.test`
+    const f = await makeFixture({
+      agents: [{ address, status: 'pending_verification', codeHash: hashToken('action', '482913'), consentRequiredFromUserId: userId }],
+    })
+    await runSync(f.deps)
+    const agentId = f.agentIds[0]!
+
+    f.mailbox.receiveInbound({
+      from: PLATFORM_SENDER,
+      to: [address],
+      subject: 'Verify this address',
+      bodyText: 'Your code is 482913 — it expires in 30 minutes.',
+    })
+    const result = await runSync(f.deps)
+
+    expect(result.insertedMessages).toBe(0)
+    expect(await ticketsFor(f.connectionId)).toHaveLength(0)
+    expect(await messagesFor(f.connectionId)).toHaveLength(0)
+
+    // Untouched: neither activated, nor the hash spent, nor the consent gate cleared.
+    const [agent] = await withOrg(app.db, orgId, (tx) => tx.select().from(agents).where(eq(agents.id, agentId)))
+    expect(agent).toMatchObject({ status: 'pending_verification', verificationCodeHash: hashToken('action', '482913'), consentRequiredFromUserId: userId })
+
+    const audits = await withOrg(app.db, orgId, (tx) =>
+      tx.select().from(auditLog).where(and(eq(auditLog.entityId, agentId), eq(auditLog.action, 'agent.address_verified'))),
+    )
+    expect(audits).toHaveLength(0)
   })
 
   it('17. a junk-foldered inbound flags the ticket as provider spam', async () => {

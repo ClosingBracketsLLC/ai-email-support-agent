@@ -72,6 +72,19 @@ describe('agents router', () => {
     await expect(c.agents.update.mutate({ agentId: added.agentId, status: 'active' })).rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' } })
   })
 
+  it('the two-hop resurrection is blocked: a pending_verification agent cannot be set disabled either (review fix, Critical)', async () => {
+    const { client: c, connectionId } = await setupOrgWithActiveAgent('owner-tworhop@example.com', 'support@tworhop.test')
+    const added = await c.mailboxes.addAddress.mutate({ connectionId, address: 'alias@tworhop.test', replyFromConnection: false })
+    expect(added.status).toBe('pending_verification')
+
+    // The first hop of the old exploit — disabling a still-pending agent — is refused outright now,
+    // so there is no window left for the second hop (disabled → active) to ever run.
+    await expect(c.agents.update.mutate({ agentId: added.agentId, status: 'disabled' })).rejects.toMatchObject({ data: { code: 'FORBIDDEN' } })
+
+    const res = await c.agents.list.query()
+    expect(res.agents.find((a) => a.id === added.agentId)?.status).toBe('pending_verification')
+  })
+
   it('a disabled agent can be set active again (but never resurrects from pending_verification)', async () => {
     const { client: c, agentId } = await setupOrgWithActiveAgent('owner-reactivate@example.com', 'support@reactivate.test')
     await c.agents.update.mutate({ agentId, status: 'disabled' })

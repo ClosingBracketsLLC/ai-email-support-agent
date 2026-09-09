@@ -36,16 +36,37 @@ export const agentsRouter = router({
     return { agents: rows }
   }),
 
-  /** In-org lookup by id — a cross-org agentId is NOT_FOUND by construction (RLS hides the row before
-   * this ever sees it). `status: 'active'` is refused unless the agent is already `active` or
-   * `disabled`: a `pending_verification` agent has neither proved it controls its address nor cleared
-   * its consent gate, and this endpoint has no business short-circuiting either. */
+  /**
+   * In-org lookup by id — a cross-org agentId is NOT_FOUND by construction (RLS hides the row before
+   * this ever sees it). `status` may change ONLY when the agent is NOT consent-gated AND its current
+   * status is already `active` or `disabled` — review fix (Critical): a `pending_verification` agent
+   * is untouchable by `status` in EITHER direction here, closing the two-hop path that used to
+   * resurrect one (set it `disabled` first, a no-op-looking call that this endpoint used to allow
+   * from `pending_verification`, then `active` next, which the direct check alone caught — but only
+   * on the SECOND call). A consent-gated agent is refused regardless of its current status: consent,
+   * not verification, is what's outstanding, and this endpoint has no business deciding either one.
+   */
   update: managerProcedure.input(UpdateAgentInput).mutation(async ({ ctx, input }) => {
     await ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
       const [agent] = await tx.select().from(agents).where(and(eq(agents.orgId, ctx.orgId), eq(agents.id, input.agentId)))
       if (!agent) throw new TRPCError({ code: 'NOT_FOUND', message: 'agent not found' })
-      if (input.status === 'active' && agent.status !== 'active' && agent.status !== 'disabled') {
-        throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'cannot activate an agent that has not completed address verification' })
+      if (input.status !== undefined) {
+        if (agent.consentRequiredFromUserId) {
+          throw new TRPCError({ code: 'FORBIDDEN', message: 'this agent is waiting on the connecting user\'s consent; its status cannot be changed until then' })
+        }
+        if (agent.status !== 'active' && agent.status !== 'disabled') {
+          // The direct case (target 'active'): unchanged code/message from before this fix — a
+          // `pending_verification` agent hasn't proved it controls its address yet. Every OTHER
+          // target (chiefly 'disabled') is the two-hop resurrection this fix closes: setting a
+          // pending agent 'disabled' used to succeed outright, silently satisfying the direct
+          // check's "already active or disabled" condition for a LATER call that then set it
+          // 'active' — so that path is refused too, as FORBIDDEN (this is a real permission
+          // boundary, not a transient precondition the caller can just wait out).
+          if (input.status === 'active') {
+            throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'cannot activate an agent that has not completed address verification' })
+          }
+          throw new TRPCError({ code: 'FORBIDDEN', message: 'cannot change status on an agent that has not completed address verification' })
+        }
       }
 
       const patch: Record<string, unknown> = {}

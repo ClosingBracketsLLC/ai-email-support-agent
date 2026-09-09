@@ -4,7 +4,7 @@
  * owner's inbox screen needs.
  */
 import { TRPCError } from '@trpc/server'
-import { and, asc, desc, eq, inArray, lt, sql } from 'drizzle-orm'
+import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm'
 import { InboxListInput, TicketIdInput, type InboxSection } from '@aesa/contracts'
 import { agents, categories, messages, tickets } from '@aesa/db'
 import { orgProcedure, router } from '../init.ts'
@@ -24,36 +24,54 @@ const ticketSummaryColumns = {
   agentAddress: agents.address, spamFlagged: tickets.spamFlagged, hasAttachments: tickets.hasAttachments,
 }
 
+/** Strips the internal `sortKey` field `list`'s own selection adds for pagination — never part of
+ * the documented `TicketSummary` shape. */
+function toSummary<T extends Record<keyof typeof ticketSummaryColumns, unknown>>(row: T): { [K in keyof typeof ticketSummaryColumns]: T[K] } {
+  const summary = {} as { [K in keyof typeof ticketSummaryColumns]: T[K] }
+  for (const key of Object.keys(ticketSummaryColumns) as (keyof typeof ticketSummaryColumns)[]) summary[key] = row[key]
+  return summary
+}
+
+// A ticket that has never had an inbound message (an owner-initiated thread still awaiting its first
+// reply) has a NULL last_inbound_at. Sorting/cursoring on last_inbound_at alone (review fix,
+// Important) meant the ORDER BY needed NULLS LAST *and* the keyset predicate structurally excluded
+// every such ticket the moment any cursor was in play (`last_inbound_at < cursor` is never true when
+// the left side is NULL — Postgres treats that comparison as UNKNOWN, not "true", so those rows
+// silently vanished from every page after the first). Falling back to the NOT NULL `created_at`
+// removes the null tail entirely: every ticket sorts on a real timestamp, so plain `<` keyset
+// pagination is correct with no special-casing.
+// Typed `string`, not `Date`: drizzle only runs a column's driver-value mapping (Postgres text →
+// `Date`) for a field tied to a real `Column` object — a raw `sql` expression comes back from
+// node-postgres exactly as Postgres formats it as text ('2026-01-01 00:00:00+00'), which `new Date()`
+// still parses correctly (verified below, at the one place that needs a real Date out of it).
+const sortKey = sql<string>`COALESCE(${tickets.lastInboundAt}, ${tickets.createdAt})`
+
 export const inboxRouter = router({
   list: orgProcedure.input(InboxListInput).query(async ({ ctx, input }) => {
     const cursorDate = input.cursor ? new Date(input.cursor) : null
     const rows = await ctx.deps.api.withOrg(ctx.orgId, (tx) =>
-      tx.select(ticketSummaryColumns)
+      tx.select({ ...ticketSummaryColumns, sortKey })
         .from(tickets)
         .leftJoin(categories, eq(categories.id, tickets.categoryId))
         .leftJoin(agents, eq(agents.id, tickets.agentId))
         .where(and(
           eq(tickets.orgId, ctx.orgId),
           inArray(tickets.status, SECTION_STATUSES[input.section]),
-          ...(cursorDate ? [lt(tickets.lastInboundAt, cursorDate)] : []),
+          ...(cursorDate ? [sql`${sortKey} < ${cursorDate}`] : []),
         ))
-        // NULLS LAST (Postgres' DESC default is NULLS FIRST, the opposite of what we want here): a
-        // ticket that has never had an inbound message — an owner-initiated thread still awaiting its
-        // first reply — sorts after every ticket with a real lastInboundAt. Keyset pagination rides
-        // that same column (`InboxListInput.cursor` is a plain ISO datetime, brief's own shape) and so,
-        // a known and accepted Phase 2 limitation, cannot resume INTO that null tail once a cursor is
-        // in play; only a cursor-less first page can surface those tickets. Real tickets acquire a
-        // lastInboundAt as soon as any customer message lands, so this only affects the rare
-        // owner-sent-first thread that has had no reply yet.
-        .orderBy(sql`${tickets.lastInboundAt} DESC NULLS LAST`, desc(tickets.id))
+        .orderBy(sql`${sortKey} DESC`, desc(tickets.id))
         .limit(input.limit + 1),
     )
 
     const hasMore = rows.length > input.limit
     const page = hasMore ? rows.slice(0, input.limit) : rows
     const last = page[page.length - 1]
-    const nextCursor = hasMore && last?.lastInboundAt ? last.lastInboundAt.toISOString() : null
-    return { tickets: page, nextCursor }
+    // `sortKey` is a raw SQL expression, not a plain column reference — drizzle only runs a column's
+    // own driver-value mapping (string → Date) for fields tied to a real `Column`, so this comes back
+    // from node-postgres as Postgres' own timestamptz text ('2026-01-01 00:00:00+00'), not a `Date`.
+    // `new Date(...)` parses that format correctly (verified against Node's Date parser).
+    const nextCursor = hasMore && last ? new Date(last.sortKey).toISOString() : null
+    return { tickets: page.map(toSummary), nextCursor }
   }),
 
   ticket: orgProcedure.input(TicketIdInput).query(async ({ ctx, input }) => {

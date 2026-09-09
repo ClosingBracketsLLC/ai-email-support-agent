@@ -212,10 +212,15 @@ export const mailboxesRouter = router({
       const consentRequiredFromUserId = conn.connectedByUserId === ctx.user.id ? null : conn.connectedByUserId
       const status: AgentStatus = isPrimary && !consentRequiredFromUserId ? 'active' : 'pending_verification'
 
+      // A consent-gated alias gets NO code yet (review fix — status alone used to conflate the two
+      // proofs this agent needs: mailbox control via a code, and the connecting user's consent. A
+      // code issued here would let the consenting user's own "no" be raced by a customer/attacker
+      // simply mailing the code before consent is ever decided). `consentAddress`'s approve branch
+      // issues a fresh one, post-approval, once the gate is the only thing left to satisfy.
       let verificationCodeHash: string | null = null
       let verificationExpiresAt: Date | null = null
       let code: string | null = null
-      if (!isPrimary) {
+      if (!isPrimary && !consentRequiredFromUserId) {
         const issued = issueVerificationCode()
         code = issued.code
         verificationCodeHash = issued.hash
@@ -286,9 +291,13 @@ export const mailboxesRouter = router({
    * `managerProcedure`: the deciding user is fixed by who connected the mailbox, not by the caller's
    * current role (a demoted admin who still holds the pending consent is still the right person to
    * ask). Reject deletes the agent outright — there is nothing else pending on it to clean up.
+   *
+   * Approve on an ALIAS issues a FRESH verification code here — this is the only point at which a
+   * consent-gated alias ever gets one (`addAddress` above withholds it while gated). The mail send is
+   * post-tx, same reason as everywhere else in this file: `withOrg` may never span network I/O.
    */
-  consentAddress: orgProcedure.input(ConsentAddressInput).mutation(async ({ ctx, input }) =>
-    ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
+  consentAddress: orgProcedure.input(ConsentAddressInput).mutation(async ({ ctx, input }) => {
+    const result = await ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
       const [agent] = await tx.select().from(agents).where(and(eq(agents.orgId, ctx.orgId), eq(agents.id, input.agentId)))
       if (!agent) throw new TRPCError({ code: 'NOT_FOUND', message: 'agent not found' })
       if (!agent.consentRequiredFromUserId || agent.consentRequiredFromUserId !== ctx.user.id) {
@@ -298,16 +307,31 @@ export const mailboxesRouter = router({
       if (!input.approve) {
         await tx.delete(agents).where(eq(agents.id, agent.id))
         await audit(tx, { actor: ctx.actor, action: 'agent.consent_decided', entityType: 'agent', entityId: agent.id, detail: { approved: false }, ip: ctx.ip, userAgent: ctx.userAgent })
-        return { agentId: agent.id, deleted: true as const }
+        return { agentId: agent.id, deleted: true as const, mail: null }
       }
 
       const [conn] = await tx.select({ emailAddress: mailboxConnections.emailAddress }).from(mailboxConnections).where(eq(mailboxConnections.id, agent.connectionId))
-      const status: AgentStatus = conn?.emailAddress === agent.address ? 'active' : 'pending_verification'
-      await tx.update(agents).set({ consentRequiredFromUserId: null, status }).where(eq(agents.id, agent.id))
+      const isPrimary = conn?.emailAddress === agent.address
+      const status: AgentStatus = isPrimary ? 'active' : 'pending_verification'
+
+      const patch: { consentRequiredFromUserId: null; status: AgentStatus; verificationCodeHash?: string; verificationExpiresAt?: Date } = {
+        consentRequiredFromUserId: null, status,
+      }
+      let mail: { address: string; code: string } | null = null
+      if (!isPrimary) {
+        const issued = issueVerificationCode()
+        patch.verificationCodeHash = issued.hash
+        patch.verificationExpiresAt = issued.expiresAt
+        mail = { address: agent.address, code: issued.code }
+      }
+      await tx.update(agents).set(patch).where(eq(agents.id, agent.id))
       await audit(tx, { actor: ctx.actor, action: 'agent.consent_decided', entityType: 'agent', entityId: agent.id, detail: { approved: true }, ip: ctx.ip, userAgent: ctx.userAgent })
-      return { agentId: agent.id, deleted: false as const, status }
-    }),
-  ),
+      return { agentId: agent.id, deleted: false as const, status, mail }
+    })
+
+    if (result.mail) await ctx.deps.mail.send(verificationMail(result.mail.address, result.mail.code))
+    return result.deleted ? { agentId: result.agentId, deleted: true as const } : { agentId: result.agentId, deleted: false as const, status: result.status }
+  }),
 
   /** Idempotent: the operator grants Gmail testing-mode access by hand (runbook), so a second request
    * for the same address is a no-op, not an error. */

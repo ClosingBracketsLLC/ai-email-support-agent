@@ -136,6 +136,54 @@ describe('mailboxes router: addresses, verification, consent, gmail access', () 
     expect(afterReject).toBeUndefined()
   })
 
+  it('a consent-gated ALIAS gets no code until approval; approving issues + emails a fresh one; resend then works (review fix, Critical)', async () => {
+    const ownerA = await signInWithOtp(t.app, t.mail, 'owner-consent-alias-a@example.com', 'Ann')
+    const a = client(base, ownerA.cookie)
+    const { orgId } = await a.workspace.create.mutate({ businessName: 'Acme', timezone: 'UTC' })
+    const connectionId = await insertConnectedMailbox(t.api, orgId, ownerA.user.id, 'support@consentalias.test')
+
+    const ownerB = await signInWithOtp(t.app, t.mail, 'owner-consent-alias-b@example.com', 'Bea')
+    await t.handle.pool.query(`INSERT INTO member (organization_id, user_id, role) VALUES ($1, $2, 'admin')`, [orgId, ownerB.user.id])
+    await t.app.inject({
+      method: 'POST', url: '/api/auth/organization/set-active',
+      headers: { origin: WEB, cookie: ownerB.cookie, 'content-type': 'application/json' },
+      payload: { organizationId: orgId },
+    })
+    const b = client(base, ownerB.cookie)
+
+    const added = await b.mailboxes.addAddress.mutate({ connectionId, address: 'sales@consentalias.test', replyFromConnection: false })
+    expect(added.status).toBe('pending_verification')
+
+    // No code yet, no mail sent: a code proves mailbox control, but consent — a DIFFERENT proof —
+    // hasn't been given yet, and the two must never be satisfiable independently of each other.
+    expect(t.mail.latestTo('sales@consentalias.test')).toBeUndefined()
+    const [gated] = await t.api.withOrg(orgId, (tx) => tx.select().from(agents).where(eq(agents.id, added.agentId)))
+    expect(gated).toMatchObject({ status: 'pending_verification', verificationCodeHash: null, consentRequiredFromUserId: ownerA.user.id })
+
+    // A approves: a FRESH code is generated and emailed ONLY now, at approval time — never before.
+    const approved = await a.mailboxes.consentAddress.mutate({ agentId: added.agentId, approve: true })
+    expect(approved).toMatchObject({ deleted: false, status: 'pending_verification' })
+
+    const mail = t.mail.latestTo('sales@consentalias.test')
+    expect(mail).toBeDefined()
+    const code = mail!.subject.match(/\b(\d{6})\b/)?.[1]
+    expect(code).toBeDefined()
+
+    const [afterApprove] = await t.api.withOrg(orgId, (tx) => tx.select().from(agents).where(eq(agents.id, added.agentId)))
+    expect(afterApprove).toMatchObject({ status: 'pending_verification', consentRequiredFromUserId: null })
+    expect(afterApprove?.verificationCodeHash).toBeTruthy()
+    expect(hashesEqual(hashToken('action', code!), afterApprove!.verificationCodeHash!)).toBe(true)
+
+    // The approve-alias flow ends with a WORKING resend path — the gate is gone and a live code exists.
+    const oldHash = afterApprove!.verificationCodeHash!
+    await b.mailboxes.resendVerification.mutate({ agentId: added.agentId })
+    const [afterResend] = await t.api.withOrg(orgId, (tx) => tx.select().from(agents).where(eq(agents.id, added.agentId)))
+    expect(afterResend!.verificationCodeHash).not.toBe(oldHash)
+    const newCode = t.mail.latestTo('sales@consentalias.test')!.subject.match(/\b(\d{6})\b/)?.[1]
+    expect(newCode).toBeDefined()
+    expect(hashesEqual(hashToken('action', newCode!), afterResend!.verificationCodeHash!)).toBe(true)
+  })
+
   it('resendVerification rotates the code — the old hash no longer matches', async () => {
     const { client: c, orgId, connectionId } = await setupOrgWithMailbox('owner-resend@example.com', 'support@resend.test')
     const added = await c.mailboxes.addAddress.mutate({ connectionId, address: 'alias@resend.test', replyFromConnection: false })
