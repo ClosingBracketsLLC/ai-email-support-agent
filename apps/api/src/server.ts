@@ -4,6 +4,7 @@ import rateLimit from '@fastify/rate-limit'
 import { fastifyTRPCPlugin, type FastifyTRPCPluginOptions } from '@trpc/server/adapters/fastify'
 import { fromNodeHeaders } from 'better-auth/node'
 import Fastify, { type FastifyBaseLogger, type FastifyError, type FastifyInstance } from 'fastify'
+import { registerConnectRoutes } from './connect/routes.ts'
 import type { ServerDeps } from './deps.ts'
 import { createContextFactory } from './trpc/context.ts'
 import { appRouter, type AppRouter } from './trpc/router.ts'
@@ -112,6 +113,12 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         return mail ? reply.send(mail) : reply.code(404).send({ statusCode: 404, error: 'Not Found' })
       })
     }
+
+    // The mailbox OAuth connect flow's two unauthenticated hops (connect/routes.ts) — mounted here, not
+    // on `app` directly, for the same reason every other plain route in this block is: only a route
+    // declared inside a register() actually gets wrapped by @fastify/rate-limit's onRoute-driven
+    // `global: true` mode (see this block's own opening comment).
+    registerConnectRoutes(routes, deps)
   })
 
   app.register(fastifyTRPCPlugin, {

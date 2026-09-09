@@ -64,6 +64,13 @@
       "when": 1788938900000,
       "tag": "0008_support_hardening",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1788966154931,
+      "tag": "0009_resolve_oauth_flow",
+      "breakpoints": true
     }
   ]
 }

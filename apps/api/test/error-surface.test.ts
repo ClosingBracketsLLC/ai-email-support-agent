@@ -38,7 +38,7 @@ function buildFailingDeps(opts: { sessionThrows?: boolean } = {}): { deps: Serve
       getActiveMember: async () => ({ id: 'member1', organizationId: ORG_ID, role: 'owner' }),
     },
   } as unknown as ServerDeps['auth']
-  const api: ServerDeps['api'] = { withOrg: async () => { throw boom() }, health: base.api.health }
+  const api: ServerDeps['api'] = { withOrg: async () => { throw boom() }, resolveOauthFlow: base.api.resolveOauthFlow, health: base.api.health }
   return { deps: { ...base, auth, api }, log: () => lines.join('') }
 }
 

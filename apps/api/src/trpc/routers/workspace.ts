@@ -4,6 +4,7 @@ import { eq } from 'drizzle-orm'
 import { CreateWorkspaceInput, UpdateProfileInput, deriveAllowedHosts, isOnboardingStep, nextOnboardingStep, slugify, type OnboardingStep, type Tone } from '@aesa/contracts'
 import { audit, workspaces } from '@aesa/db'
 import type { Auth } from '../../auth.ts'
+import { mapAuthError } from '../auth-errors.ts'
 import { authedProcedure, managerProcedure, orgProcedure, router } from '../init.ts'
 
 // Intl.supportedValuesOf('timeZone') omits 'UTC' itself (ECMA-402 treats it as a legacy alias, not a
@@ -57,7 +58,17 @@ export const workspaceRouter = router({
   /** First sign-in: organization (Better Auth) + workspaces row. The caller becomes the owner and the org goes active. */
   create: authedProcedure.input(CreateWorkspaceInput).mutation(async ({ ctx, input }) => {
     if (!SUPPORTED_TIMEZONES.has(input.timezone)) throw new TRPCError({ code: 'BAD_REQUEST', message: 'unknown timezone' })
-    const org = await createOrganizationWithFreshSlug(ctx.deps.auth, ctx.headers, input.businessName)
+    let org: { id: string }
+    try {
+      org = await createOrganizationWithFreshSlug(ctx.deps.auth, ctx.headers, input.businessName)
+    } catch (e) {
+      // createOrganizationWithFreshSlug's own 5th-collision case already throws a friendly TRPCError —
+      // pass it straight through. Anything else (organizationLimit's FORBIDDEN, chiefly) is a raw
+      // Better Auth APIError that reached here untranslated (Phase 1 carry-over: it used to surface as a
+      // masked generic 500).
+      if (e instanceof TRPCError) throw e
+      throw mapAuthError(e, 'could not create workspace')
+    }
     await ctx.deps.api.withOrg(org.id, async (tx) => {
       await tx.insert(workspaces).values({ orgId: org.id, businessName: input.businessName, timezone: input.timezone })
       await audit(tx, { actor: ctx.actor, action: 'workspace.create', entityType: 'workspace', entityId: org.id, detail: { businessName: input.businessName }, ip: ctx.ip, userAgent: ctx.userAgent })

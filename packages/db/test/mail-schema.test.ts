@@ -91,6 +91,7 @@ describe('SECURITY DEFINER resolvers', () => {
   let appDb: ReturnType<typeof createDb>
   let orgB: string
   let disabledOnlyEmail: string
+  let flowId: string
 
   beforeAll(async () => {
     appDb = createDb(url, { role: 'app' })
@@ -104,6 +105,15 @@ describe('SECURITY DEFINER resolvers', () => {
       ['Owner B', `ownerb-${randomBytes(4).toString('hex')}@example.com`],
     )
     const userBId = usr.rows[0]!.id
+
+    // oauth_flows fixture (Task 17): tied to the top-level org/user, resolved cross-org below with no
+    // aesa_platform and no app.org_id set — exactly the OAuth callback's own path.
+    const flow = await admin.query<{ id: string }>(
+      `INSERT INTO oauth_flows (org_id, user_id, provider, nonce_hash, pkce_ciphertext, platform, expires_at)
+       VALUES ($1, $2, 'gmail', 'noncehash', $3, 'web', now() + interval '10 minutes') RETURNING id`,
+      [orgId, userBId, Buffer.from('ciphertext')],
+    )
+    flowId = flow.rows[0]!.id
 
     // the fixture connection (orgId/connectionId, set up in the top-level beforeAll) gets the push fields
     // this describe block asserts on
@@ -156,6 +166,17 @@ describe('SECURITY DEFINER resolvers', () => {
     expect(none.rows).toEqual([])
   })
 
+  it('resolve_oauth_flow finds the flow by id without aesa_platform and with no app.org_id set', async () => {
+    const direct = await appDb.pool.query<{ count: string }>('SELECT count(*) FROM oauth_flows')
+    expect(direct.rows[0]!.count).toBe('0')
+
+    const res = await appDb.pool.query(`SELECT * FROM resolve_oauth_flow($1)`, [flowId])
+    expect(res.rows).toEqual([{ flow_id: flowId, org_id: orgId }])
+
+    const none = await appDb.pool.query(`SELECT * FROM resolve_oauth_flow($1)`, ['00000000-0000-0000-0000-000000000000'])
+    expect(none.rows).toEqual([])
+  })
+
   // regression: 0006 originally issued REVOKE ALL ... FROM PUBLIC / GRANT EXECUTE ... TO aesa_app AFTER
   // ALTER FUNCTION ... OWNER TO aesa_platform. aesa_owner (the migration role) is only a WITH INHERIT
   // FALSE *member* of aesa_platform, not the owner post-transfer, so Postgres silently downgrades those
@@ -163,7 +184,7 @@ describe('SECURITY DEFINER resolvers', () => {
   // could resolve provider/email -> org_id cross-org. Asserting the aesa_app side alone proves nothing
   // (it was already true either way); the PUBLIC assertion is the one that actually catches the bug.
   it('locks the resolvers down to aesa_app only — PUBLIC has no EXECUTE', async () => {
-    for (const sig of ['resolve_mailbox_connection(text,text)', 'resolve_mailbox_subscription(text)']) {
+    for (const sig of ['resolve_mailbox_connection(text,text)', 'resolve_mailbox_subscription(text)', 'resolve_oauth_flow(uuid)']) {
       const priv = await admin.query<{ public_exec: boolean; app_exec: boolean }>(
         `SELECT has_function_privilege('public', $1, 'EXECUTE') AS public_exec,
                 has_function_privilege('aesa_app', $1, 'EXECUTE') AS app_exec`,
