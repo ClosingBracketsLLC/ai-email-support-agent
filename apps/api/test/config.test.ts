@@ -80,6 +80,10 @@ describe('api config', () => {
     expect(c.gmailPubsubAudience).toBe('aud')
     expect(c.gmailPubsubServiceAccount).toBe('sa@project.iam.gserviceaccount.com')
   })
+  it('GMAIL_PUBSUB_AUDIENCE and GMAIL_PUBSUB_SA_EMAIL are all-or-none — the webhook route 404s otherwise, so a half-configured deploy fails at boot instead', () => {
+    expect(() => loadConfig({ ...BASE, GMAIL_PUBSUB_AUDIENCE: 'aud' })).toThrow(/GMAIL_PUBSUB_AUDIENCE and GMAIL_PUBSUB_SA_EMAIL/)
+    expect(() => loadConfig({ ...BASE, GMAIL_PUBSUB_SA_EMAIL: 'sa@project.iam.gserviceaccount.com' })).toThrow(/GMAIL_PUBSUB_AUDIENCE and GMAIL_PUBSUB_SA_EMAIL/)
+  })
   it('derives a stable 32-byte flowKey from BETTER_AUTH_SECRET, distinct from betterAuthSecret itself', () => {
     const c = loadConfig(BASE)
     expect(c.flowKey).toBeInstanceOf(Buffer)

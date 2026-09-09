@@ -28,7 +28,7 @@ const noopEnqueue: EnqueueFn = async () => null
  * every other suite gets the same behavior as before this parameter existed. */
 export async function createTestApi(
   overrides: Partial<NodeJS.ProcessEnv> = {},
-  depsOverrides: Partial<Pick<ServerDeps, 'enqueue' | 'mailProviders'>> = {},
+  depsOverrides: Partial<Pick<ServerDeps, 'enqueue' | 'mailProviders' | 'verifyGoogleJwt'>> = {},
 ) {
   const t = await createTestDatabase()
   const config = loadConfig({ ...TEST_ENV, ...overrides, DATABASE_URL: t.url })
@@ -39,7 +39,11 @@ export async function createTestApi(
   const logger = createAppLogger({ level: 'warn', stream: { write: (line: string) => void lines.push(line) } })
   const auth = createAuth({ db: handle.db, config, mail, logger, audit: (orgId, entry) => api.withOrg(orgId, (tx) => audit(tx, entry)) })
   const enqueue = depsOverrides.enqueue ?? noopEnqueue
-  const app = buildServer({ config, auth, api, mail, logger, enqueue, mailProviders: depsOverrides.mailProviders })
+  const app = buildServer({
+    config, auth, api, mail, logger, enqueue,
+    mailProviders: depsOverrides.mailProviders,
+    verifyGoogleJwt: depsOverrides.verifyGoogleJwt,
+  })
   return { app, config, mail, api, handle, lines, close: async () => { await app.close(); await handle.pool.end(); await t.drop() } }
 }
 
@@ -50,6 +54,9 @@ export function stubDeps(env: Partial<NodeJS.ProcessEnv> = {}, opts: { level?: s
   const api: ServerDeps['api'] = {
     withOrg: async () => { throw new Error('no database in stubDeps') },
     resolveOauthFlow: async () => null,
+    resolveMailboxConnection: async () => null,
+    resolveMailboxSubscription: async () => null,
+    recordWebhookEvent: async () => { throw new Error('no database in stubDeps') },
     health: async () => ({ db: 'error', migrations: { count: 0, latest: null } }),
   }
   const logger = createAppLogger({ level: opts.level ?? 'silent', stream: opts.stream })

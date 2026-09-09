@@ -8,7 +8,7 @@
     "@aesa/contracts": "workspace:*", "@aesa/core": "workspace:*", "@aesa/crypto": "workspace:*", "@aesa/db": "workspace:*",
     "@aesa/mail": "workspace:*", "@aesa/queue": "workspace:*",
     "@better-auth/expo": "1.7.3", "@fastify/cors": "^11.3.0", "@fastify/rate-limit": "^10.3.0", "@trpc/server": "11.18.0", "better-auth": "1.7.3",
-    "drizzle-orm": "^0.44.0", "fastify": "^5.4.0", "pg": "^8.16.0", "pg-boss": "^10.4.2", "pino": "^10.3.0", "resend": "^6.26.0", "superjson": "^2.2.0",
+    "drizzle-orm": "^0.44.0", "fastify": "^5.4.0", "jose": "^6.2.12", "pg": "^8.16.0", "pg-boss": "^10.4.2", "pino": "^10.3.0", "resend": "^6.26.0", "superjson": "^2.2.0",
     "tsx": "^4.20.0", "zod": "^4.0.0"
   },
   "devDependencies": { "@trpc/client": "11.18.0", "@types/node": "^22", "@types/pg": "^8.15.0", "typescript": "^5.9.2", "vitest": "^3.2.0" }

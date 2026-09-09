@@ -3,7 +3,7 @@ import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import { z } from 'zod'
 import type { MailProvider } from '@aesa/contracts'
-import { withOrg, type Db, type OrgTx } from '@aesa/db'
+import { webhookEvents, withOrg, type Db, type OrgTx } from '@aesa/db'
 import { enqueue as enqueueJob, type JobDefinition } from '@aesa/queue'
 import type { MailboxProvider } from '@aesa/mail'
 import type { Auth } from './auth.ts'
@@ -31,6 +31,20 @@ export interface ApiFacade {
    * `aesa_app` may call it with no `app.org_id` set at all.
    */
   resolveOauthFlow(flowId: string): Promise<{ flowId: string; orgId: string } | null>
+  /**
+   * Task 18's provider webhooks (Gmail Pub/Sub, Microsoft Graph) carry no session either — the org has
+   * to be found from a provider-supplied identifier alone, via 0006's other two SECURITY DEFINER
+   * resolvers. `clientStateHash` is `mailbox_connections.push_client_state_hash` (Graph's clientState
+   * check); Gmail rows leave it null.
+   */
+  resolveMailboxConnection(provider: MailProvider, email: string): Promise<{ connectionId: string; orgId: string; clientStateHash: string | null } | null>
+  resolveMailboxSubscription(subscriptionId: string): Promise<{ connectionId: string; orgId: string; clientStateHash: string | null } | null>
+  /**
+   * `webhook_events` (RLS-exempt platform table, migration 0005/0006): INSERT ... ON CONFLICT
+   * (provider, external_id) DO NOTHING. Returns false when the row already existed — a duplicate
+   * delivery the caller should ack without redoing any enqueue.
+   */
+  recordWebhookEvent(provider: string, externalId: string, envelope: unknown): Promise<boolean>
 }
 
 /** Called only by the composition root (src/index.ts) and test helpers — the two places that hold a raw handle. */
@@ -41,6 +55,27 @@ export function createApiFacade(handle: { db: Db; pool: pg.Pool }): ApiFacade {
       const res = await handle.pool.query<{ flow_id: string; org_id: string }>('SELECT * FROM resolve_oauth_flow($1)', [flowId])
       const row = res.rows[0]
       return row ? { flowId: row.flow_id, orgId: row.org_id } : null
+    },
+    async resolveMailboxConnection(provider, email) {
+      const res = await handle.pool.query<{ connection_id: string; org_id: string; client_state_hash: string | null }>(
+        'SELECT * FROM resolve_mailbox_connection($1, $2)', [provider, email],
+      )
+      const row = res.rows[0]
+      return row ? { connectionId: row.connection_id, orgId: row.org_id, clientStateHash: row.client_state_hash } : null
+    },
+    async resolveMailboxSubscription(subscriptionId) {
+      const res = await handle.pool.query<{ connection_id: string; org_id: string; client_state_hash: string | null }>(
+        'SELECT * FROM resolve_mailbox_subscription($1)', [subscriptionId],
+      )
+      const row = res.rows[0]
+      return row ? { connectionId: row.connection_id, orgId: row.org_id, clientStateHash: row.client_state_hash } : null
+    },
+    async recordWebhookEvent(provider, externalId, envelope) {
+      const inserted = await handle.db.insert(webhookEvents)
+        .values({ provider, externalId, envelope })
+        .onConflictDoNothing({ target: [webhookEvents.provider, webhookEvents.externalId] })
+        .returning({ id: webhookEvents.id })
+      return inserted.length > 0
     },
     async health() {
       try {
@@ -97,4 +132,9 @@ export interface ServerDeps {
   /** Test seam: overrides the real Gmail/Graph adapters per provider (connect/routes.ts); production
    * code leaves this unset and resolves the real adapter every time. */
   mailProviders?: Partial<Record<MailProvider, MailboxProvider>>
+  /** Test seam for the Gmail Pub/Sub webhook's OIDC verification (webhooks/gmail.ts): overrides the
+   * real `jose` JWKS/issuer/audience check with a fake that returns or throws whatever a test needs,
+   * so no suite has to mint a Google-signed token. Production leaves this unset and always resolves
+   * the real verifier, bound to `config.gmailPubsubAudience` at server-build time. */
+  verifyGoogleJwt?: (jwt: string) => Promise<{ email?: string; email_verified?: boolean }>
 }

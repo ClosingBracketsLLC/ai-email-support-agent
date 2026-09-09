@@ -8,6 +8,8 @@ import { registerConnectRoutes } from './connect/routes.ts'
 import type { ServerDeps } from './deps.ts'
 import { createContextFactory } from './trpc/context.ts'
 import { appRouter, type AppRouter } from './trpc/router.ts'
+import { registerGmailWebhook } from './webhooks/gmail.ts'
+import { registerMicrosoftWebhook } from './webhooks/microsoft.ts'
 
 export type { ServerDeps } from './deps.ts'
 
@@ -119,6 +121,12 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // declared inside a register() actually gets wrapped by @fastify/rate-limit's onRoute-driven
     // `global: true` mode (see this block's own opening comment).
     registerConnectRoutes(routes, deps)
+
+    // Task 18: the Gmail Pub/Sub and Microsoft Graph inbound webhooks — same "why here, not on `app`"
+    // reasoning as registerConnectRoutes above (rate-limit's `global: true` onRoute hook). Neither
+    // carries a session; each has its own trust anchor (the OIDC bearer token, clientState) instead.
+    registerGmailWebhook(routes, deps)
+    registerMicrosoftWebhook(routes, deps)
   })
 
   app.register(fastifyTRPCPlugin, {

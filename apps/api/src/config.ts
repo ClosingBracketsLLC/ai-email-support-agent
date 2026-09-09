@@ -99,6 +99,14 @@ function oauthPair(name: string, id: string | undefined, secret: string | undefi
   return { clientId: id, clientSecret: new Secret(secret) }
 }
 
+/** Task 18: the Gmail Pub/Sub webhook is "armed" (routes.ts 404s otherwise) exactly when both are set —
+ * one without the other is a half-configured deploy, same all-or-none shape as oauthPair() above. */
+function gmailPubsubPair(audience: string | undefined, serviceAccount: string | undefined): { audience: string; serviceAccount: string } | null {
+  if (!audience && !serviceAccount) return null
+  if (!audience || !serviceAccount) throw new Error('GMAIL_PUBSUB_AUDIENCE and GMAIL_PUBSUB_SA_EMAIL must be set together')
+  return { audience, serviceAccount }
+}
+
 function deriveFlowKey(betterAuthSecret: string): Buffer {
   return Buffer.from(hkdfSync('sha256', betterAuthSecret, 'aesa', 'oauth-flow-key', 32))
 }
@@ -140,6 +148,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): ApiConfig {
     throw new Error('AUTH_RATE_LIMIT=on requires TRUST_PROXY in production: Better Auth keys its limiter on x-forwarded-for and otherwise puts every client in one bucket')
   }
 
+  const gmailPubsub = gmailPubsubPair(d.GMAIL_PUBSUB_AUDIENCE, d.GMAIL_PUBSUB_SA_EMAIL)
+
   return {
     env: d.NODE_ENV, databaseUrl: d.DATABASE_URL, port: d.PORT, host: d.HOST, logLevel: d.LOG_LEVEL,
     appBaseUrl, appWebOrigin, webOrigins, trustedOrigins, trustProxy,
@@ -149,8 +159,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): ApiConfig {
     mail,
     gmailOauth: oauthPair('GMAIL_OAUTH', d.GMAIL_OAUTH_CLIENT_ID, d.GMAIL_OAUTH_CLIENT_SECRET),
     msOauth: oauthPair('MS_OAUTH', d.MS_OAUTH_CLIENT_ID, d.MS_OAUTH_CLIENT_SECRET),
-    gmailPubsubAudience: d.GMAIL_PUBSUB_AUDIENCE ?? null,
-    gmailPubsubServiceAccount: d.GMAIL_PUBSUB_SA_EMAIL ?? null,
+    gmailPubsubAudience: gmailPubsub?.audience ?? null,
+    gmailPubsubServiceAccount: gmailPubsub?.serviceAccount ?? null,
     flowKey: deriveFlowKey(d.BETTER_AUTH_SECRET),
   }
 }
