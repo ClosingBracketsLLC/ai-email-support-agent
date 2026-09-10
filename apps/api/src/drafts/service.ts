@@ -254,6 +254,14 @@ export async function loadDraftView(tx: OrgTx, orgId: string, draftId: string): 
  */
 const FAILED_DRAFT_TICKET_STATUSES = ['needs_owner', 'triaged'] as const
 
+/** The read and the write agree: a `failed` draft is the owner's while the ticket is `triaged` (the
+ * stale hand-back) or `needs_owner` FOR the send failure — not for a later, unrelated escalation
+ * (`owner_handling`, `tripwire`, …) that happens to sit on a ticket still carrying one (final fix wave). */
+function failedDraftIsOwners(ticket: { status: string; needsOwnerReason: string | null }): boolean {
+  if (!(FAILED_DRAFT_TICKET_STATUSES as readonly string[]).includes(ticket.status)) return false
+  return ticket.status === 'triaged' || ticket.needsOwnerReason === 'send_failed'
+}
+
 /**
  * The draft the ticket screen opens on: the one LIVE draft (at most one, by the partial unique) —
  * or, when there is none AND the ticket is still one of `FAILED_DRAFT_TICKET_STATUSES`, its most
@@ -271,11 +279,11 @@ const FAILED_DRAFT_TICKET_STATUSES = ['needs_owner', 'triaged'] as const
  * chip, which keeps the list's "a draft is waiting for you" chip honest.
  */
 export async function loadLiveDraftView(
-  tx: OrgTx, orgId: string, ticketId: string, ticketStatus: string,
+  tx: OrgTx, orgId: string, ticketId: string, ticket: { status: string; needsOwnerReason: string | null },
 ): Promise<DraftView | null> {
   const [live] = await draftViewQuery(tx, orgId, and(eq(drafts.ticketId, ticketId), inArray(drafts.status, [...LIVE_DRAFT_STATUSES]))!)
   if (live) return toDraftView(live)
-  if (!(FAILED_DRAFT_TICKET_STATUSES as readonly string[]).includes(ticketStatus)) return null
+  if (!failedDraftIsOwners(ticket)) return null
 
   // `decided_at` is always set on a `failed` draft (both edges into it, `approved → failed` and
   // `sending → failed`, run downstream of an approve), but NULLS LAST keeps the order total if that

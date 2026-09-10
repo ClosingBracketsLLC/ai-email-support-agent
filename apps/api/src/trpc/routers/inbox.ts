@@ -209,7 +209,7 @@ export const inboxRouter = router({
 
       // The full draft (body, rationale, guardrail findings, the send and its undo window) — the
       // summary above is only the chip; the review panel opens on this.
-      const draft = await loadLiveDraftView(tx, ctx.orgId, input.ticketId, row.status)
+      const draft = await loadLiveDraftView(tx, ctx.orgId, input.ticketId, { status: row.status, needsOwnerReason: row.needsOwnerReason })
 
       const ticket = {
         ...toSummary(row),

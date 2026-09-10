@@ -226,7 +226,7 @@ instruction from him in the session.
   error handler strips SQL parameters and redacts URLs before anything reaches a log or a client.
 - **App bundle.** `apps/app` never value-imports a server package — `@aesa/db`, `@aesa/core`,
   `@aesa/crypto`, `@aesa/queue`, `@aesa/mail`, `@aesa/platform-mail`, `@aesa/llm`, `@aesa/agent`,
-  `@aesa/test-kit`, `@aesa/api`, `drizzle-orm`, `fastify` or `node:*` — nor any of their sub-paths
+  `@aesa/test-kit`, `@aesa/api`, `drizzle-orm`, `fastify`, `better-auth/node` or `node:*` — nor any of their sub-paths
   (`@aesa/db/*`, `@aesa/api/*`, `@aesa/agent/*`, `drizzle-orm/*`); `import type` is allowed
   throughout (ESLint block for `apps/app/**`). Share types through `@aesa/contracts`.
 - **Auth tables.** Better Auth's `user`/`session`/`account`/`verification`/`organization`/`member`/

@@ -386,12 +386,12 @@ the record)</summary>
   commit. The per-task execution ledger and the fix-wave workspace were ephemeral SDD artifacts;
   everything load-bearing from them is distilled below, and the git history plus the review record
   are the durable account. Gate on the branch after the fix wave: typecheck and lint clean across
-  all 13 packages/apps; `pnpm test` green with **1,637 tests** (`@aesa/contracts` 21,
+  all 13 packages/apps; `pnpm test` green with **1,641 tests** plus 4 conditional skips (`@aesa/contracts` 21,
   `@aesa/crypto` 42, `@aesa/platform-mail` 18, `@aesa/core` 204, `@aesa/llm` 98, `@aesa/agent` 65,
   `@aesa/db` 72, `@aesa/queue` 17, `@aesa/mail` 237, `@aesa/test-kit` 43 [39 run + 4 conditional
-  skips], `apps/api` 207, `apps/worker` 357 [including the 8-scenario `e2e-phase2.test.ts` and
+  skips], `apps/api` 210, `apps/worker` 357 [including the 8-scenario `e2e-phase2.test.ts` and
   `e2e-phase3.test.ts`, 21 cases covering the twenty scenarios of the spec's Phase 3 *Verify* list
-  — scenario 6 is split into 6a and 6b], `apps/app` 260 jest across 33 suites — no database);
+  — scenario 6 is split into 6a and 6b], `apps/app` 261 jest across 33 suites — no database);
   `db:check` reports no drift; the Expo web export produces **21 static routes** (unchanged — Phase
   3 added no route file; `activity.tsx` already existed); the Playwright signup smoke passes (still
   ending at the gated mailbox step — providerless CI cannot reach go-live, per Phase 2's Task 20
@@ -710,7 +710,7 @@ the record)</summary>
 a merge commit on Robert's go-ahead (the standing flow from his 2026-09-09 instruction). Once it is
 merged, check out `main`, pull, and branch `phase-4` off it. Start with
 `superpowers:writing-plans` against the spec's *Build phases → Phase 4* section. Run the local setup
-from `CLAUDE.md` and confirm the 1,637-test baseline above before writing the plan.
+from `CLAUDE.md` and confirm the 1,641-test baseline above before writing the plan.
 
 **The hand-off.** Phase 4 is knowledge: the document parsers, the site crawler, Voyage embeddings,
 retrieval, and the `minio`/R2 upload path. Two seams are already in place and waiting for it:
@@ -849,14 +849,16 @@ verification walk:
 
 **The ledger's deferred minors still carried** — the whole-branch review triaged 24, the fix wave
 cleared nine of them (69, 70, 71, 79, 129 from that triage, plus 39, 112, 136 and 89b picked up by
-the sections that were already in those files), and these 19 carry:
+the sections that were already in those files), one (47) turned out to be moot and is dropped, and
+these 18 carry:
 
 - 40 — `use-gate.test.tsx` near-duplicates the `setActive`-rejection scaffold (the two tests assert
   different things; the review's own triage says drop rather than merge).
 - 41 — the Task 1 report's rationale is imprecise about the `provider as MailProvider` cast
   precedent; the code is safe by the DB CHECK. Report text only.
-- 47 — `ticket-row.test.tsx`'s `it.each` title says "one-word chip"; the review confirmed the block
-  it titles carries only genuinely one-word chips, so the recorded minor no longer applies. Drop.
+- 47 (dropped, not carried) — `ticket-row.test.tsx`'s `it.each` title says "one-word chip"; the
+  review confirmed the block it titles carries only genuinely one-word chips, so the recorded minor
+  no longer applies.
 - 48 — the Task 2 report miscounts `DECISION_REASONS` as 20 (it is 21). Report text only.
 - 53 — the Task 3 report mischaracterises migration 0010's per-table index split (the total, 12, is
   right). Report text only.

@@ -238,6 +238,12 @@ describe('inbox router (read-only)', () => {
     const waiting = await insertTicket(orgId, connectionId, { status: 'waiting_on_customer', agentId, lastInboundAt: new Date() })
     await seedPendingDraft(t.api, orgId, waiting.id, { agentId, status: 'failed' })
     expect((await c.inbox.ticket.query({ ticketId: waiting.id })).draft).toBeNull()
+
+    // ...and on a needs_owner ticket whose reason is NOT the send failure — a later, unrelated
+    // escalation on a ticket still carrying the old failed draft (the read matches resumeDraft's write).
+    const handling = await insertTicket(orgId, connectionId, { status: 'needs_owner', needsOwnerReason: 'owner_handling', agentId, lastInboundAt: new Date() })
+    await seedPendingDraft(t.api, orgId, handling.id, { agentId, status: 'failed' })
+    expect((await c.inbox.ticket.query({ ticketId: handling.id })).draft).toBeNull()
   })
 
   it('a cursor that passes zod but is not a real instant is served WITHOUT the cursor and flagged degraded', async () => {
