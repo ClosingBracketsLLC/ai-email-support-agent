@@ -108,4 +108,75 @@ describe('createFakeProvider', () => {
     expect(withoutParsed.parseStrategy).toBe('none')
     expect(withoutParsed.parsed).toBeNull()
   })
+
+  it('routes a request whose meta.role has a byRole queue to that queue, and to `scripts` otherwise', async () => {
+    const provider = createFakeProvider([{ text: 'fallback' }], {
+      byRole: { triage: [{ text: 'triage-1' }, { text: 'triage-2' }] },
+    })
+    const triageReq = baseRequest({ meta: { orgId: 'org_1', role: 'triage', idempotencyKey: 'k1' } })
+    const draftReq = baseRequest({ meta: { orgId: 'org_1', role: 'draft', idempotencyKey: 'k2' } })
+
+    const t1 = await provider.chat(triageReq)
+    const d1 = await provider.chat(draftReq)
+    const t2 = await provider.chat(triageReq)
+    const t3 = await provider.chat(triageReq) // byRole queue exhausted — repeats its last script
+
+    expect([t1.text, d1.text, t2.text, t3.text]).toEqual(['triage-1', 'fallback', 'triage-2', 'triage-2'])
+    expect(provider.callsFor('triage')).toEqual([triageReq, triageReq, triageReq])
+    expect(provider.callsFor('draft')).toEqual([draftReq])
+    expect(provider.callsFor('probe')).toEqual([])
+  })
+
+  it('allows `scripts` to be empty when every needed role has a byRole queue', async () => {
+    const provider = createFakeProvider([], { byRole: { draft: [{ text: 'only-draft' }] } })
+
+    const result = await provider.chat(baseRequest({ meta: { orgId: 'org_1', role: 'draft', idempotencyKey: 'k' } }))
+
+    expect(result.text).toBe('only-draft')
+  })
+
+  it('throws when both `scripts` and every byRole queue are empty', () => {
+    expect(() => createFakeProvider([])).toThrow(/at least one script/)
+    expect(() => createFakeProvider([], { byRole: { draft: [] } })).toThrow(/at least one script/)
+  })
+
+  it('throws at call time for a role with no byRole queue and no fallback in `scripts`', async () => {
+    const provider = createFakeProvider([], { byRole: { draft: [{ text: 'only-draft' }] } })
+
+    await expect(provider.chat(baseRequest({ meta: { orgId: 'org_1', role: 'triage', idempotencyKey: 'k' } }))).rejects.toThrow(
+      /no script available/,
+    )
+  })
+
+  it('scripts an explicit finish reason, defaulting to "stop"', async () => {
+    const provider = createFakeProvider([{ text: 'a', finish: 'refusal' }, { text: 'b' }])
+
+    const refused = await provider.chat(baseRequest())
+    const normal = await provider.chat(baseRequest())
+
+    expect(refused.finish).toBe('refusal')
+    expect(normal.finish).toBe('stop')
+  })
+
+  it('scripts an explicit parseStrategy, overriding the parsed-based default', async () => {
+    const provider = createFakeProvider([{ parsed: { ok: true }, parseStrategy: 'repair' }])
+
+    const result = await provider.chat(baseRequest())
+
+    expect(result.parseStrategy).toBe('repair')
+  })
+
+  it('merges a capabilities override over the Task 6 default', async () => {
+    const provider = createFakeProvider([{ text: 'ok' }], { capabilities: { structuredOutput: 'json_mode' } })
+
+    expect(provider.capabilities('any-model')).toEqual({ structuredOutput: 'json_mode', tools: true, effort: true, cacheMinTokens: 512 })
+  })
+
+  it('uses a custom kind when given one, and "fake" by default', () => {
+    const custom = createFakeProvider([{ text: 'ok' }], { kind: 'fake-custom' })
+    const defaultKind = createFakeProvider([{ text: 'ok' }])
+
+    expect(custom.kind).toBe('fake-custom')
+    expect(defaultKind.kind).toBe('fake')
+  })
 })
