@@ -9,7 +9,7 @@ import { Banner } from '@/components/banner'
 import { Loading } from '@/components/loading'
 import { Muted } from '@/components/typography'
 import { useTRPC } from '@/lib/trpc'
-import { WIDE_BREAKPOINT, radius, spacing, typeScale, useColors } from '@/theme'
+import { WIDE_BREAKPOINT, font, radius, spacing, typeScale, useColors } from '@/theme'
 import { AgentOffBanner } from './agent-off-banner'
 import { TicketRow, type TicketSummary } from './ticket-row'
 
@@ -96,7 +96,7 @@ const styles = StyleSheet.create({
   column: { flex: 1, width: '100%', maxWidth: 560, gap: spacing.md },
   segmented: { flexDirection: 'row', gap: spacing.xs },
   tab: { flex: 1, borderWidth: 1, borderRadius: radius.md, paddingVertical: spacing.sm, alignItems: 'center' },
-  tabLabel: { fontWeight: '600' },
+  tabLabel: { fontFamily: font.uiStrong },
   listContent: { gap: 0, paddingBottom: spacing.lg },
   loadMore: { borderWidth: 1, borderRadius: radius.md, paddingVertical: spacing.sm, alignItems: 'center', marginTop: spacing.sm },
 })

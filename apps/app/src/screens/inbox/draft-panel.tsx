@@ -1,12 +1,12 @@
 import { useEffect, useImperativeHandle, useState, type Ref } from 'react'
-import { Platform, StyleSheet, Text, View } from 'react-native'
+import { StyleSheet, Text, View } from 'react-native'
 import { DRAFT_BODY_MAX, type DraftStatus, type RejectAction } from '@aesa/contracts'
 import { Banner } from '@/components/banner'
 import { Button } from '@/components/button'
 import { Card } from '@/components/card'
 import { TextField } from '@/components/text-field'
 import { Heading, Muted } from '@/components/typography'
-import { radius, spacing, typeScale, useColors } from '@/theme'
+import { font, radius, spacing, typeScale, useColors } from '@/theme'
 import { REASON_SENTENCE, decisionReasonLabel, holdReasonLabel, sendFailureLabel } from './reason-labels'
 import { RejectSheet } from './reject-sheet'
 import { UndoBar } from './undo-bar'
@@ -233,7 +233,7 @@ const styles = StyleSheet.create({
   headerRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
   headerTitle: { flex: 1 },
   chip: { borderWidth: 1, borderRadius: radius.lg, paddingHorizontal: spacing.sm, paddingVertical: 2 },
-  body: { fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }) },
+  body: { fontFamily: font.mono },
   editor: { minHeight: 160, textAlignVertical: 'top' },
   actions: { gap: spacing.sm },
 })

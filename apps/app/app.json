@@ -11,14 +11,14 @@
     "ios": { "bundleIdentifier": "com.closingbrackets.aesa", "supportsTablet": true },
     "android": {
       "package": "com.closingbrackets.aesa",
-      "adaptiveIcon": { "foregroundImage": "./assets/adaptive-icon.png", "backgroundColor": "#0F172A" }
+      "adaptiveIcon": { "foregroundImage": "./assets/adaptive-icon.png", "backgroundColor": "#0B1220" }
     },
     "web": { "output": "server", "favicon": "./assets/favicon.png" },
     "plugins": [
       "expo-router",
       "expo-secure-store",
-      ["expo-splash-screen", { "backgroundColor": "#0F172A", "image": "./assets/splash-icon.png", "imageWidth": 120 }],
-      ["expo-notifications", { "icon": "./assets/notification-icon.png", "color": "#0F172A" }]
+      ["expo-splash-screen", { "backgroundColor": "#0B1220", "image": "./assets/splash-icon.png", "imageWidth": 108 }],
+      ["expo-notifications", { "icon": "./assets/notification-icon.png", "color": "#2563EB" }]
     ],
     "experiments": { "typedRoutes": true }
   }

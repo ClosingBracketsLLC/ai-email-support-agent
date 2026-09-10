@@ -12,7 +12,7 @@ import { Screen } from '@/components/screen'
 import { TextField } from '@/components/text-field'
 import { Heading, Muted } from '@/components/typography'
 import { useTRPC } from '@/lib/trpc'
-import { radius, spacing, typeScale, useColors } from '@/theme'
+import { font, radius, spacing, typeScale, useColors } from '@/theme'
 import { SandboxCard } from './sandbox-card'
 
 const PERSONA_LABEL: Record<PersonaPreset, string> = { support: 'Support', sales: 'Sales', concierge: 'Concierge', billing: 'Billing' }
@@ -156,7 +156,7 @@ export function AgentEditScreen() {
           <Pressable
             key={p} role="radio" accessibilityState={{ checked: personaPreset === p }}
             onPress={() => onPersonaPresetChange(p)} testID={`persona-preset-${p}`}
-            style={[styles.presetCard, { borderColor: personaPreset === p ? c.primary : c.border, backgroundColor: personaPreset === p ? c.info : c.bg }]}
+            style={[styles.presetCard, { borderColor: personaPreset === p ? c.primary : c.border, backgroundColor: personaPreset === p ? c.primaryTint : c.bg }]}
           >
             <Text style={[typeScale.body, styles.presetLabel, { color: c.text }]}>{PERSONA_LABEL[p]}</Text>
             <Text style={[typeScale.caption, { color: c.muted }]}>{PERSONA_DESCRIPTION[p]}</Text>
@@ -202,14 +202,14 @@ export function AgentEditScreen() {
                 its reply-from is inherently itself. */}
             <Pressable
               role="radio" accessibilityState={{ checked: !replyFromConnection }} onPress={() => onReplyFromChange(false)} testID="reply-as-own"
-              style={[styles.radioBox, { borderColor: !replyFromConnection ? c.primary : c.border, backgroundColor: !replyFromConnection ? c.info : c.bg }]}
+              style={[styles.radioBox, { borderColor: !replyFromConnection ? c.primary : c.border, backgroundColor: !replyFromConnection ? c.primaryTint : c.bg }]}
             >
               <Text style={[typeScale.body, { color: c.text }]}>Reply as {agent.address}</Text>
               <Text style={[typeScale.caption, { color: c.muted }]}>Set up Send-as with your provider first</Text>
             </Pressable>
             <Pressable
               role="radio" accessibilityState={{ checked: replyFromConnection }} onPress={() => onReplyFromChange(true)} testID="reply-from-connection"
-              style={[styles.radioBox, { borderColor: replyFromConnection ? c.primary : c.border, backgroundColor: replyFromConnection ? c.info : c.bg }]}
+              style={[styles.radioBox, { borderColor: replyFromConnection ? c.primary : c.border, backgroundColor: replyFromConnection ? c.primaryTint : c.bg }]}
             >
               <Text style={[typeScale.body, { color: c.text }]}>Reply from {agent.connectionEmailAddress}</Text>
             </Pressable>
@@ -255,7 +255,7 @@ export function AgentEditScreen() {
 const styles = StyleSheet.create({
   field: { gap: spacing.xs },
   presetCard: { borderWidth: 1, borderRadius: radius.md, padding: spacing.sm, gap: 2 },
-  presetLabel: { fontWeight: '600' },
+  presetLabel: { fontFamily: font.uiStrong },
   radios: { gap: spacing.xs },
   radioBox: { borderWidth: 1, borderRadius: radius.md, padding: spacing.sm, gap: 2 },
   chipsRow: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.xs },

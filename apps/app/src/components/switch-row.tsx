@@ -16,7 +16,7 @@ export function SwitchRow({
   return (
     <View style={styles.row}>
       <View style={styles.labels}>
-        <Text style={[typeScale.body, styles.label, { color: c.text }]}>{label}</Text>
+        <Text style={[typeScale.bodyStrong, { color: c.text }]}>{label}</Text>
         {hint ? <Text style={[typeScale.caption, { color: c.muted }]}>{hint}</Text> : null}
       </View>
       <Switch
@@ -39,5 +39,4 @@ export function SwitchRow({
 const styles = StyleSheet.create({
   row: { flexDirection: 'row', alignItems: 'center', gap: spacing.md },
   labels: { flex: 1, gap: spacing.xs },
-  label: { fontWeight: '600' },
 })

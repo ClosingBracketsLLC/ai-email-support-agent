@@ -1,20 +1,64 @@
-import { useColorScheme } from 'react-native'
+import { BRAND } from '@aesa/contracts'
+import { Platform, useColorScheme } from 'react-native'
 
-const light = { bg: '#FFFFFF', surface: '#F8FAFC', text: '#0F172A', muted: '#64748B', border: '#E2E8F0', primary: '#2563EB', onPrimary: '#FFFFFF', danger: '#DC2626', success: '#16A34A', info: '#EFF6FF' }
-const dark = { bg: '#0F172A', surface: '#1E293B', text: '#F8FAFC', muted: '#94A3B8', border: '#334155', primary: '#60A5FA', onPrimary: '#0F172A', danger: '#F87171', success: '#4ADE80', info: '#1E3A5F' }
-export type Colors = typeof light
+const L = BRAND.light
+const D = BRAND.dark
 
-export const spacing = { xs: 4, sm: 8, md: 16, lg: 24, xl: 32 } as const
-export const radius = { sm: 6, md: 10, lg: 16 } as const
-export const typeScale = {
-  title: { fontSize: 28, fontWeight: '700' as const, lineHeight: 34 },
-  heading: { fontSize: 20, fontWeight: '600' as const, lineHeight: 26 },
-  body: { fontSize: 16, lineHeight: 22 },
-  caption: { fontSize: 13, lineHeight: 18 },
+/**
+ * The theme is a ROLE-keyed view over the brand tokens (brand/tokens.json → BRAND): light uses the
+ * spec's light names, dark maps the night/lifted names onto the same roles. theme.test.ts pins that
+ * every value here is a token of its theme — a colour that is not in tokens.json cannot appear in the app.
+ */
+export const palettes = {
+  light: {
+    bg: L.paper, surface: L.mist, text: L.ink, muted: L.slate, border: L.line,
+    primary: L.primary, primaryTint: L.primaryTint, onPrimary: L.primaryOn,
+    success: L.success, successTint: L.successTint, successText: L.successText, successSolid: L.successSolid, onSuccess: L.successOn,
+    warning: L.warning, warningTint: L.warningTint, warningText: L.warningText, onWarning: L.warningOn,
+    danger: L.danger, dangerTint: L.dangerTint, dangerText: L.dangerText, onDanger: L.dangerOn,
+  },
+  dark: {
+    bg: D.night, surface: D.nightSurface, text: D.paperOnNight, muted: D.slateOnNight, border: D.lineOnNight,
+    primary: D.lifted, primaryTint: D.liftedTint, onPrimary: D.liftedOn,
+    success: D.success, successTint: D.successTint, successText: D.successText, successSolid: D.successSolid, onSuccess: D.successOn,
+    warning: D.warning, warningTint: D.warningTint, warningText: D.warningText, onWarning: D.warningOn,
+    danger: D.danger, dangerTint: D.dangerTint, dangerText: D.dangerText, onDanger: D.dangerOn,
+  },
 }
+export type Colors = { [K in keyof typeof palettes.light]: string }
+
+/**
+ * Family names as expo-font registers the bundled faces (src/lib/fonts.ts): ONE family per weight.
+ * Styles therefore never request a weight through the style prop — with a single-face family Android
+ * fakes the bold and iOS ignores the request; naming the 600 face is the only way to get the real one
+ * on both. (`brand/test/app-typography.test.ts` greps the app's source for that style property's name;
+ * this comment avoids spelling it out so it does not trip the guard on its own explanation.)
+ */
+export const font = {
+  display: 'Fraunces_600SemiBold',
+  displayMedium: 'Fraunces_500Medium',
+  ui: 'PlusJakartaSans_400Regular',
+  uiMedium: 'PlusJakartaSans_500Medium',
+  uiStrong: 'PlusJakartaSans_600SemiBold',
+  /** The draft body keeps the platform monospace so whitespace is exact (spec §4). */
+  mono: Platform.select({ ios: BRAND.type.mono.ios, android: BRAND.type.mono.android, default: BRAND.type.mono.web }) as string,
+} as const
+
+const S = BRAND.type.scale
+export const typeScale = {
+  title: { fontFamily: font.display, fontSize: S.title.fontSize, lineHeight: S.title.lineHeight, letterSpacing: S.title.fontSize * S.title.letterSpacing },
+  heading: { fontFamily: font.uiStrong, fontSize: S.heading.fontSize, lineHeight: S.heading.lineHeight },
+  body: { fontFamily: font.ui, fontSize: S.body.fontSize, lineHeight: S.body.lineHeight },
+  bodyStrong: { fontFamily: font.uiStrong, fontSize: S.bodyStrong.fontSize, lineHeight: S.bodyStrong.lineHeight },
+  caption: { fontFamily: font.ui, fontSize: S.small.fontSize, lineHeight: S.small.lineHeight },
+  label: { fontFamily: font.uiStrong, fontSize: S.label.fontSize, lineHeight: S.label.lineHeight, letterSpacing: S.label.fontSize * S.label.letterSpacing, textTransform: 'uppercase' as const },
+} as const
+
+export const spacing = BRAND.spacing
+export const radius = BRAND.radius
 /** Tablet landscape and desktop get the sidebar shell; below this it is tabs. */
 export const WIDE_BREAKPOINT = 900
 
 export function useColors(): Colors {
-  return useColorScheme() === 'dark' ? dark : light
+  return useColorScheme() === 'dark' ? palettes.dark : palettes.light
 }

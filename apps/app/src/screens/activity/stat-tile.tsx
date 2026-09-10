@@ -16,7 +16,7 @@ export function StatTile({ label, value, subtitle, testID }: StatTileProps) {
   return (
     <View testID={testID} style={[styles.tile, { borderColor: c.border, backgroundColor: c.surface }]}>
       <Text style={[typeScale.caption, { color: c.muted }]}>{label}</Text>
-      <Text style={[typeScale.heading, styles.value, { color: c.text }]}>{value}</Text>
+      <Text style={[typeScale.heading, { color: c.text }]}>{value}</Text>
       {subtitle ? <Text style={[typeScale.caption, { color: c.muted }]}>{subtitle}</Text> : null}
     </View>
   )
@@ -24,5 +24,4 @@ export function StatTile({ label, value, subtitle, testID }: StatTileProps) {
 
 const styles = StyleSheet.create({
   tile: { flexBasis: '47%', flexGrow: 1, borderWidth: 1, borderRadius: radius.md, padding: spacing.sm, gap: 2 },
-  value: { fontWeight: '700' },
 })

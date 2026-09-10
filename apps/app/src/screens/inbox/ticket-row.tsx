@@ -98,7 +98,7 @@ export function TicketRow({ ticket, onPress }: { ticket: TicketSummary; onPress:
     >
       <View style={styles.main}>
         <View style={styles.titleLine}>
-          <Text style={[typeScale.body, styles.subject, { color: c.text }]} numberOfLines={1}>{subject}</Text>
+          <Text style={[typeScale.bodyStrong, styles.subject, { color: c.text }]} numberOfLines={1}>{subject}</Text>
           {ticket.spamFlagged ? <Text testID={`ticket-spam-${ticket.id}`} accessibilityLabel="Marked as spam">🚫</Text> : null}
           {ticket.hasAttachments ? <Text testID={`ticket-attachment-${ticket.id}`} accessibilityLabel="Has attachments">📎</Text> : null}
         </View>
@@ -111,12 +111,12 @@ export function TicketRow({ ticket, onPress }: { ticket: TicketSummary; onPress:
       {draft || chip ? (
         <View style={styles.chips}>
           {draft ? (
-            <View style={[styles.chip, { borderColor: c.primary, backgroundColor: c.info }]} testID={`ticket-draft-${ticket.id}`}>
+            <View style={[styles.chip, { borderColor: c.primary, backgroundColor: c.primaryTint }]} testID={`ticket-draft-${ticket.id}`}>
               <Text style={[typeScale.caption, { color: c.text }]}>{draft}</Text>
             </View>
           ) : null}
           {chip ? (
-            <View style={[styles.chip, { borderColor: c.border, backgroundColor: c.info }]} testID={`ticket-reason-${ticket.id}`}>
+            <View style={[styles.chip, { borderColor: c.border, backgroundColor: c.primaryTint }]} testID={`ticket-reason-${ticket.id}`}>
               <Text style={[typeScale.caption, { color: c.text }]}>{chip}</Text>
             </View>
           ) : null}
@@ -130,7 +130,7 @@ const styles = StyleSheet.create({
   row: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, paddingVertical: spacing.sm, paddingHorizontal: spacing.md, borderBottomWidth: StyleSheet.hairlineWidth },
   main: { flex: 1, gap: 2 },
   titleLine: { flexDirection: 'row', alignItems: 'center', gap: spacing.xs },
-  subject: { flex: 1, fontWeight: '600' },
+  subject: { flex: 1 },
   metaLine: { flexDirection: 'row' },
   chips: { alignItems: 'flex-end', gap: spacing.xs },
   chip: { borderWidth: 1, borderRadius: radius.lg, paddingHorizontal: spacing.sm, paddingVertical: 2 },
