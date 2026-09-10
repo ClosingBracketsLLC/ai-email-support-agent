@@ -299,6 +299,9 @@ importers:
       '@aesa/contracts':
         specifier: workspace:*
         version: link:../contracts
+      '@aesa/core':
+        specifier: workspace:*
+        version: link:../core
       '@aesa/llm':
         specifier: workspace:*
         version: link:../llm
