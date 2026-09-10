@@ -42,7 +42,16 @@ export interface ClaimedTicket {
 }
 
 export type ClaimResult =
-  | { claimed: false; reason: 'ticket_missing' | 'not_triaged' | 'failure_ceiling' | 'watermark' | 'stuck_escalated'; status?: string }
+  | {
+      claimed: false
+      reason: 'ticket_missing' | 'not_triaged' | 'failure_ceiling' | 'watermark' | 'stuck_escalated'
+      /** The status the LOCKED row carried, on `not_triaged`. */
+      status?: string
+      /** `stuck_escalated` only: the escalation notification the claim inserted, for the caller to
+       *  enqueue `notify.dispatch` with AFTER its transaction commits. Absent when the day's page
+       *  had already gone out (dedupe hit). */
+      notificationId?: string
+    }
   | {
       claimed: true
       /** True only when the STUCK branch is what authorized this claim — the only claim that charges a failure. */
@@ -129,18 +138,17 @@ export async function claimTicket(tx: OrgTx, p: { orgId: string; ticketId: strin
   // the ceiling count: excluded from selection by the guard above, never escalated, and so never
   // notified — stranded forever with zero owner signal. The stamp still goes on (harmless: the
   // ticket is leaving `triaged`), so the whole thing is one commit.
-  //
-  // The notification `escalateTicket` inserts is NOT returned: `ClaimResult` carries no id, so the
-  // caller cannot enqueue `notify.dispatch` for it. That is a latency cost, not a lost page — the
-  // poll sweep re-enqueues any `pending` notification older than STUCK_NOTIFICATION_MINUTES.
   if (stuckClaim && agentFailureCount >= INVARIANTS.AGENT_FAILURE_ESCALATE_AT) {
     await tx.update(tickets).set({ lastAgentRunAt: p.now, agentFailureCount }).where(eq(tickets.id, p.ticketId))
-    await escalateTicket(tx, {
+    const { notificationId } = await escalateTicket(tx, {
       orgId: p.orgId, ticketId: p.ticketId, fromStatus: 'triaged', reason: 'agent_failed',
       day: utcDayString(p.now), now: p.now, actor: DRAFT_ACTOR, auditAction: 'ticket.escalated',
       detail: { agentFailureCount },
     })
-    return { claimed: false, reason: 'stuck_escalated' }
+    // The caller enqueues notify.dispatch with this AFTER the claim transaction commits.
+    return notificationId === undefined
+      ? { claimed: false, reason: 'stuck_escalated' }
+      : { claimed: false, reason: 'stuck_escalated', notificationId }
   }
 
   await tx

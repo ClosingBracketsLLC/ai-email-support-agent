@@ -163,6 +163,27 @@ describe('escalateTicket', () => {
     expect((await getTicket(ticketId)).needsOwnerReason).toBe('agent_run_cap')
   })
 
+  it('an explicit dedupeKey overrides the per-day default, so two different keys both page', async () => {
+    const ticketId = await seedTicket()
+    const capKey = `agent_run_cap:${ticketId}:${DAY}`
+    const orphanKey = `orphaned:${ticketId}:${DAY}`
+
+    const first = await withOrg(app.db, orgId, (tx) =>
+      escalateTicket(tx, { orgId, ticketId, fromStatus: 'triaged', reason: 'agent_run_cap', day: DAY, dedupeKey: capKey, now: NOW, actor: 'system:ticket.draft', auditAction: 'ticket.escalated' }))
+    await withOrg(app.db, orgId, (tx) => tx.update(tickets).set({ status: 'awaiting_review' }).where(eq(tickets.id, ticketId)))
+    const second = await withOrg(app.db, orgId, (tx) =>
+      escalateTicket(tx, { orgId, ticketId, fromStatus: 'awaiting_review', reason: 'orphaned', day: DAY, dedupeKey: orphanKey, now: NOW, actor: 'system:cron:ticket.backstop-sweep', auditAction: 'ticket.escalated' }))
+
+    const capRows = await notificationsFor(capKey)
+    const orphanRows = await notificationsFor(orphanKey)
+    expect(capRows).toHaveLength(1)
+    expect(orphanRows).toHaveLength(1)
+    expect(first.notificationId).toBe(capRows[0]!.id)
+    expect(second.notificationId).toBe(orphanRows[0]!.id)
+    // The default key was never used — these two pages are keyed by their own reasons.
+    expect(await notificationsFor(escalationDedupeKey(ticketId, DAY))).toHaveLength(0)
+  })
+
   it('lost race: the ticket already left fromStatus — nothing is written', async () => {
     const ticketId = await seedTicket({ status: 'resolved' })
 

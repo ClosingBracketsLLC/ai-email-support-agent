@@ -1,9 +1,15 @@
 /**
- * The ONE way any process moves a ticket INTO `needs_owner`: the worker's drafting/send/sweep jobs
- * and the api's draft service all enter through `escalateTicket`, so the guarded flip, the cleared
- * `escalation_notified_at`, the redraft-cycle reset, the notification row and the audit row can
- * never drift apart between callers. It lives in `@aesa/db` rather than in the worker because both
- * sides need it and neither may own the other's copy.
+ * The one way the DRAFTING and SEND paths move a ticket INTO `needs_owner`: the worker's
+ * `ticket.draft` / `send.execute` / backstop-sweep jobs and the api's draft service all enter
+ * through `escalateTicket`, so the guarded flip, the cleared `escalation_notified_at`, the
+ * redraft-cycle reset, the notification row and the audit row can never drift apart between
+ * callers. It lives in `@aesa/db` rather than in the worker because both sides need it and neither
+ * may own the other's copy.
+ *
+ * Two Phase 2 writers predate it and still flip `needs_owner` directly — `ticket-triage.ts` (its
+ * cap and verdict paths, which write the verdict columns in the same guarded UPDATE) and
+ * `packages/mail/src/store.ts` (the tripwire at ingest). Nothing here assumes they route through
+ * this module; folding them in is a separate change.
  *
  * `escalationCopy` / `escalationDedupeKey` / `insertEscalationNotification` were private to
  * `apps/worker/src/jobs/ticket-triage.ts` in Phase 2 and moved here unchanged (the four Phase 2
@@ -90,8 +96,14 @@ export interface EscalateTicketParams {
    *  action that already moved the ticket wins and this call writes nothing at all. */
   fromStatus: string
   reason: NeedsOwnerReason
-  /** UTC day (YYYY-MM-DD) for the notification dedupe key. */
+  /** UTC day (YYYY-MM-DD) for the default notification dedupe key. */
   day: string
+  /**
+   * Overrides the default `escalationDedupeKey(ticketId, day)` — "at most one page per ticket per
+   * UTC day". Pass a reason-scoped key (`agent_run_cap:<ticket>:<day>`, `orphaned:<ticket>:<day>`,
+   * …) where a second, materially different escalation the same day must still page.
+   */
+  dedupeKey?: string
   now: Date
   /** The owner caused this escalation (a reject, a take-over): pre-stamp `escalation_notified_at`
    *  and page nobody — they are already looking at the ticket. */
@@ -112,7 +124,8 @@ export interface EscalateTicketParams {
  *  2. `escalation_notified_at` is nulled on every entry (the dispatcher's "not yet paged" flag), or
  *     pre-stamped to `now` when `quiet`.
  *  3. The redraft cycle is reset — `clearRedraftCycle()` in `@aesa/core`, spelled inline here.
- *  4. One audit row, then the notification (skipped entirely when `quiet`).
+ *  4. One audit row, then the notification (skipped entirely when `quiet`), deduped on
+ *     `p.dedupeKey` or, by default, one page per ticket per UTC day.
  *
  * The returned `notificationId` is what the caller enqueues `notify.dispatch` with, AFTER its
  * transaction commits; `undefined` means either `quiet` or a dedupe hit (already paged today).
@@ -142,7 +155,7 @@ export async function escalateTicket(tx: OrgTx, p: EscalateTicketParams): Promis
 
   if (p.quiet) return { escalated: true }
   const notificationId = await insertEscalationNotification(
-    tx, p.orgId, p.ticketId, escalationDedupeKey(p.ticketId, p.day), p.reason, { draftId: p.draftId },
+    tx, p.orgId, p.ticketId, p.dedupeKey ?? escalationDedupeKey(p.ticketId, p.day), p.reason, { draftId: p.draftId },
   )
   return notificationId === undefined ? { escalated: true } : { escalated: true, notificationId }
 }

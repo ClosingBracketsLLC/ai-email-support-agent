@@ -101,6 +101,11 @@ describe('claimTicket', () => {
       claims: true, stuckClaim: false, agentFailureCount: 1,
     },
     {
+      name: 'live: a claim 5 minutes old with no new inbound is not re-claimed underneath itself',
+      seed: { agentFailureCount: 0, lastAgentRunAt: minutesAgo(5), lastAgentFinishedAt: null, lastAgentPromptedAt: null, lastInboundAt: minutesAgo(30) },
+      claims: false, stuckClaim: false, agentFailureCount: 0,
+    },
+    {
       name: 'C: a completed run with no new inbound is not claimable 25 minutes later',
       seed: { agentFailureCount: 0, lastAgentRunAt: minutesAgo(25), lastAgentFinishedAt: minutesAgo(24), lastAgentPromptedAt: minutesAgo(50), lastInboundAt: minutesAgo(50) },
       claims: false, stuckClaim: false, agentFailureCount: 0,
@@ -172,7 +177,12 @@ describe('claimTicket', () => {
       escalationNotifiedAt: NOW, ownerRedraftFeedback: 'shorter please', redraftCount: 1,
     })
 
-    expect(await claim(ticketId)).toEqual({ claimed: false, reason: 'stuck_escalated' })
+    const result = await claim(ticketId)
+
+    const notifications = await notificationsFor(escalationDedupeKey(ticketId, DAY))
+    expect(notifications).toHaveLength(1)
+    // The caller enqueues notify.dispatch with this once the claim transaction has committed.
+    expect(result).toEqual({ claimed: false, reason: 'stuck_escalated', notificationId: notifications[0]!.id })
 
     const ticket = await getTicket(ticketId)
     expect(ticket.status).toBe('needs_owner')
@@ -182,7 +192,6 @@ describe('claimTicket', () => {
     expect(ticket.lastAgentRunAt).toEqual(NOW)
     expect(ticket.ownerRedraftFeedback).toBeNull()
     expect(ticket.redraftCount).toBe(0)
-    expect(await notificationsFor(escalationDedupeKey(ticketId, DAY))).toHaveLength(1)
     expect(await auditRowsFor(ticketId, 'ticket.escalated')).toHaveLength(1)
   })
 
@@ -245,7 +254,7 @@ describe('claimTicket', () => {
       })()
       release()
       await held
-      expect(await claiming).toEqual({ claimed: false, reason: 'stuck_escalated' })
+      expect(await claiming).toMatchObject({ claimed: false, reason: 'stuck_escalated' })
       await polling
     } finally {
       await holder.pool.end()

@@ -21,7 +21,7 @@
  */
 import { and, count, eq, gt, gte, sql } from 'drizzle-orm'
 import { INVARIANTS, resolveSetting, type SettingKey } from '@aesa/core'
-import { agentRuns, usageCounters, type OrgTx } from '@aesa/db'
+import { agentRuns, LLM_METERS, usageCounters, type OrgTx } from '@aesa/db'
 import { utcDayString } from '../date-utils.ts'
 
 /** The `usage_counters` meter the org-wide daily draft cap is measured against. */
@@ -109,7 +109,7 @@ export async function gateAndRecordRun(tx: OrgTx, p: GateParams): Promise<GateOu
   const draftsToday = await meterValue(tx, day, DRAFT_METER)
   if (draftsToday >= resolveSetting('autonomy.daily_draft_cap', { org: p.settings })) return { outcome: 'org_draft_capped' }
 
-  const costMicrosToday = await meterValue(tx, day, 'llm_cost_micros')
+  const costMicrosToday = await meterValue(tx, day, LLM_METERS.costMicros)
   if (costMicrosToday >= usdCapToMicros(resolveSetting('autonomy.daily_llm_usd_cap', { org: p.settings }))) {
     return { outcome: 'org_spend_capped', costMicrosToday }
   }
@@ -145,7 +145,7 @@ export async function readCapsUnlocked(
   const day = utcDayString(p.now)
   return {
     ticketRunsToday: await draftRunsForTicketToday(tx, p.ticketId, utcMidnight(p.now)),
-    orgCostMicrosToday: await meterValue(tx, day, 'llm_cost_micros'),
+    orgCostMicrosToday: await meterValue(tx, day, LLM_METERS.costMicros),
     orgDraftsToday: await meterValue(tx, day, DRAFT_METER),
   }
 }

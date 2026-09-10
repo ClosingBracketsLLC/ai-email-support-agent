@@ -5,10 +5,10 @@
  * serialize them without deadlocking, and both must come away with their own run row.
  */
 import { randomBytes } from 'node:crypto'
-import { and, eq } from 'drizzle-orm'
+import { and, eq, sql } from 'drizzle-orm'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { INVARIANTS, type SettingKey } from '@aesa/core'
-import { agentRunEvents, agentRuns, mailboxConnections, orgSettings, tickets, usageCounters, user, withOrg, withPlatform, workspaces } from '@aesa/db'
+import { agentRunEvents, agentRuns, mailboxConnections, tickets, usageCounters, user, withOrg, withPlatform, workspaces } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
 import { DRAFT_METER, gateAndRecordRun, PER_ORG_DRAFT_CONCURRENCY, readCapsUnlocked, utcMidnight } from '../src/drafting/caps.ts'
@@ -19,6 +19,7 @@ const NOW = new Date('2026-06-15T12:00:00Z')
 const TODAY = '2026-06-15'
 const YESTERDAY = '2026-06-14'
 const minutesAgo = (n: number) => new Date(NOW.getTime() - n * 60_000)
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 const ZERO_USAGE = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, apiCalls: 0, costMicros: 0 }
 
@@ -47,15 +48,15 @@ afterAll(async () => {
   await t.drop()
 })
 
-// One org is shared by every test, so agent_runs, usage_counters and org_settings are shared state:
-// a `running` row left behind by one test would trip the NEXT test's org-concurrency check. Reset
-// all three before every test rather than relying on end-of-test cleanup.
+// One org is shared by every test, so agent_runs and usage_counters are shared state: a `running`
+// row left behind by one test would trip the NEXT test's org-concurrency check, and a meter left
+// high would cap it. Reset both before every test rather than relying on end-of-test cleanup.
+// (The caps themselves are NOT org_settings rows here: the gate resolves them from the `settings`
+// object its caller passes — the draft job is what reads org_settings, in Task 11.)
 beforeEach(async () => {
   await withOrg(app.db, orgId, (tx) => tx.delete(agentRuns))   // agent_run_events cascade
   await setUsageCounter(DRAFT_METER, 0)
   await setUsageCounter('llm_cost_micros', 0)
-  await setOrgSetting('autonomy.daily_draft_cap', 2000)
-  await setOrgSetting('autonomy.daily_llm_usd_cap', 60)
   ticketId = await seedTicket()
 })
 
@@ -63,11 +64,6 @@ async function seedTicket(): Promise<string> {
   const [row] = await withOrg(app.db, orgId, (tx) =>
     tx.insert(tickets).values({ orgId, connectionId, providerThreadId: `thread-${rand()}`, status: 'triaged' }).returning({ id: tickets.id }))
   return row!.id
-}
-
-async function setOrgSetting(key: string, value: unknown): Promise<void> {
-  await withOrg(app.db, orgId, (tx) =>
-    tx.insert(orgSettings).values({ orgId, key, value }).onConflictDoUpdate({ target: [orgSettings.orgId, orgSettings.key], set: { value } }))
 }
 
 async function setUsageCounter(meter: string, value: number, day = TODAY): Promise<void> {
@@ -155,8 +151,7 @@ describe('gateAndRecordRun', () => {
     expect((await gate()).outcome).toBe('proceed')
   })
 
-  it('org_draft_capped: the org setting is what the meter is measured against', async () => {
-    await setOrgSetting('autonomy.daily_draft_cap', 1)
+  it("org_draft_capped: the caller's resolved daily draft cap is what the meter is measured against", async () => {
     await setUsageCounter(DRAFT_METER, 1)
 
     expect(await gate({ settings: { 'autonomy.daily_draft_cap': 1 } })).toEqual({ outcome: 'org_draft_capped' })
@@ -178,18 +173,57 @@ describe('gateAndRecordRun', () => {
     expect((await gate()).outcome).toBe('ticket_capped')
   })
 
-  // The lock is per org: two workers gating for the SAME org serialize, and the second one sees the
-  // first one's committed run row — never a stale count that would let both slip past a cap.
-  it('serializes two concurrent gates for one org: both proceed, with distinct rows and one meter', async () => {
-    const second = createDb(t.url)
+  // (i) Contention: a gate really does WAIT on the org's advisory lock. A holder transaction on a
+  // second connection takes the same lock and parks; the gate must not settle while it is held.
+  it('blocks on the org advisory lock while another transaction holds it', async () => {
+    const holder = createDb(t.url)
+    let release!: () => void
+    const lockGate = new Promise<void>((resolve) => { release = resolve })
+    // `release()` also runs in the finally: a failed assertion below must not leave the holder
+    // parked forever, or `pool.end()` would hang and the failure would surface as a timeout.
+    let held: Promise<void> | undefined
     try {
-      const [a, b] = await Promise.all([gate(), gate({ ticketId: await seedTicket() }, second.db)])
+      held = withOrg(holder.db, orgId, async (tx) => {
+        await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`draft-gate:${orgId}`}))`)
+        await lockGate
+      })
+      await sleep(100)                       // the holder now owns the lock
 
-      expect(a.outcome).toBe('proceed')
-      expect(b.outcome).toBe('proceed')
-      const ids = new Set((await runRows()).map((r) => r.id))
-      expect(ids.size).toBe(2)
-      expect(await readUsageCounter(DRAFT_METER)).toBe(2)
+      let settled = false
+      const gating = gate().finally(() => { settled = true })
+      await sleep(150)
+      expect(settled).toBe(false)            // still waiting — the gate is genuinely serialized
+
+      release()
+      await held
+      expect((await gating).outcome).toBe('proceed')
+    } finally {
+      release()
+      await held
+      await holder.pool.end()
+    }
+  })
+
+  // (ii) The race the lock exists to stop: two workers gating for the same org against a cap of 1.
+  // Unlocked, both read `draft_runs = 0` before either writes and BOTH proceed — one run over cap.
+  // Serialized, the loser reads the winner's committed bump and is refused.
+  it('serializes two concurrent gates: exactly one proceeds through a cap of 1', async () => {
+    const otherTicketId = await seedTicket()       // hoisted: both gates must start together
+    const second = createDb(t.url)
+    const settings = { 'autonomy.daily_draft_cap': 1 }
+    try {
+      // Warm the second pool first: establishing its connection takes long enough that an unwarmed
+      // one would let the first gate finish before the second even began — no race to observe.
+      await second.db.execute(sql`SELECT 1`)
+
+      const results = await Promise.all([
+        gate({ settings }),
+        gate({ ticketId: otherTicketId, settings }, second.db),
+      ])
+
+      expect(results.map((r) => r.outcome).sort()).toEqual(['org_draft_capped', 'proceed'])
+      expect(await runRows()).toHaveLength(1)
+      expect(await readUsageCounter(DRAFT_METER)).toBe(1)
     } finally {
       await second.pool.end()
     }
