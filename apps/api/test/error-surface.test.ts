@@ -1,3 +1,6 @@
+import { execFileSync } from 'node:child_process'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { TRPCError } from '@trpc/server'
 import { DrizzleQueryError } from 'drizzle-orm/errors'
 import { describe, expect, it } from 'vitest'
@@ -149,5 +152,38 @@ describe('/trpc error surface (init.ts isDev:false + errorFormatter)', () => {
     const body = res.json() as SuperjsonTrpcError
     expect(body.error.json.message).toBe('Internal Server Error')
     expect((body.error.json.data as { findings?: unknown }).findings).toBeUndefined()
+  })
+})
+
+/**
+ * The other surface: what the api lets IN. CLAUDE.md — "the api never holds the KEK, never calls a
+ * model". Fix wave A1 makes the approve gate build the SAME guardrail policy as the worker's send
+ * gate, which means `apps/api` now depends on `@aesa/agent` — but only through the pure
+ * `@aesa/agent/policy` sub-path (prompt TEXT plus `@aesa/core`, no `@aesa/llm`, no `run.ts`).
+ *
+ * This walks the REAL module graph the way `tsx` builds it at runtime, not vitest's, so a value
+ * import of `@aesa/llm` or a slip to the package root (`@aesa/agent`) anywhere under the draft
+ * service fails here — the Anthropic SDK must never be resolvable from an api process.
+ */
+describe('the api module graph', () => {
+  const API_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..')
+
+  it('importing the draft service never pulls in @aesa/llm or @anthropic-ai/sdk', () => {
+    const probe = `
+      import { registerHooks } from 'node:module'
+      const seen = []
+      registerHooks({ resolve(specifier, context, next) { seen.push(specifier); return next(specifier, context) } })
+      const mod = await import('./src/drafts/service.ts')
+      console.log(JSON.stringify({ approve: typeof mod.approveDraft, seen }))
+    `
+    const stdout = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', probe], {
+      cwd: API_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'],
+    })
+    const result = JSON.parse(stdout.trim().split('\n').at(-1)!) as { approve: string; seen: string[] }
+
+    expect(result.approve).toBe('function')                       // the service really loaded
+    expect(result.seen).toContain('@aesa/agent/policy')           // through the pure sub-path...
+    expect(result.seen).not.toContain('@aesa/agent')              // ...and never the package root
+    expect(result.seen.filter((sp) => sp.includes('@aesa/llm') || sp.includes('@anthropic-ai'))).toEqual([])
   })
 })

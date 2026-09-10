@@ -23,6 +23,9 @@ importers:
 
   apps/api:
     dependencies:
+      '@aesa/agent':
+        specifier: workspace:*
+        version: link:../../packages/agent
       '@aesa/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
@@ -8325,9 +8328,7 @@ snapshots:
       metro-runtime: 0.84.6
     transitivePeerDependencies:
       - '@babel/core'
-      - bufferutil
       - supports-color
-      - utf-8-validate
 
   '@react-native/normalize-colors@0.74.89': {}
 

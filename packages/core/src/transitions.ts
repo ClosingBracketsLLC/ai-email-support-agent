@@ -23,7 +23,10 @@ export const ticketTransitions = defineTransitions<TicketStatus>({
   triaged: ['awaiting_review', 'auto_sending', 'needs_owner', 'resolved'],
   awaiting_review: ['waiting_on_customer', 'triaged', 'needs_owner', 'resolved'],
   auto_sending: ['waiting_on_customer', 'awaiting_review', 'triaged', 'needs_owner'],
-  needs_owner: ['triaged', 'resolved', 'waiting_on_customer'],
+  // `awaiting_review`: `drafts.resume` on a draft a terminal send failure left `failed` puts the
+  // reply back in To review, and the ticket with it — guarded on `needs_owner_reason = 'send_failed'`
+  // so only the escalation the send job itself raised is ever walked back (fix wave A3, final-E I2).
+  needs_owner: ['triaged', 'resolved', 'waiting_on_customer', 'awaiting_review'],
   waiting_on_customer: ['new', 'resolved'],
   resolved: ['new'],
 })
@@ -39,7 +42,12 @@ export const draftTransitions = defineTransitions<DraftStatus>({
   // send lands `held` beside a permanently `sending` draft that nothing can move (a `held` send is
   // not claimable and no sweep selects a `sending` draft) — the Task 13 review's stuck state.
   sending: ['sent', 'failed', 'held'],
-  sent: [], rejected: [], superseded: [], expired: [], failed: [],
+  // `failed` → `pending`: the ONE way back from a terminal send failure (a third-pass guardrail
+  // refusal, a dead letter). `drafts.resume` writes it, the owner edits and re-approves, and the
+  // SAME `outbound_sends` row re-queues through `failed → queued` below. Without it the runbook's
+  // documented recovery ("fix the cause, tap Back to review, approve again") is a dead button and
+  // the only exit is a hand-written reply (final-E I2 / fix wave A3).
+  sent: [], rejected: [], superseded: [], expired: [], failed: ['pending'],
 })
 
 export const OUTBOUND_SEND_STATUSES = ['queued', 'held', 'claimed', 'sent', 'failed'] as const // === contracts' (pinned by test)

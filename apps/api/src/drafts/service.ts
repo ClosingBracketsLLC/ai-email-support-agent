@@ -27,9 +27,13 @@
  */
 import { and, eq, inArray, isNull, sql, type SQL } from 'drizzle-orm'
 import type pino from 'pino'
+// The pure sub-path, never the package root: `@aesa/agent/policy` pulls in `@aesa/core` and this
+// package's prompt-TEXT modules only, so the Anthropic SDK never enters an api process (CLAUDE.md —
+// the api never calls a model). `error-surface.test.ts` walks the real module graph to hold that.
+import { buildReplyPolicy } from '@aesa/agent/policy'
 import { APPROVE_UNDO_SECONDS, OUTBOUND_SEND_STATUSES, type DraftStatus, type OutboundSendStatus, type RejectAction } from '@aesa/contracts'
 import {
-  buildWorkspacePolicy, clearRedraftCycle, draftTransitions, outboundSendTransitions, resolveRejectAction, validateReplyBody,
+  clearRedraftCycle, draftTransitions, outboundSendTransitions, resolveRejectAction, ticketTransitions, validateReplyBody,
   type GuardrailFinding,
 } from '@aesa/core'
 import {
@@ -72,8 +76,26 @@ export interface RejectInput {
 /** The draft statuses the one-live-draft partial unique covers (migration 0011). */
 export const LIVE_DRAFT_STATUSES = ['pending', 'approved', 'held', 'sending'] as const
 
-/** The live-draft statuses `resolveTicket` may supersede (the two the draft matrix allows). */
-const SUPERSEDABLE_DRAFT_STATUSES = ['pending', 'approved'] as const
+/**
+ * The live-draft statuses "Mark resolved" RETIRES, and what each becomes — both edges are in the
+ * draft matrix (`pending|approved → superseded`, `held → expired`).
+ *
+ * All three, not just the first two (fix wave A2, final-C I1): a draft `send.execute` parked on
+ * `held` is live as far as `drafts_live_per_ticket_uidx` is concerned, so leaving it behind poisoned
+ * the ticket — the next cycle's `ticket.draft` INSERT hit 23505, which is not a `LostRaceError`, and
+ * kept failing until `sweeps.daily` expired the draft up to seven days later.
+ *
+ * `sending` is deliberately absent: a reply is in flight (or already delivered) and only the send job
+ * may decide what happened to it. Its send row is left alone for the same reason.
+ */
+const DRAFT_RETIREMENT = { pending: 'superseded', approved: 'superseded', held: 'expired' } as const
+type RetirableDraftStatus = keyof typeof DRAFT_RETIREMENT
+const RETIRABLE_DRAFT_STATUSES = Object.keys(DRAFT_RETIREMENT) as RetirableDraftStatus[]
+
+/** The send statuses a resolve may pull back. `claimed` as well as `queued` (fix wave A2): the
+ * in-flight job's pre-send flip matches on `status = 'claimed' AND claim_token = …`, so holding the
+ * row here makes that flip match nothing and the run back off before anything is sent. */
+const HOLDABLE_SEND_STATUSES = ['queued', 'claimed'] as const
 
 /** The ticket statuses an owner may resolve from (spec: To review and its two neighbours). */
 const RESOLVABLE_TICKET_STATUSES = ['needs_owner', 'awaiting_review', 'triaged'] as const
@@ -241,106 +263,126 @@ export async function approveDraft(
   deps: DraftServiceDeps, orgId: string, input: { draftId: string; body?: string }, actor: DraftActor,
   opts?: { consumeTokenId?: string },
 ): Promise<ApproveResult> {
-  const now = clock(deps)
-  const outcome = await withDeadlockRetry(() => deps.api.withOrg(orgId, async (tx): Promise<ApproveResult> => {
-    // Lock order `outbound_sends` → `drafts` → `tickets` (see this file's header): a no-op when this
-    // draft has never been approved, and the lock the upsert below would otherwise take second.
-    await tx.select({ id: outboundSends.id })
-      .from(outboundSends)
-      .where(and(eq(outboundSends.orgId, orgId), eq(outboundSends.draftId, input.draftId)))
-      .limit(1)
-      .for('update')
+  const outcome = await withDeadlockRetry(async () => {
+    // Inside the retried body, not outside it (fix wave A5, final-C M4): a retry is a fresh set of
+    // reads and a fresh CLOCK, so `decided_at` and the 15-second `send_after` come from when this
+    // attempt actually ran, not from before the deadlock it lost.
+    const now = clock(deps)
+    return deps.api.withOrg(orgId, async (tx): Promise<ApproveResult> => {
+      // Lock order `outbound_sends` → `drafts` → `tickets` (see this file's header): a no-op when this
+      // draft has never been approved, and the lock the upsert below would otherwise take second.
+      await tx.select({ id: outboundSends.id })
+        .from(outboundSends)
+        .where(and(eq(outboundSends.orgId, orgId), eq(outboundSends.draftId, input.draftId)))
+        .limit(1)
+        .for('update')
 
-    const [draft] = await tx.select({
-      id: drafts.id, ticketId: drafts.ticketId, agentId: drafts.agentId, status: drafts.status, body: drafts.body, viewedAt: drafts.viewedAt,
-    }).from(drafts).where(and(eq(drafts.orgId, orgId), eq(drafts.id, input.draftId))).limit(1).for('update')
-    if (!draft) return { ok: false, code: 'not_found' }
-    if (draft.status !== 'pending') return { ok: false, code: 'not_pending' }
+      const [draft] = await tx.select({
+        id: drafts.id, ticketId: drafts.ticketId, agentId: drafts.agentId, status: drafts.status, body: drafts.body, viewedAt: drafts.viewedAt,
+        customerLanguage: drafts.customerLanguage,
+      }).from(drafts).where(and(eq(drafts.orgId, orgId), eq(drafts.id, input.draftId))).limit(1).for('update')
+      if (!draft) return { ok: false, code: 'not_found' }
+      if (draft.status !== 'pending') return { ok: false, code: 'not_pending' }
 
-    // The email surface only ever gets here from the page that RENDERED the body, so the click is
-    // itself the proof of a read; the app has to say so explicitly (Task 20 marks viewed on render).
-    const viewedAt = draft.viewedAt ?? (actor.source === 'email' ? now : null)
-    if (viewedAt === null) return { ok: false, code: 'not_viewed' }
+      // The email surface only ever gets here from the page that RENDERED the body, so the click is
+      // itself the proof of a read; the app has to say so explicitly (Task 20 marks viewed on render).
+      const viewedAt = draft.viewedAt ?? (actor.source === 'email' ? now : null)
+      if (viewedAt === null) return { ok: false, code: 'not_viewed' }
 
-    const [ticket] = await tx.select({ id: tickets.id, connectionId: tickets.connectionId, agentId: tickets.agentId })
-      .from(tickets).where(and(eq(tickets.orgId, orgId), eq(tickets.id, draft.ticketId))).limit(1)
-    if (!ticket) return { ok: false, code: 'not_found' }
+      const [ticket] = await tx.select({ id: tickets.id, connectionId: tickets.connectionId, agentId: tickets.agentId, language: tickets.language })
+        .from(tickets).where(and(eq(tickets.orgId, orgId), eq(tickets.id, draft.ticketId))).limit(1)
+      if (!ticket) return { ok: false, code: 'not_found' }
 
-    const [workspace] = await tx.select({
-      killSwitch: workspaces.killSwitch, agentEnabled: workspaces.agentEnabled, allowedUrlHosts: workspaces.allowedUrlHosts,
-      allowedEmailDomains: workspaces.allowedEmailDomains, contactPhone: workspaces.contactPhone, contactUrls: workspaces.contactUrls,
-      locale: workspaces.locale,
-    }).from(workspaces).where(eq(workspaces.orgId, orgId)).limit(1)
-    if (!workspace) throw new Error(`approveDraft: org ${orgId} has no workspace row`)
+      const [workspace] = await tx.select({
+        killSwitch: workspaces.killSwitch, agentEnabled: workspaces.agentEnabled, allowedUrlHosts: workspaces.allowedUrlHosts,
+        allowedEmailDomains: workspaces.allowedEmailDomains, contactPhone: workspaces.contactPhone, contactUrls: workspaces.contactUrls,
+        locale: workspaces.locale, operatingGuidance: workspaces.operatingGuidance,
+      }).from(workspaces).where(eq(workspaces.orgId, orgId)).limit(1)
+      if (!workspace) throw new Error(`approveDraft: org ${orgId} has no workspace row`)
 
-    // The kill levers, in `send.execute`'s own order (its firstKillLever) — the send would refuse
-    // anyway, so refusing here keeps the ticket in To review instead of parking a held send on it.
-    if (workspace.killSwitch) return { ok: false, code: 'kill_switch' }
-    if (!workspace.agentEnabled) return { ok: false, code: 'agent_disabled' }
+      // The kill levers, in `send.execute`'s own order (its firstKillLever) — the send would refuse
+      // anyway, so refusing here keeps the ticket in To review instead of parking a held send on it.
+      if (workspace.killSwitch) return { ok: false, code: 'kill_switch' }
+      if (!workspace.agentEnabled) return { ok: false, code: 'agent_disabled' }
 
-    const agentId = draft.agentId ?? ticket.agentId
-    const [agent] = agentId
-      ? await tx.select({ id: agents.id, domain: agents.domain }).from(agents).where(and(eq(agents.orgId, orgId), eq(agents.id, agentId))).limit(1)
-      : []
-    // No agent row means no From address and no domain to allow: nothing can be sent, and "the agent
-    // is not set up" is the truest of the six codes for it.
-    if (!agent) return { ok: false, code: 'agent_disabled' }
+      const agentId = draft.agentId ?? ticket.agentId
+      const [agent] = agentId
+        ? await tx.select({
+          id: agents.id, domain: agents.domain, displayName: agents.displayName, address: agents.address,
+          replyFromAddress: agents.replyFromAddress, personaPreset: agents.personaPreset, personaText: agents.personaText,
+          guidanceExtra: agents.guidanceExtra,
+        }).from(agents).where(and(eq(agents.orgId, orgId), eq(agents.id, agentId))).limit(1)
+        : []
+      // No agent row means no From address and no domain to allow: nothing can be sent, and "the agent
+      // is not set up" is the truest of the six codes for it.
+      if (!agent) return { ok: false, code: 'agent_disabled' }
 
-    // The approve gate screens FAILS only: `trustedTexts: []` (an owner may legitimately paste the
-    // workspace's own guidance wording into a reply) and no `groundedNumbers` (the owner is the
-    // grounding). The draft gate already screened the model's own body against the full policy.
-    const policy = buildWorkspacePolicy({
-      workspace: {
-        allowedUrlHosts: workspace.allowedUrlHosts, allowedEmailDomains: workspace.allowedEmailDomains,
-        contactPhone: workspace.contactPhone, contactUrls: workspace.contactUrls, locale: workspace.locale,
-      },
-      agentDomain: agent.domain, trustedTexts: [], expectedLanguage: null,
-    })
-    const screened = validateReplyBody(input.body ?? draft.body, policy)
-    if (!screened.ok) {
-      // Warnings never block, so only the failures are the reasons for this refusal.
-      return { ok: false, code: 'guardrail', findings: screened.findings.filter((f) => f.severity === 'fail') }
-    }
-
-    const finalBody = screened.normalizedBody
-    const editDistanceRatio = input.body === undefined ? 0 : levenshteinRatio(finalBody, draft.body)
-    const edited = editDistanceRatio > 0
-
-    draftTransitions.assert('pending', 'approved')
-    const approved = await tx.update(drafts)
-      .set({
-        status: 'approved', finalBody, decidedBy: actor.userId, decidedAt: now, decisionSource: actor.source,
-        editDistanceRatio, viewedAt,
+      // THE SAME POLICY THE SEND GATE BUILDS — `@aesa/agent/policy`'s `buildReplyPolicy`, from the same
+      // four trusted texts and the same `expectedLanguage`, off the same rows (fix wave A1, reversing
+      // ruling ledger line 28). The gate this call feeds is `send.execute` step 2; a policy that
+      // differed by one trusted text meant an owner edit quoting ten words of their own operating
+      // guidance passed HERE and was then destroyed there by `landTerminal('guardrail:…')` — the draft
+      // `failed`, the ticket paged, and (until A3) no way back (final-C I2 / final-E I1).
+      //
+      // The one deliberate difference is in the OPTIONS, not the policy: no `groundedNumbers`, because
+      // the owner IS the grounding for their own edit — and `unbacked_number` is a `warn` that could
+      // never have blocked either gate anyway.
+      const policy = buildReplyPolicy({
+        workspace: {
+          allowedUrlHosts: workspace.allowedUrlHosts, allowedEmailDomains: workspace.allowedEmailDomains,
+          contactPhone: workspace.contactPhone, contactUrls: workspace.contactUrls, locale: workspace.locale,
+        },
+        agent,
+        workspaceGuidance: workspace.operatingGuidance,
+        agentGuidance: agent.guidanceExtra,
+        expectedLanguage: ticket.language,
       })
-      .where(and(eq(drafts.id, draft.id), eq(drafts.status, 'pending')))
-      .returning({ id: drafts.id })
-    if (approved.length === 0) return { ok: false, code: 'not_pending' }
+      const screened = validateReplyBody(input.body ?? draft.body, policy, { replyLanguage: draft.customerLanguage })
+      if (!screened.ok) {
+        // Warnings never block, so only the failures are the reasons for this refusal.
+        return { ok: false, code: 'guardrail', findings: screened.findings.filter((f) => f.severity === 'fail') }
+      }
 
-    // ONE ledger row per draft (the unique on draft_id). A re-approve after an undo or a failed
-    // attempt revives that row instead of stacking a second one — and only from the two states the
-    // send matrix allows back to `queued`, so a claimed or already sent delivery can never be reset.
-    const sendAfter = new Date(now.getTime() + APPROVE_UNDO_SECONDS * 1000)
-    const [send] = await tx.insert(outboundSends)
-      .values({ orgId, draftId: draft.id, ticketId: ticket.id, connectionId: ticket.connectionId, agentId: agent.id, status: 'queued', sendAfter })
-      .onConflictDoUpdate({
-        target: outboundSends.draftId,
-        set: { status: 'queued', sendAfter, attempts: 0, claimedAt: null, claimExpiresAt: null, claimToken: null, lastError: null, updatedAt: now },
-        setWhere: inArray(outboundSends.status, [...REQUEUEABLE_SEND_STATUSES]),
+      const finalBody = screened.normalizedBody
+      const editDistanceRatio = input.body === undefined ? 0 : levenshteinRatio(finalBody, draft.body)
+      const edited = editDistanceRatio > 0
+
+      draftTransitions.assert('pending', 'approved')
+      const approved = await tx.update(drafts)
+        .set({
+          status: 'approved', finalBody, decidedBy: actor.userId, decidedAt: now, decisionSource: actor.source,
+          editDistanceRatio, viewedAt,
+        })
+        .where(and(eq(drafts.id, draft.id), eq(drafts.status, 'pending')))
+        .returning({ id: drafts.id })
+      if (approved.length === 0) return { ok: false, code: 'not_pending' }
+
+      // ONE ledger row per draft (the unique on draft_id). A re-approve after an undo or a failed
+      // attempt revives that row instead of stacking a second one — and only from the two states the
+      // send matrix allows back to `queued`, so a claimed or already sent delivery can never be reset.
+      const sendAfter = new Date(now.getTime() + APPROVE_UNDO_SECONDS * 1000)
+      const [send] = await tx.insert(outboundSends)
+        .values({ orgId, draftId: draft.id, ticketId: ticket.id, connectionId: ticket.connectionId, agentId: agent.id, status: 'queued', sendAfter })
+        .onConflictDoUpdate({
+          target: outboundSends.draftId,
+          set: { status: 'queued', sendAfter, attempts: 0, claimedAt: null, claimExpiresAt: null, claimToken: null, lastError: null, updatedAt: now },
+          setWhere: inArray(outboundSends.status, [...REQUEUEABLE_SEND_STATUSES]),
+        })
+        .returning({ id: outboundSends.id })
+      // Zero rows means the existing ledger row is claimed/sent/queued while its draft was still
+      // `pending` — an impossible pairing, so refuse loudly and roll the approval back.
+      if (!send) throw new Error(`approveDraft: draft ${draft.id} already has a live outbound send`)
+
+      await consumeActionToken(tx, opts?.consumeTokenId, now)
+
+      await audit(tx, {
+        actor: actor.actor, action: 'draft.approved', entityType: 'draft', entityId: draft.id,
+        detail: { draftId: draft.id, ticketId: ticket.id, edited, editDistanceRatio, source: actor.source },
+        ip: actor.ip, userAgent: actor.userAgent,
       })
-      .returning({ id: outboundSends.id })
-    // Zero rows means the existing ledger row is claimed/sent/queued while its draft was still
-    // `pending` — an impossible pairing, so refuse loudly and roll the approval back.
-    if (!send) throw new Error(`approveDraft: draft ${draft.id} already has a live outbound send`)
-
-    await consumeActionToken(tx, opts?.consumeTokenId, now)
-
-    await audit(tx, {
-      actor: actor.actor, action: 'draft.approved', entityType: 'draft', entityId: draft.id,
-      detail: { draftId: draft.id, ticketId: ticket.id, edited, editDistanceRatio, source: actor.source },
-      ip: actor.ip, userAgent: actor.userAgent,
+      return { ok: true, sendId: send.id, sendAfter, edited }
     })
-    return { ok: true, sendId: send.id, sendAfter, edited }
-  }))
+  })
 
   if (outcome.ok) {
     const jobId = await deps.enqueue(
@@ -382,69 +424,110 @@ async function consumeActionToken(tx: OrgTx, tokenId: string | undefined, now: D
 export async function holdDraft(
   deps: DraftServiceDeps, orgId: string, draftId: string, actor: DraftActor, opts?: { consumeTokenId?: string },
 ): Promise<{ ok: true } | { ok: false; code: 'not_found' | 'not_holdable' | 'too_late' }> {
-  const now = clock(deps)
-  return withDeadlockRetry(() => deps.api.withOrg(orgId, async (tx) => {
-    // Send row first: `send.execute` claims it before it touches the draft, and the undo races
-    // exactly that claim — locking in the other order is how the two would deadlock.
-    const [send] = await tx.select({ id: outboundSends.id, status: outboundSends.status })
-      .from(outboundSends).where(and(eq(outboundSends.orgId, orgId), eq(outboundSends.draftId, draftId))).limit(1).for('update')
-    const [draft] = await tx.select({ id: drafts.id, ticketId: drafts.ticketId, status: drafts.status })
-      .from(drafts).where(and(eq(drafts.orgId, orgId), eq(drafts.id, draftId))).limit(1).for('update')
-    if (!draft) return { ok: false, code: 'not_found' }
-    if (draft.status !== 'approved') return { ok: false, code: 'not_holdable' }
-    if (!send) return { ok: false, code: 'not_holdable' }
-    if (send.status === 'claimed' || send.status === 'sent') return { ok: false, code: 'too_late' }
-    if (send.status !== 'queued') return { ok: false, code: 'not_holdable' }
+  return withDeadlockRetry(async () => {
+    // A fresh clock per attempt, for the same reason `approveDraft` takes one (fix wave A5).
+    const now = clock(deps)
+    return deps.api.withOrg(orgId, async (tx) => {
+      // Send row first: `send.execute` claims it before it touches the draft, and the undo races
+      // exactly that claim — locking in the other order is how the two would deadlock.
+      const [send] = await tx.select({ id: outboundSends.id, status: outboundSends.status })
+        .from(outboundSends).where(and(eq(outboundSends.orgId, orgId), eq(outboundSends.draftId, draftId))).limit(1).for('update')
+      const [draft] = await tx.select({ id: drafts.id, ticketId: drafts.ticketId, status: drafts.status })
+        .from(drafts).where(and(eq(drafts.orgId, orgId), eq(drafts.id, draftId))).limit(1).for('update')
+      if (!draft) return { ok: false, code: 'not_found' }
+      if (draft.status !== 'approved') return { ok: false, code: 'not_holdable' }
+      if (!send) return { ok: false, code: 'not_holdable' }
+      if (send.status === 'claimed' || send.status === 'sent') return { ok: false, code: 'too_late' }
+      if (send.status !== 'queued') return { ok: false, code: 'not_holdable' }
 
-    outboundSendTransitions.assert('queued', 'held')
-    const held = await tx.update(outboundSends)
-      .set({ status: 'held' })
-      .where(and(eq(outboundSends.id, send.id), eq(outboundSends.status, 'queued')))
-      .returning({ id: outboundSends.id })
-    if (held.length === 0) return { ok: false, code: 'too_late' }
+      outboundSendTransitions.assert('queued', 'held')
+      const held = await tx.update(outboundSends)
+        .set({ status: 'held' })
+        .where(and(eq(outboundSends.id, send.id), eq(outboundSends.status, 'queued')))
+        .returning({ id: outboundSends.id })
+      if (held.length === 0) return { ok: false, code: 'too_late' }
 
-    // approved → held → pending, both legs guarded and both in the matrix: there is no
-    // approved → pending edge, and inventing one would let the two state machines drift.
-    draftTransitions.assert('approved', 'held')
-    await tx.update(drafts).set({ status: 'held' }).where(and(eq(drafts.id, draft.id), eq(drafts.status, 'approved')))
-    draftTransitions.assert('held', 'pending')
-    await tx.update(drafts).set({ status: 'pending' }).where(and(eq(drafts.id, draft.id), eq(drafts.status, 'held')))
+      // approved → held → pending, both legs guarded and both in the matrix: there is no
+      // approved → pending edge, and inventing one would let the two state machines drift.
+      draftTransitions.assert('approved', 'held')
+      await tx.update(drafts).set({ status: 'held' }).where(and(eq(drafts.id, draft.id), eq(drafts.status, 'approved')))
+      draftTransitions.assert('held', 'pending')
+      await tx.update(drafts).set({ status: 'pending' }).where(and(eq(drafts.id, draft.id), eq(drafts.status, 'held')))
 
-    await consumeActionToken(tx, opts?.consumeTokenId, now)
-    await audit(tx, {
-      actor: actor.actor, action: 'draft.held', entityType: 'draft', entityId: draft.id,
-      detail: { draftId: draft.id, ticketId: draft.ticketId, sendId: send.id, source: actor.source },
-      ip: actor.ip, userAgent: actor.userAgent,
+      await consumeActionToken(tx, opts?.consumeTokenId, now)
+      await audit(tx, {
+        actor: actor.actor, action: 'draft.held', entityType: 'draft', entityId: draft.id,
+        detail: { draftId: draft.id, ticketId: draft.ticketId, sendId: send.id, source: actor.source },
+        ip: actor.ip, userAgent: actor.userAgent,
+      })
+      return { ok: true }
     })
-    return { ok: true }
-  }))
+  })
 }
 
+/** The two statuses "Back to review" may resume from, both with a `→ pending` edge in the matrix. */
+const RESUMABLE_DRAFT_STATUSES = ['held', 'failed'] as const
+type ResumableDraftStatus = (typeof RESUMABLE_DRAFT_STATUSES)[number]
+
 /**
- * The way back for a draft `send.execute` parked on `held` (a kill lever, a mailbox that needs
- * re-authing): `held → pending` puts it in To review again. The send row stays `held` on purpose —
- * the next approve revives that same ledger row through `approveDraft`'s ON CONFLICT path, so the
- * delivery keeps its history (attempts, provider ids) instead of starting a second one.
+ * "Back to review", for the two ways `send.execute` can park a reply:
+ *
+ *  - **`held`** — a kill lever, or a mailbox that needs re-authing. Nothing was attempted, the ticket
+ *    is still `awaiting_review`, and only the draft moves.
+ *  - **`failed`** — a TERMINAL refusal: the third-pass guardrail (`landTerminal`), or a dead letter
+ *    after the retry budget (`landDeadLetter`). Those also escalate the ticket to
+ *    `needs_owner/send_failed`, so the resume walks that escalation back to `awaiting_review` —
+ *    guarded on BOTH the status and the reason, so a ticket escalated for anything else (the owner
+ *    taking it over, the redraft cap, a tripwire) is left exactly as its escalator left it, and a
+ *    stale-failed draft, whose ticket `landStale` sent back to `triaged` for a re-draft, is left
+ *    alone too. `escalation_notified_at` is NOT re-stamped: the owner was already paged, and clearing
+ *    it would let the next escalation page them again about a ticket they are looking at.
+ *    (fix wave A3 / final-E I2 — without `failed → pending` the runbook's documented recovery, "fix
+ *    the cause, tap Back to review, approve again", had no button behind it.)
+ *
+ * The send row is untouched either way — `held` stays `held`, `failed` stays `failed`. The next
+ * approve revives that same ledger row through `approveDraft`'s ON CONFLICT path
+ * (`REQUEUEABLE_SEND_STATUSES` covers both), so the delivery keeps its history (attempts, provider
+ * ids, `last_error`) instead of starting a second one.
+ *
+ * Lock order: drafts → tickets, the same order `rejectDraft` takes. No send row is read or written.
  */
 export async function resumeDraft(
   deps: DraftServiceDeps, orgId: string, draftId: string, actor: DraftActor,
-): Promise<{ ok: true } | { ok: false; code: 'not_found' | 'not_held' }> {
+): Promise<{ ok: true } | { ok: false; code: 'not_found' | 'not_resumable' }> {
   return deps.api.withOrg(orgId, async (tx) => {
     const [draft] = await tx.select({ id: drafts.id, ticketId: drafts.ticketId, status: drafts.status })
       .from(drafts).where(and(eq(drafts.orgId, orgId), eq(drafts.id, draftId))).limit(1).for('update')
     if (!draft) return { ok: false, code: 'not_found' }
-    if (draft.status !== 'held') return { ok: false, code: 'not_held' }
+    const from = draft.status as ResumableDraftStatus
+    if (!RESUMABLE_DRAFT_STATUSES.includes(from)) return { ok: false, code: 'not_resumable' }
 
-    draftTransitions.assert('held', 'pending')
+    draftTransitions.assert(from, 'pending')
     const resumed = await tx.update(drafts)
       .set({ status: 'pending' })
-      .where(and(eq(drafts.id, draft.id), eq(drafts.status, 'held')))
+      .where(and(eq(drafts.id, draft.id), eq(drafts.status, from)))
       .returning({ id: drafts.id })
-    if (resumed.length === 0) return { ok: false, code: 'not_held' }
+    if (resumed.length === 0) return { ok: false, code: 'not_resumable' }
+
+    // Only the send job's OWN escalation is walked back, and only for the draft status that job
+    // pairs it with — both halves guarded in the one statement, so a concurrent writer that moved
+    // the ticket in between simply wins and the resume stops at the draft.
+    let ticketReturned = false
+    if (from === 'failed') {
+      ticketTransitions.assert('needs_owner', 'awaiting_review')
+      const moved = await tx.update(tickets)
+        .set({ status: 'awaiting_review', needsOwnerReason: null })
+        .where(and(
+          eq(tickets.orgId, orgId), eq(tickets.id, draft.ticketId),
+          eq(tickets.status, 'needs_owner'), eq(tickets.needsOwnerReason, 'send_failed'),
+        ))
+        .returning({ id: tickets.id })
+      ticketReturned = moved.length > 0
+    }
 
     await audit(tx, {
       actor: actor.actor, action: 'draft.resumed', entityType: 'draft', entityId: draft.id,
-      detail: { draftId: draft.id, ticketId: draft.ticketId, source: actor.source },
+      detail: { draftId: draft.id, ticketId: draft.ticketId, from, ticketReturned, source: actor.source },
       ip: actor.ip, userAgent: actor.userAgent,
     })
     return { ok: true }
@@ -595,21 +678,24 @@ export async function markViewed(deps: DraftServiceDeps, orgId: string, draftId:
 }
 
 /**
- * "Mark resolved": the owner is done with this ticket. The live draft (if any) is superseded and its
- * queued send held, so nothing goes out after the fact, and the redraft cycle is cleared the way
- * every other exit from it is.
+ * "Mark resolved": the owner is done with this ticket. The live draft (if any) is RETIRED — every
+ * status the one-live-draft partial unique covers except `sending`, `pending|approved → superseded`
+ * and `held → expired` — and its send pulled back from `queued` OR `claimed`, so nothing goes out
+ * after the fact and the ticket is clear for the next draft cycle. The redraft cycle is cleared the
+ * way every other exit from it is.
  */
 export async function resolveTicket(deps: DraftServiceDeps, orgId: string, ticketId: string, actor: DraftActor): Promise<boolean> {
   return withDeadlockRetry(() => deps.api.withOrg(orgId, async (tx) => {
     // Lock order `outbound_sends` → `drafts` → `tickets` (see this file's header). The send rows go
     // first, found through a subquery so no draft row has to be read (let alone locked) before them.
+    // The subquery spans every retirable status, so the `held` draft's send is locked too.
     await tx.select({ id: outboundSends.id })
       .from(outboundSends)
       .where(and(
         eq(outboundSends.orgId, orgId),
         inArray(outboundSends.draftId, tx.select({ id: drafts.id })
           .from(drafts)
-          .where(and(eq(drafts.orgId, orgId), eq(drafts.ticketId, ticketId), inArray(drafts.status, [...SUPERSEDABLE_DRAFT_STATUSES])))),
+          .where(and(eq(drafts.orgId, orgId), eq(drafts.ticketId, ticketId), inArray(drafts.status, RETIRABLE_DRAFT_STATUSES)))),
       ))
       .for('update')
 
@@ -620,7 +706,7 @@ export async function resolveTicket(deps: DraftServiceDeps, orgId: string, ticke
     // won the race is still selected here, and superseded, and its send held.
     const [live] = await tx.select({ id: drafts.id, status: drafts.status })
       .from(drafts)
-      .where(and(eq(drafts.orgId, orgId), eq(drafts.ticketId, ticketId), inArray(drafts.status, [...SUPERSEDABLE_DRAFT_STATUSES])))
+      .where(and(eq(drafts.orgId, orgId), eq(drafts.ticketId, ticketId), inArray(drafts.status, RETIRABLE_DRAFT_STATUSES)))
       .limit(1)
       .for('update')
 
@@ -630,25 +716,37 @@ export async function resolveTicket(deps: DraftServiceDeps, orgId: string, ticke
       .returning({ id: tickets.id })
     if (moved.length === 0) return false
 
-    let supersededDraftId: string | null = null
+    let retired: { id: string; from: RetirableDraftStatus; to: DraftStatus } | null = null
     if (live) {
-      draftTransitions.assert(live.status as DraftStatus, 'superseded')
-      const superseded = await tx.update(drafts)
-        .set({ status: 'superseded' })
-        .where(and(eq(drafts.orgId, orgId), eq(drafts.id, live.id), inArray(drafts.status, [...SUPERSEDABLE_DRAFT_STATUSES])))
+      const from = live.status as RetirableDraftStatus
+      const to: DraftStatus = DRAFT_RETIREMENT[from]
+      draftTransitions.assert(from, to)
+      const rows = await tx.update(drafts)
+        .set({ status: to })
+        .where(and(eq(drafts.orgId, orgId), eq(drafts.id, live.id), eq(drafts.status, from)))
         .returning({ id: drafts.id })
-      if (superseded.length > 0) {
-        supersededDraftId = live.id
-        outboundSendTransitions.assert('queued', 'held')
+      if (rows.length > 0) {
+        retired = { id: live.id, from, to }
+        for (const s of HOLDABLE_SEND_STATUSES) outboundSendTransitions.assert(s, 'held')
         await tx.update(outboundSends)
           .set({ status: 'held', lastError: 'held:ticket_resolved' })
-          .where(and(eq(outboundSends.orgId, orgId), eq(outboundSends.draftId, live.id), eq(outboundSends.status, 'queued')))
+          .where(and(eq(outboundSends.orgId, orgId), eq(outboundSends.draftId, live.id), inArray(outboundSends.status, [...HOLDABLE_SEND_STATUSES])))
+        // One row per retired draft, named for the status it landed in — the ticket.resolved row
+        // below says the ticket was resolved, not what happened to the reply that was waiting on it.
+        await audit(tx, {
+          actor: actor.actor, action: to === 'superseded' ? 'draft.superseded' : 'draft.expired',
+          entityType: 'draft', entityId: live.id,
+          detail: { draftId: live.id, ticketId, from, via: 'ticket_resolved' }, ip: actor.ip, userAgent: actor.userAgent,
+        })
       }
     }
 
     await audit(tx, {
       actor: actor.actor, action: 'ticket.resolved', entityType: 'ticket', entityId: ticketId,
-      detail: { ticketId, supersededDraftId }, ip: actor.ip, userAgent: actor.userAgent,
+      // `supersededDraftId` keeps its name and its null-when-nothing-was-live meaning; `retiredAs`
+      // says which of the two retirements it took.
+      detail: { ticketId, supersededDraftId: retired?.id ?? null, retiredAs: retired?.to ?? null },
+      ip: actor.ip, userAgent: actor.userAgent,
     })
     return true
   }))

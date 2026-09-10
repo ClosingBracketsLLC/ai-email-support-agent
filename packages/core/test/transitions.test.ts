@@ -17,9 +17,20 @@ describe('transitions', () => {
     expect(ticketTransitions.can('resolved', 'triaged')).toBe(false)
   })
   it('draft terminal states have no exits', () => {
-    for (const s of ['sent', 'rejected', 'superseded', 'expired', 'failed'] as const)
+    for (const s of ['sent', 'rejected', 'superseded', 'expired'] as const)
       expect(draftTransitions.can(s, 'pending')).toBe(false)
     expect(() => draftTransitions.assert('sent', 'pending')).toThrow(IllegalTransitionError)
+  })
+  it('draft: failed → pending is the ONE way back — the owner fixes the cause and returns the reply to review', () => {
+    // A send that failed terminally (a guardrail refusal at the third pass, a dead letter) leaves the
+    // draft `failed`. Without this edge `drafts.resume` has nothing to move and the runbook's
+    // "fix the cause, tap Back to review, approve again" is a dead button (final-E I2 / fix wave A3).
+    expect(draftTransitions.can('failed', 'pending')).toBe(true)
+    // Only `pending`: a failed draft never jumps straight back to approved or into a send.
+    expect(draftTransitions.can('failed', 'approved')).toBe(false)
+    expect(draftTransitions.can('failed', 'sending')).toBe(false)
+    expect(draftTransitions.can('failed', 'held')).toBe(false)
+    expect(() => draftTransitions.assert('failed', 'approved')).toThrow(IllegalTransitionError)
   })
   it('draft: sending → held is legal — a crashed send whose retry finds a kill lever must not strand the draft', () => {
     expect(draftTransitions.can('sending', 'held')).toBe(true)
@@ -28,6 +39,12 @@ describe('transitions', () => {
     // Still not a way back into the review queue directly: a held draft re-enters via `pending`.
     expect(draftTransitions.can('sending', 'approved')).toBe(false)
     expect(draftTransitions.can('held', 'pending')).toBe(true)
+  })
+  it('ticket: needs_owner → awaiting_review is legal — resuming a send-failed draft puts the ticket back in To review', () => {
+    // The other half of the failed-draft return path (fix wave A3): `resumeDraft` flips the ticket
+    // back only from `needs_owner` + `needs_owner_reason = 'send_failed'`, which is exactly the state
+    // `landTerminal`/`landDeadLetter` left it in, and where a live `pending` draft belongs again.
+    expect(ticketTransitions.can('needs_owner', 'awaiting_review')).toBe(true)
   })
   it('defineTransitions rejects a matrix that lists a self-transition', () => {
     expect(() => defineTransitions({ a: ['a'], b: [] } as const)).toThrow(/self/)

@@ -315,10 +315,17 @@ describe('mailbox connect flow', () => {
     expect(t.mail.latestTo('support2@acme.test')).toBeUndefined()
   })
 
-  it('claimConnection called twice is idempotent — the second call returns the same connection', async () => {
+  it('claimConnection called twice is idempotent — the second call returns the same connection and sends NO second email', async () => {
+    // Ledger 39 / fix wave A6: the claim-time mail is the mailbox owner's paper trail of WHO attached
+    // their mailbox. A replayed claim (a retried mutation, a double tap) used to re-mail them about a
+    // connection nothing actually changed.
+    const mailsTo = () => t.mail.all().filter((m) => m.to === 'support@acme.test').length
+    const before = mailsTo()
+
     const first = await a.mailboxes.claimConnection.mutate({ flowId })
     const second = await a.mailboxes.claimConnection.mutate({ flowId })
     expect(second).toEqual(first)
+    expect(mailsTo()).toBe(before)
   })
 
   it('an expired flow 400s at the callback', async () => {

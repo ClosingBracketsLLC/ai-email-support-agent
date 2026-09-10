@@ -5,14 +5,14 @@
  */
 import { randomUUID } from 'node:crypto'
 import { createTRPCClient, httpBatchLink } from '@trpc/client'
-import { desc, eq } from 'drizzle-orm'
+import { and, desc, eq, inArray } from 'drizzle-orm'
 import superjson from 'superjson'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { APPROVE_UNDO_SECONDS } from '@aesa/contracts'
 import { auditLog, draftActionTokens, drafts, notifications, outboundSends, tickets, workspaces } from '@aesa/db'
 import { JOB_NAMES } from '@aesa/queue'
 import {
-  approveDraft, holdDraft, levenshteinRatio, markViewed, rejectDraft, resolveTicket, resumeDraft, withDeadlockRetry,
+  LIVE_DRAFT_STATUSES, approveDraft, holdDraft, levenshteinRatio, markViewed, rejectDraft, resolveTicket, resumeDraft, withDeadlockRetry,
   type DraftActor, type DraftServiceDeps,
 } from '../src/drafts/service.ts'
 import type { ApiFacade, EnqueueFn } from '../src/deps.ts'
@@ -206,6 +206,74 @@ describe('draft service', () => {
     expect(sent).toEqual([])
   })
 
+  // A1 (final-C I2 / final-E I1): the approve gate and the send gate MUST build the same policy from
+  // the same four trusted texts. `trustedTexts: []` at approve let an owner edit quoting the
+  // workspace's own guidance through, and `send.execute` step 2 then destroyed the draft with
+  // `landTerminal('guardrail:trusted_text_leak')` 15 seconds later.
+  const GUIDANCE = 'Always confirm the order number before you promise a delivery date to any customer who writes in about shipping.'
+
+  it('refuses an edit that quotes ten consecutive words of the workspace guidance (trusted_text_leak), writing nothing', async () => {
+    const org = await seedOrg()
+    await t.api.withOrg(org.orgId, (tx) => tx.update(workspaces).set({ operatingGuidance: GUIDANCE }).where(eq(workspaces.orgId, org.orgId)))
+    const { draft } = await seedReviewable(org)
+    const [token] = await t.api.withOrg(org.orgId, (tx) => tx.insert(draftActionTokens).values({
+      orgId: org.orgId, draftId: draft.id, userId: org.userId, tokenHash: `hash-${randomUUID()}`,
+      expiresAt: new Date(Date.now() + 86_400_000),
+    }).returning())
+
+    // Ten consecutive words of GUIDANCE, verbatim, inside an otherwise ordinary reply.
+    const leak = 'Hi Casey,\n\nAlways confirm the order number before you promise a delivery date — so could you send it over?\n\nThanks'
+    const res = await approveDraft(deps, org.orgId, { draftId: draft.id, body: leak }, org.actor, { consumeTokenId: token!.id })
+
+    expect(res.ok).toBe(false)
+    if (res.ok) throw new Error('unreachable')
+    expect(res.code).toBe('guardrail')
+    expect(res.findings?.map((f) => f.code)).toContain('trusted_text_leak')
+
+    expect(await readDraft(org.orgId, draft.id)).toMatchObject({ status: 'pending', finalBody: null })
+    expect(await readSend(org.orgId, draft.id)).toBeUndefined()
+    const [after] = await t.api.withOrg(org.orgId, (tx) => tx.select().from(draftActionTokens).where(eq(draftActionTokens.id, token!.id)))
+    expect(after!.consumedAt).toBeNull()
+    expect(sent).toEqual([])
+  })
+
+  it('a clean edit still approves against the full policy — the guidance is loaded, it is just not quoted', async () => {
+    const org = await seedOrg()
+    await t.api.withOrg(org.orgId, (tx) => tx.update(workspaces).set({ operatingGuidance: GUIDANCE }).where(eq(workspaces.orgId, org.orgId)))
+    const { draft } = await seedReviewable(org)
+
+    const clean = 'Hi Casey,\n\nCould you send me your order number? I will check the shipping date and come straight back.\n\nThanks'
+    const res = await approveDraft(deps, org.orgId, { draftId: draft.id, body: clean }, org.actor)
+    expect(res).toMatchObject({ ok: true, edited: true })
+    expect(await readDraft(org.orgId, draft.id)).toMatchObject({ status: 'approved', finalBody: clean })
+  })
+
+  // A5 (final-C M4): the retried body is meant to be "a fresh set of reads" — and a fresh clock with
+  // them, or the retry stamps `decided_at` and `send_after` from before the deadlock it lost.
+  it('a deadlocked approve retries with a FRESH clock: decided_at and send_after come from the retry', async () => {
+    const org = await seedOrg()
+    const { draft } = await seedReviewable(org)
+    const t0 = new Date('2026-09-10T10:00:00.000Z')
+    const t1 = new Date('2026-09-10T10:00:05.000Z')
+    const stamps = [t0, t1]
+    let attempts = 0
+    // How drizzle surfaces a deadlock: the SQLSTATE sits on the wrapped pg error, not the wrapper.
+    const deadlock = (): Error => Object.assign(new Error('Failed query: update "drafts" …'), {
+      cause: Object.assign(new Error('deadlock detected'), { code: '40P01' }),
+    })
+    const api: ApiFacade = {
+      ...t.api,
+      withOrg: (id, fn) => { if (++attempts === 1) throw deadlock(); return t.api.withOrg(id, fn) },
+    }
+
+    const res = await approveDraft({ ...deps, api, now: () => stamps.shift() ?? t1 }, org.orgId, { draftId: draft.id }, org.actor)
+    expect(res.ok).toBe(true)
+    expect(attempts).toBe(2)
+    expect((await readDraft(org.orgId, draft.id))!.decidedAt!.toISOString()).toBe(t1.toISOString())
+    expect((await readSend(org.orgId, draft.id))!.sendAfter.toISOString())
+      .toBe(new Date(t1.getTime() + APPROVE_UNDO_SECONDS * 1000).toISOString())
+  })
+
   it('consumes the action token in the same transaction on success, and throws (rolling back) when it is already consumed', async () => {
     const org = await seedOrg()
     const { draft } = await seedReviewable(org)
@@ -314,14 +382,75 @@ describe('draft service', () => {
     expect(await resumeDraft(deps, org.orgId, draft.id, org.actor)).toEqual({ ok: true })
     expect(await readDraft(org.orgId, draft.id)).toMatchObject({ status: 'pending' })
     expect(await readSend(org.orgId, draft.id)).toMatchObject({ id: send!.id, status: 'held' })
-    expect(await readAudit(org.orgId, 'draft.resumed')).toHaveLength(1)
+    const audits = await readAudit(org.orgId, 'draft.resumed')
+    expect(audits).toHaveLength(1)
+    expect(audits[0]!.detail).toMatchObject({ from: 'held' })
 
-    // Not held any more.
-    expect(await resumeDraft(deps, org.orgId, draft.id, org.actor)).toEqual({ ok: false, code: 'not_held' })
+    // Not held (or failed) any more.
+    expect(await resumeDraft(deps, org.orgId, draft.id, org.actor)).toEqual({ ok: false, code: 'not_resumable' })
 
     const res = await approveDraft(deps, org.orgId, { draftId: draft.id }, org.actor)
     expect(res).toMatchObject({ ok: true, sendId: send!.id })
     expect(await readSend(org.orgId, draft.id)).toMatchObject({ id: send!.id, status: 'queued', attempts: 0, lastError: null })
+  })
+
+  // A3 (final-E I2): a terminal send failure (`landTerminal`, `landDeadLetter`) leaves the draft
+  // `failed` and the ticket `needs_owner/send_failed`. `failed` had no outgoing edge, so the
+  // runbook's documented recovery — "fix the cause, then approve the draft again" — was a dead
+  // button and the send matrix's `failed → queued` edge was unreachable.
+  it('resumes a draft a FAILED send left behind: draft → pending, ticket needs_owner/send_failed → awaiting_review, the send row still failed', async () => {
+    const org = await seedOrg()
+    const ticket = await insertTicket(t.api, org.orgId, {
+      connectionId: org.connectionId, agentId: org.agentId, status: 'needs_owner', needsOwnerReason: 'send_failed',
+    })
+    const notifiedAt = new Date(Date.now() - 60_000)
+    await t.api.withOrg(org.orgId, (tx) => tx.update(tickets).set({ escalationNotifiedAt: notifiedAt }).where(eq(tickets.id, ticket.id)))
+    const draft = await seedPendingDraft(t.api, org.orgId, ticket.id, { agentId: org.agentId, viewedAt: new Date(), status: 'failed' })
+    const [send] = await t.api.withOrg(org.orgId, (tx) => tx.insert(outboundSends).values({
+      orgId: org.orgId, draftId: draft.id, ticketId: ticket.id, connectionId: org.connectionId, agentId: org.agentId,
+      status: 'failed', sendAfter: new Date(), attempts: 3, lastError: 'guardrail:trusted_text_leak',
+    }).returning())
+
+    expect(await resumeDraft(deps, org.orgId, draft.id, org.actor)).toEqual({ ok: true })
+    expect(await readDraft(org.orgId, draft.id)).toMatchObject({ status: 'pending' })
+    const after = await readTicket(org.orgId, ticket.id)
+    expect(after).toMatchObject({ status: 'awaiting_review', needsOwnerReason: null })
+    // The page already went out; re-stamping it would re-page the owner about a ticket they are on.
+    expect(after!.escalationNotifiedAt!.toISOString()).toBe(notifiedAt.toISOString())
+    // The ledger row keeps its history — the re-approve revives THIS row, it does not start a second.
+    expect(await readSend(org.orgId, draft.id)).toMatchObject({ id: send!.id, status: 'failed', attempts: 3 })
+    const audits = await readAudit(org.orgId, 'draft.resumed')
+    expect(audits).toHaveLength(1)
+    expect(audits[0]!.detail).toMatchObject({ from: 'failed' })
+
+    // The whole point: approve now works, and re-queues the same ledger row.
+    const res = await approveDraft(deps, org.orgId, { draftId: draft.id }, org.actor)
+    expect(res).toMatchObject({ ok: true, sendId: send!.id })
+    expect(await readSend(org.orgId, draft.id)).toMatchObject({ id: send!.id, status: 'queued', attempts: 0, lastError: null })
+  })
+
+  it('resumes a failed draft whose ticket is NOT needs_owner/send_failed and leaves that ticket exactly as it was', async () => {
+    const org = await seedOrg()
+    // `landStale` fails the draft but sends the ticket back to `triaged` for a re-draft — it never
+    // escalates, so there is no needs_owner to walk back.
+    const ticket = await insertTicket(t.api, org.orgId, { connectionId: org.connectionId, agentId: org.agentId, status: 'triaged' })
+    const draft = await seedPendingDraft(t.api, org.orgId, ticket.id, { agentId: org.agentId, viewedAt: new Date(), status: 'failed' })
+
+    expect(await resumeDraft(deps, org.orgId, draft.id, org.actor)).toEqual({ ok: true })
+    expect(await readDraft(org.orgId, draft.id)).toMatchObject({ status: 'pending' })
+    expect(await readTicket(org.orgId, ticket.id)).toMatchObject({ status: 'triaged', needsOwnerReason: null })
+  })
+
+  it('refuses a resume on a ticket escalated for some OTHER reason — only the send job\'s own escalation is walked back', async () => {
+    const org = await seedOrg()
+    const ticket = await insertTicket(t.api, org.orgId, {
+      connectionId: org.connectionId, agentId: org.agentId, status: 'needs_owner', needsOwnerReason: 'owner_handling',
+    })
+    const draft = await seedPendingDraft(t.api, org.orgId, ticket.id, { agentId: org.agentId, viewedAt: new Date(), status: 'failed' })
+
+    expect(await resumeDraft(deps, org.orgId, draft.id, org.actor)).toEqual({ ok: true })
+    expect(await readDraft(org.orgId, draft.id)).toMatchObject({ status: 'pending' })
+    expect(await readTicket(org.orgId, ticket.id)).toMatchObject({ status: 'needs_owner', needsOwnerReason: 'owner_handling' })
   })
 
   // -- reject --
@@ -489,6 +618,50 @@ describe('draft service', () => {
     expect(draftAfter).toMatchObject({ status: 'superseded' })
     if (approve.ok) expect(sendAfter).toMatchObject({ status: 'held' })
     else expect(approve).toEqual({ ok: false, code: 'not_pending' })
+  })
+
+  // A2 (final-C I1): a `held` draft is LIVE as far as `drafts_live_per_ticket_uidx` is concerned
+  // (migration 0011 covers pending|approved|held|sending). Leaving it behind meant the next draft
+  // cycle on that ticket — a customer reply reopens it, triage runs, `ticket.draft` INSERTs — died on
+  // a 23505 the job does not treat as a lost race, and kept dying until sweeps.daily expired it.
+  it('resolveTicket retires a job-held draft (held → expired), leaving NO live draft and a clear ticket for the next draft cycle', async () => {
+    const org = await seedOrg()
+    const ticket = await insertTicket(t.api, org.orgId, { connectionId: org.connectionId, agentId: org.agentId, status: 'awaiting_review' })
+    const draft = await seedPendingDraft(t.api, org.orgId, ticket.id, { agentId: org.agentId, viewedAt: new Date(), status: 'held' })
+    await t.api.withOrg(org.orgId, (tx) => tx.insert(outboundSends).values({
+      orgId: org.orgId, draftId: draft.id, ticketId: ticket.id, connectionId: org.connectionId, agentId: org.agentId,
+      status: 'held', sendAfter: new Date(), attempts: 1, lastError: 'held:workspace_kill_switch',
+    }))
+
+    expect(await resolveTicket(deps, org.orgId, ticket.id, org.actor)).toBe(true)
+    expect(await readTicket(org.orgId, ticket.id)).toMatchObject({ status: 'resolved' })
+    expect(await readDraft(org.orgId, draft.id)).toMatchObject({ status: 'expired' })
+    expect(await readAudit(org.orgId, 'draft.expired')).toHaveLength(1)
+
+    // The partial unique's OWN status set: nothing left in it for this ticket...
+    const stillLive = await t.api.withOrg(org.orgId, (tx) => tx.select({ id: drafts.id }).from(drafts)
+      .where(and(eq(drafts.ticketId, ticket.id), inArray(drafts.status, [...LIVE_DRAFT_STATUSES]))!))
+    expect(stillLive).toEqual([])
+    // ...so the insert `ticket.draft` does after a reopen succeeds instead of raising 23505.
+    const next = await seedPendingDraft(t.api, org.orgId, ticket.id, { agentId: org.agentId })
+    expect(next.status).toBe('pending')
+  })
+
+  it('resolveTicket holds a CLAIMED send as well as a queued one — the in-flight job\'s pre-send flip then matches nothing', async () => {
+    const org = await seedOrg()
+    const { ticket, draft } = await seedReviewable(org)
+    const approved = await approveDraft(deps, org.orgId, { draftId: draft.id }, org.actor)
+    if (!approved.ok) throw new Error('approve failed')
+
+    // `send.execute` claimed the row (the 15 s window elapsed) but has not reached its pre-send flip.
+    await t.api.withOrg(org.orgId, (tx) => tx.update(outboundSends)
+      .set({ status: 'claimed', claimedAt: new Date(), claimToken: randomUUID(), claimExpiresAt: new Date(Date.now() + 120_000) })
+      .where(eq(outboundSends.id, approved.sendId)))
+
+    expect(await resolveTicket(deps, org.orgId, ticket.id, org.actor)).toBe(true)
+    expect(await readDraft(org.orgId, draft.id)).toMatchObject({ status: 'superseded' })
+    expect(await readSend(org.orgId, draft.id)).toMatchObject({ id: approved.sendId, status: 'held', lastError: 'held:ticket_resolved' })
+    expect(await readAudit(org.orgId, 'draft.superseded')).toHaveLength(1)
   })
 
   it('resolveTicket supersedes a pending draft too and leaves other orgs alone', async () => {

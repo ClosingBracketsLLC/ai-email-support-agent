@@ -93,12 +93,6 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // function the plugin itself is registered. fastifyTRPCPlugin already gets this for free (it declares its
   // routes inside its own register() call, which boots after rate-limit's in FIFO order).
   app.register(async (routes) => {
-    // The review pages' Approve/Hold buttons are real <form method="post"> submissions, so the browser
-    // sends application/x-www-form-urlencoded — a media type Fastify ships no parser for (it would 415
-    // before the handler ever ran). @fastify/formbody is fastify-plugin-wrapped, so this adds the parser
-    // to THIS encapsulation context (every route in this block), not a child of it.
-    routes.register(formbody)
-
     // Better Auth: build a fetch Request from the Fastify request (URL rooted at the configured base, never
     // the Host header) and copy the Response back. Cookies are copied through getSetCookie so several
     // Set-Cookie lines survive.
@@ -155,7 +149,20 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // Task 19: the session-less one-click review pages (review/routes.ts). Same "why here, not on
     // `app`" reasoning again — and the rate limit matters more here than anywhere else in this block:
     // /a/:draftId is the one public URL whose path a stranger can guess.
-    registerReviewRoutes(routes, deps)
+    //
+    // Its OWN register(), for @fastify/formbody's sake (fix wave A4, final-C M1). The Approve/Hold
+    // buttons are real <form method="post"> submissions, so the browser sends
+    // application/x-www-form-urlencoded — a media type Fastify ships no parser for. formbody is
+    // fastify-plugin-wrapped, so registering it on the shared context above added that parser to
+    // /api/auth/*, /trpc's siblings and both provider webhooks as well, where the 415 it replaced is
+    // a real barrier: urlencoded is a CORS "simple" content type (no preflight) and the /trpc origin
+    // hook covers only /trpc. One extra encapsulation keeps the parser where the forms are.
+    // @fastify/rate-limit's `global: true` still reaches inside — its onRoute hook lives on `app` and
+    // Fastify propagates onRoute into every descendant context.
+    await routes.register(async (review) => {
+      await review.register(formbody)
+      registerReviewRoutes(review, deps)
+    })
   })
 
   app.register(fastifyTRPCPlugin, {

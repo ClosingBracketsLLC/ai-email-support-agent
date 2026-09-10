@@ -241,7 +241,8 @@ export function registerReviewRoutes(routes: FastifyInstance, deps: ServerDeps):
     reviewReply(reply, await safeRender(req, () => handleGet(deps, req.params.draftId, req.query.t))))
 
   // The token comes off the FORM, not the query string: a POST's url is what lands in the access log.
-  // `@fastify/formbody` (registered in server.ts) is what turns the body into this object at all.
+  // `@fastify/formbody` — registered in server.ts on THIS encapsulation context and no wider (fix
+  // wave A4) — is what turns the body into this object at all.
   routes.post<{ Params: { draftId: string }; Body: { t?: string } }>('/a/:draftId/approve', async (req, reply) =>
     reviewReply(reply, await safeRender(req, () => handleApprove(deps, req, req.params.draftId, req.body?.t))))
 

@@ -100,6 +100,31 @@ describe('review pages (/a/:draftId)', () => {
     payload: `t=${encodeURIComponent(token)}`,
   })
 
+  // -- the urlencoded parser's blast radius (fix wave A4, final-C M1) --
+
+  it('the form parser reaches the review POST and NOTHING else: /api/auth/* and /trpc still 415 on urlencoded', async () => {
+    const org = await seedOrg()
+    const { draft } = await seedReviewable(org, { viewedAt: new Date() })
+    const token = await mintToken(t.api, org.orgId, draft.id, org.userId)
+
+    // The review POST parses (the button is a real <form method="post">).
+    const approved = await post(draft.id, 'approve', token)
+    expect(approved.statusCode).toBe(200)
+    expect(approved.body).toContain('Approved')
+    expect(await readDraft(org.orgId, draft.id)).toMatchObject({ status: 'approved' })
+
+    // `application/x-www-form-urlencoded` is a CORS "simple" content type — no preflight — so the
+    // 415 Fastify answers with no parser for it is a real barrier in front of the auth proxy and
+    // /trpc. Registering formbody on the shared context handed both of them that parser.
+    const form = { 'content-type': 'application/x-www-form-urlencoded', origin: WEB }
+    const auth = await t.app.inject({ method: 'POST', url: '/api/auth/sign-in/email-otp', headers: form, payload: 'email=a@b.c&otp=123456' })
+    expect(auth.statusCode).toBe(415)
+    expect(auth.json()).toMatchObject({ code: 'FST_ERR_CTP_INVALID_MEDIA_TYPE' })
+
+    const trpc = await t.app.inject({ method: 'POST', url: '/trpc/workspace.create', headers: form, payload: 'businessName=Acme' })
+    expect(trpc.statusCode).toBe(415)
+  })
+
   // -- GET renders --
 
   it('GET with a valid token on a pending draft renders the review page, escaped, and writes NOTHING', async () => {

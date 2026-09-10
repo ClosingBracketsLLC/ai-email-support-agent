@@ -141,8 +141,11 @@ export const agentsRouter = router({
         throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'agent is not active' })
       }
 
+      // The `orgId` predicate is a brace, not the lock: RLS already scopes this read. It is here
+      // because every other read in this file carries it, and because a table that ever landed in
+      // `RLS_EXEMPT`'s list would otherwise silently read another org's cap (fix wave A5, final-C M3).
       const settingsRows = await tx.select({ key: orgSettings.key, value: orgSettings.value })
-        .from(orgSettings).where(eq(orgSettings.key, 'sandbox.daily_cap'))
+        .from(orgSettings).where(and(eq(orgSettings.orgId, ctx.orgId), eq(orgSettings.key, 'sandbox.daily_cap')))
       const cap = resolveSetting('sandbox.daily_cap', { org: buildOrgSettings(settingsRows) })
 
       const [counter] = await tx.select({ value: usageCounters.value }).from(usageCounters)

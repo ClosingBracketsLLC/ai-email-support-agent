@@ -67,7 +67,9 @@ export const draftsRouter = router({
     return { held: false, code: res.code }
   }),
 
-  /** "Back to review" for a draft the send job parked on hold (a kill lever, a mailbox re-auth). */
+  /** "Back to review" for a draft the send job parked: `held` (a kill lever, a mailbox re-auth) or
+   * `failed` (a terminal guardrail refusal or a dead letter, which also returns the ticket from
+   * `needs_owner/send_failed` to `awaiting_review`). `{ resumed: false }` means it was neither. */
   resume: orgProcedure.input(DraftIdInput).mutation(async ({ ctx, input }) => {
     const res = await resumeDraft(serviceDeps(ctx), ctx.orgId, input.draftId, appActor(ctx))
     if (res.ok) return { resumed: true }
