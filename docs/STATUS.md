@@ -888,6 +888,20 @@ these 18 carry:
 - 183 — no test renders a NEW undo window after an expired one (correct by inspection: the latch is
   keyed to the `undoAt` value, and both ends are pinned by the two existing tests).
 
+## Brand (spec approved 2026-09-10; plan next)
+
+The product name is **aesa** ("AY-sah", lowercase everywhere, standalone from ClosingBrackets).
+`docs/superpowers/specs/2026-09-10-aesa-brand-design.md` is the approved brand system: the mark is
+Fraunces 144pt SemiBold's `æ` with its central column narrowed 187→153 font units (derivation in
+`brand/scripts/derive/`, reproducible byte for byte); azure `#2563EB` primary with ink/night/lifted
+neutrals; sent/on-hold/blocked in green `#0E9F6E` / amber `#F59E0B` / rose `#E11D48` with darker
+chip-text shades for AA; Fraunces display + Plus Jakarta Sans UI; app icon = lifted blue on ink;
+Lucide-style icons. Work happens on branch `brand` (cut from `phase-3`; its PR follows PR #3).
+**Next session:** `superpowers:writing-plans` on that spec, then subagent-driven development —
+the plan builds `brand/` (sources, tokens, `pnpm brand:build`), the tokens module in
+`@aesa/contracts`, the app theme/fonts/icons, and the api's favicons, social card and review-page
+CSS. The public landing page is a plan of its own afterwards.
+
 ## Later phases (see the spec for scope and verification)
 
 - Phase 4 — knowledge (parsers, crawler, Voyage embeddings, retrieval, `minio`/R2 uploads).
