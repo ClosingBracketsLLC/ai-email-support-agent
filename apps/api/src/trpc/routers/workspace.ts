@@ -1,11 +1,18 @@
 import { TRPCError } from '@trpc/server'
 import { APIError } from 'better-auth/api'
-import { eq } from 'drizzle-orm'
-import { CreateWorkspaceInput, UpdateProfileInput, deriveAllowedHosts, isOnboardingStep, nextOnboardingStep, slugify, type OnboardingStep, type Tone } from '@aesa/contracts'
-import { audit, workspaces } from '@aesa/db'
+import { and, asc, count, desc, eq, inArray, sql } from 'drizzle-orm'
+import {
+  CreateWorkspaceInput, SetAgentEnabledInput, deriveAllowedHosts, isOnboardingStep, nextOnboardingStep, slugify,
+  UpdateProfileInput, type OnboardingStep, type Tone,
+} from '@aesa/contracts'
+import { agents, audit, drafts, tickets, workspaces } from '@aesa/db'
 import type { Auth } from '../../auth.ts'
 import { mapAuthError } from '../auth-errors.ts'
 import { authedProcedure, managerProcedure, orgProcedure, router } from '../init.ts'
+
+/** The "live" draft statuses — the same set `drafts_live_per_ticket_uidx` (migration 0011) enforces
+ * one-per-ticket over. `goLiveStatus`'s `firstDraft` is the newest of these, org-wide. */
+const LIVE_DRAFT_STATUSES = ['pending', 'approved', 'held', 'sending'] as const
 
 // Intl.supportedValuesOf('timeZone') omits 'UTC' itself (ECMA-402 treats it as a legacy alias, not a
 // canonical named identifier), even though it is a real, commonly-sent IANA zone — add it back explicitly.
@@ -16,7 +23,7 @@ type WorkspaceRow = typeof workspaces.$inferSelect
 export interface WorkspaceView {
   orgId: string; businessName: string; websiteUrl: string | null; description: string | null; tone: Tone
   timezone: string; locale: string; contactPhone: string | null; contactUrls: string[]; allowedUrlHosts: string[]
-  operatingGuidance: string; agentEnabled: boolean; onboardingStep: OnboardingStep; createdAt: Date
+  operatingGuidance: string; agentEnabled: boolean; agentEnabledAt: Date | null; onboardingStep: OnboardingStep; createdAt: Date
 }
 
 /** The client-facing shape. Never the box key, never the kill switch internals. */
@@ -24,7 +31,7 @@ export function toWorkspaceView(w: WorkspaceRow): WorkspaceView {
   return {
     orgId: w.orgId, businessName: w.businessName, websiteUrl: w.websiteUrl, description: w.description, tone: w.tone as Tone,
     timezone: w.timezone, locale: w.locale, contactPhone: w.contactPhone, contactUrls: w.contactUrls, allowedUrlHosts: w.allowedUrlHosts,
-    operatingGuidance: w.operatingGuidance, agentEnabled: w.agentEnabled,
+    operatingGuidance: w.operatingGuidance, agentEnabled: w.agentEnabled, agentEnabledAt: w.agentEnabledAt,
     onboardingStep: isOnboardingStep(w.onboardingStep) ? w.onboardingStep : 'profile', createdAt: w.createdAt,
   }
 }
@@ -109,6 +116,62 @@ export const workspaceRouter = router({
         await audit(tx, { actor: ctx.actor, action: 'workspace.onboarding.advance', entityType: 'workspace', entityId: ctx.orgId, detail: { from, to }, ip: ctx.ip, userAgent: ctx.userAgent })
       }
       return { from, to }
+    }),
+  ),
+
+  /**
+   * The master switch. Enabling completes the go-live onboarding step in the SAME write — the
+   * go-live step's whole purpose is this switch, so there is no separate "advance" call for it
+   * (unlike every other step). `agentEnabledAt` is COALESCEd: the workspace's first-ever enable
+   * timestamp survives every later on/off flip.
+   */
+  setAgentEnabled: managerProcedure.input(SetAgentEnabledInput).mutation(async ({ ctx, input }) => {
+    const updated = await ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
+      const [current] = await tx.select({ onboardingStep: workspaces.onboardingStep }).from(workspaces).where(eq(workspaces.orgId, ctx.orgId))
+      if (!current) throw new TRPCError({ code: 'NOT_FOUND', message: 'workspace not created yet' })
+      const onboardingStep = input.enabled && current.onboardingStep === 'go_live' ? 'done' : current.onboardingStep
+
+      const patch: Record<string, unknown> = { agentEnabled: input.enabled, onboardingStep }
+      if (input.enabled) patch.agentEnabledAt = sql`COALESCE(${workspaces.agentEnabledAt}, now())`
+
+      const [row] = await tx.update(workspaces).set(patch).where(eq(workspaces.orgId, ctx.orgId)).returning()
+      await audit(tx, {
+        actor: ctx.actor, action: input.enabled ? 'workspace.agent_enabled' : 'workspace.agent_disabled',
+        entityType: 'workspace', entityId: ctx.orgId, detail: { onboardingStep }, ip: ctx.ip, userAgent: ctx.userAgent,
+      })
+      return row!
+    })
+    return { ...toWorkspaceView(updated), role: ctx.member.role }
+  }),
+
+  /** The go-live screen's poll target: whether the switch is on, the addresses it can flip live, and
+   * whether the owner's own test email has produced a draft yet. */
+  goLiveStatus: orgProcedure.query(async ({ ctx }) =>
+    ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
+      const [ws] = await tx.select({ agentEnabled: workspaces.agentEnabled }).from(workspaces).where(eq(workspaces.orgId, ctx.orgId))
+      if (!ws) throw new TRPCError({ code: 'NOT_FOUND', message: 'workspace not created yet' })
+
+      const activeAgents = await tx.select({ address: agents.address }).from(agents)
+        .where(and(eq(agents.orgId, ctx.orgId), eq(agents.status, 'active')))
+        .orderBy(asc(agents.priority), asc(agents.createdAt))
+
+      const [ticketsSeen] = await tx.select({ value: count() }).from(tickets).where(eq(tickets.orgId, ctx.orgId))
+
+      const [firstDraft] = await tx.select({
+        ticketId: drafts.ticketId, draftId: drafts.id, subject: tickets.subject, createdAt: drafts.createdAt,
+      })
+        .from(drafts)
+        .innerJoin(tickets, eq(tickets.id, drafts.ticketId))
+        .where(and(eq(drafts.orgId, ctx.orgId), inArray(drafts.status, LIVE_DRAFT_STATUSES)))
+        .orderBy(desc(drafts.createdAt))
+        .limit(1)
+
+      return {
+        agentEnabled: ws.agentEnabled,
+        agentAddresses: activeAgents.map((a) => a.address),
+        firstDraft: firstDraft ?? null,
+        ticketsSeen: ticketsSeen?.value ?? 0,
+      }
     }),
   ),
 })

@@ -1,4 +1,5 @@
 import { router } from './init.ts'
+import { activityRouter } from './routers/activity.ts'
 import { agentsRouter } from './routers/agents.ts'
 import { devicesRouter } from './routers/devices.ts'
 import { draftsRouter } from './routers/drafts.ts'
@@ -15,5 +16,6 @@ export const appRouter = router({
   agents: agentsRouter,
   inbox: inboxRouter,
   drafts: draftsRouter,
+  activity: activityRouter,
 })
 export type AppRouter = typeof appRouter

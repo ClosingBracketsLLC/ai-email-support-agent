@@ -2,9 +2,11 @@ import { createTRPCClient, httpBatchLink } from '@trpc/client'
 import { eq } from 'drizzle-orm'
 import superjson from 'superjson'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { auditLog } from '@aesa/db'
+import { auditLog, workspaces } from '@aesa/db'
 import type { AppRouter } from '../src/trpc/router.ts'
-import { WEB, createTestApi, listen, signInWithOtp } from './helpers/app.ts'
+import {
+  WEB, createTestApi, insertAgent, insertConnectedMailbox, insertTicket, listen, seedPendingDraft, signInWithOtp,
+} from './helpers/app.ts'
 
 const client = (base: string, cookie?: string) => createTRPCClient<AppRouter>({
   links: [httpBatchLink({ url: `${base}/trpc`, transformer: superjson, headers: () => ({ origin: WEB, ...(cookie ? { cookie } : {}) }) })],
@@ -89,5 +91,88 @@ describe('workspace router', () => {
     const activate = await t.app.inject({ method: 'POST', url: '/api/auth/organization/set-active', headers: { origin: WEB, cookie: cookieB, 'content-type': 'application/json' }, payload: { organizationId: orgB } })
     expect(activate.statusCode).toBe(200)
     expect((await client(base, cookieB).workspace.get.query()).orgId).toBe(orgB)
+  })
+
+  it('setAgentEnabled(true) on a go_live workspace completes onboarding, stamps agentEnabledAt (COALESCE), and audits workspace.agent_enabled', async () => {
+    const owner = await signInWithOtp(t.app, t.mail, 'golive1@example.com', 'Golive')
+    const c = client(base, owner.cookie)
+    const { orgId } = await c.workspace.create.mutate({ businessName: 'GoLive Co', timezone: 'UTC' })
+    await t.api.withOrg(orgId, (tx) => tx.update(workspaces).set({ onboardingStep: 'go_live' }).where(eq(workspaces.orgId, orgId)))
+
+    const before = Date.now()
+    const res = await c.workspace.setAgentEnabled.mutate({ enabled: true })
+    expect(res).toMatchObject({ agentEnabled: true, onboardingStep: 'done', role: 'owner' })
+    expect(res.agentEnabledAt).toBeInstanceOf(Date)
+    expect(res.agentEnabledAt!.getTime()).toBeGreaterThanOrEqual(before - 1000)
+    const stampedAt = res.agentEnabledAt!.getTime()
+
+    const enabledRows = await t.api.withOrg(orgId, (tx) => tx.select().from(auditLog).where(eq(auditLog.action, 'workspace.agent_enabled')))
+    expect(enabledRows).toHaveLength(1)
+    expect(enabledRows[0]).toMatchObject({ actor: `user:${owner.user.id}`, entityType: 'workspace', entityId: orgId })
+
+    // On an already-`done` workspace, enabling again leaves the step unchanged (not an error) and the
+    // COALESCE leaves agentEnabledAt exactly where it was — but the switch was still flipped ON again,
+    // so it still audits (unconditionally, same as every other setAgentEnabled(true) call).
+    const again = await c.workspace.setAgentEnabled.mutate({ enabled: true })
+    expect(again).toMatchObject({ agentEnabled: true, onboardingStep: 'done' })
+    expect(again.agentEnabledAt!.getTime()).toBe(stampedAt)
+    expect(await t.api.withOrg(orgId, (tx) => tx.select().from(auditLog).where(eq(auditLog.action, 'workspace.agent_enabled')))).toHaveLength(2)
+
+    // false flips agentEnabled but keeps agentEnabledAt (the workspace's first-ever enable timestamp),
+    // and audits the disable action separately from the enable ones above.
+    const off = await c.workspace.setAgentEnabled.mutate({ enabled: false })
+    expect(off).toMatchObject({ agentEnabled: false, onboardingStep: 'done' })
+    expect(off.agentEnabledAt!.getTime()).toBe(stampedAt)
+
+    const disabledRows = await t.api.withOrg(orgId, (tx) => tx.select().from(auditLog).where(eq(auditLog.action, 'workspace.agent_disabled')))
+    expect(disabledRows).toHaveLength(1)
+    expect(disabledRows[0]).toMatchObject({ actor: `user:${owner.user.id}`, entityType: 'workspace', entityId: orgId })
+  })
+
+  it('setAgentEnabled: a member (not manager) is FORBIDDEN', async () => {
+    const owner = await signInWithOtp(t.app, t.mail, 'switchowner@example.com', 'Owner')
+    const ownerClient = client(base, owner.cookie)
+    const { orgId } = await ownerClient.workspace.create.mutate({ businessName: 'Switchco', timezone: 'UTC' })
+    const { invitationId } = await ownerClient.team.invite.mutate({ email: 'switchmember@example.com', role: 'member' })
+    const member = await signInWithOtp(t.app, t.mail, 'switchmember@example.com', 'Member')
+    await t.app.inject({ method: 'POST', url: '/api/auth/organization/accept-invitation', headers: { origin: WEB, cookie: member.cookie, 'content-type': 'application/json' }, payload: { invitationId } })
+    await t.app.inject({ method: 'POST', url: '/api/auth/organization/set-active', headers: { origin: WEB, cookie: member.cookie, 'content-type': 'application/json' }, payload: { organizationId: orgId } })
+
+    await expect(client(base, member.cookie).workspace.setAgentEnabled.mutate({ enabled: true })).rejects.toMatchObject({ data: { code: 'FORBIDDEN' } })
+  })
+
+  it('goLiveStatus: agent addresses in priority order (active only), ticketsSeen, and the newest live draft', async () => {
+    const owner = await signInWithOtp(t.app, t.mail, 'golivestatus@example.com', 'GLS')
+    const c = client(base, owner.cookie)
+    const { orgId } = await c.workspace.create.mutate({ businessName: 'GLS Co', timezone: 'UTC' })
+
+    const empty = await c.workspace.goLiveStatus.query()
+    expect(empty).toEqual({ agentEnabled: false, agentAddresses: [], firstDraft: null, ticketsSeen: 0 })
+
+    const connectionId = await insertConnectedMailbox(t.api, orgId, owner.user.id, 'primary@gls.test')
+    await insertAgent(t.api, orgId, connectionId, 'second@gls.test', { priority: 5 })
+    const firstAgentId = await insertAgent(t.api, orgId, connectionId, 'primary@gls.test', { priority: 1 })
+    await insertAgent(t.api, orgId, connectionId, 'off@gls.test', { priority: 0, status: 'disabled' })
+
+    const withAgents = await c.workspace.goLiveStatus.query()
+    expect(withAgents).toMatchObject({ agentEnabled: false, agentAddresses: ['primary@gls.test', 'second@gls.test'], firstDraft: null, ticketsSeen: 0 })
+
+    const ticket = await insertTicket(t.api, orgId, { connectionId, agentId: firstAgentId, subject: 'Where is my order?' })
+    expect((await c.workspace.goLiveStatus.query()).ticketsSeen).toBe(1)
+    expect((await c.workspace.goLiveStatus.query()).firstDraft).toBeNull()
+
+    const draft = await seedPendingDraft(t.api, orgId, ticket.id, { agentId: firstAgentId })
+    const withDraft = await c.workspace.goLiveStatus.query()
+    expect(withDraft.firstDraft).toMatchObject({ ticketId: ticket.id, draftId: draft.id, subject: 'Where is my order?' })
+    expect(withDraft.firstDraft!.createdAt).toBeInstanceOf(Date)
+
+    // A rejected (non-live) draft on a second ticket must never surface as the "first" draft even
+    // though it is newer — only pending/approved/held/sending count as "live".
+    const ticket2 = await insertTicket(t.api, orgId, { connectionId, agentId: firstAgentId, subject: 'Rejected one' })
+    const rejected = await seedPendingDraft(t.api, orgId, ticket2.id, { agentId: firstAgentId, status: 'rejected' })
+    void rejected
+    const afterRejected = await c.workspace.goLiveStatus.query()
+    expect(afterRejected.firstDraft).toMatchObject({ ticketId: ticket.id, draftId: draft.id })
+    expect(afterRejected.ticketsSeen).toBe(2)
   })
 })

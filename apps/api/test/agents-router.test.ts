@@ -1,8 +1,9 @@
 import { createTRPCClient, httpBatchLink } from '@trpc/client'
 import { and, eq } from 'drizzle-orm'
 import superjson from 'superjson'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { auditLog } from '@aesa/db'
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import { agentRuns, agents, auditLog, SANDBOX_METERS, usageCounters } from '@aesa/db'
+import type { EnqueueFn } from '../src/deps.ts'
 import type { AppRouter } from '../src/trpc/router.ts'
 import { WEB, createTestApi, insertConnectedMailbox, listen, signInWithOtp } from './helpers/app.ts'
 
@@ -110,5 +111,115 @@ describe('agents router', () => {
     expect(res.categories).toHaveLength(8)
     expect(res.categories.every((cat) => cat.mode === 'review')).toBe(true)
     expect(res.categories.map((cat) => cat.key)).toContain('order_status')
+  })
+})
+
+describe('agents router — sandbox', () => {
+  let t: Awaited<ReturnType<typeof createTestApi>>
+  let base: string
+  let sent: { name: string; data: Record<string, unknown>; entityId: string }[]
+  let enqueueResult: string | null = 'job-1'
+
+  beforeAll(async () => {
+    sent = []
+    const enqueue: EnqueueFn = async (name, data, opts) => {
+      sent.push({ name, data, entityId: opts.entityId })
+      return enqueueResult
+    }
+    t = await createTestApi({}, { enqueue })
+    base = await listen(t.app)
+  })
+  afterAll(async () => { await t.close() })
+  beforeEach(() => { sent.length = 0; enqueueResult = 'job-1' })
+
+  async function setupActiveAgent(ownerEmail: string, mailboxEmail: string) {
+    const signed = await signInWithOtp(t.app, t.mail, ownerEmail, 'Owner')
+    const c = client(base, signed.cookie)
+    const { orgId } = await c.workspace.create.mutate({ businessName: 'Acme', timezone: 'UTC' })
+    const connectionId = await insertConnectedMailbox(t.api, orgId, signed.user.id, mailboxEmail)
+    const added = await c.mailboxes.addAddress.mutate({ connectionId, address: mailboxEmail, replyFromConnection: false })
+    return { orgId, c, agentId: added.agentId }
+  }
+
+  it('sandboxStart inserts a running run, bumps sandbox_runs, enqueues agent.sandbox with entityId runId, and audits agent.sandbox_started', async () => {
+    const org = await setupActiveAgent('sandbox1@example.com', 'support@sandbox1.test')
+    const question = 'Do you ship to Canada?'
+    const res = await org.c.agents.sandboxStart.mutate({ agentId: org.agentId, subject: 'Q', question })
+    expect(res.runId).toMatch(/^[0-9a-f-]{36}$/)
+
+    const [run] = await t.api.withOrg(org.orgId, (tx) => tx.select().from(agentRuns).where(eq(agentRuns.id, res.runId)))
+    expect(run).toMatchObject({ kind: 'sandbox', agentId: org.agentId, provider: 'anthropic', model: 'claude-opus-5', status: 'running' })
+    expect(run!.input).toMatchObject({ subject: 'Q', question })
+
+    const [counter] = await t.api.withOrg(org.orgId, (tx) =>
+      tx.select().from(usageCounters).where(and(eq(usageCounters.orgId, org.orgId), eq(usageCounters.meter, SANDBOX_METERS.runs))))
+    expect(counter?.value).toBe(1)
+
+    expect(sent).toEqual([{ name: 'agent.sandbox', data: { orgId: org.orgId, runId: res.runId }, entityId: res.runId }])
+
+    const auditRows = await t.api.withOrg(org.orgId, (tx) => tx.select().from(auditLog).where(eq(auditLog.action, 'agent.sandbox_started')))
+    expect(auditRows[0]).toMatchObject({ detail: { runId: res.runId, questionLen: question.length } })
+  })
+
+  it('the cap: at sandbox.daily_cap, sandboxStart is TOO_MANY_REQUESTS and writes no run and bumps nothing further', async () => {
+    const org = await setupActiveAgent('sandbox2@example.com', 'support@sandbox2.test')
+    const today = new Date().toISOString().slice(0, 10)
+    await t.api.withOrg(org.orgId, (tx) => tx.insert(usageCounters).values({ orgId: org.orgId, day: today, meter: SANDBOX_METERS.runs, value: 100 }))
+
+    await expect(org.c.agents.sandboxStart.mutate({ agentId: org.agentId, subject: 'Q', question: 'Anything?' }))
+      .rejects.toMatchObject({ data: { code: 'TOO_MANY_REQUESTS' } })
+
+    const runs = await t.api.withOrg(org.orgId, (tx) => tx.select().from(agentRuns).where(eq(agentRuns.agentId, org.agentId)))
+    expect(runs).toHaveLength(0)
+    const [counter] = await t.api.withOrg(org.orgId, (tx) =>
+      tx.select().from(usageCounters).where(and(eq(usageCounters.orgId, org.orgId), eq(usageCounters.meter, SANDBOX_METERS.runs))))
+    expect(counter?.value).toBe(100)
+  })
+
+  it('an inactive agent is PRECONDITION_FAILED', async () => {
+    const org = await setupActiveAgent('sandbox3@example.com', 'support@sandbox3.test')
+    await t.api.withOrg(org.orgId, (tx) => tx.update(agents).set({ status: 'disabled' }).where(eq(agents.id, org.agentId)))
+
+    await expect(org.c.agents.sandboxStart.mutate({ agentId: org.agentId, subject: 'Q', question: 'Anything?' }))
+      .rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' } })
+  })
+
+  it('a null enqueue marks the run failed with enqueue_failed, visible through sandboxGet', async () => {
+    const org = await setupActiveAgent('sandbox4@example.com', 'support@sandbox4.test')
+    enqueueResult = null
+    const res = await org.c.agents.sandboxStart.mutate({ agentId: org.agentId, subject: 'Q', question: 'Anything?' })
+
+    const got = await org.c.agents.sandboxGet.query({ runId: res.runId })
+    expect(got).toMatchObject({ status: 'failed', errorCode: 'enqueue_failed', output: null })
+  })
+
+  it('sandboxGet returns the seeded output, and a cross-org run is NOT_FOUND', async () => {
+    const org = await setupActiveAgent('sandbox5@example.com', 'support@sandbox5.test')
+    const other = await setupActiveAgent('sandbox6@example.com', 'support@sandbox6.test')
+    const res = await org.c.agents.sandboxStart.mutate({ agentId: org.agentId, subject: 'Q', question: 'Anything?' })
+
+    const output = {
+      outcome: 'reply' as const, body: 'Yes we do.', normalizedBody: 'Yes we do.', guardrail: { ok: true, findings: [] },
+      confidence: 0.9, decision: 'send' as const, decisionReason: 'ok' as const, reason: null, rationale: 'r', unresolvedQuestions: [],
+      usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, apiCalls: 1, costMicros: 5 },
+    }
+    await t.api.withOrg(org.orgId, (tx) => tx.update(agentRuns).set({ status: 'succeeded', output, finishedAt: new Date() }).where(eq(agentRuns.id, res.runId)))
+
+    const got = await org.c.agents.sandboxGet.query({ runId: res.runId })
+    expect(got).toMatchObject({ status: 'succeeded', errorCode: null, output })
+    expect(got.startedAt).toBeInstanceOf(Date)
+    expect(got.finishedAt).toBeInstanceOf(Date)
+
+    await expect(other.c.agents.sandboxGet.query({ runId: res.runId })).rejects.toMatchObject({ data: { code: 'NOT_FOUND' } })
+  })
+
+  it('an unparsable stored output never 500s — sandboxGet reports output: null', async () => {
+    const org = await setupActiveAgent('sandbox7@example.com', 'support@sandbox7.test')
+    const res = await org.c.agents.sandboxStart.mutate({ agentId: org.agentId, subject: 'Q', question: 'Anything?' })
+    await t.api.withOrg(org.orgId, (tx) =>
+      tx.update(agentRuns).set({ status: 'succeeded', output: { garbage: true }, finishedAt: new Date() }).where(eq(agentRuns.id, res.runId)))
+
+    const got = await org.c.agents.sandboxGet.query({ runId: res.runId })
+    expect(got).toMatchObject({ status: 'succeeded', output: null })
   })
 })

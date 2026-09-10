@@ -7,6 +7,7 @@
  * the volatile one, so it goes last here. Nothing is lost: the guidance block states in words that
  * it is authoritative over the knowledge section that follows it.
  */
+import { DRAFT_MODEL_ID } from '@aesa/contracts'
 import type { ChatMeta, ChatRequest, SystemBlock } from '@aesa/llm'
 import { guidanceBlock, knowledgeBlock, personaBlock, platformRulesBlock, workspaceProfileBlock, type WorkspaceProfile } from './blocks.ts'
 import { DraftDecision } from './decision.ts'
@@ -24,7 +25,9 @@ export interface DraftPromptInput extends DraftUserInput {
   effort: 'medium' | 'high'
 }
 
-export const DRAFT_MODEL = 'claude-opus-5'
+/** Aliases `@aesa/contracts`'s `DRAFT_MODEL_ID` — the ONE source, so the api (which may not
+ *  value-import this package's runtime) can write the same model id without duplicating the literal. */
+export const DRAFT_MODEL = DRAFT_MODEL_ID
 export const DRAFT_MAX_OUTPUT_TOKENS = 4096
 
 export function buildDraftRequest(input: DraftPromptInput, meta: ChatMeta, signal: AbortSignal): ChatRequest<DraftDecision> {

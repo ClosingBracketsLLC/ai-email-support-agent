@@ -26,6 +26,12 @@ export const SEND_METERS = {
   aiHandledConversations: 'ai_handled_conversations',
 } as const
 
+/** The one `usage_counters` meter `agents.sandboxStart` (Task 18) bumps under `sandbox.daily_cap` —
+ * the worker's `agent.sandbox` job never touches it. Plain string, like the others above. */
+export const SANDBOX_METERS = {
+  runs: 'sandbox_runs',
+} as const
+
 const utcDayString = (d: Date): string => d.toISOString().slice(0, 10)
 
 /**
