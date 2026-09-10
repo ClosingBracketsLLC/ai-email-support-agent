@@ -21,6 +21,14 @@ describe('transitions', () => {
       expect(draftTransitions.can(s, 'pending')).toBe(false)
     expect(() => draftTransitions.assert('sent', 'pending')).toThrow(IllegalTransitionError)
   })
+  it('draft: sending → held is legal — a crashed send whose retry finds a kill lever must not strand the draft', () => {
+    expect(draftTransitions.can('sending', 'held')).toBe(true)
+    expect(draftTransitions.can('sending', 'sent')).toBe(true)
+    expect(draftTransitions.can('sending', 'failed')).toBe(true)
+    // Still not a way back into the review queue directly: a held draft re-enters via `pending`.
+    expect(draftTransitions.can('sending', 'approved')).toBe(false)
+    expect(draftTransitions.can('held', 'pending')).toBe(true)
+  })
   it('defineTransitions rejects a matrix that lists a self-transition', () => {
     expect(() => defineTransitions({ a: ['a'], b: [] } as const)).toThrow(/self/)
   })

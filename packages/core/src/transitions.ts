@@ -34,7 +34,11 @@ export const draftTransitions = defineTransitions<DraftStatus>({
   pending: ['approved', 'rejected', 'superseded', 'expired'],
   approved: ['sending', 'held', 'failed', 'superseded'],
   held: ['pending', 'expired'],
-  sending: ['sent', 'failed'],
+  // `sending` → `held`: a send that crashed mid-delivery leaves the draft here, and the retry's
+  // recovery scan can come back "not delivered" with a kill lever now on. Without this edge the
+  // send lands `held` beside a permanently `sending` draft that nothing can move (a `held` send is
+  // not claimable and no sweep selects a `sending` draft) — the Task 13 review's stuck state.
+  sending: ['sent', 'failed', 'held'],
   sent: [], rejected: [], superseded: [], expired: [], failed: [],
 })
 

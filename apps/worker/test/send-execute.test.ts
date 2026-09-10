@@ -19,8 +19,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { INVARIANTS } from '@aesa/core'
 import { encrypt, hashToken, loadKekRing, type KekRing } from '@aesa/crypto'
 import {
-  agentCategoryPolicies, agents, auditLog, categories, drafts, ensureDefaultCategories, loadOrgDek,
-  mailboxConnections, mailboxCredentials, messages, notifications, outboundSends, platformState,
+  agentCategoryPolicies, agents, audit, auditLog, bumpMeter, categories, drafts, ensureDefaultCategories,
+  loadOrgDek, mailboxConnections, mailboxCredentials, messages, notifications, outboundSends, platformState,
   provisionOrgKeys, SEND_METERS, tickets, usageCounters, user, withOrg, withPlatform, workspaces,
 } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
@@ -152,6 +152,12 @@ async function seedFreshCredential(orgId: string, connectionId: string): Promise
       refreshTokenHash: hashToken('refresh', refreshToken),
       encryption: 'dek', dataKeyVersion: version,
     }))
+}
+
+async function unexpireCredential(connectionId: string): Promise<void> {
+  await withPlatform(app.db, 'test:unexpire-credential', (tx) =>
+    tx.update(mailboxCredentials).set({ accessTokenExpiresAt: new Date(Date.now() + 3_600_000) })
+      .where(eq(mailboxCredentials.connectionId, connectionId)))
 }
 
 async function expireCredential(connectionId: string): Promise<void> {
@@ -950,6 +956,209 @@ describe('send.execute', () => {
     expect((await getDraft(s.draftId)).status).toBe('approved')
   })
 
+  // ---- the crash re-entry: kill levers run AFTER the recovery scan (controller ruling) ----
+
+  it('A1 a crash re-entry whose scan HITS completes even with a kill lever on — the customer already has the mail', async () => {
+    const s = await seedApprovedDraft()
+    const already = await putMarkedReplyOnThread(s)
+    await asCrashReEntry(s)
+    await withOrg(app.db, fx.orgId, (tx) => tx.update(workspaces).set({ killSwitch: true }).where(eq(workspaces.orgId, fx.orgId)))
+    const { deps, notified } = makeDeps()
+
+    await run(deps, s.sendId)
+
+    expect(fx.mailbox.sentMessages()).toHaveLength(1)
+    const send = await getSend(s.sendId)
+    expect(send.status).toBe('sent')
+    expect(send.providerMessageId).toBe(already.id)
+    expect((await getDraft(s.draftId)).status).toBe('sent')
+    expect(await auditActions(s.sendId)).not.toContain('send.held')
+    expect(notified).toHaveLength(0)
+    expect((await getTicket(s.ticketId)).status).toBe('waiting_on_customer')
+  })
+
+  it('A2 a crash re-entry whose scan MISSES applies the lever, moving the send AND the draft to held together', async () => {
+    const s = await seedApprovedDraft()
+    await asCrashReEntry(s)
+    await withOrg(app.db, fx.orgId, (tx) => tx.update(workspaces).set({ killSwitch: true }).where(eq(workspaces.orgId, fx.orgId)))
+    const { deps, notified } = makeDeps()
+
+    await run(deps, s.sendId)
+
+    expect(fx.mailbox.sentMessages()).toHaveLength(0)
+    const send = await getSend(s.sendId)
+    expect(send.status).toBe('held')
+    expect(send.lastError).toBe('held:workspace_kill_switch')
+    // `sending → held` (added to draftTransitions): a held send beside a `sending` draft is stuck forever.
+    expect((await getDraft(s.draftId)).status).toBe('held')
+    const rows = await orgNotifications()
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.dedupeKey).toBe(`send_held:${s.sendId}:${TODAY}`)
+    expect(notified).toHaveLength(1)
+  })
+
+  it('A3 a reauth on a crash re-entry releases for a retry and THROWS — delivery is unverified, so nothing is held', async () => {
+    const s = await seedApprovedDraft()
+    await asCrashReEntry(s)
+    await expireCredential(fx.connectionId)
+    const { deps, notified } = makeDeps({
+      providerFactory: () => stubProvider({ refresh: async () => { throw new ProviderAuthError('refresh rejected') } }),
+      clientFactory: () => { throw new Error('must not build a client on a reauth failure') },
+    })
+
+    await expect(run(deps, s.sendId)).rejects.toBeInstanceOf(ProviderAuthError)
+
+    const send = await getSend(s.sendId)
+    expect(send.status).toBe('queued')
+    expect(send.lastError).toBe('reauth_required: delivery unverified')
+    expect(send.sendAfter.getTime()).toBeGreaterThan(NOW.getTime())
+    expect(send.claimToken).toBeNull()
+    // Still `sending`: only the marker scan may decide what happened to it.
+    expect((await getDraft(s.draftId)).status).toBe('sending')
+    const rows = await orgNotifications()
+    expect(rows.map((r) => r.kind)).toEqual(['mailbox_reauth'])
+    expect(notified).toHaveLength(1)
+  })
+
+  it('A4 a stale crash re-entry fails the draft too, instead of stranding it in sending', async () => {
+    const s = await seedApprovedDraft()
+    await asCrashReEntry(s)
+    await addNewerInbound(s, 'never mind, it arrived')
+    const { deps, draftEnqueues } = makeDeps()
+
+    await run(deps, s.sendId)
+
+    expect(fx.mailbox.sentMessages()).toHaveLength(0)
+    const send = await getSend(s.sendId)
+    expect(send.status).toBe('failed')
+    expect(send.lastError).toBe(STALE_ERROR)
+    expect((await getDraft(s.draftId)).status).toBe('failed')
+    const ticket = await getTicket(s.ticketId)
+    expect(ticket.status).toBe('triaged')
+    expect(ticket.lastAgentRunAt).toBeNull()
+    expect(draftEnqueues).toEqual([{ orgId: fx.orgId, ticketId: s.ticketId }])
+  })
+
+  // ---- review round 1: the completion gate, the dead-letter guard, the claim collapse ----
+
+  it('I2 a deadline-overlap retry that completed first leaves this run writing no second meter, audit row or onSent', async () => {
+    const s = await seedApprovedDraft()
+    // `expireInSeconds` equals the claim horizon, so pg-boss can start a retry while this handler is
+    // still inside its provider call. The retry reclaims (the horizon lapsed at the same instant),
+    // recovers by marker and completes. This wrapper is that winning worker, injected at the exact
+    // point the real one would land: after our send, before our completeSend.
+    const wrapped: MailboxClient = {
+      ...fx.mailbox,
+      getMessage: async (id, opts) => {
+        const meta = await fx.mailbox.getMessage(id, opts)
+        await withOrg(app.db, fx.orgId, async (tx) => {
+          await tx.update(outboundSends).set({ status: 'sent', providerMessageId: id, sentAt: NOW }).where(eq(outboundSends.id, s.sendId))
+          await tx.update(drafts).set({ status: 'sent' }).where(eq(drafts.id, s.draftId))
+          await bumpMeter(tx, fx.orgId, TODAY, SEND_METERS.reviewSends, 1)
+          await audit(tx, {
+            actor: 'system:send.execute', action: 'send.sent', entityType: 'outbound_send', entityId: s.sendId,
+            detail: { recovered: true, providerMessageId: id },
+          })
+        })
+        return meta
+      },
+    }
+    const { deps, sentEvents } = makeDeps({ clientFactory: () => wrapped })
+
+    await run(deps, s.sendId)
+
+    // One reply, one meter, one audit row, one onSent — `review_sends` is a billing meter.
+    expect(fx.mailbox.sentMessages()).toHaveLength(1)
+    expect(await meters()).toMatchObject({ [SEND_METERS.reviewSends]: 1 })
+    expect(await auditRows('send.sent')).toHaveLength(1)
+    expect(sentEvents).toHaveLength(0)
+    expect(await outboundMessages(s.ticketId)).toHaveLength(1)
+    expect((await getSend(s.sendId)).status).toBe('sent')
+  })
+
+  it('I1 a post-commit hook failure on the last attempt never flips a delivered send to failed', async () => {
+    const s = await seedApprovedDraft()
+    const { deps, notified } = makeDeps({ onSent: async () => { throw new Error('memory.capture is down') } })
+
+    // completeSend swallows the hook failure, so the run resolves and the ledger stays `sent`.
+    await run(deps, s.sendId, { attempt: 6, lastAttempt: true })
+
+    const send = await getSend(s.sendId)
+    expect(send.status).toBe('sent')
+    expect(send.sentAt).not.toBeNull()
+    expect((await getDraft(s.draftId)).status).toBe('sent')
+    expect(await auditActions(s.sendId)).not.toContain('send.dead_letter')
+    expect((await getTicket(s.ticketId)).status).toBe('waiting_on_customer')
+    expect(notified).toHaveLength(0)
+  })
+
+  it('I1 a last-attempt throw on a row an overlapping retry already completed neither dead-letters nor downgrades it', async () => {
+    const s = await seedApprovedDraft();
+    (await putMarkedReplyOnThread(s))
+    await asCrashReEntry(s)
+    // The overlap winner completes the reply while we are inside the scan; our scan then fails.
+    const wrapped: MailboxClient = {
+      ...fx.mailbox,
+      findSentByMarker: async () => {
+        await withOrg(app.db, fx.orgId, async (tx) => {
+          await tx.update(outboundSends).set({ status: 'sent', sentAt: NOW }).where(eq(outboundSends.id, s.sendId))
+          await tx.update(drafts).set({ status: 'sent' }).where(eq(drafts.id, s.draftId))
+        })
+        throw new MailApiError('backend error', 500)
+      },
+    }
+    const { deps, notified } = makeDeps({ clientFactory: () => wrapped })
+
+    await expect(run(deps, s.sendId, { attempt: 6, lastAttempt: true })).rejects.toBeInstanceOf(MailApiError)
+
+    const send = await getSend(s.sendId)
+    expect(send.status).toBe('sent') // neither the scan release nor the dead-letter touched it
+    expect(send.sentAt).not.toBeNull()
+    expect((await getDraft(s.draftId)).status).toBe('sent')
+    expect(await auditActions(s.sendId)).not.toContain('send.dead_letter')
+    expect((await getTicket(s.ticketId)).status).not.toBe('needs_owner')
+    expect(notified).toHaveLength(0)
+  })
+
+  it('I3 a throw between the committed claim and the send collapses the claim horizon so the very next retry reclaims', async () => {
+    const s = await seedApprovedDraft()
+    await expireCredential(fx.connectionId)
+    const { deps } = makeDeps({
+      providerFactory: () => stubProvider({ refresh: async () => { throw new Error('provider 503') } }),
+      clientFactory: () => { throw new Error('must not build a client') },
+    })
+
+    await expect(run(deps, s.sendId)).rejects.toThrow(/provider 503/)
+
+    const send = await getSend(s.sendId)
+    expect(send.status).toBe('claimed')
+    expect(send.claimExpiresAt!.getTime()).toBeLessThanOrEqual(Date.now())
+    expect(send.lastError).toMatch(/provider 503/)
+    // Proof the collapse is what matters: the very next retry reclaims and reaches the mailbox.
+    // (Without it the row stays claimed until `now + 600 s` and attempts 2-4 return silently.)
+    await unexpireCredential(fx.connectionId)
+    const { deps: healthy } = makeDeps({ now: monotonicClock(new Date(NOW.getTime() + 60_000)) })
+    await run(healthy, s.sendId)
+    expect((await getSend(s.sendId)).status).toBe('sent')
+    expect((await getSend(s.sendId)).attempts).toBe(2)
+  })
+
+  it('M2 a send_failed escalation still pages when the ticket already paged today for another reason', async () => {
+    const s = await seedApprovedDraft({ ticket: { customerEmail: null } })
+    await withOrg(app.db, fx.orgId, (tx) =>
+      tx.insert(notifications).values({
+        orgId: fx.orgId, kind: 'escalation', title: 'Draft blocked', body: 'earlier today',
+        dedupeKey: `escalation:${s.ticketId}:${TODAY}`, payload: { ticketId: s.ticketId },
+      }))
+    const { deps, notified } = makeDeps()
+
+    await run(deps, s.sendId)
+
+    const rows = await orgNotifications()
+    expect(rows.map((r) => r.dedupeKey).sort()).toEqual([`escalation:${s.ticketId}:${TODAY}`, `send_failed:${s.ticketId}:${TODAY}`].sort())
+    expect(notified).toHaveLength(1)
+  })
+
   it('1 the claim horizon is real: a live claim held by another worker is not stealable', async () => {
     const s = await seedApprovedDraft()
     await withOrg(app.db, fx.orgId, (tx) =>
@@ -966,6 +1175,49 @@ describe('send.execute', () => {
     expect((await getSend(s.sendId)).attempts).toBe(0)
   })
 })
+
+/**
+ * Rewrites a seeded fixture into a CRASH RE-ENTRY: the draft is `sending` (a prior attempt got past
+ * the pre-send flip) and the send row is `claimed` with a horizon step 9 already collapsed, so the
+ * next run re-claims it. This is the state every deferred-lever case starts from.
+ */
+async function asCrashReEntry(s: Seeded, opts: { providerDraftId?: string } = {}): Promise<void> {
+  await withOrg(app.db, fx.orgId, async (tx) => {
+    await tx.update(drafts).set({ status: 'sending' }).where(eq(drafts.id, s.draftId))
+    await tx
+      .update(outboundSends)
+      .set({
+        status: 'claimed', claimedAt: new Date(NOW.getTime() - 1000), claimExpiresAt: new Date(NOW.getTime() - 1000),
+        claimToken: crypto.randomUUID(), attempts: 1, lastError: 'socket hung up',
+        ...(opts.providerDraftId ? { providerDraftId: opts.providerDraftId } : {}),
+      })
+      .where(eq(outboundSends.id, s.sendId))
+  })
+}
+
+/** Puts a marked copy of the reply on the thread, as a crashed prior attempt would have left it. */
+async function putMarkedReplyOnThread(s: Seeded): Promise<{ id: string }> {
+  return fx.mailbox.sendReply({
+    threadId: s.threadId, to: CUSTOMER, subject: 'Where is my order?', inReplyTo: s.inbound[0]!.rfcMessageId,
+    references: s.inbound[0]!.rfcMessageId, bodyText: CLEAN_BODY, from: fx.selfAddress,
+    replyToProviderMessageId: s.inbound[0]!.id, extraHeaders: { [MARKER_HEADER]: s.draftId },
+  })
+}
+
+/** Adds an inbound newer than the draft's snapshot, in the mock AND in the ticket's thread. */
+async function addNewerInbound(s: Seeded, body = 'any news?'): Promise<Date> {
+  const newer = fx.mailbox.receiveInbound({ from: CUSTOMER, to: [fx.selfAddress], subject: 'Where is my order?', bodyText: body, threadId: s.threadId })
+  const meta = await fx.mailbox.getMessage(newer.id, { format: 'metadata' })
+  await withOrg(app.db, fx.orgId, async (tx) => {
+    await tx.insert(messages).values({
+      orgId: fx.orgId, ticketId: s.ticketId, connectionId: fx.connectionId, providerMessageId: newer.id,
+      direction: 'inbound', fromAddress: CUSTOMER, bodyText: body, rfcMessageId: meta.rfcMessageId,
+      dmarcPass: true, sentAt: meta.internalDate,
+    })
+    await tx.update(tickets).set({ lastInboundAt: meta.internalDate }).where(eq(tickets.id, s.ticketId))
+  })
+  return meta.internalDate
+}
 
 /** A follow-up approved draft + send row on an already-answered ticket (the month-meter cases). */
 async function seedSecondSend(ticketId: string): Promise<{ draftId: string; sendId: string }> {

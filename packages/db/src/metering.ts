@@ -28,7 +28,12 @@ export const SEND_METERS = {
 
 const utcDayString = (d: Date): string => d.toISOString().slice(0, 10)
 
-async function bumpMeter(tx: OrgTx, orgId: string, day: string, meter: string, delta: number): Promise<void> {
+/**
+ * The one `usage_counters` upsert. Exported because `send.execute` writes `SEND_METERS` through the
+ * same statement (Task 13 review, Minor 5) — two copies of an upsert whose conflict target IS the
+ * table's primary key is exactly the kind of duplication that drifts.
+ */
+export async function bumpMeter(tx: OrgTx, orgId: string, day: string, meter: string, delta: number): Promise<void> {
   await tx.insert(usageCounters).values({ orgId, day, meter, value: delta })
     .onConflictDoUpdate({
       target: [usageCounters.orgId, usageCounters.day, usageCounters.meter],

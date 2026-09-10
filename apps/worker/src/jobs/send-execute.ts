@@ -25,8 +25,16 @@
  * **The recovery scan runs FIRST — before staleness and before the pre-checks.** A completed send is
  * a fait accompli: once the customer has the mail the only correct continuation is the post-send
  * bookkeeping (all of it idempotent and guarded), never a refusal claiming it never sent. Only the
- * checks that make recovery itself impossible — an unclaimable ledger row, a kill lever, an
- * unusable draft, a credential we cannot even build a client with — run ahead of it.
+ * checks that make recovery itself impossible run ahead of it: an unclaimable ledger row, a missing
+ * agent (no persona, no From address, nothing to reconstruct a `messages` row from), an unusable
+ * draft, and a credential we cannot even build a client with.
+ *
+ * The kill levers sit on BOTH sides of that line (controller ruling, fix round 1). On a fresh
+ * `approved` draft nothing has been attempted, so they refuse at step 1. On a `sending` draft — a
+ * crash re-entry — they are deferred past the scan: a lever flipped after a reply was already
+ * delivered must not turn that reply into a `held` send the owner is told never went out. A scan HIT
+ * completes regardless of the levers; a MISS applies them before staleness, moving the send AND the
+ * draft to `held` together.
  *
  * **Refusals vs throws.** A *refusal* is terminal (`→ failed` + audit + escalation + return, never a
  * throw): none of them get better on a retry, and the owner tapped Approve — a silent, log-only
@@ -40,7 +48,7 @@
  * killed connection). The claim (step 1) and the pre-send flip (step 8) are each ONE statement set in
  * ONE transaction. The api never runs any of this: sending is worker-only.
  */
-import { and, asc, eq, gt, lte, or, sql } from 'drizzle-orm'
+import { and, asc, eq, gt, lte, ne, or, sql } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import { z } from 'zod'
@@ -49,8 +57,8 @@ import {
 } from '@aesa/core'
 import type { KekRing } from '@aesa/crypto'
 import {
-  agentCategoryPolicies, agents, audit, drafts, escalateTicket, mailboxConnections,
-  messages, notifications, outboundSends, platformState, SEND_METERS, tickets, usageCounters, withOrg, workspaces,
+  agentCategoryPolicies, agents, audit, bumpMeter, drafts, escalateTicket, mailboxConnections,
+  messages, notifications, outboundSends, platformState, SEND_METERS, tickets, withOrg, workspaces,
   type Db, type OrgTx,
 } from '@aesa/db'
 import {
@@ -301,7 +309,12 @@ async function claimSend(deps: SendExecuteDeps, orgId: string, sendId: string, n
   })
 }
 
-/** The first lever that is on, in the spec's order, or null. */
+/**
+ * The first lever that is on, in the spec's order, or null. Pure — which is what lets `afterClaim`
+ * evaluate it once and apply it at either of two points (see the file header). The `agent === null`
+ * arm is a formality by the time the deferred call runs: `afterClaim` refuses a missing agent row
+ * ahead of the scan for every draft status, since nothing can be sent OR recovered without one.
+ */
 function firstKillLever(c: ClaimedSend): KillLever | null {
   if (c.platformKillSwitch) return 'platform_killswitch'
   if (c.workspace.killSwitch) return 'workspace_kill_switch'
@@ -327,11 +340,21 @@ interface Landing {
   day: string
 }
 
-/** `claimed → held` + `approved → held` + audit + ONE day-scoped page. Never throws. */
+/**
+ * `claimed → held` + `approved | sending → held` + audit + ONE day-scoped page. Never throws.
+ *
+ * The draft guard covers `sending` as well as `approved` because a lever can also be applied on a
+ * crash RE-ENTRY, after the recovery scan proved nothing was delivered (controller ruling, fix round
+ * 1). A `held` send beside a permanently `sending` draft is unrecoverable — no sweep selects either
+ * — so the two must always move together; `draftTransitions` allows `sending → held` for this.
+ */
 async function landHeld(l: Landing, lever: KillLever): Promise<void> {
   const notificationId = await withOrg(l.deps.db, l.orgId, async (tx) => {
     await setSendStatus(tx, l.sendId, 'held', { lastError: `held:${lever}`, now: l.now })
-    await tx.update(drafts).set({ status: 'held' }).where(and(eq(drafts.id, l.draftId), eq(drafts.status, 'approved')))
+    await tx
+      .update(drafts)
+      .set({ status: 'held' })
+      .where(and(eq(drafts.id, l.draftId), or(eq(drafts.status, 'approved'), eq(drafts.status, 'sending'))))
     await audit(tx, {
       actor: SEND_ACTOR, action: 'send.held', entityType: 'outbound_send', entityId: l.sendId,
       detail: { lever, ticketId: l.ticketId, draftId: l.draftId },
@@ -381,6 +404,10 @@ async function landTerminal(l: Landing, reason: string, opts: { escalate: boolea
     const { notificationId } = await escalateTicket(tx, {
       orgId: l.orgId, ticketId: l.ticketId, fromStatus: 'awaiting_review', reason: 'send_failed',
       day: l.day, now: l.now, draftId: l.draftId, actor: SEND_ACTOR, auditAction: 'ticket.escalated',
+      // Reason-scoped, like `ticket.draft`'s cap key: a ticket that already paged today for a
+      // different reason (a blocked draft the owner then fixed and re-approved) must still page for
+      // the send failure, or the flip to `needs_owner` happens silently.
+      dedupeKey: `send_failed:${l.ticketId}:${l.day}`,
       detail: { sendId: l.sendId, error: reason },
     })
     return notificationId
@@ -405,10 +432,12 @@ async function landTerminal(l: Landing, reason: string, opts: { escalate: boolea
 async function landStale(l: Landing, threadSnapshotAt: Date, newerInboundAt: Date | null): Promise<void> {
   const notificationId = await withOrg(l.deps.db, l.orgId, async (tx) => {
     await setSendStatus(tx, l.sendId, 'failed', { lastError: STALE_ERROR, now: l.now })
+    // `sending` too: a crash re-entry whose scan MISSED can reach staleness with the draft already
+    // flipped by the crashed attempt's step 8, and leaving it `sending` strands it forever.
     await tx
       .update(drafts)
       .set({ status: 'failed' })
-      .where(and(eq(drafts.id, l.draftId), eq(drafts.status, 'approved')))
+      .where(and(eq(drafts.id, l.draftId), or(eq(drafts.status, 'approved'), eq(drafts.status, 'sending'))))
     await tx
       .update(tickets)
       .set({ status: 'triaged', lastAgentRunAt: null })
@@ -437,15 +466,28 @@ async function landStale(l: Landing, threadSnapshotAt: Date, newerInboundAt: Dat
   await l.deps.enqueueDraft(l.orgId, l.ticketId)
 }
 
-/** Step 12. Called only on the LAST attempt, immediately before the error is rethrown. */
+/**
+ * Step 12. Called only on the LAST attempt, immediately before the error is rethrown.
+ *
+ * It refuses to touch a row that is already `sent`: `completeSend`'s post-commit hooks
+ * (`enqueueDraft`, and Phase 5's `memory.capture` behind `onSent`) run outside its transaction, so a
+ * throw from one of them reaches here for a reply the customer already has. Flipping `sent → failed`
+ * there is an illegal edge, contradicts `sent_at`/`provider_message_id`, and makes the row eligible
+ * for Task 14's re-approve re-queue — a genuine double-send hazard.
+ */
 async function landDeadLetter(deps: SendExecuteDeps, orgId: string, sendId: string, now: Date, err: unknown): Promise<void> {
   const reason = errorMessage(err)
+  const day = utcDayString(now)
   const notificationId = await withOrg(deps.db, orgId, async (tx) => {
     const [send] = await tx
-      .select({ draftId: outboundSends.draftId, ticketId: outboundSends.ticketId })
+      .select({ draftId: outboundSends.draftId, ticketId: outboundSends.ticketId, status: outboundSends.status })
       .from(outboundSends)
       .where(eq(outboundSends.id, sendId))
     if (!send) return undefined
+    if (send.status === 'sent') {
+      deps.logger.warn({ sendId, error: reason }, 'send.dead_letter_skipped_already_sent')
+      return undefined
+    }
     await setSendStatus(tx, sendId, 'failed', { lastError: reason, now })
     await tx
       .update(drafts)
@@ -457,7 +499,8 @@ async function landDeadLetter(deps: SendExecuteDeps, orgId: string, sendId: stri
     })
     const { notificationId } = await escalateTicket(tx, {
       orgId, ticketId: send.ticketId, fromStatus: 'awaiting_review', reason: 'send_failed',
-      day: utcDayString(now), now, draftId: send.draftId, actor: SEND_ACTOR, auditAction: 'ticket.escalated',
+      day, now, draftId: send.draftId, actor: SEND_ACTOR, auditAction: 'ticket.escalated',
+      dedupeKey: `send_failed:${send.ticketId}:${day}`,
       detail: { sendId, error: reason },
     })
     return notificationId
@@ -465,7 +508,34 @@ async function landDeadLetter(deps: SendExecuteDeps, orgId: string, sendId: stri
   if (notificationId) await deps.enqueueNotify(orgId, notificationId)
 }
 
-/** Every terminal/held write clears the claim: a row that is no longer `claimed` must not look held. */
+/**
+ * Collapse THIS run's claim horizon to `now` so the pg-boss retry can reclaim immediately. Guarded on
+ * `status = 'claimed' AND claim_token = $token`, so it is a no-op once any landing has released the
+ * row (every landing nulls the token) or another worker has reclaimed it — which makes it safe to
+ * call from both step 9's own catch and the generic post-claim catch.
+ *
+ * Safe in every case because a re-entry must pass through the recovery scan first: the alternative
+ * (leaving the horizon at `now + 600`) makes attempts 2-4 of pg-boss's backoff find an unclaimable
+ * row and return silently, burning the whole retry budget and deferring the dead-letter by ~15
+ * minutes (Task 13 review, Important 3).
+ */
+async function collapseClaimHorizon(
+  deps: SendExecuteDeps, orgId: string, sendId: string, claimToken: string, now: Date, lastError: string,
+): Promise<void> {
+  await withOrg(deps.db, orgId, (tx) =>
+    tx
+      .update(outboundSends)
+      .set({ claimExpiresAt: now, lastError, updatedAt: now })
+      .where(and(eq(outboundSends.id, sendId), eq(outboundSends.status, 'claimed'), eq(outboundSends.claimToken, claimToken))))
+}
+
+/**
+ * Every terminal/held/release write clears the claim: a row that is no longer `claimed` must not look
+ * held. Guarded on `status <> 'sent'` — `sent` is terminal in `outboundSendTransitions`, and the one
+ * way to reach here with a `sent` row is a deadline-overlap retry that completed the reply while this
+ * handler was inside a provider call. Downgrading it would contradict `sent_at`/`provider_message_id`
+ * and make the row eligible for Task 14's re-approve re-queue — a double-send hazard.
+ */
 async function setSendStatus(
   tx: OrgTx, sendId: string, status: 'held' | 'failed' | 'queued', p: { lastError: string; now: Date; sendAfter?: Date },
 ): Promise<void> {
@@ -480,7 +550,7 @@ async function setSendStatus(
       updatedAt: p.now,
       ...(p.sendAfter ? { sendAfter: p.sendAfter } : {}),
     })
-    .where(eq(outboundSends.id, sendId))
+    .where(and(eq(outboundSends.id, sendId), ne(outboundSends.status, 'sent')))
 }
 
 // ---------------------------------------------------------------------------
@@ -507,7 +577,7 @@ interface CompleteSendInput {
  */
 async function completeSend(l: Landing, input: CompleteSendInput): Promise<void> {
   const month = l.now.toISOString().slice(0, 7)
-  const handBack = await withOrg(l.deps.db, l.orgId, async (tx) => {
+  const { completed, handBack } = await withOrg(l.deps.db, l.orgId, async (tx) => {
     // The mailbox poll will see this same SENT message and run its own insert; whichever writer gets
     // there first wins and exactly ONE outbound row survives. `draft_id` is force-written (the poll
     // reads it off the marker too, so both agree) and the rfc id is only ever FILLED IN, never
@@ -515,6 +585,12 @@ async function completeSend(l: Landing, input: CompleteSendInput): Promise<void>
     await tx
       .insert(messages)
       .values({
+        // NOTE: this row is a RECONSTRUCTION of what went out, not a record of it — the body,
+        // subject, From and especially `sent_at` are THIS run's values, and on the recovery path the
+        // message was actually sent by an earlier attempt at an earlier instant. The marker
+        // guarantees it is the same draft, and the mailbox poll's own insert is `DO NOTHING`, so
+        // nothing corrects it later: downstream surfaces must not read an outbound `sent_at` as
+        // provider truth (Task 13 review, Minor 6).
         orgId: l.orgId, ticketId: l.ticketId, connectionId: l.connectionId, providerMessageId: input.providerMessageId,
         direction: 'outbound', fromAddress: input.fromAddress, subject: input.subject, bodyText: input.bodyText,
         rfcMessageId: input.rfcMessageId, draftId: l.draftId, sentAt: l.now,
@@ -530,7 +606,12 @@ async function completeSend(l: Landing, input: CompleteSendInput): Promise<void>
         },
       })
 
-    await tx
+    // THE completion gate. Zero rows means this reply was already completed — by a deadline-overlap
+    // retry that reclaimed, recovered by marker and finished while this handler was still inside its
+    // provider call (`expireInSeconds` equals the claim horizon, so the two windows touch). Every
+    // row write above and below is guarded or idempotent, but the meters, the audit row and the
+    // post-commit hooks are NOT: `review_sends` is a billing meter and must count one reply once.
+    const completedRows = await tx
       .update(outboundSends)
       .set({
         status: 'sent',
@@ -543,6 +624,8 @@ async function completeSend(l: Landing, input: CompleteSendInput): Promise<void>
         updatedAt: l.now,
       })
       .where(and(eq(outboundSends.id, l.sendId), eq(outboundSends.status, 'claimed')))
+      .returning({ id: outboundSends.id })
+    const completed = completedRows.length > 0
 
     // `approved → sending → sent`: the fresh path already flipped to `sending` in step 8, a recovery
     // that crashed before step 8 has not — both walk the same two guarded statements.
@@ -578,7 +661,12 @@ async function completeSend(l: Landing, input: CompleteSendInput): Promise<void>
       handBack = rows.length > 0
     }
 
-    await bumpMeter(tx, l.orgId, l.day, SEND_METERS.reviewSends)
+    if (!completed) {
+      l.deps.logger.warn({ sendId: l.sendId, providerMessageId: input.providerMessageId }, 'send.already_completed')
+      return { completed: false, handBack: false }
+    }
+
+    await bumpMeter(tx, l.orgId, l.day, SEND_METERS.reviewSends, 1)
     // At most once per ticket per calendar month — the stamp IS the dedupe, so a second send in the
     // same month matches nothing and the meter stays put.
     if (input.aiHandledMonth !== month) {
@@ -587,26 +675,34 @@ async function completeSend(l: Landing, input: CompleteSendInput): Promise<void>
         .set({ aiHandledMonth: month })
         .where(and(eq(tickets.id, l.ticketId), or(sql`${tickets.aiHandledMonth} IS NULL`, sql`${tickets.aiHandledMonth} <> ${month}`)))
         .returning({ id: tickets.id })
-      if (stamped.length > 0) await bumpMeter(tx, l.orgId, l.day, SEND_METERS.aiHandledConversations)
+      if (stamped.length > 0) await bumpMeter(tx, l.orgId, l.day, SEND_METERS.aiHandledConversations, 1)
     }
 
     await audit(tx, {
       actor: SEND_ACTOR, action: 'send.sent', entityType: 'outbound_send', entityId: l.sendId,
       detail: { recovered: input.recovered, providerMessageId: input.providerMessageId, ticketId: l.ticketId, draftId: l.draftId },
     })
-    return handBack
+    return { completed: true, handBack }
   })
 
-  // Post-commit: never inside the transaction (a queue outage must not roll back a delivered reply).
-  if (handBack) await l.deps.enqueueDraft(l.orgId, l.ticketId)
-  await l.deps.onSent?.({ orgId: l.orgId, ticketId: l.ticketId, draftId: l.draftId })
-}
+  if (!completed) return
 
-async function bumpMeter(tx: OrgTx, orgId: string, day: string, meter: string): Promise<void> {
-  await tx
-    .insert(usageCounters)
-    .values({ orgId, day, meter, value: 1 })
-    .onConflictDoUpdate({ target: [usageCounters.orgId, usageCounters.day, usageCounters.meter], set: { value: sql`${usageCounters.value} + 1` } })
+  // Post-commit: never inside the transaction (a queue outage must not roll back a delivered reply),
+  // and never allowed to propagate — the reply IS sent, and letting a queue hiccup or Phase 5's
+  // memory capture surface as a send failure would dead-letter a delivered message on the last
+  // attempt (Task 13 review, Important 1).
+  if (handBack) {
+    try {
+      await l.deps.enqueueDraft(l.orgId, l.ticketId)
+    } catch (err) {
+      l.deps.logger.warn({ sendId: l.sendId, ticketId: l.ticketId, error: errorMessage(err) }, 'send.handback_enqueue_failed')
+    }
+  }
+  try {
+    await l.deps.onSent?.({ orgId: l.orgId, ticketId: l.ticketId, draftId: l.draftId })
+  } catch (err) {
+    l.deps.logger.warn({ sendId: l.sendId, ticketId: l.ticketId, error: errorMessage(err) }, 'send.on_sent_failed')
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -642,17 +738,41 @@ async function execute(deps: SendExecuteDeps, payload: SendExecutePayload, ctx: 
     deps.logger.info({ sendId, attempt: ctx.attempt }, 'send.execute_not_claimable')
     return
   }
-  const { claimToken, send, draft, ticket, agent, connection, workspace } = claimed
-  const l: Landing = { deps, orgId, sendId, draftId: draft.id, ticketId: ticket.id, connectionId: send.connectionId, now, day }
+  const l: Landing = {
+    deps, orgId, sendId, draftId: claimed.draft.id, ticketId: claimed.ticket.id,
+    connectionId: claimed.send.connectionId, now, day,
+  }
 
-  const lever = firstKillLever(claimed)
-  if (lever) {
-    await landHeld(l, lever)
+  try {
+    await afterClaim(deps, ctx, claimed, l)
+  } catch (err) {
+    // The claim is COMMITTED, so any throw from here on would otherwise leave the row `claimed` for
+    // a full 600 s while pg-boss's first three or four retries land inside that horizon, match
+    // nothing and return silently — the retry budget burnt doing nothing and the dead-letter
+    // deferred by ~15 minutes. Collapse the horizon on our own token so the very next retry
+    // reclaims (and, as always, scans first). A no-op when a landing already released the row.
+    await collapseClaimHorizon(deps, orgId, sendId, claimed.claimToken, deps.now?.() ?? new Date(), errorMessage(err))
+    throw err
+  }
+}
+
+/**
+ * Step 1's landings through step 11 — everything the COMMITTED claim owns. Split out of `execute`
+ * only so its single caller can wrap it in the claim-horizon collapse; the step order is unchanged.
+ */
+async function afterClaim(deps: SendExecuteDeps, ctx: SendExecuteContext, claimed: ClaimedSend, l: Landing): Promise<void> {
+  const { orgId, sendId, now } = l
+  const { claimToken, send, draft, ticket, agent, connection, workspace } = claimed
+
+  // A missing agent row holds at step 1 for ANY draft status, levers-deferred or not: without it
+  // there is no persona, no signature and no From address, so there is nothing to send AND nothing
+  // for `completeSend` to reconstruct a `messages` row from on a recovery. It is the one lever that
+  // makes even recovery impossible, so it keeps its place ahead of the scan — and it is what proves
+  // `agent` non-null for the policy (step 2) and the threading (step 7) below.
+  if (agent === null) {
+    await landHeld(l, 'agent_inactive')
     return
   }
-  // `firstKillLever` reports a missing agent row as `agent_inactive`, so reaching here proves there
-  // is one — a send with no persona and no From address is exactly as un-sendable as a paused agent.
-  if (agent === null) throw new Error(`send.execute: send ${sendId} passed the kill levers with no agent`)
   const sendingAgent = agent
 
   // A draft the owner rejected, or one a newer draft superseded, must never go out on a late claim.
@@ -664,6 +784,20 @@ async function execute(deps: SendExecuteDeps, payload: SendExecutePayload, ctx: 
   }
   if (draft.finalBody === null) {
     await landTerminal(l, 'draft has no final body')
+    return
+  }
+
+  /**
+   * The kill levers (controller ruling, fix round 1). For an `approved` draft nothing has been
+   * attempted yet, so they apply HERE, ahead of everything. For a `sending` draft — a crash
+   * re-entry — they are DEFERRED past the recovery scan: a lever flipped after a reply was already
+   * delivered must not turn that reply into a `held` send the owner is told never went out. On a
+   * scan HIT the send completes regardless of the levers; on a MISS they apply before staleness.
+   */
+  const deferLevers = draft.status === 'sending'
+  const lever = firstKillLever(claimed)
+  if (lever && !deferLevers) {
+    await landHeld(l, lever)
     return
   }
 
@@ -708,8 +842,22 @@ async function execute(deps: SendExecuteDeps, payload: SendExecutePayload, ctx: 
     )
   } catch (err) {
     if (!(err instanceof ProviderAuthError)) throw err
-    // `getAccessToken` already flipped the connection to `reauth_required`. Hold the send (the
-    // owner's approval survives) and tell them to reconnect, once per UTC day.
+    // `getAccessToken` already flipped the connection to `reauth_required`; either way the owner
+    // hears about it, once per UTC day.
+    if (deferLevers) {
+      // A crash re-entry: the credential died before we could scan, so DELIVERY IS UNVERIFIED and
+      // holding would park a possibly-delivered reply in a state nothing can move. Release for a
+      // retry and throw — a reconnect inside the retry budget recovers by marker, and the last
+      // attempt dead-letters into `send_failed`, which is a state the owner can act on.
+      await withOrg(deps.db, orgId, (tx) =>
+        setSendStatus(tx, sendId, 'queued', {
+          lastError: 'reauth_required: delivery unverified', now,
+          sendAfter: new Date(now.getTime() + RELEASE_RETRY_SECONDS * 1000),
+        }))
+      await notifyReauthRequired({ db: deps.db, enqueueNotify: deps.enqueueNotify }, orgId, send.connectionId, now)
+      throw err
+    }
+    // Nothing was attempted: hold the send (the owner's approval survives) and page them.
     await withOrg(deps.db, orgId, async (tx) => {
       await setSendStatus(tx, sendId, 'held', { lastError: 'reauth_required', now })
       await tx.update(drafts).set({ status: 'held' }).where(and(eq(drafts.id, draft.id), eq(drafts.status, 'approved')))
@@ -754,6 +902,14 @@ async function execute(deps: SendExecuteDeps, payload: SendExecutePayload, ctx: 
         recovered: true, providerMessageId: recoveredId, providerThreadId: ticket.providerThreadId, rfcMessageId,
         fromAddress, subject, bodyText, threadSnapshotAt: draft.threadSnapshotAt, aiHandledMonth: ticket.aiHandledMonth,
       })
+      return
+    }
+
+    // The deferred levers (see `deferLevers` above). The scan proved nothing was delivered, so a
+    // lever now means the same thing it would have meant at step 1 — with the wider draft guard
+    // (`sending → held`) so the send and the draft move together.
+    if (lever) {
+      await landHeld(l, lever)
       return
     }
 
@@ -810,16 +966,21 @@ async function execute(deps: SendExecuteDeps, payload: SendExecutePayload, ctx: 
 
     // --- Step 8: the atomic pre-send flip, immediately before the send. Zero rows means the claim
     // was lost (its horizon expired and another worker took it) — that worker owns the send now.
+    // A FRESH clock read, not the run-start `now`: `claim_expires_at` was written as `now + 600` by
+    // this same run's claim, so comparing against the start instant makes that half of the predicate
+    // vacuously true. What it is meant to assert is that the horizon has not lapsed WHILE the scan
+    // and the thread read were running.
+    const flipAt = deps.now?.() ?? new Date()
     const stillOurs = await withOrg(deps.db, orgId, async (tx) => {
       const rows = await tx
         .update(outboundSends)
-        .set({ updatedAt: now })
+        .set({ updatedAt: flipAt })
         .where(
           and(
             eq(outboundSends.id, sendId),
             eq(outboundSends.status, 'claimed'),
             eq(outboundSends.claimToken, claimToken),
-            gt(outboundSends.claimExpiresAt, now),
+            gt(outboundSends.claimExpiresAt, flipAt),
           ),
         )
         .returning({ id: outboundSends.id })
@@ -858,14 +1019,10 @@ async function execute(deps: SendExecuteDeps, payload: SendExecutePayload, ctx: 
         },
       })
     } catch (err) {
-      // Collapse the claim horizon to `now` so the pg-boss retry can reclaim IMMEDIATELY and scan
-      // first. Status stays `claimed` and the draft stays `sending`: this run genuinely does not know
+      // Collapse the claim horizon so the pg-boss retry can reclaim IMMEDIATELY and scan first.
+      // Status stays `claimed` and the draft stays `sending`: this run genuinely does not know
       // whether the customer has the mail, and only the marker scan can answer that.
-      await withOrg(deps.db, orgId, (tx) =>
-        tx
-          .update(outboundSends)
-          .set({ claimExpiresAt: now, lastError: errorMessage(err), updatedAt: now })
-          .where(and(eq(outboundSends.id, sendId), eq(outboundSends.claimToken, claimToken))))
+      await collapseClaimHorizon(deps, orgId, sendId, claimToken, now, errorMessage(err))
       throw err
     }
 
