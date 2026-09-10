@@ -7,7 +7,7 @@ export function Button({ label, onPress, variant = 'primary', loading = false, d
   const c = useColors()
   const inactive = disabled || loading
   const bg = variant === 'primary' ? c.primary : variant === 'danger' ? c.danger : c.surface
-  const fg = variant === 'secondary' ? c.text : c.onPrimary
+  const fg = variant === 'secondary' ? c.text : variant === 'danger' ? c.onDanger : c.onPrimary
   return (
     <Pressable
       role="button" accessibilityLabel={label} accessibilityState={{ disabled: inactive, busy: loading }} disabled={inactive} onPress={onPress} testID={testID}

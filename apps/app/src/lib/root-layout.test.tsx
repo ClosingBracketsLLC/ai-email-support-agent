@@ -28,6 +28,7 @@ test('holds the splash and renders nothing until the fonts are ready, then hides
   mockFonts = { ready: false }
   const view = await render(<RootLayout />)
   expect(screen.queryByTestId('stack')).toBeNull()
+  expect(view.toJSON()).toBeNull()
   expect(mockHide).not.toHaveBeenCalled()
 
   mockFonts = { ready: true }

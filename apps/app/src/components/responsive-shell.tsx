@@ -1,15 +1,15 @@
-import Ionicons from '@expo/vector-icons/Ionicons'
 import { useRouter, usePathname } from 'expo-router'
 import { Tabs } from 'expo-router/js-tabs'
 import { Pressable, StyleSheet, Text, View, useWindowDimensions } from 'react-native'
+import { Lockup } from './brand'
+import { Icon, type IconName } from './icon'
 import { WIDE_BREAKPOINT, radius, spacing, typeScale, useColors } from '@/theme'
 
-type Glyph = keyof typeof Ionicons.glyphMap
-interface TabDef { name: 'inbox' | 'activity' | 'settings'; title: string; icon: Glyph; iconActive: Glyph; href: '/inbox' | '/activity' | '/settings' }
+interface TabDef { name: 'inbox' | 'activity' | 'settings'; title: string; icon: IconName; href: '/inbox' | '/activity' | '/settings' }
 const TABS: TabDef[] = [
-  { name: 'inbox', title: 'Inbox', icon: 'mail-outline', iconActive: 'mail', href: '/inbox' },
-  { name: 'activity', title: 'Activity', icon: 'pulse-outline', iconActive: 'pulse', href: '/activity' },
-  { name: 'settings', title: 'Settings', icon: 'settings-outline', iconActive: 'settings', href: '/settings' },
+  { name: 'inbox', title: 'Inbox', icon: 'inbox', href: '/inbox' },
+  { name: 'activity', title: 'Activity', icon: 'activity', href: '/activity' },
+  { name: 'settings', title: 'Settings', icon: 'settings', href: '/settings' },
 ]
 
 /**
@@ -35,7 +35,7 @@ export function ResponsiveShell() {
       <View style={styles.main}>
         <Tabs screenOptions={{ headerShown: false, tabBarActiveTintColor: c.primary, tabBarInactiveTintColor: c.muted, tabBarStyle: wide ? { display: 'none' } : { backgroundColor: c.bg, borderTopColor: c.border } }}>
           {TABS.map((t) => (
-            <Tabs.Screen key={t.name} name={t.name} options={{ title: t.title, tabBarButtonTestID: `tab-${t.name}`, tabBarIcon: ({ color, focused }) => <Ionicons name={focused ? t.iconActive : t.icon} size={22} color={color} /> }} />
+            <Tabs.Screen key={t.name} name={t.name} options={{ title: t.title, tabBarButtonTestID: `tab-${t.name}`, tabBarIcon: ({ color }) => <Icon name={t.icon} size={22} color={color as string} /> }} />
           ))}
           {/* The ticket thread is reached only from an inbox row or a push tap (router.push), never from
               a tab button — `href: null` keeps it out of the tab bar; `expo-router`'s `Tabs` otherwise
@@ -53,14 +53,14 @@ function Sidebar({ pathname }: { pathname: string }) {
   const router = useRouter()
   return (
     <View style={[styles.sidebar, { borderRightColor: c.border, backgroundColor: c.surface }]} accessibilityRole="menu">
-      <Text style={[typeScale.heading, styles.brand, { color: c.text }]}>aesa</Text>
+      <View style={styles.brand}><Lockup height={24} /></View>
       {TABS.map((t) => {
         const active = pathname === t.href || pathname.startsWith(`${t.href}/`)
         return (
           // expo-router's `Link asChild` wrapping `Pressable` crashes on web ("Failed to set an indexed
           // property [0] on 'CSSStyleDeclaration'") the first time it mounts — router.push avoids it.
           <Pressable key={t.name} accessibilityRole="menuitem" testID={`nav-${t.name}`} onPress={() => router.push(t.href)} style={[styles.item, active && { backgroundColor: c.primaryTint }]}>
-            <Ionicons name={active ? t.iconActive : t.icon} size={20} color={active ? c.primary : c.muted} />
+            <Icon name={t.icon} size={20} color={active ? c.primary : c.muted} />
             <Text style={[typeScale.body, { color: active ? c.primary : c.text }]}>{t.title}</Text>
           </Pressable>
         )

@@ -14,15 +14,14 @@ const files = walk(SRC)
 
 describe('the app follows the brand type and colour rules', () => {
   it('never sets fontWeight — each weight is a registered family (theme.ts `font`)', () => {
-    const offenders = files.filter((f) => /fontWeight/.test(readFileSync(f, 'utf8')))
+    const offenders = files.filter((f) => /fontWeight\s*:/.test(readFileSync(f, 'utf8')))
     expect(offenders.map((f) => f.slice(SRC.length))).toEqual([])
   })
   it('never hard-codes a colour outside theme.ts', () => {
     const offenders = files.filter((f) => !f.endsWith('theme.ts') && /#[0-9a-fA-F]{6}\b|rgba?\(/.test(readFileSync(f, 'utf8')))
     expect(offenders.map((f) => f.slice(SRC.length))).toEqual([])
   })
-  // Task 6 unskips: the shell still uses Ionicons (`@expo/vector-icons`) until Task 6 replaces it.
-  it.skip('never imports the icon font', () => {
+  it('never imports the icon font', () => {
     const offenders = files.filter((f) => /@expo\/vector-icons/.test(readFileSync(f, 'utf8')))
     expect(offenders.map((f) => f.slice(SRC.length))).toEqual([])
   })

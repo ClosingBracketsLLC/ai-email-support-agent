@@ -24,8 +24,6 @@ jest.mock('expo-router/js-tabs', () => {
   return { Tabs }
 })
 
-jest.mock('@expo/vector-icons/Ionicons', () => () => null)
-
 // Mocking the whole 'react-native' barrel (spreading jest.requireActual('react-native')) forces every one of
 // its lazy getters (DevMenu, Clipboard, ProgressBarAndroid, ...) to evaluate eagerly, which throws
 // ("TurboModuleRegistry.getEnforcing(...): 'DevMenu' could not be found") in this jest environment. Mocking
@@ -54,12 +52,15 @@ test('the Tabs navigator survives crossing the wide breakpoint — one instance 
   expect(mockMounts).toBe(1)
   expect(mockUnmounts).toBe(0)
   expect(screen.getByTestId('nav-inbox')).toBeTruthy()
+  expect(screen.getByTestId('brand-lockup')).toBeTruthy()
+  expect(screen.getAllByTestId('icon-inbox').length).toBeGreaterThanOrEqual(1)
 
   mockDims = { width: 400, height: 800, scale: 1, fontScale: 1 }
   await view.rerender(<ResponsiveShell />)
   expect(mockMounts).toBe(1)
   expect(mockUnmounts).toBe(0)
   expect(screen.queryByTestId('nav-inbox')).toBeNull()
+  expect(screen.queryByTestId('brand-lockup')).toBeNull()
 })
 
 test('while wide, pressing a sidebar item navigates with router.push (Link asChild crashed on web)', async () => {

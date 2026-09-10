@@ -29,10 +29,8 @@ export type Colors = { [K in keyof typeof palettes.light]: string }
 
 /**
  * Family names as expo-font registers the bundled faces (src/lib/fonts.ts): ONE family per weight.
- * Styles therefore never request a weight through the style prop — with a single-face family Android
- * fakes the bold and iOS ignores the request; naming the 600 face is the only way to get the real one
- * on both. (`brand/test/app-typography.test.ts` greps the app's source for that style property's name;
- * this comment avoids spelling it out so it does not trip the guard on its own explanation.)
+ * Styles never set `fontWeight` — with a single-face family Android fakes the bold and iOS ignores
+ * it; name the 600 face instead.
  */
 export const font = {
   display: 'Fraunces_600SemiBold',

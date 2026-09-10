@@ -6,6 +6,7 @@ import { SafeAreaView } from 'react-native-safe-area-context'
 import type { RejectAction } from '@aesa/contracts'
 import { Banner } from '@/components/banner'
 import { Button } from '@/components/button'
+import { Chip, type ChipTone } from '@/components/chip'
 import { Loading } from '@/components/loading'
 import { Heading, Muted } from '@/components/typography'
 import { useTRPC } from '@/lib/trpc'
@@ -15,6 +16,8 @@ import { reasonSentence } from './reason-labels'
 
 /** How often the ticket re-reads itself while a reply is on its way out (spec §Send). */
 const TICKET_POLL_MS = 10_000
+
+const TICKET_STATUS_TONE: Record<string, ChipTone> = { awaiting_review: 'primary', auto_sending: 'primary', needs_owner: 'warning', waiting_on_customer: 'success', resolved: 'success' }
 
 interface AttachmentMeta { filename?: string; mime?: string; size?: number }
 /** `messages.attachments` is a jsonb column typed `unknown` at the schema level (comment: "[{filename,
@@ -249,9 +252,7 @@ export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?:
         <BackRow onBack={() => router.back()} />
         <Heading numberOfLines={1}>{ticket.subject || '(no subject)'}</Heading>
         <View style={styles.headerMeta}>
-          <View style={[styles.statusChip, { borderColor: c.border }]} testID="ticket-status">
-            <Text style={[typeScale.caption, { color: c.text }]}>{ticket.status}</Text>
-          </View>
+          <Chip tone={TICKET_STATUS_TONE[ticket.status] ?? 'neutral'} testID="ticket-status">{ticket.status}</Chip>
           {ticket.agentAddress ? <Muted>{ticket.agentAddress}</Muted> : null}
           {ticket.categoryLabel ? <Muted>{ticket.categoryLabel}</Muted> : null}
         </View>
@@ -348,7 +349,6 @@ const styles = StyleSheet.create({
   header: { padding: spacing.md, gap: spacing.xs, borderBottomWidth: StyleSheet.hairlineWidth },
   backRow: { paddingVertical: spacing.xs },
   headerMeta: { flexDirection: 'row', gap: spacing.sm, flexWrap: 'wrap', alignItems: 'center' },
-  statusChip: { borderWidth: 1, borderRadius: radius.lg, paddingHorizontal: spacing.sm, paddingVertical: 2 },
   messages: { padding: spacing.md, gap: spacing.sm },
   bubbleRow: { flexDirection: 'row' },
   bubbleRowOut: { justifyContent: 'flex-end' },

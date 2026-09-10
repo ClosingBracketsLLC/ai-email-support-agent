@@ -4,16 +4,27 @@ import { font, palettes, radius, spacing, typeScale } from './theme'
 test('every palette value is a brand token of its own theme, and both themes share one key set', () => {
   const light = new Set<string>(Object.values(BRAND.light))
   const dark = new Set<string>(Object.values(BRAND.dark))
-  // Jest's `expect()` takes exactly one argument (no vitest-style message param), so each assertion
-  // below carries its own diagnostic in a comment rather than a second argument.
-  for (const [, v] of Object.entries(palettes.light)) expect(light.has(v)).toBe(true) // every light.<k> = <v> must be a light-theme token
-  for (const [, v] of Object.entries(palettes.dark)) expect(dark.has(v)).toBe(true) // every dark.<k> = <v> must be a dark-theme token
+  // A failure here names the offending key rather than just reporting a boolean.
+  expect(Object.entries(palettes.light).filter(([, v]) => !light.has(v))).toEqual([])
+  expect(Object.entries(palettes.dark).filter(([, v]) => !dark.has(v))).toEqual([])
   expect(Object.keys(palettes.dark)).toEqual(Object.keys(palettes.light))
 })
 
 test('roles map to the documented tokens', () => {
-  expect(palettes.light).toMatchObject({ bg: BRAND.light.paper, surface: BRAND.light.mist, text: BRAND.light.ink, muted: BRAND.light.slate, border: BRAND.light.line, primary: BRAND.light.primary, primaryTint: BRAND.light.primaryTint, onPrimary: BRAND.light.primaryOn })
-  expect(palettes.dark).toMatchObject({ bg: BRAND.dark.night, surface: BRAND.dark.nightSurface, text: BRAND.dark.paperOnNight, muted: BRAND.dark.slateOnNight, border: BRAND.dark.lineOnNight, primary: BRAND.dark.lifted, primaryTint: BRAND.dark.liftedTint, onPrimary: BRAND.dark.liftedOn })
+  const L = BRAND.light
+  const D = BRAND.dark
+  expect(palettes.light).toMatchObject({
+    bg: L.paper, surface: L.mist, text: L.ink, muted: L.slate, border: L.line, primary: L.primary, primaryTint: L.primaryTint, onPrimary: L.primaryOn,
+    success: L.success, successTint: L.successTint, successText: L.successText, successSolid: L.successSolid, onSuccess: L.successOn,
+    warning: L.warning, warningTint: L.warningTint, warningText: L.warningText, onWarning: L.warningOn,
+    danger: L.danger, dangerTint: L.dangerTint, dangerText: L.dangerText, onDanger: L.dangerOn,
+  })
+  expect(palettes.dark).toMatchObject({
+    bg: D.night, surface: D.nightSurface, text: D.paperOnNight, muted: D.slateOnNight, border: D.lineOnNight, primary: D.lifted, primaryTint: D.liftedTint, onPrimary: D.liftedOn,
+    success: D.success, successTint: D.successTint, successText: D.successText, successSolid: D.successSolid, onSuccess: D.successOn,
+    warning: D.warning, warningTint: D.warningTint, warningText: D.warningText, onWarning: D.warningOn,
+    danger: D.danger, dangerTint: D.dangerTint, dangerText: D.dangerText, onDanger: D.dangerOn,
+  })
 })
 
 test('the type scale names a family per weight and never a fontWeight', () => {
