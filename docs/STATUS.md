@@ -775,6 +775,10 @@ the record)</summary>
   13. **No pixel/screenshot test of the rendered SVG components** (jest-expo has no SVG
       rasteriser) — structural assertions (which paths, transforms, fills) plus the
       rebuild-and-diff build test plus the Playwright smoke are the visual gate.
+  14. **Spec §6's header lockup is met on wide layouts (the sidebar) and the sign-in screen only.**
+      On a phone the tabs run `headerShown: false` (`responsive-shell.tsx`), so after sign-in the
+      phone shows no brand chrome in the inbox/activity/settings tabs — unchanged from the
+      pre-branch app; see *Open items for Robert*.
 - Execution-time rulings recorded during the build: no separate worktree (the repo's standing
   practice); the SVG regex helpers (`allPathData`, `pathData`, `viewBox`, `hullBounds`) live in
   `brand/scripts/svg.ts`, imported by both `brand/test/*` and `scripts/build.ts` rather than
@@ -795,6 +799,31 @@ the record)</summary>
   requested and is untouched. One more from execution: the bottom tab bar's active state is now
   colour-only — one icon variant per name (spec §5) — a WCAG 1.4.1 point for the whole-branch
   review or a later pass; the sidebar keeps a tint as a second channel alongside colour.
+- **Fix wave** (whole-branch review, "with fixes"): `4a7f110` (app: the three Important findings
+  below), `78e8ec4` (api: a comment-only fix), and this commit (brand/docs). The three Important
+  findings: the font bundle went from 32 bundled faces to the 5 the theme names — `fonts.ts` now
+  imports each face from its own per-weight subpath (`@expo-google-fonts/fraunces/500Medium` etc.)
+  instead of the package barrel, verified by the web export's `.ttf` count; the sidebar's active
+  label was `primary` text on `primaryTint` (4.46, below AA) and is now `c.text` at
+  `typeScale.bodyStrong` (14.78), which also resolves the carry-over above — the bottom tab bar's
+  `tabBarLabel` now renders `font.uiStrong` on the focused tab as its own second channel alongside
+  colour (WCAG 1.4.1), replacing the outline/filled icon pair this branch removed. Also in this
+  wave: `brand/icons/LICENSE` (Lucide's ISC text, verbatim, plus the derivation note), both
+  `brand.md` §9 and `README.md` pointing at it; the `agent-edit.tsx` category pills now render
+  through `Chip`; `brand.tsx`'s mark/wordmark aspect ratios derive from their viewBox strings; the
+  app-typography colour guard tightened to catch 3–8-digit hex and `hsla?()` too (still zero
+  offenders); three doc corrections (`brand.md`'s `Mark`/`Wordmark`/`Lockup` default heights, the
+  `_layout.tsx` splash comment, one `pages.ts` comment); the README's rebuild sentence on
+  `resvg`'s native build being platform-specific. Re-run gate: typecheck and lint clean across all
+  14 packages/apps; `pnpm test` green with **1,788 tests** plus 4 conditional skips (`@aesa/app`
+  287, up 1 from the review baseline; every other package/app unchanged from the review's count —
+  see that record above); `db:check` reports no drift; the Expo web export still produces **21
+  static routes** and now **5 `.ttf` files** (down from 32); `pnpm e2e` passes. One flake noted,
+  not fixed here: `apps/worker/test/e2e-phase3.test.ts`'s test 10 (`send.execute`'s follow-up
+  draft) intermittently misses its `waitFor` window under the full monorepo `pnpm test`'s CPU
+  contention — reproduced on the pre-fix-wave tree too, passes reliably standalone
+  (`pnpm --filter @aesa/worker test test/e2e-phase3.test.ts`), and `apps/worker` has no dependency
+  on anything this wave touched.
 
 ## Next: Phase 4 — knowledge
 
@@ -1015,3 +1044,11 @@ send/reply/follow-up walk against both providers from both a Gmail and an outloo
 recording the cache-hit fixture (`LLM_RECORD=1 … tsx packages/llm/scripts/record-cache-hit.ts`) and
 committing it, an EAS dev build to verify the Review/Hold push actions on iOS and Android, and
 confirming the 08:00-local digest email with working one-click links.
+
+Brand deviation 14: whether the phone inbox should get a small header lockup, now that spec §6's
+header lockup is met only on wide layouts and the sign-in screen — a phone shows no brand chrome
+in the inbox/activity/settings tabs, unchanged from the pre-branch app.
+
+Open the web export signed in at a wide window and at phone width once — the tab icons, the
+sidebar lockup and the sign-in lockup have not been rendered in a browser by any gate (the
+Playwright smoke ends at the gated mailbox step, per Phase 2's Task 20 ruling).

@@ -21,7 +21,10 @@ lockups, `og-image.svg` — plus everything under `apps/app/assets/`, everything
 then commit the outputs it writes (18 files: see `scripts/build.ts`'s `OUTPUT_PATHS`).
 `brand/test/build.test.ts` runs the same build into memory and fails if any committed byte
 differs from what the sources produce — that test, not a checklist, is the whole workflow: change
-a source, run the build, commit, and the test tells you if you forgot a file.
+a source, run the build, commit, and the test tells you if you forgot a file. The byte-for-byte
+comparison is over PNGs rendered by `@resvg/resvg-js`'s native (N-API) build, which is
+platform-specific: rebuild on linux-x64 (CI's platform) or expect CI to report a pixel-level diff
+after a rebuild on another architecture.
 
 ## Rules in brief
 
@@ -46,5 +49,6 @@ them, see `scripts/derive/README.md`.
 
 - Fraunces: SIL Open Font License 1.1.
 - Plus Jakarta Sans: SIL Open Font License 1.1.
-- The eight product icons: Lucide, ISC.
+- The eight product icons: Lucide 1.44.0 shapes with non-`<path>` primitives rewritten as paths,
+  ISC (a Feather-derived MIT notice covers a subset) — full text at `brand/icons/LICENSE`.
 - The mark and wordmark artwork, the lockups and the token system are ClosingBrackets LLC's work.

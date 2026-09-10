@@ -42,8 +42,9 @@ Colourways (four only):
 | lifted (blue) | `#93B4FF` | the mark on night (`#0B1220`) — app icon, splash, OG card |
 
 Clear space around the mark equals the height of the `a`'s bowl. Minimum sizes: 16 px for the bare
-mark, 24 px inside a lockup (the app's `Mark`/`Lockup` components in
-`apps/app/src/components/brand.tsx` default to exactly those heights). Do/don't: the mark is
+mark, 24 px inside a lockup — the caller's own rule, not a default the components enforce:
+`apps/app/src/components/brand.tsx`'s `Mark`, `Wordmark` and `Lockup` default their own `height`
+prop to 24 px, 20 px and 24 px respectively. Do/don't: the mark is
 always a filled outline — never a stroke — and never rotated, outlined, shadowed or recoloured
 outside the four colourways above.
 
@@ -295,7 +296,9 @@ The consumers (source files, not generated, but built against `BRAND`):
   typefaces themselves stay non-exclusive; the OFL's reserved-name clause (a modified *font file*
   must be renamed) does not apply here because no font file ships modified — the mark and wordmark
   are SVG path outlines, and the bundled app fonts are the unmodified Google Fonts statics.
-- Lucide icons: ISC.
+- Lucide icons: ISC (a Feather-derived MIT notice covers the subset Lucide's own LICENSE names) —
+  full text at `brand/icons/LICENSE`; §7 records which of the eight files derives from which
+  Lucide source and the non-`<path>`-primitive rewrite.
 - The mark and wordmark artwork, the two lockups and the token system (`tokens.json`, the colour
   and type scale) are ClosingBrackets LLC's own work. Trademark registration of the mark is
   Robert's call and an attorney's review — nothing here constitutes one.

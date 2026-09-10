@@ -18,7 +18,7 @@ describe('the app follows the brand type and colour rules', () => {
     expect(offenders.map((f) => f.slice(SRC.length))).toEqual([])
   })
   it('never hard-codes a colour outside theme.ts', () => {
-    const offenders = files.filter((f) => !f.endsWith('theme.ts') && /#[0-9a-fA-F]{6}\b|rgba?\(/.test(readFileSync(f, 'utf8')))
+    const offenders = files.filter((f) => !f.endsWith('theme.ts') && /#[0-9a-fA-F]{3,8}\b|\b(?:rgba?|hsla?)\(/.test(readFileSync(f, 'utf8')))
     expect(offenders.map((f) => f.slice(SRC.length))).toEqual([])
   })
   it('never imports the icon font', () => {
