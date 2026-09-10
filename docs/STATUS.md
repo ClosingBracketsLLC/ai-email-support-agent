@@ -704,13 +704,107 @@ the record)</summary>
   their guarded UPDATE's `RETURNING`, the draft insert retiring every live draft except `sending`,
   and the app's five copy/state minors.
 
+### Brand — the aesa identity (complete on branch `brand`; PR follows PR #3)
+
+- Plan: `docs/superpowers/plans/2026-09-10-brand-system.md` (7 tasks, executed with
+  subagent-driven development). Commits `0f3efbe..1d843c7` on `brand`, branched from `phase-3` at
+  `7a40be2` — the spec commit (`0f3efbe`), the derivation-record and STATUS hand-off commit
+  (`963d21e`), the plan commit (`d604089`), and six task commits with no fix-wave commit (each
+  task reviewed clean): `b736516` (Task 1, the `@aesa/brand` package, `tokens.json`, the pinned
+  WCAG pairs), `e564be4` (Task 2, the mark and wordmark sources plus the wordmark derivation and
+  the eight Lucide-based icons), `b2fa0c9` (Task 3, the build — lockups, colourways, OG card,
+  rasters, ICO, the generated `BRAND` module), `073e9f5` (Task 4, the api's favicons/social
+  card/review-page CSS), `658b70e` (Task 5, the app's theme, bundled fonts, `app.json`),
+  `1d843c7` (Task 6, the app's SVG mark/wordmark/lockup, the eight icons, brand-toned chips and
+  banners) — plus the docs commit that closes it (this commit, Task 7). A whole-branch review
+  follows this record, per `superpowers:subagent-driven-development`; its fixes, if any, are
+  appended below afterward. Gate at this commit: typecheck and lint clean across all 14
+  packages/apps (`brand` added); `pnpm test` green with **1,787 tests** plus 4 conditional skips
+  (`@aesa/contracts` 21, `@aesa/crypto` 42, `brand` 110, `@aesa/platform-mail` 18, `@aesa/core`
+  204, `@aesa/llm` 98, `@aesa/agent` 65, `@aesa/db` 72, `@aesa/queue` 17, `@aesa/mail` 237,
+  `@aesa/test-kit` 43 [39 run + 4 conditional skips], `apps/api` 221, `apps/worker` 357, `apps/app`
+  286 jest across 40 suites); `db:check` reports no drift; the Expo web export produces **21
+  static routes** (unchanged — no new route file); `pnpm e2e` passes (still ending at the gated
+  mailbox step, per Phase 2's Task 20 ruling).
+- What exists now: the root-level `@aesa/brand` workspace package (`brand/`) — its four sources
+  (`tokens.json`, `mark.svg`, `wordmark.svg`, `icons/*.svg`), the Python derivation
+  (`scripts/derive/`, reproducible byte for byte against the spec's Appendix A), `scripts/{svg,
+  compose,ico,build}.ts`, and `pnpm brand:build`'s 18 generated outputs (the other three mark
+  colourways, the two lockups and the OG card SVG under `brand/`; five PNGs in
+  `apps/app/assets/`; six files in `apps/api/public/`; `packages/contracts/src/brand.ts`'s
+  `BRAND`); the api's six-file asset allowlist (`src/brand/assets.ts`, ETag, a day of caching),
+  the token-built review CSS and inline SVG wordmark (`src/brand/css.ts`), and the review pages
+  restyled on both (`src/review/pages.ts`); the app's theme (`src/theme.ts`'s
+  `palettes`/`font`/`typeScale` over `BRAND`), the five bundled Fraunces/Plus Jakarta Sans faces
+  behind the splash hold (`src/lib/fonts.ts`), the `Mark`/`Wordmark`/`Lockup` SVG components and
+  the `Icon` component's eight product icons (`src/components/{brand,icon}.tsx`), the brand-toned
+  `Chip`, the shell's sidebar lockup and SVG tab icons (no `@expo/vector-icons` import remains),
+  and `app.json` built on the tokens. `brand/brand.md` is the guide; `brand/README.md` is the
+  short version.
+- Deviations from the spec, all recorded in the plan's deviations list:
+  1. **`@resvg/resvg-js` is a devDependency of `@aesa/brand`, not the root** — the native N-API
+     build (same Rust renderer as `@resvg/resvg-wasm`, no system libraries, faster).
+  2. **Fraunces optical size 36 is not used in the app.** The `@expo-google-fonts/fraunces`
+     statics are cut at the axis default (opsz 144); nothing in the app sets display type in the
+     18–27 px range the spec reserves for opsz 36. The landing page can use the variable font.
+  3. **The Android adaptive-icon foreground draws the mark at 35% of the tile height, not 56%** —
+     56% clips on Android's 66/108 safe-circle mask; iOS and the Apple touch icon keep 56% (iOS
+     only rounds corners).
+  4. **The splash "20% of the short edge" becomes `imageWidth: 108` in `app.json`** —
+     `expo-splash-screen` sizes by width in dp regardless of device, fixed against a 390-pt
+     reference phone.
+  5. **Two dark-theme tokens the spec's prose omits are added:** `lineOnNight` (borders on night)
+     and `liftedOn` (text on a lifted-blue button, 9.11).
+  6. **`primary` text on `primaryTint` is 4.46 — below AA for body text**, pinned as a
+     large-text-only pair (≥ 18.66 px bold); chips and selected cards use `ink` text instead.
+  7. **The mark, wordmark, horizontal-lockup geometry and the eight icon path lists all ride in
+     the generated `BRAND`** (`BRAND.paths`, `BRAND.icons`) — no second generated file in the app,
+     and the app's lockup is byte-identical in geometry to `brand/lockup-horizontal.svg`.
+  8. **`brand/mark.svg` and `brand/wordmark.svg` carry TIGHT viewBoxes**, not the spec appendix's
+     40-unit padded box — padding is a placement decision (clear space), not baked into an asset.
+  9. **The colourway marks, the two lockups and `og-image.svg` are build OUTPUTS**, not sources —
+     one rebuild after a mark change propagates everywhere, proven byte-for-byte by a test.
+  10. **The lockup geometry is made exact:** the mark's top meets the wordmark's ascender line
+      (1484 font units), the gap is one stem width (240 units); the stacked lockup's gap is half
+      the mark's height.
+  11. **No dark-mode social card and no dark favicon variant.** `og.png` already IS the night card
+      the spec asks for; the favicon SVG (azure on transparent) has no text/background pair to
+      screen.
+  12. **Sign-in copy changes from "Sign in to aesa" to "Sign in"** under the new header lockup —
+      the name is now the lockup, so repeating it in the title read as a stutter.
+  13. **No pixel/screenshot test of the rendered SVG components** (jest-expo has no SVG
+      rasteriser) — structural assertions (which paths, transforms, fills) plus the
+      rebuild-and-diff build test plus the Playwright smoke are the visual gate.
+- Execution-time rulings recorded during the build: no separate worktree (the repo's standing
+  practice); the SVG regex helpers (`allPathData`, `pathData`, `viewBox`, `hullBounds`) live in
+  `brand/scripts/svg.ts`, imported by both `brand/test/*` and `scripts/build.ts` rather than
+  duplicated into the latter; a legitimate literal colour caught by the app-typography guard would
+  move into `theme.ts` as a role sourced from an existing token rather than a new one
+  (`tokens.json`'s key sets are pinned by the contrast test); Task 5's four test-tightening minors
+  folded into Task 6's dispatch; and — the two load-bearing for this record — `brand.test.tsx` and
+  `icon.test.tsx` mock `react-native-svg` through one shared factory
+  (`apps/app/src/test-utils/svg-mock.ts`: `Svg`/`Path`/`G` → `View` keeping every prop) because
+  RNTL 14 removed `UNSAFE_getByType` and the host `RNSVGPath` carries `fill` as a processed brush
+  object rather than the hex string the component passed, so even a host-props approach could not
+  read the value under test; the components themselves and `responsive-shell.test.tsx` still
+  render the real library.
+- Carry-overs for later: the public landing page is its own plan — it should use the variable
+  Fraunces with opsz 36 for mid sizes; a dark-mode social card if the landing page wants one; a
+  `success` button variant on `successSolid` when a screen needs one; screenshot tests if a
+  renderer becomes available; renaming the `aesa` codename in package scopes and roles was NOT
+  requested and is untouched. One more from execution: the bottom tab bar's active state is now
+  colour-only — one icon variant per name (spec §5) — a WCAG 1.4.1 point for the whole-branch
+  review or a later pass; the sidebar keeps a tint as a second channel alongside colour.
+
 ## Next: Phase 4 — knowledge
 
 **Where to start.** `phase-3` is complete on its branch and lands on `main` through a GitHub PR with
 a merge commit on Robert's go-ahead (the standing flow from his 2026-09-09 instruction). Once it is
 merged, check out `main`, pull, and branch `phase-4` off it. Start with
 `superpowers:writing-plans` against the spec's *Build phases → Phase 4* section. Run the local setup
-from `CLAUDE.md` and confirm the 1,641-test baseline above before writing the plan.
+from `CLAUDE.md` and confirm the 1,641-test baseline above before writing the plan. The `brand`
+branch (cut from `phase-3`) is complete and lands on `main` the same way, through its own PR with a
+merge commit, on Robert's go-ahead, after PR #3.
 
 **The hand-off.** Phase 4 is knowledge: the document parsers, the site crawler, Voyage embeddings,
 retrieval, and the `minio`/R2 upload path. Two seams are already in place and waiting for it:
@@ -887,20 +981,6 @@ these 18 carry:
   owner's own disposition winning is the better outcome; it wants a sentence in the file header.
 - 183 — no test renders a NEW undo window after an expired one (correct by inspection: the latch is
   keyed to the `undoAt` value, and both ends are pinned by the two existing tests).
-
-## Brand (spec approved 2026-09-10; plan next)
-
-The product name is **aesa** ("AY-sah", lowercase everywhere, standalone from ClosingBrackets).
-`docs/superpowers/specs/2026-09-10-aesa-brand-design.md` is the approved brand system: the mark is
-Fraunces 144pt SemiBold's `æ` with its central column narrowed 187→153 font units (derivation in
-`brand/scripts/derive/`, reproducible byte for byte); azure `#2563EB` primary with ink/night/lifted
-neutrals; sent/on-hold/blocked in green `#0E9F6E` / amber `#F59E0B` / rose `#E11D48` with darker
-chip-text shades for AA; Fraunces display + Plus Jakarta Sans UI; app icon = lifted blue on ink;
-Lucide-style icons. Work happens on branch `brand` (cut from `phase-3`; its PR follows PR #3).
-**Next session:** `superpowers:writing-plans` on that spec, then subagent-driven development —
-the plan builds `brand/` (sources, tokens, `pnpm brand:build`), the tokens module in
-`@aesa/contracts`, the app theme/fonts/icons, and the api's favicons, social card and review-page
-CSS. The public landing page is a plan of its own afterwards.
 
 ## Later phases (see the spec for scope and verification)
 

@@ -19,9 +19,11 @@ Requires Node >= 22, pnpm 10, Docker.
     pnpm --filter @aesa/app dev                  # Expo: press w for web (http://localhost:8081), i / a for simulators
     pnpm e2e                                     # Playwright smoke (export the web app first: pnpm --filter @aesa/app export:web)
     pnpm typecheck && pnpm lint && pnpm test && pnpm db:check
+    pnpm brand:build                             # rebuild the brand assets after changing a brand/ source; see brand/README.md
 
 Layout: `apps/api` (Fastify + Better Auth + tRPC), `apps/worker` (pg-boss), `apps/app` (Expo),
-`packages/{contracts,db,crypto,core,queue,mail,platform-mail,llm,agent,test-kit}`.
+`packages/{contracts,db,crypto,core,queue,mail,platform-mail,llm,agent,test-kit}`, `brand`
+(the `@aesa/brand` workspace package — see `brand/README.md`).
 Ports: the api listens on 3001 (`PORT`; `HOST` defaults to `0.0.0.0`), the worker binds no port, Postgres
 is on 5434. `APP_BASE_URL` is the api's public origin (Better Auth baseURL, OAuth redirect URIs);
 `APP_WEB_ORIGIN` is the Expo web origin (CORS, trusted origin, invitation links).
