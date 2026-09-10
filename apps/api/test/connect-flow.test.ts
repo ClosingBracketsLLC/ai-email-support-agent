@@ -275,6 +275,14 @@ describe('mailbox connect flow', () => {
     expect(syncCall!.data.orgId).toBe(orgId)
   })
 
+  it('a successful claim emails the claimed mailbox naming the claiming user and the settings link (Phase 3 pre-flight, reverse-phish trail)', async () => {
+    const mail = t.mail.latestTo('support@acme.test')
+    expect(mail).toBeDefined()
+    expect(mail!.subject).toContain('connected to aesa')
+    expect(mail!.text).toContain(userA.email)
+    expect(mail!.text).toContain('/settings/mailboxes')
+  })
+
   it('claimConnection by a DIFFERENT user in the same org is FORBIDDEN (the account-linking fix)', async () => {
     providerOverrides.gmail = fakeGmailProvider(fixedExchange({
       tokens: { refreshToken: 'rt-2', accessToken: 'at-2', accessTokenExpiresAt: null },
@@ -301,6 +309,10 @@ describe('mailbox connect flow', () => {
     const [flowRow] = await t.api.withOrg(orgId, (tx) => tx.select().from(oauthFlows).where(eq(oauthFlows.id, started.flowId)))
     const [stillPending] = await t.api.withOrg(orgId, (tx) => tx.select().from(mailboxConnections).where(eq(mailboxConnections.id, flowRow!.connectionId!)))
     expect(stillPending?.status).toBe('pending_claim')
+  })
+
+  it('a claim that fails (FORBIDDEN, the wrong user) sends no claim-time email', async () => {
+    expect(t.mail.latestTo('support2@acme.test')).toBeUndefined()
   })
 
   it('claimConnection called twice is idempotent — the second call returns the same connection', async () => {

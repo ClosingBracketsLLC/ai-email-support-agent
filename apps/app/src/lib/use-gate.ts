@@ -46,7 +46,7 @@ export function useGate(): GateTarget {
     const orgId = target.orgId
     activating.current = orgId
     authClient.organization.setActive({ organizationId: orgId })
-      .then(() => refetch())
+      .then(() => refetch({ query: { disableCookieCache: true } }))
       .then(() => queryClient.invalidateQueries())
       .then(() => { activating.current = null; setActivateError(null) })
       .catch(() => setActivateError({ orgId, message: 'Could not open your workspace.' }))

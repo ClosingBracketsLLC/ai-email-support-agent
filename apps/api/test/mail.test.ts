@@ -1,6 +1,6 @@
 import { Secret } from '@aesa/crypto'
 import { describe, expect, it } from 'vitest'
-import { invitationMail, otpMail } from '../src/mail/templates.ts'
+import { invitationMail, mailboxClaimedMail, otpMail } from '../src/mail/templates.ts'
 import { createDevSink, createResendTransport } from '../src/mail/transport.ts'
 
 describe('mail transports', () => {
@@ -31,5 +31,17 @@ describe('mail transports', () => {
     expect(otp.to).toBe('a@x.test'); expect(otp.subject).toContain('123456'); expect(otp.text).toContain('123456'); expect(otp.text).toContain('10 minutes')
     const inv = invitationMail({ to: 'b@x.test', inviterName: 'Robert', orgName: 'Acme', url: 'http://localhost:8081/invite/abc' })
     expect(inv.subject).toContain('Acme'); expect(inv.text).toContain('Robert'); expect(inv.text).toContain('http://localhost:8081/invite/abc'); expect(inv.text).toContain('48 hours')
+  })
+
+  it('mailboxClaimedMail names the address, the provider, the claiming user, and the settings link', () => {
+    const claimed = mailboxClaimedMail({
+      to: 'support@acme.test', emailAddress: 'support@acme.test', provider: 'gmail',
+      claimedByEmail: 'owner@acme.test', settingsUrl: 'http://localhost:8081/settings/mailboxes',
+    })
+    expect(claimed.to).toBe('support@acme.test')
+    expect(claimed.subject).toBe('Your mailbox support@acme.test was connected to aesa')
+    expect(claimed.text).toContain('gmail')
+    expect(claimed.text).toContain('owner@acme.test')
+    expect(claimed.text).toContain('http://localhost:8081/settings/mailboxes')
   })
 })

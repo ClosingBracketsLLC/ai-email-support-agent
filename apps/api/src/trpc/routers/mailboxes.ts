@@ -12,7 +12,7 @@ import { and, count, eq } from 'drizzle-orm'
 import {
   AddAddressInput, AdminConsentInfoInput, ClaimConnectionInput, ConsentAddressInput, DisconnectInput,
   MAX_AGENTS_PER_DOMAIN, RequestGmailAccessInput, ResendVerificationInput, StartConnectInput, emailDomain,
-  type AgentStatus,
+  type AgentStatus, type MailProvider,
 } from '@aesa/contracts'
 import {
   agentCategoryPolicies, agents, audit, categories, ensureDefaultCategories, getOrgBoxPublicKeyOrNull,
@@ -21,6 +21,7 @@ import {
 import { hashToken } from '@aesa/crypto'
 import { JOB_NAMES } from '@aesa/queue'
 import { createFlow } from '../../connect/flows.ts'
+import { mailboxClaimedMail } from '../../mail/templates.ts'
 import type { OutgoingMail } from '../../mail/transport.ts'
 import { isUniqueViolation } from '../../pg-error.ts'
 import { managerProcedure, orgProcedure, router } from '../init.ts'
@@ -63,7 +64,7 @@ type ClaimOutcome =
   | { kind: 'not_ready' }
   | { kind: 'rejected' }
   | { kind: 'not_connectable'; status: string }
-  | { kind: 'ok'; connectionId: string; emailAddress: string }
+  | { kind: 'ok'; connectionId: string; emailAddress: string; provider: MailProvider }
 
 export const mailboxesRouter = router({
   /** provider configured? enqueue keys.provision (idempotent, debounced) so a brand-new org's DEK/box
@@ -120,11 +121,11 @@ export const mailboxesRouter = router({
           actor: ctx.actor, action: 'mailbox.connected', entityType: 'mailbox_connection', entityId: conn.id,
           detail: { emailAddress: conn.emailAddress }, ip: ctx.ip, userAgent: ctx.userAgent,
         })
-        return { kind: 'ok', connectionId: conn.id, emailAddress: conn.emailAddress }
+        return { kind: 'ok', connectionId: conn.id, emailAddress: conn.emailAddress, provider: conn.provider as MailProvider }
       }
       if (conn.status === 'connected') {
         // Idempotent: a second call for an already-connected row returns the same result with no writes.
-        return { kind: 'ok', connectionId: conn.id, emailAddress: conn.emailAddress }
+        return { kind: 'ok', connectionId: conn.id, emailAddress: conn.emailAddress, provider: conn.provider as MailProvider }
       }
       // 'disabled' (disconnected since this flow was consumed) or 'reauth_required': claiming it now
       // would silently report success for a mailbox that isn't actually usable (Task 17 review,
@@ -145,6 +146,18 @@ export const mailboxesRouter = router({
     // none and nothing is ingested — and re-enqueuing on the idempotent second call above is harmless
     // (singletonKey dedupes it).
     await ctx.deps.enqueue(JOB_NAMES.mailboxSync, { orgId: ctx.orgId, connectionId: outcome.connectionId }, { entityId: outcome.connectionId })
+
+    // Also post-tx, same reason: this is the mailbox owner's own paper trail of who attached it (Phase 2
+    // review's reverse-phish note) — platform mail must never fail the claim itself.
+    try {
+      await ctx.deps.mail.send(mailboxClaimedMail({
+        to: outcome.emailAddress, emailAddress: outcome.emailAddress, provider: outcome.provider,
+        claimedByEmail: ctx.user.email, settingsUrl: `${ctx.deps.config.appWebOrigin}/settings/mailboxes`,
+      }))
+    } catch (err) {
+      ctx.deps.logger.warn({ err }, 'mailbox.claim_email_failed')
+    }
+
     return { connectionId: outcome.connectionId, emailAddress: outcome.emailAddress }
   }),
 

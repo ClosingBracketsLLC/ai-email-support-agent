@@ -87,6 +87,49 @@ describe('useGate — activating the first membership', () => {
     await waitFor(() => expect(mockSetActive).toHaveBeenCalledTimes(2))
   })
 
+  it('a rejected setActive reports "Could not open your workspace." and retry() calls setActive again', async () => {
+    mockUseSession.mockReturnValue({ data: { session: { activeOrganizationId: null } }, isPending: false, error: null, refetch: jest.fn() })
+    mockUseListOrganizations.mockReturnValue({ data: [{ id: 'o1' }], isPending: false })
+    mockSetActive.mockRejectedValue(new Error('nope'))
+
+    const { result } = await setupGate()
+
+    await waitFor(() => expect(asError(result.current)).toMatchObject({ kind: 'error', message: 'Could not open your workspace.' }))
+    expect(mockSetActive).toHaveBeenCalledTimes(1)
+
+    await act(() => { asError(result.current).retry() })
+    await waitFor(() => expect(mockSetActive).toHaveBeenCalledTimes(2))
+  })
+
+  it('activates the first membership exactly once and re-reads the session without the cookie cache', async () => {
+    const setActiveGate = deferred<void>()
+    mockSetActive.mockReturnValue(setActiveGate.promise)
+
+    const refetchGate = deferred<void>()
+    const refetch = jest.fn(() => refetchGate.promise)
+
+    mockUseSession.mockReturnValue({ data: { session: { activeOrganizationId: null } }, isPending: false, error: null, refetch })
+    mockUseListOrganizations.mockReturnValue({ data: [{ id: 'o1' }], isPending: false })
+
+    const { rerender } = await setupGate()
+
+    await waitFor(() => expect(mockSetActive).toHaveBeenCalledTimes(1))
+    expect(mockSetActive).toHaveBeenCalledWith({ organizationId: 'o1' })
+    expect(refetch).not.toHaveBeenCalled()
+
+    await act(async () => {
+      setActiveGate.resolve()
+      await Promise.resolve()
+    })
+    await waitFor(() => expect(refetch).toHaveBeenCalledWith({ query: { disableCookieCache: true } }))
+
+    // refetch is still pending: the guard holds, so re-rendering with the same, unchanged session must
+    // not fire a second activation attempt.
+    await rerender(undefined)
+    await rerender(undefined)
+    expect(mockSetActive).toHaveBeenCalledTimes(1)
+  })
+
   it('a successful activation keeps the guard set through the session refetch race, so setActive fires only once', async () => {
     const staleSession = { session: { activeOrganizationId: null } }
     const settledSession = { session: { activeOrganizationId: 'o1' } }
