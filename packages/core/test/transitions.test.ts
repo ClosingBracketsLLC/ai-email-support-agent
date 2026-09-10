@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { IllegalTransitionError, defineTransitions, draftTransitions, ticketTransitions } from '../src/transitions.ts'
+import * as contracts from '@aesa/contracts'
+import {
+  AGENT_RUN_STATUSES, DRAFT_STATUSES, IllegalTransitionError, OUTBOUND_SEND_STATUSES, agentRunTransitions,
+  defineTransitions, draftTransitions, outboundSendTransitions, ticketTransitions,
+} from '../src/transitions.ts'
 
 describe('transitions', () => {
   it('self-transitions are always illegal', () => {
@@ -25,5 +29,34 @@ describe('transitions', () => {
     // @ts-expect-error 'bogus' is not a status
     defineTransitions<S>({ x: ['y'], y: [], bogus: [] })
     expect(true).toBe(true)
+  })
+
+  it('outbound-send happy path: queued → claimed → sent', () => {
+    expect(outboundSendTransitions.can('queued', 'claimed')).toBe(true)
+    expect(outboundSendTransitions.can('claimed', 'sent')).toBe(true)
+  })
+  it('outbound-send: claimed → queued is legal (released for retry-later)', () => {
+    expect(outboundSendTransitions.can('claimed', 'queued')).toBe(true)
+  })
+  it('outbound-send terminal states: sent has no exits; failed only re-queues', () => {
+    expect(outboundSendTransitions.can('sent', 'queued')).toBe(false)
+    expect(() => outboundSendTransitions.assert('sent', 'queued')).toThrow(IllegalTransitionError)
+    expect(outboundSendTransitions.can('failed', 'queued')).toBe(true)
+    expect(outboundSendTransitions.can('failed', 'claimed')).toBe(false)
+    expect(outboundSendTransitions.can('failed', 'held')).toBe(false)
+  })
+
+  it('agent-run happy path: running → succeeded', () => {
+    expect(agentRunTransitions.can('running', 'succeeded')).toBe(true)
+  })
+  it('agent-run terminal states have no exits', () => {
+    for (const s of ['succeeded', 'failed', 'aborted'] as const) expect(agentRunTransitions.can(s, 'running')).toBe(false)
+    expect(() => agentRunTransitions.assert('succeeded', 'running')).toThrow(IllegalTransitionError)
+  })
+
+  it('DRAFT_STATUSES, OUTBOUND_SEND_STATUSES and AGENT_RUN_STATUSES equal their @aesa/contracts mirrors', () => {
+    expect(DRAFT_STATUSES).toEqual(contracts.DRAFT_STATUSES)
+    expect(OUTBOUND_SEND_STATUSES).toEqual(contracts.OUTBOUND_SEND_STATUSES)
+    expect(AGENT_RUN_STATUSES).toEqual(contracts.AGENT_RUN_STATUSES)
   })
 })

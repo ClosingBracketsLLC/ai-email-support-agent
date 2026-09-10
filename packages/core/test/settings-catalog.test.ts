@@ -13,3 +13,14 @@ describe('settings resolution: org override > plan default > code default', () =
     expect(() => resolveSetting('support.spam_shortcircuit.always', { org: { 'support.spam_shortcircuit.always': 1 } })).toThrow(/expected boolean/)
   })
 })
+
+describe('digest email settings', () => {
+  it('resolve their code defaults', () => {
+    expect(resolveSetting('notifications.digest_email', {})).toBe(true)
+    expect(resolveSetting('notifications.digest_email_hour', {})).toBe(8)
+  })
+  it('reject a wrongly-typed override', () => {
+    expect(() => resolveSetting('notifications.digest_email', { org: { 'notifications.digest_email': 'yes' } })).toThrow(/expected boolean/)
+    expect(() => resolveSetting('notifications.digest_email_hour', { org: { 'notifications.digest_email_hour': '8' } })).toThrow(/expected number/)
+  })
+})

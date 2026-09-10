@@ -8,6 +8,8 @@ export const SETTINGS_CATALOG = {
   'sandbox.daily_cap': { kind: 'number', default: 100 },
   'mailboxes.max_connections': { kind: 'number', default: 5 },
   'support.spam_shortcircuit.always': { kind: 'boolean', default: false },
+  'notifications.digest_email': { kind: 'boolean', default: true },
+  'notifications.digest_email_hour': { kind: 'number', default: 8 }, // local hour in the workspace timezone
 } as const satisfies Record<string, { kind: 'number' | 'boolean' | 'string'; default: number | boolean | string }>
 
 export type SettingKey = keyof typeof SETTINGS_CATALOG

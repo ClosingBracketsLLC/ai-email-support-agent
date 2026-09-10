@@ -1,6 +1,8 @@
 export const PACKAGE_NAME = '@aesa/core'
 export * from './tripwire.ts'
 export * from './transitions.ts'
+export * from './redraft.ts'
+export * from './autonomy.ts'
 export * from './settings-catalog.ts'
 export * from './plans.ts'
 export * from './invariants.ts'

@@ -37,3 +37,20 @@ export const draftTransitions = defineTransitions<DraftStatus>({
   sending: ['sent', 'failed'],
   sent: [], rejected: [], superseded: [], expired: [], failed: [],
 })
+
+export const OUTBOUND_SEND_STATUSES = ['queued', 'held', 'claimed', 'sent', 'failed'] as const // === contracts' (pinned by test)
+export type OutboundSendStatus = (typeof OUTBOUND_SEND_STATUSES)[number]
+export const outboundSendTransitions = defineTransitions<OutboundSendStatus>({
+  queued: ['held', 'claimed', 'failed'],
+  held: ['queued', 'failed'],
+  claimed: ['sent', 'failed', 'queued', 'held'], // queued = released for retry-later (rate limit, busy thread); held = a kill lever flipped
+  sent: [],
+  failed: ['queued'], // a re-approve after a failed send re-queues the same ledger row
+})
+
+export const AGENT_RUN_STATUSES = ['running', 'succeeded', 'failed', 'aborted'] as const
+export type AgentRunStatus = (typeof AGENT_RUN_STATUSES)[number]
+export const agentRunTransitions = defineTransitions<AgentRunStatus>({
+  running: ['succeeded', 'failed', 'aborted'],
+  succeeded: [], failed: [], aborted: [],
+})
