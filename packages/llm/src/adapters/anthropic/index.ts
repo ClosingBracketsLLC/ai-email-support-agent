@@ -1,19 +1,34 @@
 /**
- * Anthropic adapter (Phase 2 slice — spec §LLM provider adapter, deviations 4-5). Ports the
- * forced-tool pattern from doge-buddy's `apps/ops/src/support/triage.ts` `createAnthropicTriageCall`:
- * one `messages.create` call, `tool_choice` forcing the single output tool when the caller asks
- * for structured output, and a strict re-parse of the tool's `input` that never throws on a
- * schema violation — the caller (the triage runtime) owns what a failed attempt means.
+ * Anthropic adapter (Phase 2 slice — spec §LLM provider adapter, deviations 4-5; extended Phase 3
+ * — spec §LLM provider adapter cache/effort/structured-output). Ports the forced-tool pattern
+ * from doge-buddy's `apps/ops/src/support/triage.ts` `createAnthropicTriageCall`: one
+ * `messages.create` call, `tool_choice` forcing the single output tool when the caller asks for
+ * structured output, and a strict re-parse of the tool's `input` that never throws on a schema
+ * violation — the caller (the triage runtime) owns what a failed attempt means. Phase 3 adds a
+ * second, native structured-output rung (`output.mode: 'native'`), `effort`, and stability-driven
+ * `cache_control` placement on `system` blocks.
  *
  * `maxRetries: 0` on the client: retry policy belongs to the job layer (spec §Budgets), not this
  * adapter — a transparent SDK retry here would double-count the job layer's own retry budget and
  * hide rate-limit/5xx signal the caller needs to make its own backoff decision.
+ *
+ * Native structured output: `client.messages.parse()` throws a plain `AnthropicError` (not an
+ * `APIError`) when the response text violates the schema, rather than returning
+ * `parsed_output: null` — verified empirically against a stubbed `fetchFn` on the installed SDK
+ * (0.124.0) before writing this. That contradicts this package's "never throw on a schema
+ * violation" contract, so the native path below uses `messages.create()` with
+ * `output_config.format` (built from `zodOutputFormat` for the envelope's JSON Schema) and parses
+ * the returned text block itself with `envelope.safeParse`, exactly like the forced-tool path
+ * already re-parses `tool_use.input` — one no-throw contract for both structured-output rungs.
  */
 import Anthropic from '@anthropic-ai/sdk'
+import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod'
 import type { Secret } from '@aesa/crypto'
 import { z } from 'zod'
 import { LlmError } from '../../core/errors.ts'
-import type { ChatRequest, ChatResult, ChatUsage, LlmProvider, ParseStrategy } from '../../core/types.ts'
+import { estimateTokens } from '../../core/tokens.ts'
+import type { Capabilities, ChatRequest, ChatResult, ChatUsage, LlmProvider, ParseStrategy, Stability, StructuredMode } from '../../core/types.ts'
+import { ANTHROPIC_MODELS, UNKNOWN_ANTHROPIC_MODEL } from './models.ts'
 
 export interface CreateAnthropicProviderOptions {
   apiKey: Secret
@@ -102,20 +117,79 @@ function mapFinish(stopReason: Anthropic.Message['stop_reason']): ChatResult<unk
   }
 }
 
+function capabilitiesFor(model: string): Capabilities {
+  return ANTHROPIC_MODELS[model] ?? UNKNOWN_ANTHROPIC_MODEL
+}
+
+/** Both structured-output rungs (the forced tool and native `output_config.format`) ask for this
+ * shape, never the caller's schema directly — the API rejects a top-level `oneOf`/`anyOf` without
+ * `type: 'object'`, which a discriminated-union caller schema produces. Unwrapped again in
+ * `buildResult` below. */
+function envelopeSchema<T>(schema: z.ZodType<T>): z.ZodType<{ decision: T }> {
+  return z.object({ decision: schema })
+}
+
 /** zod 4's `z.toJSONSchema` emits a `$schema` meta key; this adapter strips it before it reaches
  * the request body. No live Anthropic credentials were available to confirm empirically whether
  * the API rejects `$schema` on `input_schema` — stripping is the defensive default either way,
  * since `$schema` describes the schema document itself, not the tool's parameter shape, and
  * carries no information Claude needs to fill in `tool_use.input`. Verified via the fetchFn-stub
  * test that the emitted request body never carries it. */
-function toInputSchema(schema: z.ZodType<unknown>): Anthropic.Tool['input_schema'] {
+function toJsonObjectSchema(schema: z.ZodType<unknown>): Record<string, unknown> {
   const jsonSchema = z.toJSONSchema(schema) as Record<string, unknown> & { type: 'object' }
   const { $schema, ...rest } = jsonSchema
   void $schema
-  return rest as Anthropic.Tool['input_schema']
+  return rest
 }
 
-function buildResult<T>(req: ChatRequest<T>, response: Anthropic.Message, latencyMs: number): ChatResult<T> {
+const STABILITY_RANK: Record<Stability, number> = { static: 0, agent: 1, volatile: 2 }
+
+/**
+ * Renders the ordered `system` text blocks and places `cache_control` per the stability rules
+ * (task brief §Adapter behaviour): the LAST `static` block gets the 1h breakpoint once the
+ * combined static prefix clears the model's cache minimum (a silent no-op otherwise — the intent
+ * is explicit either way); the LAST `agent` block gets the opt-in 5m breakpoint only when the
+ * caller asks for it; `volatile` blocks never carry one. Throws `LlmError('permanent')` when a
+ * block violates the required static -> agent -> volatile order, since a breakpoint placed after
+ * volatile (per-request) text would never hit on a repeat call.
+ */
+function buildSystemBlocks(system: ChatRequest<unknown>['system'], capabilities: Capabilities, agentBreakpoint: boolean): Anthropic.TextBlockParam[] {
+  let maxRank = -1
+  for (const block of system) {
+    const rank = STABILITY_RANK[block.stability]
+    if (rank < maxRank) {
+      throw new LlmError('system blocks must be ordered static → agent → volatile', 'permanent', false)
+    }
+    maxRank = rank
+  }
+
+  const lastStaticIndex = system.findLastIndex((b) => b.stability === 'static')
+  const lastAgentIndex = system.findLastIndex((b) => b.stability === 'agent')
+  const staticText = system
+    .filter((b) => b.stability === 'static')
+    .map((b) => b.text)
+    .join('')
+  const canCacheStatic = capabilities.cacheMinTokens !== null && estimateTokens(staticText) >= capabilities.cacheMinTokens
+
+  return system.map((block, index) => {
+    const param: Anthropic.TextBlockParam = { type: 'text', text: block.text }
+    if (block.stability === 'static' && index === lastStaticIndex && canCacheStatic) {
+      param.cache_control = { type: 'ephemeral', ttl: '1h' }
+    } else if (block.stability === 'agent' && index === lastAgentIndex && agentBreakpoint) {
+      param.cache_control = { type: 'ephemeral' }
+    }
+    return param
+  })
+}
+
+/** `mode` absent -> the adapter's best rung for this model (native when the model supports it,
+ * the forced-tool json_mode fallback otherwise). */
+function resolveStructuredMode(requested: StructuredMode | undefined, capabilities: Capabilities): StructuredMode {
+  if (requested) return requested
+  return capabilities.structuredOutput === 'native' ? 'native' : 'json_mode'
+}
+
+function buildResult<T>(req: ChatRequest<T>, mode: StructuredMode | undefined, response: Anthropic.Message, latencyMs: number): ChatResult<T> {
   const usage: ChatUsage = {
     inputTokens: response.usage.input_tokens,
     outputTokens: response.usage.output_tokens,
@@ -130,16 +204,30 @@ function buildResult<T>(req: ChatRequest<T>, response: Anthropic.Message, latenc
   let parsed: T | null = null
   let parseStrategy: ParseStrategy = 'none'
 
-  if (req.output) {
+  if (req.output && mode === 'native') {
+    // A schema-violating or non-JSON text block is a failed ATTEMPT, not a thrown error — same
+    // no-throw contract as the json_mode branch below, just reached via JSON.parse + safeParse
+    // instead of a strict `.parse()` (see the module doc comment for why `messages.parse()`
+    // itself isn't used here).
+    if (textBlock) {
+      try {
+        const json: unknown = JSON.parse(textBlock.text)
+        const outcome = envelopeSchema(req.output.schema).safeParse(json)
+        if (outcome.success) {
+          parsed = outcome.data.decision
+          parseStrategy = 'native'
+        }
+      } catch {
+        // Not valid JSON at all — parsed stays null.
+      }
+    }
+  } else if (req.output) {
     const toolUse = response.content.find((b): b is Anthropic.ToolUseBlock => b.type === 'tool_use')
     if (toolUse) {
-      try {
-        parsed = req.output.schema.parse(toolUse.input)
-        parseStrategy = 'native'
-      } catch (err) {
-        // A schema-violating tool call is a failed ATTEMPT, not a thrown error — the caller (the
-        // triage runtime) decides what to do with `parsed: null` (retry, escalate, ...).
-        if (!(err instanceof z.ZodError)) throw err
+      const outcome = envelopeSchema(req.output.schema).safeParse(toolUse.input)
+      if (outcome.success) {
+        parsed = outcome.data.decision
+        parseStrategy = 'json_mode'
       }
     }
   }
@@ -167,22 +255,39 @@ export function createAnthropicProvider(opts: CreateAnthropicProviderOptions): L
   return {
     kind: 'anthropic',
 
+    capabilities(model: string): Capabilities {
+      return capabilitiesFor(model)
+    },
+
     async chat<T>(req: ChatRequest<T>): Promise<ChatResult<T>> {
-      const system = req.system.map((b) => b.text).join('\n\n')
+      const capabilities = capabilitiesFor(req.model)
+      const system = buildSystemBlocks(req.system, capabilities, req.cache?.agentBreakpoint === true)
       const messages: Anthropic.MessageParam[] = req.messages.map((m) => ({ role: m.role, content: m.content }))
 
-      const tools: Anthropic.Tool[] | undefined = req.output
-        ? [
-            {
-              name: req.output.name,
-              description: 'Record the structured result.',
-              input_schema: toInputSchema(req.output.schema),
-            },
-          ]
-        : undefined
-      const toolChoice: Anthropic.ToolChoice | undefined = req.output
-        ? { type: 'tool', name: req.output.name }
-        : undefined
+      const mode: StructuredMode | undefined = req.output ? resolveStructuredMode(req.output.mode, capabilities) : undefined
+
+      const tools: Anthropic.Tool[] | undefined =
+        req.output && mode === 'json_mode'
+          ? [
+              {
+                name: req.output.name,
+                description: 'Record the structured result.',
+                input_schema: toJsonObjectSchema(envelopeSchema(req.output.schema)) as Anthropic.Tool['input_schema'],
+              },
+            ]
+          : undefined
+      const toolChoice: Anthropic.ToolChoice | undefined =
+        req.output && mode === 'json_mode' ? { type: 'tool', name: req.output.name } : undefined
+
+      const outputFormat = req.output && mode === 'native' ? zodOutputFormat(envelopeSchema(req.output.schema)) : undefined
+      const effort = req.effort && capabilities.effort ? req.effort : undefined
+      const outputConfig: Anthropic.OutputConfig | undefined =
+        effort !== undefined || outputFormat !== undefined
+          ? {
+              ...(effort !== undefined ? { effort } : {}),
+              ...(outputFormat !== undefined ? { format: outputFormat } : {}),
+            }
+          : undefined
 
       const start = performance.now()
       let response: Anthropic.Message
@@ -194,6 +299,7 @@ export function createAnthropicProvider(opts: CreateAnthropicProviderOptions): L
             ...(system.length > 0 ? { system } : {}),
             messages,
             ...(tools ? { tools, tool_choice: toolChoice } : {}),
+            ...(outputConfig ? { output_config: outputConfig } : {}),
           },
           { signal: req.signal },
         )
@@ -202,7 +308,7 @@ export function createAnthropicProvider(opts: CreateAnthropicProviderOptions): L
       }
       const latencyMs = performance.now() - start
 
-      return buildResult(req, response, latencyMs)
+      return buildResult(req, mode, response, latencyMs)
     },
   }
 }

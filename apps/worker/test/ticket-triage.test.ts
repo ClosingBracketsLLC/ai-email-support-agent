@@ -18,7 +18,7 @@ import {
 } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
-import { createFakeProvider, LlmError, type ChatRequest, type ChatResult, type LlmProvider } from '@aesa/llm'
+import { createFakeProvider, LlmError, type Capabilities, type ChatRequest, type ChatResult, type LlmProvider } from '@aesa/llm'
 import { runTicketTriage, type TicketTriageDeps } from '../src/jobs/ticket-triage.ts'
 
 const rand = () => randomBytes(4).toString('hex')
@@ -34,6 +34,10 @@ const BASE_VERDICT: TriageVerdict = {
   escalationFlags: [],
   questions: [],
 }
+
+// `LlmProvider.capabilities()` is required on the interface (Task 6); these two hand-built spy
+// providers never exercise it, so a fixed stand-in is enough.
+const SPY_CAPABILITIES: Capabilities = { structuredOutput: 'native', tools: true, effort: true, cacheMinTokens: 512 }
 
 let t: Awaited<ReturnType<typeof createTestDatabase>>
 let app: ReturnType<typeof createDb>
@@ -145,6 +149,7 @@ function verdictProvider(verdict: TriageVerdict): ReturnType<typeof createFakePr
 function spendOrderSpyProvider(capture: { valueDuringCall: number | null }, verdict: TriageVerdict): LlmProvider {
   return {
     kind: 'spend-order-spy',
+    capabilities: () => SPY_CAPABILITIES,
     async chat<T>(req: ChatRequest<T>): Promise<ChatResult<T>> {
       capture.valueDuringCall = await readUsageCounter(TODAY)
       return {
@@ -161,6 +166,7 @@ function spendOrderSpyProvider(capture: { valueDuringCall: number | null }, verd
 function concurrentOwnerRaceProvider(ticketId: string, verdict: TriageVerdict): LlmProvider {
   return {
     kind: 'race',
+    capabilities: () => SPY_CAPABILITIES,
     async chat<T>(req: ChatRequest<T>): Promise<ChatResult<T>> {
       await withOrg(app.db, orgId, (tx) => tx.update(tickets).set({ status: 'resolved' }).where(eq(tickets.id, ticketId)))
       return {

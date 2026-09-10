@@ -1,5 +1,8 @@
 import { LlmError } from '../core/errors.ts'
-import type { ChatRequest, ChatResult, ChatUsage, LlmProvider, ParseStrategy } from '../core/types.ts'
+import type { Capabilities, ChatRequest, ChatResult, ChatUsage, LlmProvider, ParseStrategy } from '../core/types.ts'
+
+/** Fixed for every model — Task 7 makes this overridable per script. */
+const FAKE_CAPABILITIES: Capabilities = { structuredOutput: 'native', tools: true, effort: true, cacheMinTokens: 512 }
 
 export interface FakeScript<T = unknown> {
   parsed?: T
@@ -27,6 +30,9 @@ export function createFakeProvider(scripts: FakeScript[]): LlmProvider & { calls
   return {
     kind: 'fake',
     calls,
+    capabilities(): Capabilities {
+      return FAKE_CAPABILITIES
+    },
     async chat<T>(req: ChatRequest<T>): Promise<ChatResult<T>> {
       calls.push(req as ChatRequest<unknown>)
       const script = scripts[Math.min(index, scripts.length - 1)] as FakeScript<T>
