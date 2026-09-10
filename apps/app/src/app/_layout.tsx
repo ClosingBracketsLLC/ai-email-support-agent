@@ -6,7 +6,10 @@ import { useBrandFonts } from '@/lib/fonts'
 
 // Hold the native splash until the brand faces are registered (or have failed to): the first frame the
 // owner sees is already set in Fraunces and Plus Jakarta Sans instead of re-flowing from the system
-// font a beat later. Web has no native splash; there this is one null render.
+// font a beat later. Web has no native splash; on the static web export `expo-font` resolves through
+// `useStaticFonts` on the server (the faces are already registered and `@font-face` is in the served
+// HTML), so hydration renders ready immediately — only the Metro dev server actually shows this null
+// first frame.
 SplashScreen.preventAutoHideAsync().catch(() => {})
 
 export default function RootLayout() {

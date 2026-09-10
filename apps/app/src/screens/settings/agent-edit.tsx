@@ -7,6 +7,7 @@ import { PERSONA_PRESETS, UpdateAgentInput } from '@aesa/contracts'
 import { Banner } from '@/components/banner'
 import { Button } from '@/components/button'
 import { Card } from '@/components/card'
+import { Chip } from '@/components/chip'
 import { Loading } from '@/components/loading'
 import { Screen } from '@/components/screen'
 import { TextField } from '@/components/text-field'
@@ -241,9 +242,7 @@ export function AgentEditScreen() {
           <Muted>Autopilot per category arrives with the learning loop</Muted>
           <View style={styles.chipsRow}>
             {categoriesQuery.data.categories.map((cat) => (
-              <View key={cat.categoryId} style={[styles.chip, { borderColor: c.border, backgroundColor: c.surface }]} testID={`category-${cat.categoryId}`}>
-                <Text style={[typeScale.caption, { color: c.text }]}>{cat.label} · {label(CATEGORY_MODE_LABEL, cat.mode)}</Text>
-              </View>
+              <Chip key={cat.categoryId} tone="neutral" testID={`category-${cat.categoryId}`}>{`${cat.label} · ${label(CATEGORY_MODE_LABEL, cat.mode)}`}</Chip>
             ))}
           </View>
         </Card>
@@ -259,5 +258,4 @@ const styles = StyleSheet.create({
   radios: { gap: spacing.xs },
   radioBox: { borderWidth: 1, borderRadius: radius.md, padding: spacing.sm, gap: 2 },
   chipsRow: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.xs },
-  chip: { borderWidth: 1, borderRadius: radius.sm, paddingHorizontal: spacing.sm, paddingVertical: spacing.xs },
 })

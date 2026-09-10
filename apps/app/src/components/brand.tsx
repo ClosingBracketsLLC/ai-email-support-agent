@@ -5,8 +5,10 @@ import { useColors } from '@/theme'
 const M = BRAND.paths.mark
 const W = BRAND.paths.wordmark
 const LK = BRAND.paths.lockupHorizontal
-const MARK_ASPECT = 1277 / 918
-const WORDMARK_ASPECT = 3383 / 920
+/** `viewBox` is `minX minY width height` — the third and fourth numbers give the aspect ratio without a second hard-coded copy of the geometry (brand.test.tsx still pins the literals). */
+const aspect = (vb: string) => { const [, , w, h] = vb.split(/\s+/).map(Number); return w! / h! }
+const MARK_ASPECT = aspect(M.viewBox)
+const WORDMARK_ASPECT = aspect(W.viewBox)
 
 /** The æ mark (spec §2.1) at `height` px in the theme primary — azure on light, lifted on dark — unless `color` names one of the other colourways. Callers keep it ≥ 16 px bare. */
 export function Mark({ height = 24, color, testID = 'brand-mark' }: { height?: number; color?: string; testID?: string }) {

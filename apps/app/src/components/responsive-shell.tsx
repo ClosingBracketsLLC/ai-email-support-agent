@@ -3,7 +3,7 @@ import { Tabs } from 'expo-router/js-tabs'
 import { Pressable, StyleSheet, Text, View, useWindowDimensions } from 'react-native'
 import { Lockup } from './brand'
 import { Icon, type IconName } from './icon'
-import { WIDE_BREAKPOINT, radius, spacing, typeScale, useColors } from '@/theme'
+import { WIDE_BREAKPOINT, font, radius, spacing, typeScale, useColors } from '@/theme'
 
 interface TabDef { name: 'inbox' | 'activity' | 'settings'; title: string; icon: IconName; href: '/inbox' | '/activity' | '/settings' }
 const TABS: TabDef[] = [
@@ -35,7 +35,21 @@ export function ResponsiveShell() {
       <View style={styles.main}>
         <Tabs screenOptions={{ headerShown: false, tabBarActiveTintColor: c.primary, tabBarInactiveTintColor: c.muted, tabBarStyle: wide ? { display: 'none' } : { backgroundColor: c.bg, borderTopColor: c.border } }}>
           {TABS.map((t) => (
-            <Tabs.Screen key={t.name} name={t.name} options={{ title: t.title, tabBarButtonTestID: `tab-${t.name}`, tabBarIcon: ({ color }) => <Icon name={t.icon} size={22} color={color as string} /> }} />
+            <Tabs.Screen
+              key={t.name}
+              name={t.name}
+              options={{
+                title: t.title,
+                tabBarButtonTestID: `tab-${t.name}`,
+                tabBarIcon: ({ color }) => <Icon name={t.icon} size={22} color={color as string} />,
+                // The outline/filled Ionicons pair used to be the second channel alongside colour
+                // (WCAG 1.4.1) — this branch's SVG icons removed it (STATUS carry-over). A weight
+                // cue on the label replaces it: primary vs muted are near-identical lightness.
+                tabBarLabel: ({ focused, color, children }) => (
+                  <Text style={[typeScale.caption, focused && { fontFamily: font.uiStrong }, { color }]}>{children}</Text>
+                ),
+              }}
+            />
           ))}
           {/* The ticket thread is reached only from an inbox row or a push tap (router.push), never from
               a tab button — `href: null` keeps it out of the tab bar; `expo-router`'s `Tabs` otherwise
@@ -61,7 +75,10 @@ function Sidebar({ pathname }: { pathname: string }) {
           // property [0] on 'CSSStyleDeclaration'") the first time it mounts — router.push avoids it.
           <Pressable key={t.name} accessibilityRole="menuitem" testID={`nav-${t.name}`} onPress={() => router.push(t.href)} style={[styles.item, active && { backgroundColor: c.primaryTint }]}>
             <Icon name={t.icon} size={20} color={active ? c.primary : c.muted} />
-            <Text style={[typeScale.body, { color: active ? c.primary : c.text }]}>{t.title}</Text>
+            {/* `primary` text on `primaryTint` is 4.46 (STATUS deviation 6, large-text-only) — below AA at
+                this 15 px body size. The active row uses `c.text` (14.78 on primaryTint) and carries the
+                weight cue instead; the icon alone keeps `c.primary` when active. */}
+            <Text style={[active ? typeScale.bodyStrong : typeScale.body, { color: c.text }]}>{t.title}</Text>
           </Pressable>
         )
       })}
