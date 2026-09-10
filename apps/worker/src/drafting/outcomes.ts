@@ -35,12 +35,14 @@ import { finishRun } from './runs.ts'
 export const DRAFT_ACTOR: AuditActor = 'system:ticket.draft'
 
 /**
- * Thrown INSIDE the final transaction when the guarded flip matches zero rows, so the draft insert
- * (and everything else already written in that transaction) rolls back with it. Caught by the job,
- * which then records the lost race in a fresh transaction.
+ * Thrown INSIDE the final transaction when the guarded flip (or the escalate landing's own
+ * `FOR UPDATE` probe) matches zero rows, so the draft insert — and everything else already written
+ * in that transaction — rolls back with it. Caught by the job, which records the lost race in a
+ * fresh transaction under the action carried here: the two landings are told apart in the audit
+ * trail, because one threw away a review draft and the other an escalation.
  */
 export class LostRaceError extends Error {
-  constructor() {
+  constructor(readonly auditAction: 'draft.propose_lost_race' | 'draft.escalate_lost_race' = 'draft.propose_lost_race') {
     super('ticket.draft: the ticket left `triaged` while the model call was in flight')
     this.name = 'LostRaceError'
   }
@@ -52,7 +54,13 @@ export interface OutcomeContext {
   ticketId: string
   runId: string
   agentId: string
+  /** The run's CLAIM-time clock: the day string, the escalation stamps and `expires_at` are all
+   *  measured from it, so they agree with what the claim wrote. */
   now: Date
+  /** A FRESH clock read taken just before the landing opens its transaction — the run's real finish
+   *  instant. Using `now` here would make every `agent_runs` row report a zero-length run and
+   *  `last_agent_finished_at` record when the run STARTED. */
+  finishedAt: Date
   /** UTC day (YYYY-MM-DD) for the escalation notifications' dedupe keys. */
   day: string
   /** This run's thread snapshot — the message-time watermark `stampFinished` promotes. */
@@ -67,7 +75,7 @@ export interface OutcomeContext {
  * job just committed is real and must stand.
  */
 async function settleRun(tx: OrgTx, ctx: OutcomeContext, output: unknown): Promise<void> {
-  const settled = await finishRun(tx, { runId: ctx.runId, status: 'succeeded', output, usage: ctx.usage, now: ctx.now })
+  const settled = await finishRun(tx, { runId: ctx.runId, status: 'succeeded', output, usage: ctx.usage, now: ctx.finishedAt })
   if (!settled) {
     ctx.logger.warn({ runId: ctx.runId, ticketId: ctx.ticketId }, 'ticket.draft: run was already settled by the backstop sweep')
   }
@@ -96,7 +104,7 @@ export async function applyEscalateOutcome(
       })
     }
     await settleRun(tx, ctx, { outcome: 'escalate', reason: p.escalateReason, rationale: p.rationale })
-    await stampFinished(tx, ctx.ticketId, ctx.threadSnapshotAt, ctx.now)
+    await stampFinished(tx, ctx.ticketId, ctx.threadSnapshotAt, ctx.finishedAt)
     return notificationId
   })
 }
@@ -145,7 +153,7 @@ export async function applyNoReplyOutcome(
         ))
     }
     await settleRun(tx, ctx, { outcome: 'no_reply', reason: p.reason, rationale: p.rationale, redraftUnfulfilled: p.ownerFeedbackPending })
-    await stampFinished(tx, ctx.ticketId, ctx.threadSnapshotAt, ctx.now)
+    await stampFinished(tx, ctx.ticketId, ctx.threadSnapshotAt, ctx.finishedAt)
     return notificationId
   })
 }
@@ -206,7 +214,20 @@ export async function applyDraftOutcome(
         .set({ status: 'awaiting_review' })
         .where(and(eq(tickets.id, ctx.ticketId), eq(tickets.status, 'triaged')))
         .returning({ id: tickets.id })
-      if (flipped.length === 0) throw new LostRaceError()
+      if (flipped.length === 0) throw new LostRaceError('draft.propose_lost_race')
+    } else {
+      // The escalate landing cannot flip the ticket until the draft exists (its id rides the
+      // notification payload), so it takes the SAME lock the review branch's UPDATE takes, in the
+      // SAME place. Without this probe the two landings lock the ticket row and the one-live-draft
+      // partial unique in opposite orders, and two concurrent runs on one ticket can deadlock.
+      // It doubles as the lost-race guard: zero rows means an owner already moved the ticket.
+      const locked = await tx
+        .select({ id: tickets.id })
+        .from(tickets)
+        .where(and(eq(tickets.id, ctx.ticketId), eq(tickets.status, 'triaged')))
+        .limit(1)
+        .for('update')
+      if (locked.length === 0) throw new LostRaceError('draft.escalate_lost_race')
     }
 
     const superseded = await tx
@@ -268,7 +289,9 @@ export async function applyDraftOutcome(
         actor: `agent:${ctx.runId}`, auditAction: 'ticket.escalated',
         detail: { draftId, decisionReason: landing.decisionReason, warnings: row.warnings },
       })
-      if (!result.escalated) throw new LostRaceError()
+      // Unreachable: the `FOR UPDATE` probe above holds this row's lock for the whole
+      // transaction, so nothing can have moved it since. Kept as the belt on that brace.
+      if (!result.escalated) throw new LostRaceError('draft.escalate_lost_race')
       notificationId = result.notificationId
     }
 
@@ -281,7 +304,7 @@ export async function applyDraftOutcome(
       },
     })
     await settleRun(tx, ctx, { outcome: 'reply', draftId, decision: landing.kind === 'review' ? 'review' : 'escalate' })
-    await stampFinished(tx, ctx.ticketId, ctx.threadSnapshotAt, ctx.now)
+    await stampFinished(tx, ctx.ticketId, ctx.threadSnapshotAt, ctx.finishedAt)
 
     return notificationId === undefined ? { draftId } : { draftId, notificationId }
   })
@@ -292,13 +315,13 @@ export async function applyDraftOutcome(
  * paid-for run threw its draft away, and still finalizing — the run DID finish, and leaving it
  * unfinished would have the stuck gate re-run it on a timer.
  */
-export async function recordLostRace(ctx: OutcomeContext): Promise<void> {
+export async function recordLostRace(ctx: OutcomeContext, action: LostRaceError['auditAction']): Promise<void> {
   await withOrg(ctx.db, ctx.orgId, async (tx) => {
     await audit(tx, {
-      actor: `agent:${ctx.runId}`, action: 'draft.propose_lost_race', entityType: 'ticket', entityId: ctx.ticketId,
+      actor: `agent:${ctx.runId}`, action, entityType: 'ticket', entityId: ctx.ticketId,
       detail: { runId: ctx.runId },
     })
     await settleRun(tx, ctx, { lostRace: true })
-    await stampFinished(tx, ctx.ticketId, ctx.threadSnapshotAt, ctx.now)
+    await stampFinished(tx, ctx.ticketId, ctx.threadSnapshotAt, ctx.finishedAt)
   })
 }

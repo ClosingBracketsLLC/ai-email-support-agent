@@ -33,6 +33,18 @@ const rand = () => randomBytes(4).toString('hex')
 const NOW = new Date('2026-09-09T12:00:00Z')
 const TODAY = '2026-09-09'
 const minutesAgo = (n: number) => new Date(NOW.getTime() - n * 60_000)
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * Most tests freeze the clock at `NOW` so timestamps can be asserted exactly. The happy path uses
+ * this instead: the FIRST read is exactly `NOW` (so the claim stamp, the day string and `expires_at`
+ * stay exact) and every later read advances a millisecond, which is what makes "the finish clock is
+ * a fresh read, not the job-start one" an assertable difference rather than a coincidence.
+ */
+function monotonicClock(): () => Date {
+  let tick = 0
+  return () => new Date(NOW.getTime() + tick++)
+}
 
 /** Passes every guardrail screen: no markup, no link, no address, no number, no promise token. */
 const CLEAN_BODY = 'Thanks for getting in touch. I have checked the details you gave us and everything looks correct on our side.'
@@ -362,13 +374,15 @@ describe('runTicketDraft', () => {
   it('6/14. the happy path: awaiting_review, one draft row, the draft_review push, a succeeded run and four events', async () => {
     const ticketId = await seedDraftableTicket()
     const provider = createFakeProvider([{ parsed: REPLY, usage: { inputTokens: 1200, outputTokens: 300 } }])
-    const { deps, notified } = makeDeps(provider)
+    const { deps, notified } = makeDeps(provider, { now: monotonicClock() })
 
     await run(deps, ticketId)
 
     const ticket = await getTicket(ticketId)
     expect(ticket.status).toBe('awaiting_review')
-    expect(ticket.lastAgentFinishedAt?.toISOString()).toBe(NOW.toISOString())
+    // The finish watermark is a FRESH clock read: strictly after the claim stamp, never equal to it.
+    expect(ticket.lastAgentRunAt?.toISOString()).toBe(NOW.toISOString())
+    expect(ticket.lastAgentFinishedAt!.getTime()).toBeGreaterThan(ticket.lastAgentRunAt!.getTime())
     expect(ticket.lastAgentPromptedAt?.toISOString()).toBe(minutesAgo(5).toISOString())
 
     const [draft] = await draftsFor(ticketId)
@@ -404,6 +418,8 @@ describe('runTicketDraft', () => {
     expect(run1!.costMicros).toBe(1200 * 5 + 300 * 25)
     expect(run1!.output).toMatchObject({ outcome: 'reply', draftId: draft!.id, decision: 'review' })
     expect(draft!.agentRunId).toBe(run1!.id)
+    expect(run1!.startedAt.toISOString()).toBe(NOW.toISOString())
+    expect(run1!.finishedAt!.getTime()).toBeGreaterThan(run1!.startedAt.getTime())
 
     expect((await eventsFor(run1!.id)).map((e) => e.kind)).toEqual(['prompt', 'call', 'guardrail', 'decision'])
 
@@ -724,6 +740,183 @@ describe('runTicketDraft', () => {
     await run(deps, ticketId)
 
     expect(provider.calls[0]!.cache).toMatchObject({ agentBreakpoint: true })
+  })
+
+  it('9d. an unparsable envelope counts a failure and rethrows, exactly like a transport error', async () => {
+    const ticketId = await seedDraftableTicket()
+    // `finish: 'stop'` with nothing parseable: the structured-output ladder has already spent its
+    // rungs by the time the job sees this, so it is the job's failure, not a refusal.
+    const provider = createFakeProvider([{ text: 'sorry, plain prose', finish: 'stop' }])
+    const { deps } = makeDeps(provider)
+
+    await expect(run(deps, ticketId)).rejects.toThrow(/unparsable/)
+
+    const ticket = await getTicket(ticketId)
+    expect(ticket.status).toBe('triaged')
+    expect(ticket.agentFailureCount).toBe(1)
+    expect(ticket.lastAgentRunAt).toBeNull()
+    expect(ticket.lastAgentFinishedAt).toBeNull()
+    const [run1] = await runsFor(ticketId)
+    expect(run1!.status).toBe('failed')
+    expect(run1!.errorCode).toBe('unparsable')
+    expect(await auditRowsFor(ticketId, 'draft.run_failed')).toHaveLength(1)
+    expect(await draftsFor(ticketId)).toHaveLength(0)
+  })
+
+  it('7b. a retriever that throws fails the run and rethrows for pg-boss, without ever calling the model', async () => {
+    const ticketId = await seedDraftableTicket()
+    const provider = createFakeProvider([{ parsed: REPLY }])
+    const { deps } = makeDeps(provider, {
+      retriever: { retrieve: async () => { throw new Error('retriever exploded') } },
+    })
+
+    await expect(run(deps, ticketId)).rejects.toThrow(/retriever exploded/)
+
+    expect(provider.calls).toHaveLength(0)
+    const ticket = await getTicket(ticketId)
+    expect(ticket.agentFailureCount).toBe(1)
+    expect(ticket.lastAgentFinishedAt).toBeNull()
+    const [run1] = await runsFor(ticketId)
+    expect(run1!.status).toBe('failed')
+    expect(run1!.errorCode).toBe('retrieval')
+  })
+
+  it('13d. an automatic redraft that THROWS still stores attempt 1 under guardrail_failed, and leaves an error event', async () => {
+    const ticketId = await seedDraftableTicket()
+    const provider = createFakeProvider([
+      { parsed: reply({ body: HTML_BODY }) },
+      { error: new LlmError('rate limited', 'rate_limit', true) },
+    ])
+    const { deps, notified } = makeDeps(provider)
+
+    await run(deps, ticketId)
+
+    expect(provider.calls).toHaveLength(2)
+    const rows = await draftsFor(ticketId)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.status).toBe('pending')
+    expect(rows[0]!.decision).toBe('escalate')
+    expect(rows[0]!.decisionReason).toBe('guardrail_failed')
+    expect(rows[0]!.body).toBe(HTML_BODY)
+    expect((await getTicket(ticketId)).needsOwnerReason).toBe('guardrail_failed')
+    expect(notified).toHaveLength(1)
+
+    // The run itself succeeded — a failed redraft is not a failed run — but attempt 2 is on record.
+    const [run1] = await runsFor(ticketId)
+    expect(run1!.status).toBe('succeeded')
+    expect(run1!.apiCalls).toBe(1) // the throwing call reported no usage
+    const errors = (await eventsFor(run1!.id)).filter((e) => e.kind === 'error')
+    expect(errors).toHaveLength(1)
+    expect(errors[0]!.payload).toMatchObject({ attempt: 2, code: 'llm_rate_limit' })
+  })
+
+  it('13e. the escalate landing takes the ticket lock FIRST, so an owner racing it drops the draft too', async () => {
+    const ticketId = await seedDraftableTicket()
+    // Both attempts fail the guardrails, so this lands on the escalate branch — and the owner
+    // resolves the ticket while the first call is in flight.
+    const provider = hookedProvider([reply({ body: HTML_BODY })], async (attempt) => {
+      if (attempt !== 1) return
+      await withOrg(app.db, fx.orgId, (tx) => tx.update(tickets).set({ status: 'resolved' }).where(eq(tickets.id, ticketId)))
+    })
+    const { deps, notified } = makeDeps(provider)
+
+    await run(deps, ticketId)
+
+    expect(await draftsFor(ticketId)).toHaveLength(0)
+    expect(await auditRowsFor(ticketId, 'draft.escalate_lost_race')).toHaveLength(1)
+    expect(await auditRowsFor(ticketId, 'draft.propose_lost_race')).toHaveLength(0)
+    expect(notified).toHaveLength(0)
+    const ticket = await getTicket(ticketId)
+    expect(ticket.status).toBe('resolved')
+    expect(ticket.lastAgentFinishedAt?.toISOString()).toBe(NOW.toISOString())
+    const [run1] = await runsFor(ticketId)
+    expect(run1!.status).toBe('succeeded')
+    expect(run1!.output).toMatchObject({ lostRace: true })
+  })
+
+  // The gate's own refusals (as opposed to rule 3's unlocked pre-claim exits) are only reachable
+  // when something lands BETWEEN the job's unlocked read and its advisory-locked gate. A second
+  // connection holding the ticket's row lock is exactly that window: the job blocks inside the
+  // claim's `SELECT … FOR UPDATE` until the holder commits its own write.
+  async function raceAtClaim(ticketId: string, duringClaim: (tx: Parameters<Parameters<typeof withOrg>[2]>[0]) => Promise<void>, body: () => Promise<void>): Promise<void> {
+    const other = createDb(t.url)
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    try {
+      const held = withOrg(other.db, fx.orgId, async (tx) => {
+        await tx.select({ id: tickets.id }).from(tickets).where(eq(tickets.id, ticketId)).limit(1).for('update')
+        await duringClaim(tx)
+        await gate
+      })
+      await sleep(100) // the holder now owns the row lock
+      const running = body()
+      await sleep(100) // the job is blocked inside claimTicket's own FOR UPDATE
+      release()
+      await held
+      await running
+    } finally {
+      await other.pool.end()
+    }
+  }
+
+  it('5b. the LOCKED gate: an org draft cap tripped after the claim unwinds the stamp and pages once', async () => {
+    const ticketId = await seedDraftableTicket()
+    const provider = createFakeProvider([{ parsed: REPLY }])
+    const { deps, notified } = makeDeps(provider)
+    // The bump below is written but UNCOMMITTED while the job runs its unlocked pre-claim read, so
+    // that read provably sees this value and rule 3's exit cannot be what fired.
+    const updatedBefore = (await getTicket(ticketId)).updatedAt
+
+    await raceAtClaim(
+      ticketId,
+      // Another worker exhausts the org's daily draft allowance while this job is mid-claim.
+      (tx) => tx
+        .insert(usageCounters)
+        .values({ orgId: fx.orgId, day: TODAY, meter: 'draft_runs', value: 999_999 })
+        .onConflictDoUpdate({ target: [usageCounters.orgId, usageCounters.day, usageCounters.meter], set: { value: 999_999 } })
+        .then(() => undefined),
+      () => run(deps, ticketId),
+    )
+
+    const ticket = await getTicket(ticketId)
+    expect(ticket.status).toBe('triaged')
+    expect(ticket.lastAgentRunAt).toBeNull() // unwound back to its prior value
+    // Decisive: rule 3's pre-claim exit never writes to the ticket at all, so a moved `updated_at`
+    // is proof the claim stamped the row and the LOCKED gate is what unwound it.
+    expect(ticket.updatedAt.getTime()).toBeGreaterThan(updatedBefore.getTime())
+    expect(provider.calls).toHaveLength(0)
+    expect(await runsFor(ticketId)).toHaveLength(0)
+    const capNotifications = await notificationsWithPrefix(`llm_cap:${fx.orgId}:`)
+    expect(capNotifications).toHaveLength(1)
+    expect(notified).toEqual([capNotifications[0]!.id])
+  })
+
+  it('5c. the LOCKED gate: a per-ticket cap tripped after the claim escalates agent_run_cap and does NOT unwind', async () => {
+    const ticketId = await seedDraftableTicket()
+    const provider = createFakeProvider([{ parsed: REPLY }])
+    const { deps, notified } = makeDeps(provider)
+
+    await raceAtClaim(
+      ticketId,
+      // Three draft runs for THIS ticket land while the job is mid-claim.
+      (tx) => tx
+        .insert(agentRuns)
+        .values(Array.from({ length: 3 }, () => ({
+          orgId: fx.orgId, kind: 'draft', ticketId, agentId: fx.agentId, provider: 'fake',
+          model: 'claude-opus-5', status: 'succeeded', startedAt: NOW,
+        })))
+        .then(() => undefined),
+      () => run(deps, ticketId),
+    )
+
+    const ticket = await getTicket(ticketId)
+    expect(ticket.status).toBe('needs_owner')
+    expect(ticket.needsOwnerReason).toBe('agent_run_cap')
+    // The stamp is left standing: the ticket is leaving `triaged`, so no claim predicate reads it again.
+    expect(ticket.lastAgentRunAt?.toISOString()).toBe(NOW.toISOString())
+    expect(provider.calls).toHaveLength(0)
+    expect(await notificationsWithPrefix(`agent_run_cap:${ticketId}:`)).toHaveLength(1)
+    expect(notified).toHaveLength(1)
   })
 
   it('14e. an unauthenticated sender still gets a draft, but the decision reason is dmarc_fail', async () => {

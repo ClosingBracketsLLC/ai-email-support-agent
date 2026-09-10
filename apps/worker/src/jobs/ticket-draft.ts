@@ -481,9 +481,12 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
   const runId = gate.runId
 
   const usage = createUsageAccumulator()
+  /** Built immediately before each landing opens its transaction, so `finishedAt` is a FRESH clock
+   *  read: `agent_runs.finished_at` and `last_agent_finished_at` record when the run actually
+   *  finished, not when it was claimed. Everything day- or claim-scoped still rides `now`. */
   const outcomeCtx = (): OutcomeContext => ({
-    db: deps.db, orgId, ticketId, runId, agentId: agent.id, now, day, threadSnapshotAt,
-    usage: usage.totals(), logger: deps.logger,
+    db: deps.db, orgId, ticketId, runId, agentId: agent.id, now, finishedAt: deps.now?.() ?? new Date(),
+    day, threadSnapshotAt, usage: usage.totals(), logger: deps.logger,
   })
 
   /**
@@ -493,9 +496,12 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
    * where the ticket has been escalated and the job returns instead of retrying further.
    */
   const fail = async (code: string, detail: string, status: 'failed' | 'aborted'): Promise<boolean> => {
+    // `recordFailure` stays on the claim-time `now` (its escalation is day-scoped); only the run
+    // row's own `finished_at` wants the real finish instant.
+    const finishedAt = deps.now?.() ?? new Date()
     const result = await withOrg(deps.db, orgId, async (tx) => {
       const recorded = await recordFailure(tx, { orgId, ticketId, code, detail, now, runId })
-      const settled = await finishRun(tx, { runId, status, errorCode: code, errorMessage: detail.slice(0, 500), usage: usage.totals(), now })
+      const settled = await finishRun(tx, { runId, status, errorCode: code, errorMessage: detail.slice(0, 500), usage: usage.totals(), now: finishedAt })
       if (!settled) deps.logger.warn({ runId, ticketId }, 'ticket.draft: run was already settled by the backstop sweep')
       await appendRunEvent(tx, runId, 'error', { code, detail })
       return recorded
@@ -542,10 +548,17 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
   })
 
   /** One model attempt plus its accounting: usage, cost and the `call` trace event. */
+  let pricingWarned = false
   const callModel = async (attempt: number, guardrailRetry: { codes: string[] } | null, effort: 'medium' | 'high'): Promise<DraftCallResult> => {
     const meta: ChatMeta = { orgId, agentId: agent.id, runId, role: 'draft', idempotencyKey: `draft:${runId}:${attempt}` }
     const call = await runDraftCall(deps.provider, promptInput(guardrailRetry, effort), meta, watchdog)
     const pricing = findPricing(call.result.model)
+    // A model with no seeded pricing row costs 0 here, which silently disables BOTH the stop-loss
+    // and this run's contribution to the org's daily spend cap — say so out loud, once per run.
+    if (!pricing && !pricingWarned) {
+      pricingWarned = true
+      deps.logger.warn({ runId, provider: deps.provider.kind, model: call.result.model }, 'ticket.draft: no pricing for model; cost recorded as 0')
+    }
     const costMicros = pricing ? computeCostMicros(call.result.usage, pricing, '1h') : 0
     usage.add(call.result.usage, costMicros)
     await withOrg(deps.db, orgId, (tx) =>
@@ -598,8 +611,15 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
           second = await callModel(2, { codes }, 'high')
         } catch (err) {
           // A failed redraft is not a failed run: the first attempt's body still goes to the owner
-          // with its findings, which is the same end state a second failing attempt would produce.
-          deps.logger.warn({ runId, ticketId, err: errorToDetail(err) }, 'ticket.draft: the automatic redraft failed')
+          // with its findings, which is the same end state a second failing attempt would produce —
+          // so no `recordFailure`, and the landing below is unchanged. It still has to be VISIBLE,
+          // or the run settles `succeeded` with no trace that attempt 2 ever happened. (Usage the
+          // throwing call may already have burned is not recoverable — the provider only reports it
+          // on a returned result.)
+          const aborted = watchdog.aborted
+          const code = aborted ? 'watchdog' : err instanceof LlmError ? `llm_${err.code}` : 'llm_unknown'
+          await withOrg(deps.db, orgId, (tx) => appendRunEvent(tx, runId, 'error', { attempt: 2, code, message: errorToDetail(err) }))
+          deps.logger.warn({ runId, ticketId, code }, 'ticket.draft: the automatic redraft failed')
         }
         if (second?.decision) {
           const next = second.decision
@@ -731,7 +751,7 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
     if (!(err instanceof LostRaceError)) throw err
     // Someone moved the ticket while the model call was in flight. The draft is dropped on the
     // floor — nothing is anchored to it — but the run still finished, so it is finalized.
-    await recordLostRace(outcomeCtx())
+    await recordLostRace(outcomeCtx(), err.auditAction)
   }
 }
 
