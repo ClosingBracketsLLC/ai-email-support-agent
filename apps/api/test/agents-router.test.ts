@@ -2,7 +2,7 @@ import { createTRPCClient, httpBatchLink } from '@trpc/client'
 import { and, eq } from 'drizzle-orm'
 import superjson from 'superjson'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
-import { agentRuns, agents, auditLog, SANDBOX_METERS, usageCounters } from '@aesa/db'
+import { agentRuns, agents, auditLog, orgSettings, SANDBOX_METERS, usageCounters } from '@aesa/db'
 import type { EnqueueFn } from '../src/deps.ts'
 import type { AppRouter } from '../src/trpc/router.ts'
 import { WEB, createTestApi, insertConnectedMailbox, listen, signInWithOtp } from './helpers/app.ts'
@@ -138,7 +138,7 @@ describe('agents router — sandbox', () => {
     const { orgId } = await c.workspace.create.mutate({ businessName: 'Acme', timezone: 'UTC' })
     const connectionId = await insertConnectedMailbox(t.api, orgId, signed.user.id, mailboxEmail)
     const added = await c.mailboxes.addAddress.mutate({ connectionId, address: mailboxEmail, replyFromConnection: false })
-    return { orgId, c, agentId: added.agentId }
+    return { orgId, c, agentId: added.agentId, cookie: signed.cookie }
   }
 
   it('sandboxStart inserts a running run, bumps sandbox_runs, enqueues agent.sandbox with entityId runId, and audits agent.sandbox_started', async () => {
@@ -174,6 +174,41 @@ describe('agents router — sandbox', () => {
     const [counter] = await t.api.withOrg(org.orgId, (tx) =>
       tx.select().from(usageCounters).where(and(eq(usageCounters.orgId, org.orgId), eq(usageCounters.meter, SANDBOX_METERS.runs))))
     expect(counter?.value).toBe(100)
+  })
+
+  // The race the advisory lock exists to stop: two callers for the same org against a cap of 1.
+  // Unlocked, both read `sandbox_runs = 0` before either writes and BOTH proceed — one run over cap
+  // (a real-money guard, since each run is a model call). Serialized, the loser reads the winner's
+  // committed bump and is refused. Two SEPARATE client instances (not two calls on one client, which
+  // tRPC's batch link could coalesce into a single HTTP request) so the requests genuinely overlap —
+  // same shape as apps/worker/test/drafting-caps.test.ts's cap-race proof.
+  it('serializes two concurrent sandboxStart calls against a cap of 1: exactly one proceeds', async () => {
+    const org = await setupActiveAgent('sandbox8@example.com', 'support@sandbox8.test')
+    await t.api.withOrg(org.orgId, (tx) => tx.insert(orgSettings).values({ orgId: org.orgId, key: 'sandbox.daily_cap', value: 1 }))
+
+    const second = client(base, org.cookie)
+    // Warm the second client first: an unwarmed one could let the first call finish before the
+    // second even begins — no race to observe.
+    await second.workspace.get.query()
+
+    const results = await Promise.allSettled([
+      org.c.agents.sandboxStart.mutate({ agentId: org.agentId, subject: 'Q', question: 'First?' }),
+      second.agents.sandboxStart.mutate({ agentId: org.agentId, subject: 'Q', question: 'Second?' }),
+    ])
+
+    const fulfilled = results.filter((r): r is PromiseFulfilledResult<{ runId: string }> => r.status === 'fulfilled')
+    const rejected = results.filter((r) => r.status === 'rejected')
+    expect(fulfilled).toHaveLength(1)
+    expect(rejected).toHaveLength(1)
+    expect((rejected[0] as PromiseRejectedResult).reason).toMatchObject({ data: { code: 'TOO_MANY_REQUESTS' } })
+
+    const [counter] = await t.api.withOrg(org.orgId, (tx) =>
+      tx.select().from(usageCounters).where(and(eq(usageCounters.orgId, org.orgId), eq(usageCounters.meter, SANDBOX_METERS.runs))))
+    expect(counter?.value).toBe(1)
+
+    const runs = await t.api.withOrg(org.orgId, (tx) => tx.select().from(agentRuns).where(eq(agentRuns.agentId, org.agentId)))
+    expect(runs).toHaveLength(1)
+    expect(runs[0]!.id).toBe(fulfilled[0]!.value.runId)
   })
 
   it('an inactive agent is PRECONDITION_FAILED', async () => {

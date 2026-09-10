@@ -4,7 +4,7 @@
  * `mailboxes.addAddress` already seeded (one per org category, mode 'review').
  */
 import { TRPCError } from '@trpc/server'
-import { and, asc, eq } from 'drizzle-orm'
+import { and, asc, eq, sql } from 'drizzle-orm'
 import { AgentIdInput, DRAFT_MODEL_ID, SandboxOutputView, SandboxRunInput, SandboxStartInput, UpdateAgentInput } from '@aesa/contracts'
 import { resolveSetting, type SettingKey } from '@aesa/core'
 import {
@@ -123,13 +123,18 @@ export const agentsRouter = router({
    * synthetic thread (`apps/worker/src/jobs/agent-sandbox.ts` does the actual model call; this
    * procedure only ever inserts the `agent_runs` row and enqueues it). The cap check, the insert and
    * the meter bump are ONE transaction, fail-closed: the cap is read and compared BEFORE the insert,
-   * so a capped org never gets a `running` row at all.
+   * so a capped org never gets a `running` row at all. Under READ COMMITTED that alone still lets two
+   * concurrent calls both read the counter before either writes — an org-scoped
+   * `pg_advisory_xact_lock`, the FIRST statement of the transaction, serializes them (same shape as
+   * the worker's draft gate, `apps/worker/src/drafting/caps.ts`'s `gateAndRecordRun`).
    */
   sandboxStart: orgProcedure.input(SandboxStartInput).mutation(async ({ ctx, input }) => {
     const now = new Date()
     const day = utcDayString(now)
 
     const runId = await ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`sandbox-gate:${ctx.orgId}`}))`)
+
       const [agent] = await tx.select({ status: agents.status }).from(agents)
         .where(and(eq(agents.orgId, ctx.orgId), eq(agents.id, input.agentId)))
       if (!agent || agent.status !== 'active') {
