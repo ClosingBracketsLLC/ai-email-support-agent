@@ -48,9 +48,9 @@ export function screenBodyTooLong(body: string, maxChars: number): GuardrailFind
   return { code: 'body_too_long', severity: 'fail', detail: `reply body is ${body.length} chars (max ${maxChars})` }
 }
 
-/** `\p{Cf}` format characters are stripped before this ever runs (not failed) — this only catches
- * a remaining `\p{Cc}` control character other than the three whitespace ones every plain-text
- * body legitimately contains. */
+/** Default-ignorable code points (`\p{Cf}` and the non-`Cf` ones alike) are stripped before this
+ * ever runs (not failed) — this only catches a remaining `\p{Cc}` control character other than the
+ * three whitespace ones every plain-text body legitimately contains. */
 export function screenInvisibleChars(body: string): GuardrailFinding | null {
   const re = /\p{Cc}/gu
   let m: RegExpExecArray | null

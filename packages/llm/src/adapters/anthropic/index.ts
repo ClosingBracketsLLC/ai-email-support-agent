@@ -190,11 +190,24 @@ function resolveStructuredMode(requested: StructuredMode | undefined, capabiliti
 }
 
 function buildResult<T>(req: ChatRequest<T>, mode: StructuredMode | undefined, response: Anthropic.Message, latencyMs: number): ChatResult<T> {
+  // `usage.cache_creation` (SDK 0.124's `CacheCreation`) breaks the cache-write total down by TTL:
+  // this request can carry a 1h breakpoint on the static prefix AND a 5m one on the agent block, and
+  // the two price differently (2x vs 1.25x input). It is nullable, so the split is passed on only
+  // when the provider actually reported it — `computeCostMicros` prices an unattributed total at the
+  // TTL its caller configured rather than guessing here.
+  const cacheCreation = response.usage.cache_creation
+  const cacheWriteSplit =
+    cacheCreation === null || cacheCreation === undefined
+      ? null
+      : { cacheWrite5mTokens: cacheCreation.ephemeral_5m_input_tokens, cacheWrite1hTokens: cacheCreation.ephemeral_1h_input_tokens }
   const usage: ChatUsage = {
     inputTokens: response.usage.input_tokens,
     outputTokens: response.usage.output_tokens,
     cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
-    cacheWriteTokens: response.usage.cache_creation_input_tokens ?? 0,
+    cacheWriteTokens:
+      response.usage.cache_creation_input_tokens ??
+      (cacheWriteSplit ? cacheWriteSplit.cacheWrite5mTokens + cacheWriteSplit.cacheWrite1hTokens : 0),
+    ...(cacheWriteSplit ?? {}),
     apiCalls: 1,
   }
 

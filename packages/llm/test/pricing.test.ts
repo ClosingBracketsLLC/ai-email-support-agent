@@ -73,7 +73,49 @@ describe('computeCostMicros', () => {
       haiku,
       '5m',
     )
-    // 3 tokens * 0.1 micros/token = 0.3 -> rounds to an integer
+    // 3 tokens * 0.1 micros/token = 0.3 -> rounds to 0, an integer (ledger 69: pin the value, not
+    // just its integer-ness — `Math.round` and `Math.ceil` are both integer-valued, only one is right).
+    expect(micros).toBe(0)
     expect(Number.isInteger(micros)).toBe(true)
+  })
+
+  // -- I1 (final-B): a 5-minute cache write must not be billed at the 1-hour rate --
+
+  it('prices each cache-write TTL bucket at its own rate, whatever the configured fallback ttl is', () => {
+    const opus5 = findPricing('claude-opus-5')!
+    const micros = computeCostMicros(
+      {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 3000,
+        cacheWrite5mTokens: 2000,
+        cacheWrite1hTokens: 1000,
+        apiCalls: 1,
+      },
+      opus5,
+      // The managed provider configures '1h'; the 5m bucket must still price at 6.25, not 10.
+      '1h',
+    )
+    // 2000 * 6.25 (1.25x input) + 1000 * 10 (2x input) = 12_500 + 10_000
+    expect(micros).toBe(22_500)
+  })
+
+  it('prices cache-write tokens the provider did not attribute to a TTL at the configured ttl', () => {
+    const opus5 = findPricing('claude-opus-5')!
+    const base = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, apiCalls: 1 }
+
+    // No split reported at all -> the whole total falls back to the configured ttl.
+    expect(computeCostMicros({ ...base, cacheWriteTokens: 2000 }, opus5, '1h')).toBe(20_000)
+    expect(computeCostMicros({ ...base, cacheWriteTokens: 2000 }, opus5, '5m')).toBe(12_500)
+
+    // A partial split -> the attributed tokens price by bucket, the remainder by the fallback.
+    const partial = computeCostMicros(
+      { ...base, cacheWriteTokens: 3000, cacheWrite5mTokens: 2000, cacheWrite1hTokens: 0 },
+      opus5,
+      '1h',
+    )
+    // 2000 * 6.25 + 1000 unattributed * 10 = 12_500 + 10_000
+    expect(partial).toBe(22_500)
   })
 })

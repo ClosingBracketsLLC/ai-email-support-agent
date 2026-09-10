@@ -99,6 +99,57 @@ describe('validateReplyBody: zero-width / format character stripping', () => {
   })
 })
 
+// -- I2 (final-B): the default-ignorable set is larger than \p{Cf}. U+FE0F (VARIATION SELECTOR-16)
+// and U+034F (COMBINING GRAPHEME JOINER) are category Mn, render as nothing, and survive NFKC —
+// one of them inside a token used to turn a hard FAIL into a clean pass on six screens.
+
+describe('validateReplyBody: default-ignorable (non-Cf) character stripping', () => {
+  const INVISIBLES: [string, string][] = [
+    ['U+FE0F (VARIATION SELECTOR-16)', '️'],
+    ['U+034F (COMBINING GRAPHEME JOINER)', '͏'],
+  ]
+
+  for (const [label, ch] of INVISIBLES) {
+    describe(label, () => {
+      it('does not hide a promised action', () => {
+        const result = validateReplyBody(`Your ref${ch}und has been processed today.`, POLICY)
+        expect(result.findings.some((f) => f.code === 'promised_action')).toBe(true)
+        expect(result.ok).toBe(false)
+      })
+
+      it('does not hide a phone number', () => {
+        const result = validateReplyBody(`Call us at +1 (888) 5${ch}55-0142 any time.`, POLICY)
+        expect(result.findings.some((f) => f.code === 'contact_channel')).toBe(true)
+        expect(result.ok).toBe(false)
+      })
+
+      it('does not hide a URL host', () => {
+        const result = validateReplyBody(`Go to evil${ch}.com now.`, POLICY)
+        expect(result.findings.some((f) => f.code === 'url_not_allowed')).toBe(true)
+        expect(result.ok).toBe(false)
+      })
+
+      it('does not hide an sk- secret', () => {
+        const result = validateReplyBody(`Key: sk-${ch}abcdefghijklmnop123`, POLICY)
+        expect(result.findings.some((f) => f.code === 'secret_leak')).toBe(true)
+        expect(result.ok).toBe(false)
+      })
+
+      it('does not hide an HTML tag', () => {
+        // Between the `<` and the tag letter — the one placement `<(?!https?://)[a-z!/]` cannot see past.
+        const result = validateReplyBody(`Hello <${ch}b>there`, POLICY)
+        expect(result.findings.some((f) => f.code === 'html_not_allowed')).toBe(true)
+        expect(result.ok).toBe(false)
+      })
+
+      it('is stripped from normalizedBody, so what is screened is what is stored and sent', () => {
+        const result = validateReplyBody(`Thanks for wri${ch}ting in.`, POLICY)
+        expect(result.normalizedBody).toBe('Thanks for writing in.')
+      })
+    })
+  }
+})
+
 // -- Promised-action screen --
 
 describe('validateReplyBody: promised-action screen', () => {

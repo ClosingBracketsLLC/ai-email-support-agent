@@ -27,7 +27,7 @@ const appImports = {
   ],
   patterns: [
     ...rawDbImports.patterns,
-    { group: ['@aesa/db/*', '@aesa/api/*', 'drizzle-orm/*', 'node:*'], message: APP_MESSAGE, allowTypeImports: true },
+    { group: ['@aesa/db/*', '@aesa/api/*', '@aesa/agent/*', 'drizzle-orm/*', 'node:*'], message: APP_MESSAGE, allowTypeImports: true },
   ],
 }
 

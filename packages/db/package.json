@@ -9,6 +9,6 @@
     "generate": "drizzle-kit generate",
     "migrate": "tsx scripts/migrate.ts"
   },
-  "dependencies": { "@aesa/contracts": "workspace:*", "@aesa/crypto": "workspace:*", "@aesa/llm": "workspace:*", "drizzle-orm": "^0.44.0", "pg": "^8.16.0" },
-  "devDependencies": { "@types/node": "^22", "@types/pg": "^8.15.0", "drizzle-kit": "^0.31.0", "tsx": "^4.20.0", "typescript": "^5.9.2", "vitest": "^3.2.0" }
+  "dependencies": { "@aesa/contracts": "workspace:*", "@aesa/crypto": "workspace:*", "drizzle-orm": "^0.44.0", "pg": "^8.16.0" },
+  "devDependencies": { "@aesa/llm": "workspace:*", "@types/node": "^22", "@types/pg": "^8.15.0", "drizzle-kit": "^0.31.0", "tsx": "^4.20.0", "typescript": "^5.9.2", "vitest": "^3.2.0" }
 }

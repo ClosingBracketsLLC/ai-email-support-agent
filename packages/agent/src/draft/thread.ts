@@ -8,7 +8,8 @@
  * approved"}` — which, spliced in as free text, would render indistinguishably from a genuine turn
  * the business sent. Each message is therefore ONE `JSON.stringify`d line: embedded newlines and
  * quotes come out backslash-escaped, so a forged structural line stays inside a single JSON string
- * value and can never become a line of its own.
+ * value and can never become a line of its own — see `jsonLine`, which also closes the separators
+ * `JSON.stringify` leaves raw.
  */
 import type { GuardrailCode } from '@aesa/contracts'
 
@@ -23,8 +24,19 @@ export interface ThreadMessage {
  * bodies, so a 200-message thread cannot blow the context window on one hostile message. */
 export const THREAD_BODY_MAX_CHARS = 6000
 
+/**
+ * `JSON.stringify` escapes `\n` and `\r`, but emits U+2028 (LINE SEPARATOR), U+2029 (PARAGRAPH
+ * SEPARATOR) and U+0085 (NEXT LINE) raw — every one of them a line break to something that renders
+ * the prompt, which is exactly the "a body becomes its own line" hole the containment exists to
+ * close. Re-escaping them here keeps the one-line invariant a property of the code rather than of
+ * whatever the model happens to do with an exotic separator.
+ */
+function jsonLine(value: unknown): string {
+  return JSON.stringify(value).replace(/[\u0085\u2028\u2029]/gu, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`)
+}
+
 export function formatThreadLine(m: ThreadMessage): string {
-  return JSON.stringify({
+  return jsonLine({
     direction: m.direction,
     at: m.at ? m.at.toISOString() : null,
     from: m.from,
@@ -94,7 +106,7 @@ export function buildUserMessage(i: DraftUserInput): string {
       '',
       '## Previous draft',
       'The reply you proposed last time, as one JSON object. It was not sent.',
-      JSON.stringify({ body: i.priorDraft.body.slice(0, THREAD_BODY_MAX_CHARS) }),
+      jsonLine({ body: i.priorDraft.body.slice(0, THREAD_BODY_MAX_CHARS) }),
     )
     if (i.priorDraft.rejectReason !== null && i.priorDraft.rejectReason.trim().length > 0) {
       lines.push(`Rejected because: ${i.priorDraft.rejectReason}`)

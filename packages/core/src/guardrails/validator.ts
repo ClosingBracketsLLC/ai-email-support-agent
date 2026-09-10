@@ -25,7 +25,7 @@ export interface GuardrailFinding {
 export interface GuardrailResult {
   /** No 'fail' findings. A 'warn'-only result is still ok:true. */
   ok: boolean
-  /** NFKC + double `\p{Cf}`-strip of the input — what was screened is what is stored and sent. */
+  /** NFKC + double default-ignorable strip of the input — what was screened is what is stored and sent. */
   normalizedBody: string
   /** Every finding, in screen order — not just the first. */
   findings: GuardrailFinding[]
@@ -40,11 +40,19 @@ export interface ValidateOptions {
   groundedNumbers?: readonly string[]
 }
 
-/** Strips default-ignorable FORMAT characters (`\p{Cf}`: ZWSP, BOM, ZWNJ/ZWJ, word joiner, soft
- * hyphen, ...) both BEFORE and AFTER NFKC — NFKC can expand a compatibility char into a sequence
- * that itself contains a format char, so a single pass is not enough. */
+/**
+ * Strips the WHOLE default-ignorable set (`\p{Default_Ignorable_Code_Point}`) both BEFORE and AFTER
+ * NFKC — NFKC can expand a compatibility char into a sequence that itself contains one, so a single
+ * pass is not enough.
+ *
+ * Not just `\p{Cf}` (ZWSP, BOM, ZWNJ/ZWJ, word joiner, soft hyphen, the bidi controls): U+FE00–FE0F
+ * (VARIATION SELECTOR-1..16) and U+034F (COMBINING GRAPHEME JOINER) are category `Mn`, render as
+ * nothing, and survive NFKC — one of them inside a token used to turn a hard FAIL into a clean pass
+ * on six of the eight screens (final-B I2). Default-ignorable is exactly the set Unicode defines as
+ * "renders as nothing", which is the property that makes a character able to hide inside a token.
+ */
 function stripFormatChars(s: string): string {
-  return s.replace(/\p{Cf}/gu, '')
+  return s.replace(/\p{Default_Ignorable_Code_Point}/gu, '')
 }
 
 /** `unbacked_number` (warn) — only runs when `opts.groundedNumbers` is supplied. */
@@ -85,7 +93,8 @@ function screenLanguageMismatch(expectedLanguage: string | null, replyLanguage: 
  * catch every bypass either way; this only decides which code comes first when a body trips both.
  *
  * Unicode-normalizes before ANY screen runs: NFKC folds compatibility look-alikes down to their
- * plain ASCII equivalents, and `\p{Cf}` format characters are stripped (not failed) so an
+ * plain ASCII equivalents, and every default-ignorable code point (format characters AND the
+ * non-`Cf` ones — variation selectors, the combining grapheme joiner) is stripped (not failed) so an
  * invisible character inside a token can't dodge a screen while rendering identically to the
  * customer. The stripped+normalized string is `normalizedBody` — what gets stored and sent.
  */

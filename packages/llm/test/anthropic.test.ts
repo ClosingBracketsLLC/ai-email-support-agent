@@ -236,6 +236,38 @@ describe('createAnthropicProvider', () => {
     await providerHaiku.chat(baseRequest({ model: 'claude-haiku-4-5', effort: 'high' }))
     const haikuOutputConfig = incapable.bodies[0]?.output_config as Record<string, unknown> | undefined
     expect(haikuOutputConfig?.effort).toBeUndefined()
+    // Ledger 70: not merely an absent `effort` — with nothing else to put in it, `output_config`
+    // itself must be left off the request body rather than sent as an empty object.
+    expect(incapable.bodies[0]).not.toHaveProperty('output_config')
+  })
+
+  it('(c2) places each breakpoint on the LAST block of its stability, never the first (ledger 71)', async () => {
+    const longStatic = 'x'.repeat(2048) // estimateTokens = 512, clears claude-opus-5's 512 min on its own
+    const { fetchFn, bodies } = capturingFetch(() => jsonResponse(anthropicMessage({ model: 'claude-opus-5' })))
+    const provider = createAnthropicProvider({ apiKey: new Secret('sk-ant-test-key'), fetchFn })
+
+    await provider.chat(
+      baseRequest({
+        model: 'claude-opus-5',
+        system: [
+          { id: 's1', text: longStatic, stability: 'static' },
+          { id: 's2', text: 'Second static block.', stability: 'static' },
+          { id: 'a1', text: 'First agent block.', stability: 'agent' },
+          { id: 'a2', text: 'Second agent block.', stability: 'agent' },
+          { id: 'v1', text: 'Customer message.', stability: 'volatile' },
+        ],
+        cache: { agentBreakpoint: true },
+      }),
+    )
+
+    // A `findIndex` regression would mark s1/a1 instead, splitting the prefix and losing the cache.
+    expect(bodies[0]?.system).toEqual([
+      { type: 'text', text: longStatic },
+      { type: 'text', text: 'Second static block.', cache_control: { type: 'ephemeral', ttl: '1h' } },
+      { type: 'text', text: 'First agent block.' },
+      { type: 'text', text: 'Second agent block.', cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: 'Customer message.' },
+    ])
   })
 
   it('(d) native structured output: output_config.format carries the envelope schema, no tools, and parsed unwraps decision', async () => {
@@ -323,6 +355,37 @@ describe('createAnthropicProvider', () => {
 
     expect(first.usage.cacheReadTokens).toBe(0)
     expect(second.usage.cacheReadTokens).toBe(1200)
+  })
+
+  it('(g2) splits cache-write tokens by TTL from usage.cache_creation, keeping cacheWriteTokens as the total', async () => {
+    // The cache-hit fixture is the SECOND call of a cached pair: the 1h static prefix is read back
+    // (1200) while the opt-in 5m agent breakpoint writes a fresh entry (400). Pricing the 400 at the
+    // 1-hour rate is the ~60% over-charge I1 (final-B) found.
+    const fetchFn = vi.fn(async () => jsonResponse(loadFixture('draft-cache-hit.json'))) as unknown as typeof fetch
+    const provider = createAnthropicProvider({ apiKey: new Secret('sk-ant-test-key'), fetchFn })
+
+    const result = await provider.chat(
+      baseRequest({ model: 'claude-sonnet-5', output: { name: 'triage', schema: OUTPUT_SCHEMA, mode: 'native' } }),
+    )
+
+    expect(result.usage.cacheWriteTokens).toBe(400)
+    expect(result.usage.cacheWrite5mTokens).toBe(400)
+    expect(result.usage.cacheWrite1hTokens).toBe(0)
+  })
+
+  it('(g3) leaves the TTL split absent when the response reports no cache_creation breakdown', async () => {
+    const fetchFn = vi.fn(async () =>
+      jsonResponse(
+        anthropicMessage({ usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 300, cache_read_input_tokens: 0 } }),
+      ),
+    ) as unknown as typeof fetch
+    const provider = createAnthropicProvider({ apiKey: new Secret('sk-ant-test-key'), fetchFn })
+
+    const result = await provider.chat(baseRequest())
+
+    expect(result.usage.cacheWriteTokens).toBe(300)
+    expect(result.usage.cacheWrite5mTokens).toBeUndefined()
+    expect(result.usage.cacheWrite1hTokens).toBeUndefined()
   })
 
   it('(h) exposes capabilities per known model id, and a json_mode/no-cache fallback for an unknown one', () => {

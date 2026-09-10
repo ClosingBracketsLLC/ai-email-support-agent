@@ -15,12 +15,23 @@ export const REPAIR_MAX_OUTPUT_TOKENS = 1024
 
 const ZERO_USAGE: ChatUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, apiCalls: 0 }
 
+/** Keeps "no rung reported a TTL split" (both absent -> absent) distinct from "the split was zero",
+ * so `computeCostMicros`'s fallback still applies to a rung that never got a breakdown. */
+function addOptional(a: number | undefined, b: number | undefined): number | undefined {
+  if (a === undefined && b === undefined) return undefined
+  return (a ?? 0) + (b ?? 0)
+}
+
 function sumUsage(a: ChatUsage, b: ChatUsage): ChatUsage {
+  const cacheWrite5mTokens = addOptional(a.cacheWrite5mTokens, b.cacheWrite5mTokens)
+  const cacheWrite1hTokens = addOptional(a.cacheWrite1hTokens, b.cacheWrite1hTokens)
   return {
     inputTokens: a.inputTokens + b.inputTokens,
     outputTokens: a.outputTokens + b.outputTokens,
     cacheReadTokens: a.cacheReadTokens + b.cacheReadTokens,
     cacheWriteTokens: a.cacheWriteTokens + b.cacheWriteTokens,
+    ...(cacheWrite5mTokens === undefined ? {} : { cacheWrite5mTokens }),
+    ...(cacheWrite1hTokens === undefined ? {} : { cacheWrite1hTokens }),
     apiCalls: a.apiCalls + b.apiCalls,
   }
 }

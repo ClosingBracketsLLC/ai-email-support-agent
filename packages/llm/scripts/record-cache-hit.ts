@@ -12,6 +12,11 @@
  * round trip — the same ~1,500-token static system prefix sent TWICE, one second apart — and
  * rewrites the fixture from the SECOND response.
  *
+ * The committed fixture is currently hand-authored (the runbook step has not been run yet) and its
+ * numbers are pinned by two tests: (g)'s `cache_read_input_tokens`, and (g2)'s `cache_creation`
+ * TTL split. A live recording will carry whatever the API actually reported, so re-run BOTH
+ * assertions against the new body and update their expected numbers with the fixture.
+ *
  * **It never runs in CI.** Like `packages/test-kit/src/recorder.ts` (the shape this is modeled on),
  * the live sequence runs only when this file is the process entry point AND `LLM_RECORD=1`, so an
  * accidental `tsx` invocation is a no-op in every environment, credentialed or not. It is a step in

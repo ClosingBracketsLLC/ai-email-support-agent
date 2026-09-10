@@ -402,9 +402,6 @@ importers:
       '@aesa/crypto':
         specifier: workspace:*
         version: link:../crypto
-      '@aesa/llm':
-        specifier: workspace:*
-        version: link:../llm
       drizzle-orm:
         specifier: ^0.44.0
         version: 0.44.7(@types/pg@8.23.1)(kysely@0.29.5)(pg@8.23.0)
@@ -412,6 +409,9 @@ importers:
         specifier: ^8.16.0
         version: 8.23.0
     devDependencies:
+      '@aesa/llm':
+        specifier: workspace:*
+        version: link:../llm
       '@types/node':
         specifier: ^22
         version: 22.20.1

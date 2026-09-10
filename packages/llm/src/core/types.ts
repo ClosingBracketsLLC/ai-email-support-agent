@@ -64,7 +64,18 @@ export interface ChatUsage {
   inputTokens: number
   outputTokens: number
   cacheReadTokens: number
+  /** Every cache-write token, both TTLs together — what `llm_calls.cache_write_tokens` records. */
   cacheWriteTokens: number
+  /**
+   * The TTL split of `cacheWriteTokens`, when the provider reports one (Anthropic's
+   * `usage.cache_creation`). One request can write BOTH: the adapter puts a 1-hour breakpoint on the
+   * static prefix and an opt-in 5-minute one on the agent block, and a 5m write costs 1.25x the
+   * input rate against a 1h write's 2x — so pricing the whole total at one rate over-charges the 5m
+   * tokens by ~60%. Absent means the provider gave no breakdown: `computeCostMicros` then prices the
+   * unattributed remainder at the TTL its caller configured.
+   */
+  cacheWrite5mTokens?: number
+  cacheWrite1hTokens?: number
   apiCalls: number
 }
 

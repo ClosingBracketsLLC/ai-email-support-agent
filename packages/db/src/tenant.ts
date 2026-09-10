@@ -44,9 +44,17 @@ export async function withOrg<T>(db: Db, orgId: string, fn: (tx: OrgTx) => Promi
  * (`tx.transaction((tx2) => ...)`), and drizzle's own `transaction()` callback parameter is `Tx`,
  * not the branded type of the transaction it was opened on — `PlatformTx` would reject it. `Tx`
  * still accepts the outer `PlatformTx` too (a strict superset), so either can be passed.
+ *
+ * Returns a NEW object rather than branding the caller's. `Object.create(tx)` puts `orgId` on a
+ * wrapper whose prototype IS the transaction, so every drizzle method and field still resolves
+ * through the chain (drizzle's pg-core classes hold no `#private` state that a receiver swap would
+ * break — `test/tenant.test.ts` proves a real query and a real audit row still work through the
+ * wrapper), while the transaction the caller passed in is left un-branded. Mutating it, as this used
+ * to, left "call it fresh per row" a rule nothing could enforce: one mistaken call on the shared
+ * outer platform tx would have branded it permanently, for every row after it.
  */
 export function withOrgIdentity(tx: Tx, orgId: string): OrgTx {
-  return Object.assign(tx, { orgId }) as unknown as OrgTx
+  return Object.assign(Object.create(tx) as Tx, { orgId }) as unknown as OrgTx
 }
 
 /**

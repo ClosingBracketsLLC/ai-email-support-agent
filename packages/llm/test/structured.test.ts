@@ -162,6 +162,59 @@ describe('withStructuredLadder', () => {
     expect(result.parsed).toBeNull()
   })
 
+  it('a refusal on rung 2 returns immediately — the repair call is never made (ledger 79)', async () => {
+    const scripts: FakeScript[] = [{ parsed: null }, { finish: 'refusal', text: 'I will not do that.' }]
+    const fake = createFakeProvider(scripts, { capabilities: { structuredOutput: 'native' } })
+    const provider = withStructuredLadder(fake)
+
+    const result = await provider.chat(baseRequest())
+
+    expect(fake.calls.map((c) => c.meta.idempotencyKey)).toEqual(['k:native', 'k:json_mode'])
+    expect(result.finish).toBe('refusal')
+    expect(result.parsed).toBeNull()
+    expect(result.usage.apiCalls).toBe(2)
+  })
+
+  it('a refusal on rung 3 (repair) returns immediately — no rung-4 extraction from the refusal text (ledger 79)', async () => {
+    const scripts: FakeScript[] = [
+      { parsed: null },
+      { parsed: null },
+      // Valid, parseable JSON in the text — rung 4 WOULD have taken it had the refusal not short-circuited.
+      { finish: 'refusal', text: 'I cannot: {"outcome":"reply","confidence":0.9}' },
+    ]
+    const fake = createFakeProvider(scripts, { capabilities: { structuredOutput: 'native' } })
+    const provider = withStructuredLadder(fake)
+
+    const result = await provider.chat(baseRequest())
+
+    expect(fake.calls).toHaveLength(3)
+    expect(result.finish).toBe('refusal')
+    expect(result.parsed).toBeNull()
+    expect(result.parseStrategy).toBe('none')
+  })
+
+  it('sums the per-TTL cache-write split across rungs, and leaves it absent when no rung reported one', async () => {
+    const split: FakeScript[] = [
+      { parsed: null, usage: { cacheWriteTokens: 400, cacheWrite5mTokens: 400, cacheWrite1hTokens: 0 } },
+      { parsed: { outcome: 'reply', confidence: 0.7 }, usage: { cacheWriteTokens: 100, cacheWrite5mTokens: 0, cacheWrite1hTokens: 100 } },
+    ]
+    const withSplit = withStructuredLadder(createFakeProvider(split, { capabilities: { structuredOutput: 'native' } }))
+    const summed = await withSplit.chat(baseRequest())
+    expect(summed.usage.cacheWriteTokens).toBe(500)
+    expect(summed.usage.cacheWrite5mTokens).toBe(400)
+    expect(summed.usage.cacheWrite1hTokens).toBe(100)
+
+    const noSplit: FakeScript[] = [
+      { parsed: null, usage: { cacheWriteTokens: 400 } },
+      { parsed: { outcome: 'reply', confidence: 0.7 }, usage: { cacheWriteTokens: 100 } },
+    ]
+    const withoutSplit = withStructuredLadder(createFakeProvider(noSplit, { capabilities: { structuredOutput: 'native' } }))
+    const plain = await withoutSplit.chat(baseRequest())
+    expect(plain.usage.cacheWriteTokens).toBe(500)
+    expect(plain.usage.cacheWrite5mTokens).toBeUndefined()
+    expect(plain.usage.cacheWrite1hTokens).toBeUndefined()
+  })
+
   it('an LlmError from any rung propagates unchanged', async () => {
     const failure = new LlmError('boom', 'permanent', false)
     const fake = createFakeProvider([{ error: failure }], { capabilities: { structuredOutput: 'native' } })
