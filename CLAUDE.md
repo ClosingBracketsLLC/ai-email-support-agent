@@ -69,8 +69,9 @@ instruction from him in the session.
   includes `sync` or `send`), `MAIL_FROM`, and — because the worker now sends the daily digest email
   through the same `@aesa/platform-mail` transport the api uses — `EMAIL_TRANSPORT` +
   `RESEND_API_KEY` (required in production on a `cron` replica) plus `APP_BASE_URL` and
-  `APP_WEB_ORIGIN` (the digest links' two bases; **both unset disables the digest email pass
-  entirely**, the push digest still runs). `apps/api`: the same `GMAIL_OAUTH_CLIENT_ID`/`_SECRET`
+  `APP_WEB_ORIGIN` (the digest links' two bases; **either one unset disables the digest email
+  pass entirely** — the gate is `!mail || !appBaseUrl || !appWebOrigin` — while the push digest
+  still runs). `apps/api`: the same `GMAIL_OAUTH_CLIENT_ID`/`_SECRET`
   and `MS_OAUTH_CLIENT_ID`/`_SECRET` pairs (the connect flow's own OAuth, distinct from Better
   Auth's `GOOGLE_CLIENT_ID`/`MICROSOFT_CLIENT_ID` SSO login), `GMAIL_PUBSUB_AUDIENCE`/`_SA_EMAIL`
   (the webhook's OIDC verification), and `MAIL_FROM`. **`MAIL_FROM`, `APP_BASE_URL` and
@@ -83,11 +84,17 @@ instruction from him in the session.
 
 - `packages/contracts` — zod inputs and enums shared by api, db and app; zod only, no Node imports.
 - `packages/db` — drizzle schema (`src/schema/`), SQL migrations, `createDb` (session role set through
-  libpq startup options), `withOrg` / `withPlatform`, per-org data keys, `createTestDatabase`.
+  libpq startup options), `withOrg` / `withPlatform` / `withOrgIdentity` (lending a platform sweep's
+  per-row SAVEPOINT tx one org's identity), per-org data keys, `escalateTicket` (the single entry
+  into `needs_owner` — see the Escalation rule below), the meter sink (`createMeterSink`,
+  `bumpMeter`, `LLM_METERS` / `SEND_METERS` / `SANDBOX_METERS`), and `createTestDatabase`.
 - `packages/crypto` — `Secret`, domain-separated token hashing, AES-256-GCM envelope with a KEK ring,
   libsodium sealed boxes, the SSRF guard (`validateOutboundUrl`, `resolvePublic`, `pinnedFetch`).
 - `packages/core` — tripwire, state-transition matrices, settings catalog, plans, startup
-  invariants, `loadDotEnv`.
+  invariants, `loadDotEnv`, and Phase 3's pure decision logic: the guardrails validator and its
+  screens (`guardrails/{validator,screens,policy,shingles}.ts` — one implementation run at all three
+  gates, over a per-tenant `WorkspacePolicy`), `decide()` (`autonomy.ts`), the redraft policy
+  (`redraft.ts`: `resolveRejectAction`, `clearRedraftCycle`, `REDRAFT_MAX`) and `appendSignature`.
 - `packages/queue` — pg-boss wrappers (`startBoss`, `registerCron`), `defineJob` / `registerJob`,
   `enqueue`, `fairSelectSql`.
 - `packages/mail` — the provider-agnostic mailbox port: Gmail + Microsoft Graph adapters, credential
@@ -109,9 +116,10 @@ instruction from him in the session.
 - `apps/api` — Fastify + Better Auth + tRPC: `/healthz`, config, scrubbed error handler, log
   redaction; the mailbox connect flow and provider webhooks; the `inbox`/`agents`/`workspace`/`team`
   routers, and Phase 3's `drafts` router (approve with the 15-second undo, hold, resume, reject with
-  redraft, mark viewed) and `activity` router (counts, cost, recent sends), both sharing ONE service
-  module (`src/drafts/service.ts`, exported as `@aesa/api/drafts`) with the session-less
-  `/a/:draftId?t=` one-click review pages. The api never holds the KEK, never calls a model, never
+  redraft, mark viewed) — which shares ONE service module (`src/drafts/service.ts`, exported as
+  `@aesa/api/drafts`) with the session-less `/a/:draftId?t=` one-click review pages and with
+  `inbox`'s draft view and resolve — plus a separate `activity` router (counts, cost, recent sends)
+  that reads its own aggregates and touches no draft service. The api never holds the KEK, never calls a model, never
   touches customer mail (it sends platform email — sign-in codes, invitations, address-verification
   codes — through `@aesa/platform-mail`'s `MailTransport`; Resend in production, the devsink
   elsewhere). It never touches `mailbox_credentials` either (platform-role only) — a connect flow's
@@ -161,7 +169,10 @@ instruction from him in the session.
   `escalateTicket` (`@aesa/db`) — it owns the guarded transition, the `escalation_notified_at` reset,
   the audit row and the deduped notification, and its `dedupeKey` is reason-scoped where a second
   same-day escalation for a DIFFERENT reason must still page. Never write
-  `tickets.status = 'needs_owner'` by hand.
+  `tickets.status = 'needs_owner'` by hand outside `ticket.triage`'s own three landings
+  (`triage_cap`, `triage_failed`, and the verdict's `triage_flags`/`sentiment_angry`), which predate
+  `escalateTicket` and pair their own guarded write with `insertEscalationNotification` inside the
+  verdict transaction.
 - **Guarded writes and the staleness anchor.** Every status write is guarded on the status it was
   read at (`WHERE ... AND status = <read value>`), and zero rows is a soft outcome the caller
   reports, never an error — that is what makes a concurrent owner, sweep or job simply win.

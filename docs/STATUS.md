@@ -377,22 +377,23 @@ the record)</summary>
 ### Phase 3 — draft, review, send (complete on branch `phase-3`; PR not yet opened)
 
 - Plan: `docs/superpowers/plans/2026-09-09-phase-3-draft-review-send.md` (23 tasks, executed with
-  subagent-driven development). 36 commits `acf1f4f..f2d66be` on `phase-3`, branched from `main` at
-  `a613a22` — the plan, the Phase 2 carry-over task, and the 23 tasks' implementation and fix-round
-  commits — plus this close-out commit (the mock-tier E2E, the cache-hit recorder, the
-  external-setup runbook and the docs). The per-task execution ledger was an ephemeral SDD workspace
+  subagent-driven development). Commits `acf1f4f..883ecac` on `phase-3`, branched from `main` at
+  `a613a22` — the plan, the Phase 2 carry-over task, the 23 tasks' implementation and fix-round
+  commits, the Task 23 close-out (the mock-tier E2E, the cache-hit recorder, the external-setup
+  runbook and the docs) and the two pre-final fixes that E2E surfaced (`883ecac`, below) — plus this
+  review-fix commit. The per-task execution ledger was an ephemeral SDD workspace
   artifact; everything load-bearing from it is distilled below, and the git history plus the
   forthcoming review record are the durable account. Gate on the branch at close: typecheck and lint
-  clean across all 13 packages/apps; `pnpm test` green with **1,569 tests** (`@aesa/contracts` 21,
-  `@aesa/crypto` 42, `@aesa/platform-mail` 17, `@aesa/core` 189, `@aesa/llm` 88, `@aesa/agent` 58,
-  `@aesa/db` 69, `@aesa/queue` 15, `@aesa/mail` 237, `@aesa/test-kit` 43 [39 run + 4 conditional
+  clean across all 13 packages/apps; `pnpm test` green with **1,572 tests** (`@aesa/contracts` 21,
+  `@aesa/crypto` 42, `@aesa/platform-mail` 17, `@aesa/core` 189, `@aesa/llm` 90, `@aesa/agent` 58,
+  `@aesa/db` 70, `@aesa/queue` 15, `@aesa/mail` 237, `@aesa/test-kit` 43 [39 run + 4 conditional
   skips], `apps/api` 195, `apps/worker` 347 [including the 8-scenario `e2e-phase2.test.ts` and the
   21-case `e2e-phase3.test.ts`], `apps/app` 248 jest across 33 suites — no database); `db:check`
   reports no drift; the Expo web export produces **21 static routes** (unchanged — Phase 3 added no
   route file; `activity.tsx` already existed); the Playwright signup smoke passes (still ending at
   the gated mailbox step — providerless CI cannot reach go-live, per Phase 2's Task 20 ruling).
 - Review: the whole-branch review record lands at
-  `docs/superpowers/reviews/2026-09-XX-phase-3-final-review.md` after this commit, per
+  `docs/superpowers/reviews/2026-09-10-phase-3-final-review.md` after this commit, per
   `superpowers:subagent-driven-development`.
 - What exists now:
   - `packages/contracts` — the draft/decision/reject/sandbox/activity contracts, twelve new
@@ -421,13 +422,15 @@ the record)</summary>
   - `apps/worker` — `ticket.draft` (the ported claim protocol: row-locked CAS on
     `last_agent_run_at`, three watermarks, stuck-run recovery, a failure ceiling, advisory-locked
     caps, the one automatic redraft, `decide()` and the outcome table), `send.execute` (marker
-    recovery scan first, kill levers re-read in the claim, staleness on `thread_snapshot_at`, the
-    atomic pre-send flip, the `Message-ID` read-back, one outbound row, the dead-letter),
+    recovery scan first; the kill levers re-read in the claim and applied there for a fresh
+    `approved` draft, but deferred past that scan on a crash re-entry so a delivered reply is never
+    reported as held; staleness on `thread_snapshot_at`, the atomic pre-send flip, the `Message-ID`
+    read-back, one outbound row, the dead-letter),
     `agent.sandbox`, the crons `ticket.backstop-sweep` and `sweeps.daily`, and the daily digest
     email with per-recipient single-use action tokens.
-  - `apps/api` — the `drafts` router and the session-less `/a/:draftId?t=` review pages over ONE
-    service module, the `activity` router, the master switch and go-live completion, and the
-    sandbox start/get procedures.
+  - `apps/api` — the `drafts` router, the session-less `/a/:draftId?t=` review pages and `inbox`'s
+    draft view/resolve over ONE service module; a separate `activity` router reading its own
+    aggregates; the master switch and go-live completion; and the sandbox start/get procedures.
   - `apps/app` — the review panel on the ticket screen (viewed-before-approve, inline Edit, the
     reject sheet with redraft-with-reason and "I'll handle it", the 15-second undo, `A`/`E`/`R` on
     web), draft rows in To review, Review/Hold notification actions, the go-live test-email box and
@@ -553,6 +556,18 @@ the record)</summary>
   - **deferred during the build (Task 16)**: the digest mints action tokens for EVERY pending draft,
     not only the ten rendered (a bounded fetch when backlogs grow), and the email pass scans every
     workspace on each 5-minute tick.
+  - **pre-final fixes (`883ecac`)**: Task 23's mock-tier E2E surfaced two real defects, both fixed
+    before the whole-branch review — `llm_calls.latency_ms` is an `integer` column while both
+    producers handed it a `performance.now()` float, so EVERY insert failed inside
+    `createMeterSink`'s deliberate swallow and the four LLM meters never moved (which silently
+    disabled `autonomy.daily_llm_usd_cap`, the org's daily spend cap, since it reads
+    `llm_cost_micros`); the value is now rounded at both producers, rounded again defensively in the
+    sink, and the worker routes the sink's `onError` to its own logger instead of `console.error`.
+    And `reopenIfEligible` reset the failure budgets but left `last_agent_run_at` standing, so a
+    reopened ticket whose follow-up's PROVIDER timestamp did not strictly postdate the previous run's
+    WALL-CLOCK claim stamp was never re-drafted and never escalated (the stuck branch cannot rescue a
+    run that finished) — it now clears the stamp too, the same way `send.execute`'s hand-backs do.
+    Four regression tests came with them.
 
 ## Next: Phase 4 — knowledge
 
@@ -560,7 +575,7 @@ the record)</summary>
 a merge commit on Robert's go-ahead (the standing flow from his 2026-09-09 instruction). Once it is
 merged, check out `main`, pull, and branch `phase-4` off it. Start with
 `superpowers:writing-plans` against the spec's *Build phases → Phase 4* section. Run the local setup
-from `CLAUDE.md` and confirm the 1,569-test baseline above before writing the plan.
+from `CLAUDE.md` and confirm the 1,572-test baseline above before writing the plan.
 
 **The hand-off.** Phase 4 is knowledge: the document parsers, the site crawler, Voyage embeddings,
 retrieval, and the `minio`/R2 upload path. Two seams are already in place and waiting for it:

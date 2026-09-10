@@ -398,6 +398,21 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
     }
   }
 
+  /**
+   * Bounded wait for every matching job row on `queueName` to reach `completed` — the deterministic
+   * way to prove a NEGATIVE ("nothing further ran") without a fixed sleep. A job that should never
+   * have been enqueued at all still shows up here, is waited on, and then fails the assertion that
+   * follows; a slow one is waited for instead of being missed.
+   */
+  async function waitForJobsCompleted(queueName: string, predicate: (row: { id: string; data: unknown }) => boolean): Promise<number> {
+    return waitFor(async () => {
+      const rows = (await queueRows(queueName)).filter(predicate)
+      expect(rows.length).toBeGreaterThan(0)
+      expect(rows.filter((r) => r.state !== 'completed').map((r) => r.state)).toEqual([])
+      return rows.length
+    })
+  }
+
   const actorFor = (org: Org): DraftActor => ({ userId: org.ownerUserId, actor: `user:${org.ownerUserId}`, source: 'app' })
 
   /** Inbound -> the real sync walk -> ticket.triage -> ticket.draft, waiting for the live draft. */
@@ -584,8 +599,12 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
     expect(ticket.needsOwnerReason).toBe('redraft_limit_reached')
     const paged = (await notificationsFor(org)).filter((n) => n.dedupeKey.startsWith(`redraft_limit:${first.ticketId}:`))
     expect(paged).toHaveLength(1)
-    // No fourth run: the reject never enqueued one, so no model call can have happened.
-    await new Promise((r) => setTimeout(r, 1_500))
+    // No fourth run. Waiting for EVERY ticket.draft job that names this ticket to be `completed` is
+    // what makes that a real assertion rather than a race: a fourth job the reject should never have
+    // enqueued would be waited for here and would then move the call count below.
+    const draftJobs = await waitForJobsCompleted(JOB_NAMES.ticketDraft, (r) => (r.data as { ticketId?: string }).ticketId === first.ticketId)
+    // Triage's own hand-off plus the two redraft enqueues; the capped reject enqueued nothing.
+    expect(draftJobs).toBe(3)
     expect(draftCallCount()).toBe(callsBefore)
     expect(await draftsFor(org, first.ticketId)).toHaveLength(3)
   }, 90_000)
@@ -844,14 +863,12 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
 
     // The customer writes back: reopen -> triage -> a fresh draft on the SAME ticket.
     scriptDraft({ parsed: reply({ body: `${CLEAN_BODY} Here is the follow up.` }) })
-    const followUp = org.mailbox.receiveInbound({ from: customer, to: [org.selfAddress], subject: 'Re: Where is my order?', bodyText: 'Thanks. One more question about the size.', threadId })
-    // `MockMailbox` stamps provider timestamps from a FIXED 2023 baseline so wall-clock values never
-    // leak into test output. A real follow-up arrives after the run that produced the reply it
-    // answers, and the draft claim's watermark compares exactly those two clocks
-    // (`last_inbound_at > last_agent_run_at`), so this one is stamped at wall-clock time — the way a
-    // real provider stamps it. (`reopenIfEligible` resets the failure budgets but NOT the claim
-    // stamp, so with the 2023 baseline a reopened ticket would never be re-selected.)
-    org.mailbox.backdate(followUp.id, new Date())
+    org.mailbox.receiveInbound({ from: customer, to: [org.selfAddress], subject: 'Re: Where is my order?', bodyText: 'Thanks. One more question about the size.', threadId })
+    // No clock fixup needed: `reopenIfEligible` clears `last_agent_run_at` on the reopen, so the
+    // claim fires on its never-run branch rather than on the `last_inbound_at > last_agent_run_at`
+    // watermark — which is what makes a reopen work at all when the provider's timestamp for the
+    // follow-up predates the previous run's wall-clock claim stamp (`MockMailbox` stamps from a
+    // fixed 2023 baseline, so here it always does).
     await triggerSync(org)
     const second = await waitFor(async () => {
       const rows = await draftsFor(org, ticketId)
@@ -874,7 +891,7 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
     const approved = await approveDraft(service, org.orgId, { draftId }, actorFor(org))
     const sendId = (approved as { ok: true; sendId: string }).sendId
 
-    await Promise.all([
+    const jobIds = await Promise.all([
       boss.send(JOB_NAMES.sendExecute, { orgId: org.orgId, sendId }),
       boss.send(JOB_NAMES.sendExecute, { orgId: org.orgId, sendId }),
     ])
@@ -882,8 +899,9 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
     await waitFor(async () => {
       expect((await sendFor(org, draftId)).status).toBe('sent')
     })
-    // Give the second delivery time to land on the already-sent row before counting.
-    await new Promise((r) => setTimeout(r, 2_500))
+    // BOTH deliveries have to have run before "exactly one message" means anything — the second one
+    // landing on the already-sent row is the whole point of the scenario.
+    expect(await waitForJobsCompleted(JOB_NAMES.sendExecute, (r) => jobIds.includes(r.id))).toBe(2)
     expect(org.mailbox.sentMessages()).toHaveLength(1)
     expect(await messagesFor(org, ticketId, 'outbound')).toHaveLength(1)
     expect((await metersFor(org))[SEND_METERS.reviewSends]).toBe(1)
@@ -904,6 +922,7 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
       return row
     })
 
+    expect(send.attempts).toBeGreaterThanOrEqual(2) // the first attempt crashed; pg-boss really retried
     expect(send.providerDraftId).toBeTruthy()
     expect(org.mailbox.drafts().size).toBe(1)
     expect(org.mailbox.drafts().get(send.providerDraftId!)!.sent).toBe(true)
