@@ -23,7 +23,7 @@
  *     with that `startAfter`, so the real undo window is genuinely 15 s of wall time. Rather than
  *     sleep it out in eight scenarios, the registered job reads a clock 16 s ahead — exactly the
  *     brief's "pass send_after by rewinding `now` on the job" — and each scenario triggers the run
- *     itself with a plain `boss.send` (no singleton key) once its arrangement is in place. The
+ *     itself with `rawSend` (its own throwaway singleton key) once its arrangement is in place. The
  *     approve's OWN delayed job still exists and still fires 15 s later; by then the row is `sent`,
  *     `held` or `failed` and it is correctly unclaimable, which is itself part of what this proves.
  *  2. **`retryDelay` is shortened to 1 s** on `ticket.draft` and `send.execute` (`boss.updateQueue`
@@ -74,6 +74,15 @@ import { maybeRegisterSendRole } from '../src/send-role.ts'
 import type { PushMessage, SendPush } from '../src/push.ts'
 
 const rand = () => randomBytes(4).toString('hex')
+/**
+ * A raw trigger, bypassing `enqueue()`'s `${orgId}:${entityId}` key on purpose. Both job queues ship
+ * `policy: 'short'`, whose unique index is over `COALESCE(singleton_key, '')` — so two KEYLESS sends
+ * on one queue would collapse into one job while the first is still `created`. Each trigger gets its
+ * own key instead, which is how a scenario asks for two jobs on ONE entity (11) or drives a run the
+ * production producer would have deduped.
+ */
+const rawSend = (boss: PgBoss, name: string, data: unknown) =>
+  boss.send(name, data as object, { singletonKey: `e2e-${randomBytes(8).toString('hex')}` })
 const DB_URL = process.env.DATABASE_URL ?? 'postgres://aesa:aesa@localhost:5434/aesa_dev'
 const SCHEMA = `pgboss_e2e_${randomBytes(4).toString('hex')}`
 const CUSTOMER_DOMAIN = 'example.test'
@@ -237,14 +246,14 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
         }),
     )
 
-    // See the file header, note 2 — retry CADENCE only; the limits and the recovery paths are the
-    // shipped ones.
+    // See the file header, note 2 — retry CADENCE only; the limits, the queue POLICY (`short`, as
+    // both job definitions ship it since fix wave W8) and the recovery paths are the shipped ones.
     await boss.updateQueue(JOB_NAMES.ticketDraft, {
-      name: JOB_NAMES.ticketDraft, policy: 'standard',
+      name: JOB_NAMES.ticketDraft, policy: 'short',
       retryLimit: 1, retryDelay: 1, retryBackoff: false, expireInSeconds: INVARIANTS.DRAFT_JOB_EXPIRE_SECONDS,
     })
     await boss.updateQueue(JOB_NAMES.sendExecute, {
-      name: JOB_NAMES.sendExecute, policy: 'standard',
+      name: JOB_NAMES.sendExecute, policy: 'short',
       retryLimit: 5, retryDelay: 1, retryBackoff: false, expireInSeconds: INVARIANTS.SEND_QUEUE_EXPIRE_SECONDS,
     })
 
@@ -439,7 +448,7 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
     const approved = await approveDraft(service, org.orgId, { draftId }, actorFor(org))
     expect(approved.ok).toBe(true)
     const sendId = (approved as { ok: true; sendId: string }).sendId
-    await boss.send(JOB_NAMES.sendExecute, { orgId: org.orgId, sendId })
+    await rawSend(boss, JOB_NAMES.sendExecute, { orgId: org.orgId, sendId })
     return sendId
   }
 
@@ -789,7 +798,7 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
     expect(approved.ok).toBe(true)
     const sendId = (approved as { ok: true; sendId: string }).sendId
     await withOrg(app.db, org.orgId, (tx) => tx.update(workspaces).set({ killSwitch: true }).where(eq(workspaces.orgId, org.orgId)))
-    await boss.send(JOB_NAMES.sendExecute, { orgId: org.orgId, sendId })
+    await rawSend(boss, JOB_NAMES.sendExecute, { orgId: org.orgId, sendId })
 
     const send = await waitFor(async () => {
       const row = await sendFor(org, draftId)
@@ -892,8 +901,8 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
     const sendId = (approved as { ok: true; sendId: string }).sendId
 
     const jobIds = await Promise.all([
-      boss.send(JOB_NAMES.sendExecute, { orgId: org.orgId, sendId }),
-      boss.send(JOB_NAMES.sendExecute, { orgId: org.orgId, sendId }),
+      rawSend(boss, JOB_NAMES.sendExecute, { orgId: org.orgId, sendId }),
+      rawSend(boss, JOB_NAMES.sendExecute, { orgId: org.orgId, sendId }),
     ])
 
     await waitFor(async () => {
@@ -975,7 +984,7 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
       expect(await messagesFor(org, ticketId, 'inbound')).toHaveLength(2)
     })
 
-    await boss.send(JOB_NAMES.sendExecute, { orgId: org.orgId, sendId })
+    await rawSend(boss, JOB_NAMES.sendExecute, { orgId: org.orgId, sendId })
     const send = await waitFor(async () => {
       const row = await sendFor(org, draftId)
       expect(row.status).toBe('failed')
@@ -1015,7 +1024,7 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
     expect((await sendFor(org, draftId)).status).toBe('held')
     expect((await getDraft(org, draftId)).status).toBe('pending')
 
-    const jobId = await boss.send(JOB_NAMES.sendExecute, { orgId: org.orgId, sendId })
+    const jobId = await rawSend(boss, JOB_NAMES.sendExecute, { orgId: org.orgId, sendId })
     await waitFor(async () => {
       expect((await queueRows(JOB_NAMES.sendExecute)).find((r) => r.id === jobId)?.state).toBe('completed')
     })
@@ -1159,7 +1168,7 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
 
   it('20. a schema-invalid ticket.draft payload (raw boss.send) is deleted outright — no handler call, no failed row', async () => {
     const before = draftCallCount()
-    const jobId = await boss.send(JOB_NAMES.ticketDraft, { orgId: 123, ticketId: 456 })
+    const jobId = await rawSend(boss, JOB_NAMES.ticketDraft, { orgId: 123, ticketId: 456 })
     expect(jobId).not.toBeNull()
 
     await waitFor(async () => {

@@ -77,10 +77,12 @@ export const DIGEST_MAX_ITEMS = 10
 
 const NO_SUBJECT = '(no subject)'
 
-function renderSection<T>(items: T[], render: (item: T) => string[]): string[] {
+/** `extra` counts items the CALLER already left out (see `digestMail`'s `moreDrafts`), so the
+ *  overflow line speaks for the whole backlog even when only the renderable slice was passed in. */
+function renderSection<T>(items: T[], render: (item: T) => string[], extra = 0): string[] {
   const lines: string[] = []
   for (const item of items.slice(0, DIGEST_MAX_ITEMS)) lines.push(...render(item), '')
-  const overflow = items.length - DIGEST_MAX_ITEMS
+  const overflow = Math.max(items.length - DIGEST_MAX_ITEMS, 0) + extra
   if (overflow > 0) lines.push(`…and ${overflow} more`, '')
   return lines
 }
@@ -93,10 +95,18 @@ export function digestMail(p: {
   to: string
   businessName: string
   drafts: DigestDraftItem[]
+  /**
+   * Pending drafts the caller did NOT pass in `drafts` — the headline count and the `…and N more`
+   * line still cover them. `digest-email.ts` mints a single-use action token per rendered item, so
+   * it slices to `DIGEST_MAX_ITEMS` before minting and reports the remainder here rather than
+   * minting thousands of rows that no email could ever link to (final-A2 M-2).
+   */
+  moreDrafts?: number
   escalations: DigestEscalationItem[]
   inboxUrl: string
 }): OutgoingMail {
-  const n = p.drafts.length
+  const moreDrafts = p.moreDrafts ?? 0
+  const n = p.drafts.length + moreDrafts
   const m = p.escalations.length
   const draftHeadline = `${n} draft${n === 1 ? '' : 's'} waiting for review`
   const escalationHeadline = `${m} ticket${m === 1 ? '' : 's'} need${m === 1 ? 's' : ''} you`
@@ -111,7 +121,7 @@ export function digestMail(p: {
         .filter((part): part is string => Boolean(part))
         .join(' · ')
       return [head, ...(d.excerpt ? [d.excerpt] : []), `Approve: ${d.approveUrl}`, `Open: ${d.openUrl}`]
-    }))
+    }, moreDrafts))
   }
   if (m > 0) {
     lines.push(`${escalationHeadline}:`, '')

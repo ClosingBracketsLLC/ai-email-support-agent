@@ -87,8 +87,19 @@ export const OUTBOUND_SUBJECT_MAX_CHARS = 900
 /** `outbound_sends.last_error` for the staleness refusal — the api's review surface reads it. */
 export const STALE_ERROR = 'stale: newer customer message'
 
-/** How long a claim released for a retry-later (an unverifiable thread) waits before it is due again. */
-const RELEASE_RETRY_SECONDS = 60
+/**
+ * How long a claim released for a retry-later (an unverifiable thread, a reauth on a crash
+ * re-entry) waits before it is due again.
+ *
+ * It MUST stay under this job's own `retryDelay` (fix wave W2 / final-A2 I-1). pg-boss schedules
+ * attempt 2 at `retryDelay + retryDelay * random()` seconds — [30 s, 60 s) here — and `claimSend`
+ * requires `send_after <= now`, so a release that lands PAST that window makes the retry claim
+ * nothing, log `send.execute_not_claimable` and RETURN SUCCESSFULLY: pg-boss completes the job,
+ * attempts 3-6 never happen, `ctx.lastAttempt` is never true and step 12's dead-letter — the only
+ * owner-visible landing on these paths — is unreachable. `@aesa/core`'s `assertInvariants()` (run at
+ * worker boot) pins the two constants together so they cannot drift apart again.
+ */
+const RELEASE_RETRY_SECONDS = INVARIANTS.SEND_RELEASE_RETRY_SECONDS
 
 const SEND_ACTOR = `system:${JOB_NAMES.sendExecute}` as const
 
@@ -124,7 +135,12 @@ export type SendExecutePayload = z.infer<typeof SendExecutePayload>
 export const sendExecuteJob: JobDefinition<SendExecutePayload> = defineJob({
   name: JOB_NAMES.sendExecute,
   schema: SendExecutePayload,
-  queue: { expireInSeconds: INVARIANTS.SEND_QUEUE_EXPIRE_SECONDS, retryLimit: 5, retryDelay: 30, retryBackoff: true },
+  // `policy: 'short'` — pg-boss's default `standard` ignores `singletonKey` outright (fix wave W8),
+  // so the backstop sweep's every-minute re-enqueue of a due send piled up duplicate jobs.
+  queue: {
+    policy: 'short', expireInSeconds: INVARIANTS.SEND_QUEUE_EXPIRE_SECONDS, retryLimit: 5,
+    retryDelay: INVARIANTS.SEND_RETRY_DELAY_SECONDS, retryBackoff: true,
+  },
   handler: async () => {
     throw new Error('send.execute: this definition has no bound deps — register it through registerSendExecute(boss, deps)')
   },
@@ -350,7 +366,10 @@ interface Landing {
  */
 async function landHeld(l: Landing, lever: KillLever): Promise<void> {
   const notificationId = await withOrg(l.deps.db, l.orgId, async (tx) => {
-    await setSendStatus(tx, l.sendId, 'held', { lastError: `held:${lever}`, now: l.now })
+    if (!(await setSendStatus(tx, l.sendId, 'held', { lastError: `held:${lever}`, now: l.now }))) {
+      l.deps.logger.warn({ sendId: l.sendId, lever }, 'send.landing_skipped_already_sent')
+      return undefined
+    }
     await tx
       .update(drafts)
       .set({ status: 'held' })
@@ -386,7 +405,10 @@ async function landHeld(l: Landing, lever: KillLever): Promise<void> {
  */
 async function landTerminal(l: Landing, reason: string, opts: { escalate: boolean } = { escalate: true }): Promise<void> {
   const notificationId = await withOrg(l.deps.db, l.orgId, async (tx) => {
-    await setSendStatus(tx, l.sendId, 'failed', { lastError: reason, now: l.now })
+    if (!(await setSendStatus(tx, l.sendId, 'failed', { lastError: reason, now: l.now }))) {
+      l.deps.logger.warn({ sendId: l.sendId, reason }, 'send.landing_skipped_already_sent')
+      return undefined
+    }
     // The draft fails only when the send's failure is NEWS about a draft still awaiting delivery.
     // The one `escalate: false` caller is the not-approved exit, where the draft is already
     // `rejected`/`superseded` — overwriting that with `failed` would erase the owner's own decision.
@@ -430,8 +452,11 @@ async function landTerminal(l: Landing, reason: string, opts: { escalate: boolea
  * DOES clear it precisely because the reply already went out.)
  */
 async function landStale(l: Landing, threadSnapshotAt: Date, newerInboundAt: Date | null): Promise<void> {
-  const notificationId = await withOrg(l.deps.db, l.orgId, async (tx) => {
-    await setSendStatus(tx, l.sendId, 'failed', { lastError: STALE_ERROR, now: l.now })
+  const { landed, notificationId } = await withOrg(l.deps.db, l.orgId, async (tx) => {
+    if (!(await setSendStatus(tx, l.sendId, 'failed', { lastError: STALE_ERROR, now: l.now }))) {
+      l.deps.logger.warn({ sendId: l.sendId }, 'send.landing_skipped_already_sent')
+      return { landed: false, notificationId: undefined }
+    }
     // `sending` too: a crash re-entry whose scan MISSED can reach staleness with the draft already
     // flipped by the crashed attempt's step 8, and leaving it `sending` strands it forever.
     await tx
@@ -440,7 +465,12 @@ async function landStale(l: Landing, threadSnapshotAt: Date, newerInboundAt: Dat
       .where(and(eq(drafts.id, l.draftId), or(eq(drafts.status, 'approved'), eq(drafts.status, 'sending'))))
     await tx
       .update(tickets)
-      .set({ status: 'triaged', lastAgentRunAt: null })
+      // `agentFailureCount: 0` (fix wave W1 / final-A1 I1): a hand-back is a FRESH drafting cycle,
+      // and a ticket that arrives back on `triaged` still at the ceiling is refused by
+      // `claimTicket` (`failure_ceiling`) AND skipped by the backstop sweep's (a) predicate —
+      // stranded with no draft and no page. The other two hand-back writers (`reopenIfEligible`,
+      // the api's redraft path) already reset it; these two were the only ones that did not.
+      .set({ status: 'triaged', lastAgentRunAt: null, agentFailureCount: 0 })
       .where(and(eq(tickets.id, l.ticketId), eq(tickets.status, 'awaiting_review')))
     await audit(tx, {
       actor: SEND_ACTOR, action: 'send.stale', entityType: 'outbound_send', entityId: l.sendId,
@@ -458,8 +488,9 @@ async function landStale(l: Landing, threadSnapshotAt: Date, newerInboundAt: Dat
       })
       .onConflictDoNothing({ target: notifications.dedupeKey })
       .returning({ id: notifications.id })
-    return row?.id
+    return { landed: true, notificationId: row?.id }
   })
+  if (!landed) return
   if (notificationId) await l.deps.enqueueNotify(l.orgId, notificationId)
   // Best-effort: the ticket is already `triaged`, so the backstop sweep re-runs the agent even if
   // this enqueue never lands.
@@ -535,11 +566,16 @@ async function collapseClaimHorizon(
  * way to reach here with a `sent` row is a deadline-overlap retry that completed the reply while this
  * handler was inside a provider call. Downgrading it would contradict `sent_at`/`provider_message_id`
  * and make the row eligible for Task 14's re-approve re-queue — a double-send hazard.
+ *
+ * RETURNS whether the guard matched. False means exactly one thing: this reply is already `sent`
+ * (or the row is gone), so the caller's landing is stale and must write NOTHING else — no draft or
+ * ticket walk-back, no audit row, and above all no "your approved reply was not sent" page for a
+ * reply the customer already has (fix wave W5, ledger 129).
  */
 async function setSendStatus(
   tx: OrgTx, sendId: string, status: 'held' | 'failed' | 'queued', p: { lastError: string; now: Date; sendAfter?: Date },
-): Promise<void> {
-  await tx
+): Promise<boolean> {
+  const rows = await tx
     .update(outboundSends)
     .set({
       status,
@@ -551,6 +587,8 @@ async function setSendStatus(
       ...(p.sendAfter ? { sendAfter: p.sendAfter } : {}),
     })
     .where(and(eq(outboundSends.id, sendId), ne(outboundSends.status, 'sent')))
+    .returning({ id: outboundSends.id })
+  return rows.length > 0
 }
 
 // ---------------------------------------------------------------------------
@@ -642,7 +680,12 @@ async function completeSend(l: Landing, input: CompleteSendInput): Promise<void>
         and(
           eq(tickets.id, l.ticketId),
           eq(tickets.status, 'awaiting_review'),
-          lte(tickets.lastInboundAt, input.threadSnapshotAt),
+          // `COALESCE(..., 'epoch')` (fix wave W7 / final-A2 M-4): `last_inbound_at` is nullable,
+          // and SQL's three-valued logic made `NULL <= snapshot` neither true nor false — the flip
+          // matched 0 rows and a SUCCESSFUL send fell into the hand-back below, parking the ticket
+          // back on `triaged` and enqueuing a spurious re-draft. The epoch is the same fail-open
+          // reading the draft's own snapshot takes for a thread with no inbound.
+          lte(sql`COALESCE(${tickets.lastInboundAt}, 'epoch'::timestamptz)`, input.threadSnapshotAt),
         ),
       )
       .returning({ id: tickets.id })
@@ -655,7 +698,8 @@ async function completeSend(l: Landing, input: CompleteSendInput): Promise<void>
       // shipped, so any owner correction on it is now fulfilled and dead.
       const rows = await tx
         .update(tickets)
-        .set({ status: 'triaged', lastAgentRunAt: null, ...clearRedraftCycle() })
+        // `agentFailureCount: 0` for the same reason `landStale` clears it — see there (fix wave W1).
+        .set({ status: 'triaged', lastAgentRunAt: null, agentFailureCount: 0, ...clearRedraftCycle() })
         .where(and(eq(tickets.id, l.ticketId), eq(tickets.status, 'awaiting_review')))
         .returning({ id: tickets.id })
       handBack = rows.length > 0
@@ -954,9 +998,12 @@ async function afterClaim(deps: SendExecuteDeps, ctx: SendExecuteContext, claime
     // --- Step 7: threading and body.
     const references = buildReferences(thread.map((m) => m.rfcMessageId), inReplyTo)
 
-    // The job's own deadline has already passed (pg-boss will retry this payload): starting a send
-    // now would be a provider call nobody is waiting on the result of, and a crash-shaped one at
-    // that. Release the claim so the retry reclaims immediately and re-enters through the scan.
+    // The handler's own deadline has passed: starting a send now would be a provider call nobody is
+    // waiting on the result of, and a crash-shaped one at that. Release the claim and return —
+    // `ctx.signal` fires at `expireInSeconds - JOB_SIGNAL_MARGIN_SECONDS`, BEFORE pg-boss's own
+    // expiry, and a handler that returns completes the job, so pg-boss does NOT retry this payload
+    // (final-A2 M-3). `send_after: now` makes the row due immediately and `ticket.backstop-sweep`
+    // rule (d) re-enqueues it once it is `DUE_SEND_GRACE_SECONDS` overdue.
     if (ctx.signal.aborted) {
       await withOrg(deps.db, orgId, (tx) =>
         setSendStatus(tx, sendId, 'queued', { lastError: 'aborted before send: job deadline reached', now, sendAfter: now }))
@@ -971,7 +1018,7 @@ async function afterClaim(deps: SendExecuteDeps, ctx: SendExecuteContext, claime
     // vacuously true. What it is meant to assert is that the horizon has not lapsed WHILE the scan
     // and the thread read were running.
     const flipAt = deps.now?.() ?? new Date()
-    const stillOurs = await withOrg(deps.db, orgId, async (tx) => {
+    const flip = await withOrg(deps.db, orgId, async (tx) => {
       const rows = await tx
         .update(outboundSends)
         .set({ updatedAt: flipAt })
@@ -984,12 +1031,30 @@ async function afterClaim(deps: SendExecuteDeps, ctx: SendExecuteContext, claime
           ),
         )
         .returning({ id: outboundSends.id })
-      if (rows.length === 0) return false
-      await tx.update(drafts).set({ status: 'sending' }).where(and(eq(drafts.id, draft.id), eq(drafts.status, 'approved')))
-      return true
+      if (rows.length === 0) return 'claim_lost' as const
+      // The DRAFT is re-checked here too, under the same transaction (fix wave W4 / final-E I4).
+      // `afterClaim` read its status at CLAIM time; anything that retired it since — the api's
+      // "Mark resolved", the worker's own re-draft supersede — leaves a row this UPDATE cannot
+      // match, and without the `RETURNING` the run sent the reply anyway, on a ticket the owner had
+      // already closed. `sending` is accepted for the same reason step 1 accepts it: it is what a
+      // crashed attempt leaves behind, and this run owns the claim.
+      const flipped = await tx
+        .update(drafts)
+        .set({ status: 'sending' })
+        .where(and(eq(drafts.id, draft.id), or(eq(drafts.status, 'approved'), eq(drafts.status, 'sending'))))
+        .returning({ id: drafts.id })
+      return flipped.length === 0 ? ('draft_gone' as const) : ('ok' as const)
     })
-    if (!stillOurs) {
+    if (flip === 'claim_lost') {
       deps.logger.warn({ sendId }, 'send.claim_lost_before_send')
+      return
+    }
+    if (flip === 'draft_gone') {
+      // Same landing step 1 takes for a draft that is no longer approved: the send row is RELEASED
+      // (`failed`) rather than left `claimed` for the full 600 s horizon, and nobody is paged —
+      // an owner or a newer draft already dispositioned this reply.
+      deps.logger.warn({ sendId, draftId: draft.id }, 'send.draft_not_approved_before_send')
+      await landTerminal(l, 'draft not approved', { escalate: false })
       return
     }
 

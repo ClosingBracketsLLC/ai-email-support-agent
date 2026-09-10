@@ -60,6 +60,18 @@ describe('digestMail', () => {
     expect(mail.text).toContain('https://app.test/inbox')
   })
 
+  it('counts `moreDrafts` in the headline and the overflow line without rendering them', () => {
+    // The digest job mints one single-use action token per RENDERED draft, so it passes only the
+    // renderable slice and reports the remainder here (final-A2 M-2 / fix wave W7).
+    const drafts = Array.from({ length: DIGEST_MAX_ITEMS }, (_, i) => draft(i))
+    const mail = digestMail({ to: 'owner@acme.test', businessName: 'Acme', drafts, moreDrafts: 7, escalations: [], inboxUrl: 'https://app.test/inbox' })
+
+    expect(mail.subject).toBe(`${DIGEST_MAX_ITEMS + 7} drafts waiting for review · Acme`)
+    expect(mail.text).toContain(`${DIGEST_MAX_ITEMS + 7} drafts waiting for review:`)
+    expect(mail.text).toContain('…and 7 more')
+    expect([...mail.text.matchAll(/^Approve: /gm)]).toHaveLength(DIGEST_MAX_ITEMS)
+  })
+
   it('singularises the subject for one draft and renders subject · customer · category · confidence', () => {
     const mail = digestMail({ to: 'owner@acme.test', businessName: 'Acme', drafts: [draft(1)], escalations: [], inboxUrl: 'https://app.test/inbox' })
     expect(mail.subject).toBe('1 draft waiting for review · Acme')

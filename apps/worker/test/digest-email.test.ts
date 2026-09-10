@@ -8,7 +8,7 @@ import { and, eq } from 'drizzle-orm'
 import pino from 'pino'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { hashToken } from '@aesa/crypto'
-import { createDevSink, type DevSink } from '@aesa/platform-mail'
+import { createDevSink, DIGEST_MAX_ITEMS, type DevSink } from '@aesa/platform-mail'
 import {
   categories, draftActionTokens, drafts, mailboxConnections, member, notifications, orgSettings, tickets, user, withOrg, workspaces,
 } from '@aesa/db'
@@ -199,6 +199,30 @@ describe('runDigestEmailForOrg', () => {
     const text = mail.latestTo(owner.email)!.text
     expect(text).toContain('Model decided · Bea Buyer · Draft Category ·')
     expect(text).toContain('Model undecided · Bea Buyer · Ticket Category ·')
+  })
+
+  it('mints a token only for the drafts it RENDERS, and still counts the rest in the overflow line', async () => {
+    // final-A2 M-2: one `draft_action_tokens` row per PENDING draft per recipient per day, of which
+    // only the first DIGEST_MAX_ITEMS are ever reachable — an org with a backlog and three admins
+    // wrote thousands of dead rows a day.
+    const orgId = await newOrgWithWorkspace()
+    const owner = await addMember(orgId, 'owner')
+    const connectionId = await seedConnection(orgId, owner.userId)
+    const total = DIGEST_MAX_ITEMS + 3
+    for (let i = 0; i < total; i++) {
+      const ticketId = await seedTicket(orgId, connectionId, { subject: `Question ${i}` })
+      await seedPendingDraft(orgId, ticketId)
+    }
+    const mail = createDevSink()
+
+    expect(await runDigestEmailForOrg(makeDeps(mail), orgId, NOW)).toBe('sent')
+
+    expect(await readTokens(orgId)).toHaveLength(DIGEST_MAX_ITEMS)
+    const text = mail.latestTo(owner.email)!.text
+    expect([...text.matchAll(/^Approve: (\S+)$/gm)]).toHaveLength(DIGEST_MAX_ITEMS)
+    // The headline and the overflow line still speak for the WHOLE backlog.
+    expect(mail.latestTo(owner.email)!.subject).toBe(`${total} drafts waiting for review · Acme Widgets`)
+    expect(text).toContain(`…and ${total - DIGEST_MAX_ITEMS} more`)
   })
 
   it('runs once per local day: a second run the same day sends nothing and mints no new tokens', async () => {

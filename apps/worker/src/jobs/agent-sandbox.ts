@@ -33,6 +33,7 @@ import { agentCategoryPolicies, agentRuns, agents, drafts, mailboxConnections, p
 import { computeCostMicros, findPricing, LlmError, type ChatMeta, type LlmProvider } from '@aesa/llm'
 import { defineJob, JOB_NAMES, registerJob, type JobDefinition } from '@aesa/queue'
 import { loadSharedDraftContext, type SharedDraftContext } from '../drafting/context.ts'
+import { errorMessage } from '../err-message.ts'
 import { buildReplyPolicy, personaFor } from '../drafting/policy.ts'
 import { appendRunEvent, finishRun } from '../drafting/runs.ts'
 
@@ -43,7 +44,9 @@ export type AgentSandboxPayload = z.infer<typeof AgentSandboxPayload>
 export const agentSandboxJob: JobDefinition<AgentSandboxPayload> = defineJob({
   name: JOB_NAMES.agentSandbox,
   schema: AgentSandboxPayload,
-  queue: { expireInSeconds: INVARIANTS.DRAFT_JOB_EXPIRE_SECONDS, retryLimit: 0 },
+  // `short`, so the `singletonKey` on `${orgId}:${runId}` actually collapses a double-tap of
+  // "Try it" while the first job is still `created` (fix wave W8: it is inert on `standard`).
+  queue: { policy: 'short', expireInSeconds: INVARIANTS.DRAFT_JOB_EXPIRE_SECONDS, retryLimit: 0 },
   handler: async () => {
     throw new Error('agent.sandbox: this definition has no bound deps — register it through registerAgentSandbox(boss, deps)')
   },
@@ -253,7 +256,11 @@ async function recordUnexpectedFailure(
 ): Promise<void> {
   const code = err instanceof SandboxLoadError ? err.code : 'internal'
   const detail = errorToDetail(err)
-  deps.logger.error({ runId, orgId, err }, 'agent.sandbox: run failed unexpectedly')
+  // `errorMessage(err)`, never `{ err }` (final-A1 M1): pino's default err serializer copies every
+  // own enumerable property of the error, and node-postgres puts the WHOLE offending row on
+  // `detail` ("Failing row contains (…)") — which on this path is most likely `agent_runs.output`,
+  // i.e. a drafted body. No draft body may reach a log line.
+  deps.logger.error({ runId, orgId, error: errorMessage(err) }, 'agent.sandbox: run failed unexpectedly')
   try {
     const finishedAt = deps.now?.() ?? new Date()
     await withOrg(deps.db, orgId, async (tx) => {
@@ -262,7 +269,7 @@ async function recordUnexpectedFailure(
       await appendRunEvent(tx, runId, 'error', { code, detail })
     })
   } catch (recordErr) {
-    deps.logger.error({ runId, orgId, err: recordErr }, 'agent.sandbox: failed to record the run failure itself; giving up')
+    deps.logger.error({ runId, orgId, error: errorMessage(recordErr) }, 'agent.sandbox: failed to record the run failure itself; giving up')
   }
 }
 

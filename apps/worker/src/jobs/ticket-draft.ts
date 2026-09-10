@@ -103,7 +103,13 @@ export type TicketDraftPayload = z.infer<typeof TicketDraftPayload>
 export const ticketDraftJob: JobDefinition<TicketDraftPayload> = defineJob({
   name: JOB_NAMES.ticketDraft,
   schema: TicketDraftPayload,
-  queue: { expireInSeconds: INVARIANTS.DRAFT_JOB_EXPIRE_SECONDS, retryLimit: 1, retryDelay: 30, retryBackoff: true },
+  // `policy: 'short'` — NOT pg-boss's default `standard`, on which the `singletonKey` `enqueue()`
+  // always sets is inert (fix wave W8 / final-A1 M3). Four producers re-enqueue the same ticket
+  // (the api's redraft, the backstop sweep every minute, `send.execute`'s two hand-backs,
+  // `ticket.triage`), and under `standard` a capped or levered org's tickets stacked up to 50
+  // duplicate jobs a minute. `short` collapses duplicates only while the first is still `created`
+  // — a job that has already started reading never swallows a newer event.
+  queue: { policy: 'short', expireInSeconds: INVARIANTS.DRAFT_JOB_EXPIRE_SECONDS, retryLimit: 1, retryDelay: 30, retryBackoff: true },
   handler: async () => {
     throw new Error('ticket.draft: this definition has no bound deps — register it through registerTicketDraft(boss, deps)')
   },

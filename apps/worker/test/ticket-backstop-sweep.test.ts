@@ -18,7 +18,7 @@ import pino from 'pino'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { INVARIANTS } from '@aesa/core'
 import {
-  agentRuns, auditLog, drafts, escalateTicket, mailboxConnections, notifications, outboundSends, tickets, user, withOrg, withPlatform,
+  agentRuns, auditLog, drafts, escalateTicket, mailboxConnections, notifications, outboundSends, platformState, tickets, user, withOrg, withPlatform,
   type EscalateTicketParams, type OrgTx,
 } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
@@ -139,6 +139,19 @@ describe('ticket.backstop-sweep', () => {
     return { ticketId, draftId, sendId: row!.id }
   }
 
+  /** Runs `fn` with the platform kill lever on, and always puts it back. */
+  async function withKillswitch<T>(fn: () => Promise<T>): Promise<T> {
+    await withPlatform(app.db, 'test:killswitch', (tx) =>
+      tx.insert(platformState).values({ key: 'killswitch.global', value: true })
+        .onConflictDoUpdate({ target: platformState.key, set: { value: true } }))
+    try {
+      return await fn()
+    } finally {
+      await withPlatform(app.db, 'test:killswitch', (tx) =>
+        tx.update(platformState).set({ value: false }).where(eq(platformState.key, 'killswitch.global')))
+    }
+  }
+
   async function resolveTicket(orgId: string, ticketId: string): Promise<void> {
     await withOrg(app.db, orgId, (tx) => tx.update(tickets).set({ status: 'resolved' }).where(eq(tickets.id, ticketId)))
   }
@@ -226,6 +239,59 @@ describe('ticket.backstop-sweep', () => {
       expect(ids).not.toContain(ticketId)
     })
 
+    it('a ticket at the failure ceiling is RESCUED: escalated agent_failed once, with a reason-scoped dedupe key', async () => {
+      // final-A1 I1: `(triaged, agent_failure_count >= AGENT_FAILURE_ESCALATE_AT)` is refused by
+      // `claimTicket` AND excluded by (a)'s predicate, so before this arm the ticket was invisible
+      // to every mechanism — no draft, no page, nothing that self-heals. `send.execute`'s two
+      // hand-backs no longer produce the state; this makes the invariant self-healing anyway.
+      const orgId = await newOrg()
+      const ticketId = await seedTicket(orgId, {
+        agentFailureCount: INVARIANTS.AGENT_FAILURE_ESCALATE_AT, lastAgentRunAt: minutesAgo(30),
+        lastAgentFinishedAt: minutesAgo(29), lastInboundAt: minutesAgo(35),
+      })
+
+      const first = await runTicketBackstopSweep(boss, makeDeps())
+
+      const ticket = await getTicket(orgId, ticketId)
+      expect(ticket.status).toBe('needs_owner')
+      expect(ticket.needsOwnerReason).toBe('agent_failed')
+      expect(first.stranded).toBeGreaterThanOrEqual(1)
+      const notifs = await notifyJobs()
+      const job = notifs.find((j) => (j.data as { orgId?: string }).orgId === orgId)
+      expect(job).toBeDefined()
+      const notification = await notificationById((job!.data as { notificationId: string }).notificationId)
+      expect(notification?.dedupeKey).toBe(`agent_failed:${ticketId}:${DAY}`)
+      expect(await auditRowsFor(ticketId, 'ticket.escalated')).toHaveLength(1)
+
+      // The ticket has left `triaged`, so a second pass finds nothing to do for it — no second page.
+      const second = await runTicketBackstopSweep(boss, makeDeps())
+      expect(second.stranded).toBe(0)
+      expect(await auditRowsFor(ticketId, 'ticket.escalated')).toHaveLength(1)
+      // …and it is still never enqueued for a draft run.
+      const ids = (await draftJobs()).map((j) => (j.data as { ticketId?: string }).ticketId)
+      expect(ids).not.toContain(ticketId)
+    })
+
+    it('the global killswitch skips (a) entirely, but (c) and (d) still run', async () => {
+      // final-E I3: with the lever on, `ticket.draft` returns without writing anything, so every
+      // selectable ticket stayed selectable and the sweep enqueued up to SELECT_CAP_PER_CYCLE jobs
+      // a minute, forever. The recovery arms must keep running — the lever pauses the AGENT, not
+      // the owner's visibility into what is stuck.
+      const orgId = await newOrg()
+      const draftable = await seedTicket(orgId, { lastAgentRunAt: null, lastInboundAt: minutesAgo(5) })
+      const due = await seedSendChain(orgId, { sendAfter: secondsAgo(DUE_SEND_GRACE_SECONDS + 30) })
+      const orphan = await seedTicket(orgId, { status: 'awaiting_review', updatedAt: minutesAgo(ORPHAN_AFTER_MINUTES + 30) })
+
+      const result = await withKillswitch(() => runTicketBackstopSweep(boss, makeDeps()))
+
+      expect((await draftJobs()).map((j) => (j.data as { ticketId?: string }).ticketId)).not.toContain(draftable)
+      expect(result.draftsEnqueued).toBe(0)
+      expect((await sendJobs()).map((j) => (j.data as { sendId?: string }).sendId)).toContain(due.sendId)
+      expect((await getTicket(orgId, orphan)).status).toBe('needs_owner')
+
+      await resolveTicket(orgId, draftable)
+    })
+
     it('a non-triaged ticket is skipped', async () => {
       const orgId = await newOrg()
       const ticketId = await seedTicket(orgId, { status: 'new', lastAgentRunAt: null, lastInboundAt: minutesAgo(5) })
@@ -298,7 +364,7 @@ describe('ticket.backstop-sweep', () => {
       await resolveTicket(orgId, withInbound)
     })
 
-    it('fair-select interleaves two orgs with 40 eligible tickets each — the first 50 enqueues alternate orgs', async () => {
+    it('fair-select interleaves two orgs with 40 eligible tickets each — the FIRST TWO enqueues are one per org', async () => {
       const orgA = await newOrg()
       const orgB = await newOrg()
       const aIds = await Promise.all(

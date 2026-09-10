@@ -21,7 +21,7 @@ import { generateToken } from '@aesa/crypto'
 import {
   categories, draftActionTokens, drafts, member, notifications, orgSettings, tickets, user, withOrg, workspaces, type Db,
 } from '@aesa/db'
-import { digestMail, type DigestDraftItem, type DigestEscalationItem, type MailTransport } from '@aesa/platform-mail'
+import { digestMail, DIGEST_MAX_ITEMS, type DigestDraftItem, type DigestEscalationItem, type MailTransport } from '@aesa/platform-mail'
 
 export interface DigestEmailDeps {
   db: Db
@@ -228,11 +228,18 @@ export async function runDigestEmailForOrg(deps: DigestEmailDeps, orgId: string,
   const escalations: DigestEscalationItem[] = pending.escalations.map(({ ticketId, ...rest }) => ({ ...rest, openUrl: `${deps.appWebOrigin}/ticket/${ticketId}` }))
   const inboxUrl = `${deps.appWebOrigin}/inbox`
 
+  // Only the RENDERED slice gets a token: the template shows at most `DIGEST_MAX_ITEMS` per
+  // section, and minting one row per pending draft per recipient wrote thousands of rows no email
+  // could link to (final-A2 M-2). `moreDrafts` keeps the headline and the `…and N more` line
+  // counting the whole backlog.
+  const renderable = pending.drafts.slice(0, DIGEST_MAX_ITEMS)
+  const moreDrafts = pending.drafts.length - renderable.length
+
   for (const recipient of recipients) {
-    const draftItems = await mintDraftItems(deps, orgId, recipient.userId, pending.drafts, now)
+    const draftItems = await mintDraftItems(deps, orgId, recipient.userId, renderable, now)
     try {
       // Network I/O: strictly outside every transaction above.
-      await deps.mail.send(digestMail({ to: recipient.email, businessName: head.businessName, drafts: draftItems, escalations, inboxUrl }))
+      await deps.mail.send(digestMail({ to: recipient.email, businessName: head.businessName, drafts: draftItems, moreDrafts, escalations, inboxUrl }))
     } catch (err) {
       // The tokens stay valid for a week, so tomorrow's digest simply mints another set; nothing
       // here is worth failing the whole cron over.

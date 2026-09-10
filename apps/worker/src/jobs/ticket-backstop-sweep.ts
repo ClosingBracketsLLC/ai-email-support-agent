@@ -2,10 +2,15 @@
  * `ticket.backstop-sweep` — the every-minute cross-org cron that catches everything the happy path
  * can silently drop: a draft run that never got claimed or got stuck mid-run, a ticket whose one
  * live draft vanished out from under it, and an approved send whose `send.execute` enqueue never
- * landed or whose claim expired without completing. ONE `withPlatform` pass covers all four
- * sub-sweeps (a)-(d); every enqueue is collected during the pass and only sent AFTER it commits, so
- * a queue outage never rolls back the writes the pass already made durable — same discipline as
- * `mailbox-poll-sweep.ts`, which this file is modeled on line for line.
+ * landed or whose claim expired without completing. ONE `withPlatform` pass covers the sub-sweeps
+ * (a), (a2), (b), (c) and (d); every enqueue is collected during the pass and only sent AFTER it
+ * commits, so a queue outage never rolls back the writes the pass already made durable — same
+ * discipline as `mailbox-poll-sweep.ts`, which this file is modeled on line for line.
+ *
+ * (a2) is the mirror of (a)'s failure-ceiling exclusion: a `triaged` ticket AT the ceiling can be
+ * drafted by nothing and is escalated by nothing, so this sweep pages the owner for it (fix wave W1
+ * / final-A1 I1). The whole pass also reads the global kill lever once and skips (a) — and only (a)
+ * — while it is on (fix wave W3 / final-E I3).
  *
  * (a)'s selection predicate is `claimTicket`'s own three-watermark gate (never run / new inbound /
  * stuck-and-unfinished), ported from doge-buddy's `selectAndEnqueueAgentRuns`
@@ -23,12 +28,12 @@
  * `escalateTicket`) that lets a test inject exactly one throwing row to prove that isolation without
  * a real trigger.
  */
-import { and, eq, inArray, lt, notExists, or, sql } from 'drizzle-orm'
+import { and, asc, eq, gte, inArray, lt, notExists, or, sql } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import { INVARIANTS } from '@aesa/core'
 import {
-  auditLog, drafts, escalateTicket, outboundSends, tickets, withOrgIdentity, withPlatform,
+  auditLog, drafts, escalateTicket, outboundSends, platformState, tickets, withOrgIdentity, withPlatform,
   type Db, type EscalateTicketParams, type OrgTx,
 } from '@aesa/db'
 import { fairSelectSql, registerCron } from '@aesa/queue'
@@ -49,7 +54,10 @@ export const SELECT_CAP_PER_CYCLE = 50
  *  ever committed. */
 export const ORPHAN_AFTER_MINUTES = 15
 
-/** Per-sweep cap on (c)'s escalation page — bounded the same way (a) is. */
+/** Per-sweep cap on the escalation pages — bounded the same way (a) is. (a2) and (c) each get
+ *  their OWN budget of this many rather than sharing one: they select disjoint ticket sets
+ *  (`triaged` at the failure ceiling vs `awaiting_review` with no live draft), so a backlog of one
+ *  must never starve the other out of the sweep. */
 export const ESCALATIONS_CAP_PER_CYCLE = 10
 
 /** (d)'s grace window: a send only counts as "due" once it has been overdue (or its claim expired)
@@ -103,37 +111,84 @@ function fairSelectQuery(p: Parameters<typeof fairSelectSql>[0]) {
 export async function runTicketBackstopSweep(
   boss: PgBoss,
   deps: TicketBackstopDeps,
-): Promise<{ draftsEnqueued: number; stuckRuns: number; orphans: number; sendsEnqueued: number }> {
+): Promise<{ draftsEnqueued: number; stuckRuns: number; orphans: number; sendsEnqueued: number; stranded: number }> {
   const now = deps.now?.() ?? new Date()
   const day = utcDayString(now)
   const escalate = deps.escalate ?? escalateTicket
   const pending: PendingEnqueue[] = []
   let stuckRuns = 0
   let orphans = 0
+  let stranded = 0
 
   await withPlatform(deps.db, 'cron:ticket.backstop-sweep', async (tx) => {
+    // The global kill lever, read ONCE for the whole pass (final-E I3). `ticket.draft` reads the
+    // same key and returns having written NOTHING — no stamp, no status change — so with the lever
+    // on every ticket (a) selects stays exactly selectable and the sweep enqueued up to
+    // SELECT_CAP_PER_CYCLE jobs every minute until the lever came off. Only (a) is skipped: (b)'s
+    // stuck-run reaper, (a2)'s and (c)'s owner escalations and (d)'s due-send re-enqueue are
+    // RECOVERY, and the lever pauses the agent, not the owner's visibility into what is stuck.
+    // ((d) self-terminates anyway: `send.execute` lands a levered row `held`, which (d) never
+    // selects.)
+    const [lever] = await tx.select({ value: platformState.value }).from(platformState).where(eq(platformState.key, 'killswitch.global'))
+    const killswitch = lever?.value === true
+    if (killswitch) deps.logger.info({}, 'ticket.backstop_sweep_draft_selection_skipped_killswitch')
+
     // (a) missed/stuck drafts — fairSelectSql over tickets, `claimTicket`'s own three-watermark
     // gate: never run, new inbound since the last run, or claimed STUCK_AFTER_MINUTES+ ago with no
     // finish stamp past that claim. `now` (not literal SQL `now()`) drives the stuck cutoff, so the
     // whole predicate moves with `deps.now` for deterministic tests.
     const stuckBefore = new Date(now.getTime() - STUCK_AFTER_MINUTES * 60_000)
     const stuckBeforeLiteral = `'${stuckBefore.toISOString()}'::timestamptz`
-    const dueQuery = fairSelectQuery({
-      from: 'tickets',
-      where: `
-        status = 'triaged'
-        AND agent_failure_count < ${INVARIANTS.AGENT_FAILURE_ESCALATE_AT}
-        AND (
-          last_agent_run_at IS NULL
-          OR last_inbound_at > last_agent_run_at
-          OR (last_agent_run_at < ${stuckBeforeLiteral} AND (last_agent_finished_at IS NULL OR last_agent_finished_at < last_agent_run_at))
-        )
-      `,
-      orderBy: 'last_inbound_at ASC NULLS FIRST',
-      limit: SELECT_CAP_PER_CYCLE,
-    })
-    const due = (await tx.execute<{ id: string; org_id: string }>(dueQuery)).rows
-    for (const row of due) pending.push({ kind: 'draft', orgId: row.org_id, entityId: row.id })
+    if (!killswitch) {
+      const dueQuery = fairSelectQuery({
+        from: 'tickets',
+        where: `
+          status = 'triaged'
+          AND agent_failure_count < ${INVARIANTS.AGENT_FAILURE_ESCALATE_AT}
+          AND (
+            last_agent_run_at IS NULL
+            OR last_inbound_at > last_agent_run_at
+            OR (last_agent_run_at < ${stuckBeforeLiteral} AND (last_agent_finished_at IS NULL OR last_agent_finished_at < last_agent_run_at))
+          )
+        `,
+        orderBy: 'last_inbound_at ASC NULLS FIRST',
+        limit: SELECT_CAP_PER_CYCLE,
+      })
+      const due = (await tx.execute<{ id: string; org_id: string }>(dueQuery)).rows
+      for (const row of due) pending.push({ kind: 'draft', orgId: row.org_id, entityId: row.id })
+    }
+
+    // (a2) stranded at the ceiling — the mirror image of (a)'s `agent_failure_count <` clause
+    // (final-A1 I1). A `triaged` ticket AT the ceiling is refused by `claimTicket` before its stuck
+    // evaluation (so the claim's own ceiling escalation can never fire for it), excluded by (a),
+    // and invisible to (c), which only looks at `awaiting_review` — a customer email nothing would
+    // ever answer and nobody would ever hear about. `send.execute`'s hand-backs no longer create
+    // the state, but this arm makes the invariant self-healing if a future writer reintroduces it.
+    // Same SAVEPOINT-per-row isolation and `withOrgIdentity` lending as (c) below.
+    const strandedCandidates = await tx
+      .select({ id: tickets.id, orgId: tickets.orgId })
+      .from(tickets)
+      .where(and(eq(tickets.status, 'triaged'), gte(tickets.agentFailureCount, INVARIANTS.AGENT_FAILURE_ESCALATE_AT)))
+      .orderBy(asc(tickets.updatedAt))
+      .limit(ESCALATIONS_CAP_PER_CYCLE)
+
+    for (const candidate of strandedCandidates) {
+      try {
+        await tx.transaction(async (tx2) => {
+          const orgTx = withOrgIdentity(tx2, candidate.orgId)
+          const { escalated, notificationId } = await escalate(orgTx, {
+            orgId: candidate.orgId, ticketId: candidate.id, fromStatus: 'triaged', reason: 'agent_failed',
+            // Reason-scoped, like (c)'s: a ticket that already paged today for something else must
+            // still page for "the agent stopped trying".
+            day, now, dedupeKey: `agent_failed:${candidate.id}:${day}`, actor: SWEEP_ACTOR, auditAction: 'ticket.escalated',
+          })
+          if (escalated) stranded += 1
+          if (notificationId) pending.push({ kind: 'notify', orgId: candidate.orgId, entityId: notificationId })
+        })
+      } catch (err) {
+        deps.logger.warn({ ticketId: candidate.id, error: errorMessage(err) }, 'ticket.backstop_sweep_stranded_escalation_failed')
+      }
+    }
 
     // (b) stuck runs — every `running` agent_runs row started long enough ago that its job's own
     // expiry (`DRAFT_JOB_EXPIRE_SECONDS`) has definitely passed, plus a margin, belongs to a process
@@ -235,7 +290,7 @@ export async function runTicketBackstopSweep(
     }
   }
 
-  return { draftsEnqueued, stuckRuns, orphans, sendsEnqueued }
+  return { draftsEnqueued, stuckRuns, orphans, sendsEnqueued, stranded }
 }
 
 export async function registerTicketBackstopSweep(boss: PgBoss, deps: TicketBackstopDeps): Promise<void> {

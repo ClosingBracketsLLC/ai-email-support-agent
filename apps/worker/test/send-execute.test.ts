@@ -664,6 +664,11 @@ describe('send.execute', () => {
     expect(send.status).toBe('queued')
     expect(send.lastError).toMatch(/thread too busy/)
     expect(send.sendAfter.getTime()).toBeGreaterThan(NOW.getTime())
+    // fix wave W2 / final-A2 I-1: the release MUST be due before pg-boss's own first retry, which
+    // for `retryDelay: 30` + backoff lands in [30 s, 60 s). A `send_after` past that makes attempt 2
+    // find an unclaimable row, return successfully, and END the retry chain — no further attempt,
+    // and therefore no `lastAttempt` dead-letter and no owner-visible landing, ever.
+    expect(send.sendAfter.getTime()).toBeLessThanOrEqual(NOW.getTime() + INVARIANTS.SEND_RETRY_DELAY_SECONDS * 1000)
     expect(send.claimToken).toBeNull()
     expect((await getDraft(s.draftId)).status).toBe('approved')
   })
@@ -1160,6 +1165,118 @@ describe('send.execute', () => {
     const rows = await orgNotifications()
     expect(rows.map((r) => r.dedupeKey).sort()).toEqual([`escalation:${s.ticketId}:${TODAY}`, `send_failed:${s.ticketId}:${TODAY}`].sort())
     expect(notified).toHaveLength(1)
+  })
+
+  // ---- fix wave W ---------------------------------------------------------
+
+  it('W1 the stale hand-back clears the failure budget, so the re-draft it asks for can actually claim', async () => {
+    // `(triaged, agent_failure_count >= AGENT_FAILURE_ESCALATE_AT)` is invisible to `claimTicket`
+    // (`failure_ceiling`) AND to the backstop sweep's (a) predicate, so a hand-back that carried the
+    // stale budget stranded the ticket with no draft, no page and nothing that self-heals
+    // (final-A1 I1). Both other hand-back writers (`reopenIfEligible`, the api's redraft) reset it.
+    const s = await seedApprovedDraft({ ticket: { agentFailureCount: INVARIANTS.AGENT_FAILURE_ESCALATE_AT } })
+    await addNewerInbound(s)
+    const { deps, draftEnqueues } = makeDeps()
+
+    await run(deps, s.sendId)
+
+    const ticket = await getTicket(s.ticketId)
+    expect(ticket.status).toBe('triaged')
+    expect(ticket.agentFailureCount).toBe(0)
+    expect(draftEnqueues).toEqual([{ orgId: fx.orgId, ticketId: s.ticketId }])
+  })
+
+  it('W1 the mid-send hand-back clears the failure budget too', async () => {
+    const s = await seedApprovedDraft({ ticket: { agentFailureCount: INVARIANTS.AGENT_FAILURE_ESCALATE_AT } })
+    const wrapped: MailboxClient = {
+      ...fx.mailbox,
+      sendReply: async (input: SendReplyInput) => {
+        await addNewerInbound(s, 'one more thing')
+        return fx.mailbox.sendReply(input)
+      },
+    }
+    const { deps } = makeDeps({ clientFactory: () => wrapped })
+
+    await run(deps, s.sendId)
+
+    expect(fx.mailbox.sentMessages()).toHaveLength(1)
+    const ticket = await getTicket(s.ticketId)
+    expect(ticket.status).toBe('triaged')
+    expect(ticket.agentFailureCount).toBe(0)
+  })
+
+  it('W4 a draft superseded between the claim and the pre-send flip is never sent', async () => {
+    // final-E I4: `afterClaim` read the draft status at CLAIM time and step 8 flipped
+    // `approved → sending` unchecked, so anything that retired the draft mid-run (the api's
+    // "Mark resolved", the worker's own re-draft supersede) still got its reply delivered.
+    const s = await seedApprovedDraft()
+    const wrapped: MailboxClient = {
+      ...fx.mailbox,
+      // Runs between the claim and the flip, and leaves the SEND row alone — the send-row guard
+      // must not be what refuses here, or the draft re-check would never be exercised.
+      findSentByMarker: async (threadId: string, marker: string, limit: number) => {
+        await withOrg(app.db, fx.orgId, (tx) => tx.update(drafts).set({ status: 'superseded' }).where(eq(drafts.id, s.draftId)))
+        return fx.mailbox.findSentByMarker(threadId, marker, limit)
+      },
+    }
+    const { deps, notified } = makeDeps({ clientFactory: () => wrapped })
+
+    await run(deps, s.sendId)
+
+    expect(fx.mailbox.sentMessages()).toHaveLength(0)
+    const send = await getSend(s.sendId)
+    // Released, not left `claimed` for the sweep: this run KNOWS the draft is gone, and leaving the
+    // claim standing would park the row for the full 600 s horizon before (d) could re-pick it.
+    expect(send.status).toBe('failed')
+    expect(send.lastError).toBe('draft not approved')
+    expect(send.claimToken).toBeNull()
+    // The owner (or a newer draft) already dispositioned this one: no draft flip, no page.
+    expect((await getDraft(s.draftId)).status).toBe('superseded')
+    expect((await getTicket(s.ticketId)).status).toBe('awaiting_review')
+    expect(notified).toHaveLength(0)
+  })
+
+  it('W5 a landing that loses to a deadline-overlap retry writes no audit row and pages nobody', async () => {
+    // Ledger 129: the guarded send UPDATE carries `status <> \'sent\'`, but `landHeld`/`landStale`/
+    // `landTerminal` wrote their audit row and paged the owner regardless — telling them an
+    // approved reply was NOT sent for a reply that WAS. `landDeadLetter` already had the guard.
+    const s = await seedApprovedDraft()
+    await addNewerInbound(s)
+    const wrapped: MailboxClient = {
+      ...fx.mailbox,
+      findSentByMarker: async (threadId: string, marker: string, limit: number) => {
+        // The overlapping retry completes this send while we are inside the provider call.
+        await withOrg(app.db, fx.orgId, (tx) =>
+          tx.update(outboundSends).set({ status: 'sent', sentAt: NOW, providerMessageId: 'overlap-1' }).where(eq(outboundSends.id, s.sendId)))
+        return fx.mailbox.findSentByMarker(threadId, marker, limit)
+      },
+    }
+    const { deps, notified, draftEnqueues } = makeDeps({ clientFactory: () => wrapped })
+
+    await run(deps, s.sendId)
+
+    expect((await getSend(s.sendId)).status).toBe('sent')
+    expect(await auditActions(s.sendId)).not.toContain('send.stale')
+    expect(await orgNotifications()).toHaveLength(0)
+    expect(notified).toHaveLength(0)
+    expect(draftEnqueues).toHaveLength(0)
+    // The whole landing is skipped, not just its tail: a delivered reply must not be walked back.
+    expect((await getDraft(s.draftId)).status).toBe('approved')
+    expect((await getTicket(s.ticketId)).status).toBe('awaiting_review')
+  })
+
+  it('W7 a ticket with no last_inbound_at still parks on the customer instead of a spurious re-draft', async () => {
+    // final-A2 M-4: `last_inbound_at <= thread_snapshot_at` is NULL (not true) when the column is
+    // NULL, so the flip matched 0 rows and a SUCCESSFUL send handed the ticket back to the agent.
+    const s = await seedApprovedDraft({ ticket: { lastInboundAt: null } })
+    const { deps, draftEnqueues } = makeDeps()
+
+    await run(deps, s.sendId)
+
+    expect(fx.mailbox.sentMessages()).toHaveLength(1)
+    expect((await getSend(s.sendId)).status).toBe('sent')
+    expect((await getTicket(s.ticketId)).status).toBe('waiting_on_customer')
+    expect(draftEnqueues).toHaveLength(0)
   })
 
   it('1 the claim horizon is real: a live claim held by another worker is not stealable', async () => {

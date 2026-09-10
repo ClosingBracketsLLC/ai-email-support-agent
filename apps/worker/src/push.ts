@@ -18,7 +18,8 @@ export interface PushMessage {
   data?: Record<string, unknown>
   /**
    * Expo's `categoryId`: the notification category whose ACTIONS the OS renders on the push itself
-   * (Approve / Open, for `draft_review`). The app registers the category; this only names it.
+   * — `Review` / `Hold`, for `draft_review` (`apps/app/src/lib/push.ts` registers the category with
+   * those two buttons; this only names it).
    */
   categoryId?: string
 }

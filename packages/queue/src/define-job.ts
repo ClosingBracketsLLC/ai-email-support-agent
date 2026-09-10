@@ -4,7 +4,16 @@ import { JOB_SIGNAL_MARGIN_SECONDS } from '@aesa/core'
 import { createQueueRetrying } from './pg-boss.ts'
 
 export interface JobQueueOptions {
-  policy?: 'standard' | 'singleton' | 'stately'
+  /**
+   * pg-boss 10 gates its singleton unique indexes on the queue's policy (plans.js: job_i1
+   * `state='created' AND policy='short'`, job_i2 `state='active' AND policy='singleton'`, job_i3
+   * `state<=active AND policy='stately'`), so on the DEFAULT `standard` a `singletonKey` is INERT —
+   * `enqueue()` sets one on every send and it dedupes nothing (fix wave W8 / final-A1 M3, pinned by
+   * `test/pg-boss-behaviour.test.ts`). Pick `'short'` on any queue whose producers may re-send the
+   * same entity while an earlier job is still `created`: it collapses those, and stops collapsing
+   * once the job goes active — so an event that arrived after the job started reading is never lost.
+   */
+  policy?: 'standard' | 'short' | 'singleton' | 'stately'
   retryLimit?: number
   retryDelay?: number
   retryBackoff?: boolean

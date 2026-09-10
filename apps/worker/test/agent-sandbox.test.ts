@@ -20,6 +20,7 @@ import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
 import { createFakeProvider, LlmError, type LlmProvider } from '@aesa/llm'
 import { runAgentSandbox, type AgentSandboxDeps, type SandboxOutput } from '../src/jobs/agent-sandbox.ts'
+import { createWorkerLogger } from '../src/logging.ts'
 
 const rand = () => randomBytes(4).toString('hex')
 const NOW = new Date('2026-09-09T12:00:00Z')
@@ -147,14 +148,14 @@ const run = (deps: AgentSandboxDeps, runId: string) => runAgentSandbox(deps, { o
  * shadows only `.transaction`; every other method (and every field a query builder reads off
  * `this`) still resolves through the prototype chain to the real `db`.
  */
-function withOneFailingTransaction(db: Db, shouldFail: () => boolean): Db {
+function withOneFailingTransaction(db: Db, shouldFail: () => boolean, error?: unknown): Db {
   let firedOnce = false
   const original = db.transaction.bind(db)
   const proxy = Object.create(db) as Db
   ;(proxy as unknown as { transaction: unknown }).transaction = (...args: unknown[]) => {
     if (!firedOnce && shouldFail()) {
       firedOnce = true
-      return Promise.reject(new Error('simulated DB failure after the model call'))
+      return Promise.reject(error ?? new Error('simulated DB failure after the model call'))
     }
     return (original as (...a: unknown[]) => unknown)(...args)
   }
@@ -388,5 +389,33 @@ describe('runAgentSandbox', () => {
     // The model WAS called before the injected failure — proves the gap this closes is downstream
     // of the call, not a re-run of an earlier, already-covered failure path.
     expect(provider.calls).toHaveLength(1)
+  })
+
+  it('W6 the recovery log line carries the error MESSAGE, never a pg `detail` with the row in it', async () => {
+    // final-A1 M1: these two sites logged `{ err }`, and pino's default err serializer copies every
+    // own enumerable property — including node-postgres's `detail`, which on a constraint violation
+    // is `Failing row contains (…)`. The row this path is most likely to be writing is
+    // `agent_runs.output`, i.e. the drafted body. The worker's redact paths cover auth only.
+    const question = 'my-secret-question-about-order-9182'
+    const runId = await seedSandboxRun({ input: { subject: 'Where is my order?', question } })
+    const provider = createFakeProvider([{ parsed: REPLY }])
+    // Shaped exactly like the `pg.DatabaseError` a failing INSERT/UPDATE raises: a terse `message`,
+    // the whole offending row on `detail`.
+    const pgLikeError = Object.assign(new Error('duplicate key value violates unique constraint "agent_runs_pkey"'), {
+      code: '23505',
+      severity: 'ERROR',
+      detail: `Failing row contains (…, ${question}, …).`,
+    })
+    const flakyDb = withOneFailingTransaction(app.db, () => provider.calls.length > 0, pgLikeError)
+    const lines: string[] = []
+    const deps = makeDeps(provider, { db: flakyDb, logger: createWorkerLogger('info', { write: (l: string) => void lines.push(l) }) })
+
+    await expect(run(deps, runId)).resolves.toBeUndefined()
+
+    const emitted = lines.join('\n')
+    expect(emitted).toContain('agent.sandbox: run failed unexpectedly')
+    expect(emitted).toContain('duplicate key value violates unique constraint')
+    expect(emitted).not.toContain(question)
+    expect(emitted).not.toContain('Failing row contains')
   })
 })

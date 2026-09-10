@@ -18,7 +18,7 @@ import { emptyRetriever, type DraftDecision } from '@aesa/agent'
 import { DRAFT_EXPIRE_DAYS } from '@aesa/contracts'
 import {
   agentCategoryPolicies, agentRunEvents, agentRuns, agents, auditLog, categories, drafts,
-  ensureDefaultCategories, mailboxConnections, messages, notifications, platformState,
+  ensureDefaultCategories, mailboxConnections, messages, notifications, outboundSends, platformState,
   tickets, usageCounters, user, withOrg, withPlatform, workspaces,
 } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
@@ -152,6 +152,30 @@ async function seedInbound(ticketId: string, over: Partial<typeof messages.$infe
       direction: 'inbound', fromAddress: 'customer@example.test', bodyText: 'Hi, where is my order?',
       dmarcPass: true, sentAt: minutesAgo(5), ...over,
     }))
+}
+
+/** An `approved` draft plus the `queued` ledger row an approve creates, on a ticket the agent is
+ *  still allowed to draft for (the re-approve-raced-by-a-new-inbound shape). */
+async function seedApprovedDraftWithSend(ticketId: string): Promise<{ draftId: string; sendId: string }> {
+  return withOrg(app.db, fx.orgId, async (tx) => {
+    const [draft] = await tx
+      .insert(drafts)
+      .values({
+        orgId: fx.orgId, ticketId, agentId: fx.agentId, categoryId: fx.categoryId, version: 1,
+        body: CLEAN_BODY, finalBody: CLEAN_BODY, decision: 'review', decisionReason: 'below_threshold',
+        status: 'approved', threadSnapshotAt: minutesAgo(5), expiresAt: new Date(NOW.getTime() + 86_400_000),
+        decidedBy: userId, decidedAt: minutesAgo(1), decisionSource: 'app',
+      })
+      .returning({ id: drafts.id })
+    const [send] = await tx
+      .insert(outboundSends)
+      .values({
+        orgId: fx.orgId, draftId: draft!.id, ticketId, connectionId: fx.connectionId, agentId: fx.agentId,
+        status: 'queued', sendAfter: new Date(NOW.getTime() + 15_000),
+      })
+      .returning({ id: outboundSends.id })
+    return { draftId: draft!.id, sendId: send!.id }
+  })
 }
 
 /** A triaged ticket with one authenticated inbound message — the ordinary starting point. */
@@ -458,6 +482,32 @@ describe('runTicketDraft', () => {
       tx.select().from(auditLog).where(and(eq(auditLog.entityId, first!.id), eq(auditLog.action, 'draft.superseded'))))
     expect(superseded).toHaveLength(1)
     expect(superseded[0]!.detail).toMatchObject({ supersededByRunId: rows[1]!.agentRunId })
+  })
+
+  it('14f. a new run supersedes an APPROVED draft (a re-approve raced by a new inbound) and holds its queued send', async () => {
+    // Reachable since fix wave A3: `drafts.resume` puts a `failed` draft back to `pending` on a
+    // ticket `landStale` already handed back to `triaged`, the owner re-approves it (draft
+    // `approved` + a `queued` send), and the re-draft this ticket is owed lands here. Superseding
+    // `pending` ONLY left the approved draft live, so the INSERT below hit
+    // `drafts_live_per_ticket_uidx` — a raw 23505, not a `LostRaceError`, so the job rethrew, the
+    // run stayed `running` until the stuck sweep aborted it, and every retry failed the same way.
+    const ticketId = await seedDraftableTicket()
+    const { draftId, sendId } = await seedApprovedDraftWithSend(ticketId)
+    const { deps } = makeDeps(createFakeProvider([{ parsed: REPLY }]))
+
+    await run(deps, ticketId)
+
+    const rows = await draftsFor(ticketId)
+    expect(rows.map((r) => r.status)).toEqual(['superseded', 'pending'])
+    expect(rows[0]!.id).toBe(draftId)
+    const [send] = await withOrg(app.db, fx.orgId, (tx) => tx.select().from(outboundSends).where(eq(outboundSends.id, sendId)))
+    // The reply the owner approved must not go out on a thread that has moved on.
+    expect(send!.status).toBe('held')
+    expect(send!.lastError).toBe('held:superseded_by_redraft')
+    const superseded = await withOrg(app.db, fx.orgId, (tx) =>
+      tx.select().from(auditLog).where(and(eq(auditLog.entityId, draftId), eq(auditLog.action, 'draft.superseded'))))
+    expect(superseded).toHaveLength(1)
+    expect(superseded[0]!.detail).toMatchObject({ from: 'approved' })
   })
 
   it('6b. owner feedback rides into the prompt, raises effort to high and marks the draft a redraft', async () => {
@@ -864,7 +914,8 @@ describe('runTicketDraft', () => {
     const provider = createFakeProvider([{ parsed: REPLY }])
     const { deps, notified } = makeDeps(provider)
     // The bump below is written but UNCOMMITTED while the job runs its unlocked pre-claim read, so
-    // that read provably sees this value and rule 3's exit cannot be what fired.
+    // under READ COMMITTED that read provably does NOT see it — rule 3's pre-claim exit therefore
+    // cannot be what fired, which is exactly what makes the LOCKED gate below the only explanation.
     const updatedBefore = (await getTicket(ticketId)).updatedAt
 
     await raceAtClaim(

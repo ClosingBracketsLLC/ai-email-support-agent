@@ -22,10 +22,11 @@
 import { and, count, eq, gt, inArray } from 'drizzle-orm'
 import type pino from 'pino'
 import type { UsageTotals } from '@aesa/agent'
-import type { DecisionReason, NeedsOwnerReason } from '@aesa/contracts'
+import type { DecisionReason, DraftStatus, NeedsOwnerReason } from '@aesa/contracts'
 import { DRAFT_EXPIRE_DAYS } from '@aesa/contracts'
+import { draftTransitions, outboundSendTransitions } from '@aesa/core'
 import {
-  audit, drafts, escalateTicket, notifications, tickets, withOrg,
+  audit, drafts, escalateTicket, notifications, outboundSends, tickets, withOrg,
   type AuditActor, type Db, type OrgTx,
 } from '@aesa/db'
 import { stampFinished } from './claim.ts'
@@ -33,6 +34,30 @@ import { finishRun } from './runs.ts'
 
 /** This job's own audit/escalation identity for rows that are not attributable to a run. */
 export const DRAFT_ACTOR: AuditActor = 'system:ticket.draft'
+
+/** The four statuses `drafts_live_per_ticket_uidx` (migration 0011) treats as live. */
+const LIVE_DRAFT_STATUSES = ['pending', 'approved', 'held', 'sending'] as const
+
+/**
+ * What a new run RETIRES before inserting its own draft, and what each becomes — the same table the
+ * api's "Mark resolved" uses, and for the same reason: every one of these occupies the ticket's one
+ * live-draft slot, so leaving one behind turns the INSERT below into a raw 23505 (fix wave W10 /
+ * final-A1 M2). `held → expired` rather than `superseded` because that is the edge the draft matrix
+ * actually has.
+ *
+ * `sending` is deliberately absent: a reply is in flight and only `send.execute` may decide what
+ * happened to it. It cannot coexist with a `triaged` ticket today (both of that job's landings move
+ * the draft out of `sending` in the same transaction that hands the ticket back), so the INSERT is
+ * still safe — and if it ever could, a lost race is the honest outcome, not a stolen send.
+ */
+const DRAFT_RETIREMENT = { pending: 'superseded', approved: 'superseded', held: 'expired' } as const
+type RetirableDraftStatus = keyof typeof DRAFT_RETIREMENT
+const RETIRABLE_DRAFT_STATUSES = Object.keys(DRAFT_RETIREMENT) as RetirableDraftStatus[]
+
+/** The send statuses a retirement pulls back, exactly as `resolveTicket` does: `claimed` too, since
+ *  `send.execute`'s pre-send flip re-checks both rows and backs off when either has moved. */
+const HOLDABLE_SEND_STATUSES = ['queued', 'claimed'] as const
+const SUPERSEDED_SEND_ERROR = 'held:superseded_by_redraft'
 
 /**
  * Thrown INSIDE the final transaction when the guarded flip (or the escalate landing's own
@@ -198,9 +223,11 @@ export function draftReviewCopy(categoryLabel: string, confidence: number, body:
  * the notification payload, so the order there is insert → escalate; the `LostRaceError` rolls the
  * insert back either way, which is what makes the two orders equivalent.
  *
- * Superseding covers `pending` only: the ticket was `triaged` at the flip, so no approved/sending
- * draft can be live on it, and the one-live-draft partial unique would have refused the insert if
- * one were.
+ * Superseding covers every live status except `sending` (`DRAFT_RETIREMENT`). `pending` is the
+ * ordinary case; `approved` became reachable when `drafts.resume` gave a `failed` draft a way back
+ * (fix wave A3) — resume + re-approve on a ticket `landStale` had already handed back to `triaged`
+ * leaves an approved draft and a queued send beside a re-draftable ticket. Its send row is held in
+ * the same transaction: the reply the owner approved answers a thread that has since moved on.
  */
 export async function applyDraftOutcome(
   ctx: OutcomeContext,
@@ -209,18 +236,32 @@ export async function applyDraftOutcome(
 ): Promise<{ draftId: string; notificationId?: string }> {
   return withOrg(ctx.db, ctx.orgId, async (tx) => {
     // Global lock order (task 17 review ruling): `outbound_sends` → `drafts` → `tickets`, one order
-    // across the worker and the api. This job never touches a send row, so the ticket's live drafts
-    // are locked FIRST — by BOTH landings, before the review landing's flip and before the escalate
-    // landing's probe — and the ticket statement below stays exactly what it was, the lost-race gate;
-    // it simply runs second. Without this the two landings raced the api's `rejectDraft` /
-    // `resolveTicket` (draft → ticket) in the opposite order and a pair could deadlock.
+    // across the worker and the api. The ticket's live drafts are locked BEFORE the ticket — by BOTH
+    // landings, before the review landing's flip and before the escalate landing's probe — and the
+    // ticket statement below stays exactly what it was, the lost-race gate; it simply runs second.
+    // Without this the two landings raced the api's `rejectDraft` / `resolveTicket` (draft → ticket)
+    // in the opposite order and a pair could deadlock.
+    // The send rows go FIRST, found through a subquery so no draft row is read (let alone locked)
+    // before them — the retirement below may hold one, and the api's `resolveTicket` takes the same
+    // three tables in the same order (fix wave W10).
     await tx
-      .select({ id: drafts.id })
+      .select({ id: outboundSends.id })
+      .from(outboundSends)
+      .where(and(
+        eq(outboundSends.orgId, ctx.orgId),
+        inArray(outboundSends.draftId, tx.select({ id: drafts.id })
+          .from(drafts)
+          .where(and(eq(drafts.orgId, ctx.orgId), eq(drafts.ticketId, ctx.ticketId), inArray(drafts.status, RETIRABLE_DRAFT_STATUSES)))),
+      ))
+      .for('update')
+
+    const live = await tx
+      .select({ id: drafts.id, status: drafts.status })
       .from(drafts)
       .where(and(
         eq(drafts.orgId, ctx.orgId),
         eq(drafts.ticketId, ctx.ticketId),
-        inArray(drafts.status, ['pending', 'approved', 'held', 'sending']),
+        inArray(drafts.status, LIVE_DRAFT_STATUSES),
       ))
       .for('update')
 
@@ -246,15 +287,28 @@ export async function applyDraftOutcome(
       if (locked.length === 0) throw new LostRaceError('draft.escalate_lost_race')
     }
 
-    const superseded = await tx
-      .update(drafts)
-      .set({ status: 'superseded' })
-      .where(and(eq(drafts.ticketId, ctx.ticketId), eq(drafts.status, 'pending')))
-      .returning({ id: drafts.id })
-    for (const old of superseded) {
+    for (const old of live) {
+      if (!RETIRABLE_DRAFT_STATUSES.includes(old.status as RetirableDraftStatus)) continue
+      const from = old.status as RetirableDraftStatus
+      const to: DraftStatus = DRAFT_RETIREMENT[from]
+      draftTransitions.assert(from, to)
+      const retired = await tx
+        .update(drafts)
+        .set({ status: to })
+        .where(and(eq(drafts.id, old.id), eq(drafts.status, from)))
+        .returning({ id: drafts.id })
+      if (retired.length === 0) continue
+      // A `pending` draft never has a send row; an `approved` or `held` one does, and it is locked
+      // (first, by the statement above this transaction's ticket work) before we touch it.
+      for (const from of HOLDABLE_SEND_STATUSES) outboundSendTransitions.assert(from, 'held')
+      await tx
+        .update(outboundSends)
+        .set({ status: 'held', lastError: SUPERSEDED_SEND_ERROR })
+        .where(and(eq(outboundSends.draftId, old.id), inArray(outboundSends.status, [...HOLDABLE_SEND_STATUSES])))
       await audit(tx, {
-        actor: `agent:${ctx.runId}`, action: 'draft.superseded', entityType: 'draft', entityId: old.id,
-        detail: { supersededByRunId: ctx.runId, ticketId: ctx.ticketId },
+        actor: `agent:${ctx.runId}`, action: to === 'superseded' ? 'draft.superseded' : 'draft.expired',
+        entityType: 'draft', entityId: old.id,
+        detail: { supersededByRunId: ctx.runId, ticketId: ctx.ticketId, from },
       })
     }
 
