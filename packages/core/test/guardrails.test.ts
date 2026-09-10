@@ -38,6 +38,19 @@ describe('validateReplyBody: plain text', () => {
     expect(result.findings.some((f) => f.code === 'empty_body')).toBe(true)
   })
 
+  it('rejects a body containing a \\p{Cc} control character other than \\n/\\r/\\t', () => {
+    const result = validateReplyBody('Thanks\u0001 for reaching out.', POLICY)
+    expect(result.ok).toBe(false)
+    expect(result.findings.map((f) => f.code)).toEqual(['invisible_chars'])
+  })
+
+  it('a body with only \\n, \\r and \\t as controls passes (invisible_chars never trips on those)', () => {
+    const body = 'Thanks for reaching out.\nLine two.\r\nColumn:\ttab.'
+    const result = validateReplyBody(body, POLICY)
+    expect(result.ok).toBe(true)
+    expect(result.findings).toEqual([])
+  })
+
   it('accepts an ordinary plain-text body, returning the unchanged normalizedBody', () => {
     const body = 'Thanks for reaching out, we will look into it.'
     const result = validateReplyBody(body, POLICY)
@@ -413,6 +426,14 @@ describe('appendSignature', () => {
   it('is idempotent — does not double-append', () => {
     const once = appendSignature('Thanks!', 'Team Acme')
     expect(appendSignature(once, 'Team Acme')).toBe(once)
+  })
+
+  it('is a no-op for an empty signature', () => {
+    expect(appendSignature('Thanks!', '')).toBe('Thanks!')
+  })
+
+  it('is a no-op for a whitespace-only signature', () => {
+    expect(appendSignature('Thanks!', '   ')).toBe('Thanks!')
   })
 })
 

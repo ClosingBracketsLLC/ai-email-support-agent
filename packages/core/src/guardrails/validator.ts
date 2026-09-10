@@ -117,8 +117,10 @@ export function validateReplyBody(rawBody: string, policy: WorkspacePolicy, opts
 }
 
 /** The signature is appended by CODE after validation, never written by the model (spec
- * §Guardrails). Idempotent: does not double-append. */
+ * §Guardrails). A no-op for an empty (or whitespace-only) signature — no blank-line suffix with
+ * nothing to sign. Idempotent for a non-empty signature: does not double-append. */
 export function appendSignature(body: string, signature: string): string {
+  if (signature.trim() === '') return body
   const suffix = `\n\n${signature}`
   return body.endsWith(suffix) ? body : `${body}${suffix}`
 }
