@@ -390,6 +390,9 @@ importers:
       '@aesa/crypto':
         specifier: workspace:*
         version: link:../crypto
+      '@aesa/llm':
+        specifier: workspace:*
+        version: link:../llm
       drizzle-orm:
         specifier: ^0.44.0
         version: 0.44.7(@types/pg@8.23.1)(kysely@0.29.5)(pg@8.23.0)
@@ -8277,7 +8280,9 @@ snapshots:
       metro-runtime: 0.84.6
     transitivePeerDependencies:
       - '@babel/core'
+      - bufferutil
       - supports-color
+      - utf-8-validate
 
   '@react-native/normalize-colors@0.74.89': {}
 

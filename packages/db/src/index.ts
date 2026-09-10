@@ -4,3 +4,4 @@ export { withOrg, withPlatform, isUuid, type OrgTx, type PlatformTx } from './te
 export { provisionOrgKeys, loadOrgDek, getOrgBoxPublicKey, getOrgBoxPublicKeyOrNull, openSealedForOrg } from './keys.ts'
 export { audit, type AuditActor, type AuditEntry } from './audit.ts'
 export { ensureDefaultCategories } from './categories.ts'
+export { createMeterSink, LLM_METERS } from './metering.ts'
