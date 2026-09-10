@@ -9,6 +9,7 @@
  * can never become a state oracle for someone probing ids.
  */
 import { APPROVE_UNDO_SECONDS, type DraftStatus } from '@aesa/contracts'
+import { REVIEW_CSS, WORDMARK_SVG } from '../brand/css.ts'
 
 export const FRIENDLY_COPY = 'This link was already handled or has expired.'
 
@@ -24,10 +25,14 @@ function esc(s: string): string {
  * `Cache-Control: no-store` header, set on every response in routes.ts.)
  */
 function page(body: string): string {
-  return '<!doctype html><html><head><meta charset="utf-8">'
+  return '<!doctype html><html lang="en"><head><meta charset="utf-8">'
     + '<meta name="viewport" content="width=device-width, initial-scale=1">'
     + '<meta name="robots" content="noindex"><meta name="referrer" content="no-referrer">'
-    + `<title>aesa</title></head><body>${body}</body></html>`
+    + '<link rel="icon" href="/favicon.svg" type="image/svg+xml">'
+    + '<link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png">'
+    + '<link rel="apple-touch-icon" href="/apple-touch-icon.png">'
+    + `<title>aesa</title><style>${REVIEW_CSS}</style></head>`
+    + `<body><main><header>${WORDMARK_SVG}</header>${body}</main></body></html>`
 }
 
 function appLink(appUrl: string | undefined, trailing: string): string {
@@ -71,7 +76,7 @@ export function reviewPage(p: ReviewPageProps): string {
 
   const warnings = p.warnings.length === 0
     ? ''
-    : `<p>Heads up:</p><ul>${p.warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>`
+    : `<div class="warn"><p>Heads up:</p><ul>${p.warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul></div>`
 
   const hidden = `<input type="hidden" name="t" value="${esc(p.token)}">`
   const approve = p.canApprove
@@ -80,11 +85,11 @@ export function reviewPage(p: ReviewPageProps): string {
     : ''
   const hold = p.canHold
     ? `<form method="post" action="/a/${esc(p.draftId)}/hold">${hidden}`
-      + '<button type="submit">Hold — do not send this</button></form>'
+      + '<button type="submit" class="secondary">Hold — do not send this</button></form>'
     : ''
 
   return page(
-    `<h1>Reply ready</h1><p>${meta}</p><pre>${esc(p.body)}</pre>${warnings}${approve}${hold}`
+    `<h1>Reply ready</h1><p class="meta">${meta}</p><pre>${esc(p.body)}</pre>${warnings}${approve}${hold}`
     + appLink(p.appUrl, 'reject or edit in the app.'),
   )
 }

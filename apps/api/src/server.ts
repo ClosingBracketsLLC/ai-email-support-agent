@@ -5,6 +5,7 @@ import rateLimit from '@fastify/rate-limit'
 import { fastifyTRPCPlugin, type FastifyTRPCPluginOptions } from '@trpc/server/adapters/fastify'
 import { fromNodeHeaders } from 'better-auth/node'
 import Fastify, { type FastifyBaseLogger, type FastifyError, type FastifyInstance } from 'fastify'
+import { registerBrandAssets } from './brand/assets.ts'
 import { registerConnectRoutes } from './connect/routes.ts'
 import type { ServerDeps } from './deps.ts'
 import { redactUrl } from './redact.ts'
@@ -124,6 +125,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       const h = await deps.api.health()
       return reply.code(h.db === 'ok' ? 200 : 503).send({ status: h.db === 'ok' ? 'ok' : 'degraded', db: h.db, migrations: h.migrations, uptimeSeconds: Math.round((Date.now() - startedAt) / 1000) })
     })
+
+    // The six brand files (favicons, apple-touch-icon, og.png) — declared inside this register() for the
+    // same reason as every other plain route here: only a route inside register() is wrapped by
+    // @fastify/rate-limit's `global: true` onRoute hook.
+    registerBrandAssets(routes)
 
     // Only exists with the devsink transport, which loadConfig refuses in production.
     if (deps.mail.kind === 'devsink') {
