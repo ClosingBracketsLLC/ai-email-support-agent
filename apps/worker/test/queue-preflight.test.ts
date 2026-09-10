@@ -1,12 +1,12 @@
 /**
- * `index.ts` calls `createQueueRetrying` for `JOB_NAMES.notifyDispatch`/`ticketTriage`/`ticketDraft`/`mailboxSync`
- * unconditionally at boot, before any role-gated `registerJob` call — because pg-boss 10's `insertJob`
- * SQL INNER JOINs a new job against the queue table and silently returns a `null` id (no error) when
- * the named queue doesn't exist yet (fix review, Important 2: a role-partitioned replica, or a dev box
- * missing ANTHROPIC_API_KEY/the KEK ring/MAIL_FROM, would otherwise never create these queues itself,
- * and mailbox.poll-sweep's (a)/(d)/(e) and ticket.triage's own hand-off enqueue into them regardless). This
- * proves the fix directly: a boss with the queues pre-created but NO job registered on any of them still
- * returns a real id.
+ * `index.ts` calls `createQueueRetrying` for `JOB_NAMES.notifyDispatch`/`ticketTriage`/`ticketDraft`/
+ * `agentSandbox`/`mailboxSync` unconditionally at boot, before any role-gated `registerJob` call —
+ * because pg-boss 10's `insertJob` SQL INNER JOINs a new job against the queue table and silently
+ * returns a `null` id (no error) when the named queue doesn't exist yet (fix review, Important 2: a
+ * role-partitioned replica, or a dev box missing ANTHROPIC_API_KEY/the KEK ring/MAIL_FROM, would
+ * otherwise never create these queues itself, and mailbox.poll-sweep's (a)/(d)/(e) and ticket.triage's
+ * own hand-off enqueue into them regardless). This proves the fix directly: a boss with the queues
+ * pre-created but NO job registered on any of them still returns a real id.
  */
 import type PgBoss from 'pg-boss'
 import { describe, expect, it } from 'vitest'
@@ -15,7 +15,7 @@ import { createQueueRetrying, defineJob, enqueue, JOB_NAMES } from '@aesa/queue'
 import { deleteJobsForOrgs, startTestBoss } from './helpers/boss.ts'
 
 describe('worker boot: pre-created queues accept sends with no registrations', () => {
-  it.each([JOB_NAMES.notifyDispatch, JOB_NAMES.ticketTriage, JOB_NAMES.ticketDraft, JOB_NAMES.mailboxSync, JOB_NAMES.sendExecute])('enqueue(%s) returns a non-null id once the queue is pre-created, before any registerJob call', async (name) => {
+  it.each([JOB_NAMES.notifyDispatch, JOB_NAMES.ticketTriage, JOB_NAMES.ticketDraft, JOB_NAMES.agentSandbox, JOB_NAMES.mailboxSync, JOB_NAMES.sendExecute])('enqueue(%s) returns a non-null id once the queue is pre-created, before any registerJob call', async (name) => {
     const boss: PgBoss = await startTestBoss()
     const orgId = crypto.randomUUID()
     try {

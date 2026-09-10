@@ -25,14 +25,13 @@ import {
   type DraftCallResult, type DraftDecision, type DraftPromptInput, type EscalateReason,
   type RetrievedAnswer, type RetrievedChunk, type Retriever, type ThreadMessage, type WorkspaceProfile,
 } from '@aesa/agent'
-import type { Tone } from '@aesa/contracts'
 import {
   COLD_START_DECISIONS, collectGroundedNumbers, decide, INVARIANTS,
   resolveSetting, validateReplyBody, type GuardrailResult, type SettingKey,
 } from '@aesa/core'
 import {
-  agentCategoryPolicies, agentRuns, agents, audit, categories, drafts, escalateTicket, mailboxConnections,
-  messages, notifications, orgSettings, platformState, tickets, withOrg, workspaces,
+  agentCategoryPolicies, agentRuns, agents, audit, drafts, escalateTicket, mailboxConnections,
+  messages, notifications, orgSettings, platformState, tickets, withOrg,
   type Db, type OrgTx,
 } from '@aesa/db'
 import { computeCostMicros, findPricing, LlmError, type ChatMeta, type LlmProvider } from '@aesa/llm'
@@ -40,6 +39,7 @@ import { defineJob, enqueue, JOB_NAMES, registerJob, type JobDefinition } from '
 import { utcDayString } from '../date-utils.ts'
 import { gateAndRecordRun, readCapsUnlocked } from '../drafting/caps.ts'
 import { claimTicket, recordFailure, unwindClaimStamp, type ClaimedTicket } from '../drafting/claim.ts'
+import { loadSharedDraftContext } from '../drafting/context.ts'
 import {
   applyDraftOutcome, applyEscalateOutcome, applyNoReplyOutcome, DRAFT_ACTOR, LostRaceError, recordLostRace,
   type DraftLanding, type OutcomeContext,
@@ -270,10 +270,7 @@ async function loadContext(
   effort: 'medium' | 'high',
 ): Promise<DraftContext> {
   return withOrg(deps.db, orgId, async (tx) => {
-    const [workspace] = await tx.select().from(workspaces).where(eq(workspaces.orgId, orgId))
-    if (!workspace) throw new Error(`ticket.draft: org ${orgId} has no workspace row`)
-
-    const cats = await tx.select({ id: categories.id, key: categories.key, label: categories.label }).from(categories)
+    const shared = await loadSharedDraftContext(tx, orgId)
 
     let categoryMode: 'off' | 'review' | 'auto' = 'review'
     if (ticket.categoryId) {
@@ -332,26 +329,13 @@ async function loadContext(
       .from(mailboxConnections)
       .where(eq(mailboxConnections.id, ticket.connectionId))
 
-    const profile: WorkspaceProfile = {
-      businessName: workspace.businessName,
-      websiteUrl: workspace.websiteUrl,
-      description: workspace.description,
-      tone: workspace.tone as Tone,
-      timezone: workspace.timezone,
-      locale: workspace.locale,
-      contactPhone: workspace.contactPhone,
-      contactUrls: workspace.contactUrls,
-      allowedUrlHosts: workspace.allowedUrlHosts,
-      allowedEmailDomains: workspace.allowedEmailDomains,
-    }
-
     const ctx: DraftContext = {
-      profile,
-      workspaceGuidance: workspace.operatingGuidance,
+      profile: shared.profile,
+      workspaceGuidance: shared.workspaceGuidance,
       agentGuidance: agent.guidanceExtra,
-      workspaceKillSwitch: workspace.killSwitch,
-      agentEnabled: workspace.agentEnabled,
-      cats,
+      workspaceKillSwitch: shared.workspaceKillSwitch,
+      agentEnabled: shared.agentEnabled,
+      cats: shared.cats,
       categoryMode,
       thread,
       latestInboundBody: latestInbound?.bodyText ?? '',
@@ -366,7 +350,7 @@ async function loadContext(
     // retrieval, which by the pinned order has not run yet — and in Phase 3 is always empty.
     const blocks = [
       platformRulesBlock(),
-      workspaceProfileBlock(profile),
+      workspaceProfileBlock(shared.profile),
       personaBlock(personaFor(agent)),
       guidanceBlock({ workspaceGuidance: ctx.workspaceGuidance, agentGuidance: ctx.agentGuidance }),
     ].filter((b) => b !== null)

@@ -5,6 +5,7 @@ import type { Db } from '@aesa/db'
 import { maybeRegisterAgentRole, type AgentRoleRegistrars } from '../src/agent-role.ts'
 import type { WorkerConfig } from '../src/config.ts'
 import { createWorkerLogger } from '../src/logging.ts'
+import type { AgentSandboxDeps } from '../src/jobs/agent-sandbox.ts'
 import type { TicketDraftDeps } from '../src/jobs/ticket-draft.ts'
 import type { TicketTriageDeps } from '../src/jobs/ticket-triage.ts'
 
@@ -28,9 +29,9 @@ function baseConfig(overrides: Partial<WorkerConfig> = {}): WorkerConfig {
   }
 }
 
-/** Both registrars share one flag: every gating test only asks "did anything register at all?". */
+/** All three registrars share one flag: every gating test only asks "did anything register at all?". */
 function spyRegistrars(mark: () => void): AgentRoleRegistrars {
-  return { registerTriage: async () => mark(), registerDraft: async () => mark() }
+  return { registerTriage: async () => mark(), registerDraft: async () => mark(), registerSandbox: async () => mark() }
 }
 
 function testLogger(): { logger: ReturnType<typeof createWorkerLogger>; lines: string[] } {
@@ -84,10 +85,11 @@ describe('maybeRegisterAgentRole', () => {
     expect(registered).toBe(false)
   })
 
-  it('registers BOTH ticket.triage and ticket.draft on ONE managed provider once the key is present', async () => {
+  it('registers ticket.triage, ticket.draft AND agent.sandbox on ONE managed provider once the key is present', async () => {
     const { logger } = testLogger()
     let triageDeps: TicketTriageDeps | undefined
     let draftDeps: TicketDraftDeps | undefined
+    let sandboxDeps: AgentSandboxDeps | undefined
     await maybeRegisterAgentRole(
       {
         boss: fakeBoss, db: fakeDb, logger,
@@ -98,15 +100,19 @@ describe('maybeRegisterAgentRole', () => {
       {
         registerTriage: async (_boss, jobDeps) => { triageDeps = jobDeps },
         registerDraft: async (_boss, jobDeps) => { draftDeps = jobDeps },
+        registerSandbox: async (_boss, jobDeps) => { sandboxDeps = jobDeps },
       },
     )
     expect(triageDeps?.db).toBe(fakeDb)
     expect(draftDeps?.db).toBe(fakeDb)
+    expect(sandboxDeps?.db).toBe(fakeDb)
     expect(triageDeps?.provider.kind).toBe('anthropic')
-    // ONE provider for the role: triage's calls are metered through the same managed stack the
-    // draft job uses (deviation 8), not a second bare adapter.
+    // ONE provider for the role: triage's and the sandbox's calls are metered through the same
+    // managed stack the draft job uses (deviation 8), not a second bare adapter.
     expect(draftDeps?.provider).toBe(triageDeps?.provider)
+    expect(sandboxDeps?.provider).toBe(triageDeps?.provider)
     expect(draftDeps?.retriever).toBeDefined()
+    expect(sandboxDeps?.retriever).toBeDefined()
     expect(triageDeps?.enqueueDraft).toBeDefined()
   })
 })
