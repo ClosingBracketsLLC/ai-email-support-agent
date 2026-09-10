@@ -22,11 +22,11 @@ import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import { z } from 'zod'
 import { runTriageCall, TRIAGE_BODY_COUNT, TRIAGE_MAX_BODY_CHARS } from '@aesa/agent'
-import { type NeedsOwnerReason, type TriageVerdict } from '@aesa/contracts'
+import { type TriageVerdict } from '@aesa/contracts'
 import { resolveSetting, type SettingKey } from '@aesa/core'
 import {
-  audit, categories, messages, notifications, orgSettings, tickets, usageCounters, withOrg, workspaces,
-  type Db, type OrgTx,
+  audit, categories, escalationDedupeKey, insertEscalationNotification, messages, orgSettings, tickets,
+  usageCounters, withOrg, workspaces, type Db, type OrgTx,
 } from '@aesa/db'
 import type { LlmProvider } from '@aesa/llm'
 import { defineJob, registerJob, JOB_NAMES, type JobDefinition } from '@aesa/queue'
@@ -188,48 +188,6 @@ async function guardedWrite(tx: OrgTx, ticketId: string, selectedStatus: string,
     .where(and(eq(tickets.id, ticketId), eq(tickets.status, selectedStatus)))
     .returning({ id: tickets.id })
   return rows.length > 0
-}
-
-function escalationCopy(reason: NeedsOwnerReason): { title: string; body: string } {
-  switch (reason) {
-    case 'triage_flags':
-      return { title: 'Ticket flagged for review', body: 'A message on this ticket was flagged during triage and needs your attention.' }
-    case 'sentiment_angry':
-      return { title: 'Angry customer', body: "This ticket's latest message reads as angry and needs your attention." }
-    case 'triage_failed':
-      return { title: 'Triage failed twice', body: 'This ticket could not be triaged automatically and needs your attention.' }
-    case 'triage_cap':
-      return { title: 'Daily triage limit reached', body: "This ticket is waiting because today's triage limit was reached." }
-    default:
-      return { title: 'Needs your attention', body: 'This ticket needs your attention.' }
-  }
-}
-
-/**
- * Day-scoped, not lifetime-scoped (controller ruling, fix review): `escalation:${ticketId}` alone
- * would mean the FIRST escalation ever notified for this ticket permanently wins the unique index —
- * a ticket that gets resolved and later re-escalates (a second `triage_failed`, a fresh angry
- * follow-up after a reopen, …) would then insert nothing and page nobody. Scoping by UTC day makes
- * the dedupe "at most one push per ticket per day", same pattern the cap path already uses, while
- * `escalation_notified_at` (cleared on every transition INTO `needs_owner`) stays the authoritative
- * "has this escalation episode been notified" stamp — this key only governs the notification row.
- */
-function escalationDedupeKey(ticketId: string, day: string): string {
-  return `escalation:${ticketId}:${day}`
-}
-
-/** `ON CONFLICT (dedupe_key) DO NOTHING` — a second escalation for the same dedupe key (e.g. the
- * same ticket capped twice in one UTC day) is a silent no-op: no duplicate row, no second page. */
-async function insertEscalationNotification(
-  tx: OrgTx, orgId: string, ticketId: string, dedupeKey: string, reason: NeedsOwnerReason,
-): Promise<string | undefined> {
-  const { title, body } = escalationCopy(reason)
-  const [row] = await tx
-    .insert(notifications)
-    .values({ orgId, kind: 'escalation', title, body, dedupeKey, payload: { ticketId } })
-    .onConflictDoNothing({ target: notifications.dedupeKey })
-    .returning({ id: notifications.id })
-  return row?.id
 }
 
 // -- Verdict precedence (rule 6) --
