@@ -15,7 +15,7 @@ import {
   approveDraft, holdDraft, levenshteinRatio, markViewed, rejectDraft, resolveTicket, resumeDraft,
   type DraftActor, type DraftServiceDeps,
 } from '../src/drafts/service.ts'
-import type { EnqueueFn } from '../src/deps.ts'
+import type { ApiFacade, EnqueueFn } from '../src/deps.ts'
 import { createAppLogger } from '../src/logging.ts'
 import type { AppRouter } from '../src/trpc/router.ts'
 import {
@@ -27,6 +27,25 @@ const client = (base: string, cookie?: string) => createTRPCClient<AppRouter>({
 })
 
 interface Recorded { name: string; data: Record<string, unknown>; opts: { entityId: string; startAfter?: Date; debounceSeconds?: number } }
+
+/**
+ * The real facade, with one seam an interleaving test needs: the transaction is held OPEN (every row
+ * lock it took still held, nothing committed) once the service's body finishes, until the test
+ * releases it. That is what lets a second, competing transaction run against a half-finished one.
+ */
+function pausingApi(api: ApiFacade, gate: { reached: () => void; release: Promise<void> }): ApiFacade {
+  return {
+    ...api,
+    withOrg: (orgId, fn) => api.withOrg(orgId, async (tx) => {
+      const out = await fn(tx)
+      gate.reached()
+      await gate.release
+      return out
+    }),
+  }
+}
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms) })
 
 describe('draft service', () => {
   let t: Awaited<ReturnType<typeof createTestApi>>
@@ -373,7 +392,7 @@ describe('draft service', () => {
     expect(await readDraft(org.orgId, draft.id)).toMatchObject({ status: 'rejected', rejectAction: 'handle' })
   })
 
-  it('falls back to the terminal escalation when the ticket already left awaiting_review, in the same transaction', async () => {
+  it('resolves terminally when the ticket already left awaiting_review — the draft is rejected and the ticket is left exactly as its owner left it', async () => {
     const org = await seedOrg()
     const ticket = await insertTicket(t.api, org.orgId, { connectionId: org.connectionId, agentId: org.agentId, status: 'needs_owner', needsOwnerReason: 'tripwire' })
     const draft = await seedPendingDraft(t.api, org.orgId, ticket.id, { agentId: org.agentId, viewedAt: new Date() })
@@ -381,7 +400,11 @@ describe('draft service', () => {
     const res = await rejectDraft(deps, org.orgId, { draftId: draft.id, action: 'redraft', reason: 'Try again please.' }, org.actor)
     expect(res).toEqual({ ok: true, resolution: 'escalate_terminal' })
     expect(await readDraft(org.orgId, draft.id)).toMatchObject({ status: 'rejected' })
-    expect(await readTicket(org.orgId, ticket.id)).toMatchObject({ status: 'needs_owner', needsOwnerReason: 'owner_handling' })
+    // `awaiting_review` is the only status a reject escalates FROM: this ticket was already escalated
+    // for another reason, and overwriting that with `owner_handling` would erase why it is waiting.
+    expect(await readTicket(org.orgId, ticket.id)).toMatchObject({ status: 'needs_owner', needsOwnerReason: 'tripwire' })
+    expect(await readAudit(org.orgId, 'ticket.escalated')).toHaveLength(0)
+    expect((await readAudit(org.orgId, 'draft.rejected'))[0]!.detail).toMatchObject({ resolution: 'escalate_terminal', escalated: false })
     expect(sent).toEqual([])
   })
 
@@ -424,6 +447,44 @@ describe('draft service', () => {
     expect(await readAudit(org.orgId, 'ticket.resolved')).toHaveLength(1)
 
     expect(await resolveTicket(deps, org.orgId, ticket.id, org.actor)).toBe(false)   // already resolved
+  })
+
+  it('resolveTicket cannot leave an approved draft with a queued send behind, even when an approve is mid-flight', async () => {
+    const org = await seedOrg()
+    const { ticket, draft } = await seedReviewable(org)
+
+    // The interleave, deterministically: the approve runs to the end of its transaction and is held
+    // there — draft `approved`, send `queued`, nothing committed, every lock still held — while the
+    // resolve runs on its own pooled connection. Before the lock-order fix the resolve read the draft
+    // WITHOUT a lock, so it saw `pending`, marked the ticket resolved, and its supersede (guarded on
+    // that stale status) then matched 0 rows: ticket `resolved`, draft `approved`, send `queued` and
+    // a send.execute job already scheduled — the reply went out after the owner said they had it.
+    let reached = (): void => {}
+    let release = (): void => {}
+    const gate = {
+      reached: () => reached(),
+      release: new Promise<void>((r) => { release = () => r() }),
+      arrived: new Promise<void>((r) => { reached = () => r() }),
+    }
+    const approving = approveDraft({ ...deps, api: pausingApi(t.api, gate) }, org.orgId, { draftId: draft.id }, org.actor)
+    await gate.arrived
+
+    const resolving = resolveTicket(deps, org.orgId, ticket.id, org.actor)
+    await delay(150)          // let the resolve reach the statement that must block on the approve
+    release()
+
+    const [approve, resolved] = await Promise.all([approving, resolving])
+    expect(resolved).toBe(true)
+
+    const draftAfter = await readDraft(org.orgId, draft.id)
+    const sendAfter = await readSend(org.orgId, draft.id)
+    expect(await readTicket(org.orgId, ticket.id)).toMatchObject({ status: 'resolved' })
+    // The invariant, whichever side won the race: never an approved draft with a live send on a
+    // resolved ticket.
+    expect(draftAfter!.status === 'approved' && sendAfter?.status === 'queued').toBe(false)
+    expect(draftAfter).toMatchObject({ status: 'superseded' })
+    if (approve.ok) expect(sendAfter).toMatchObject({ status: 'held' })
+    else expect(approve).toEqual({ ok: false, code: 'not_pending' })
   })
 
   it('resolveTicket supersedes a pending draft too and leaves other orgs alone', async () => {

@@ -12,11 +12,18 @@
  *  - `enqueue` only AFTER the transaction commits, and a null job id is logged, never thrown — the
  *    worker's backstop sweep rescues a lost send.
  *
- * Lock ORDER is load-bearing where a worker job contends for the same rows:
- *  - `holdDraft` (the undo racing `send.execute`'s claim) takes the SEND row before the draft,
- *    because the claim does exactly that;
- *  - `resolveTicket` takes the live draft's send row, then the ticket, then the draft — compatible
- *    with both `send.execute` (send → draft) and `applyDraftOutcome` (ticket → draft).
+ * LOCK ORDER — one global order across the api AND the worker (controller ruling, task 17 review):
+ * **`outbound_sends` → `drafts` → `tickets`**, which is what every `send.execute` path already takes
+ * (claim, the pre-send flip, `completeSend`, the stale/terminal landings). So:
+ *  - `approveDraft` locks the draft's existing send row (when there is one) BEFORE the draft — its
+ *    `INSERT … ON CONFLICT (draft_id) DO UPDATE … WHERE` locks the conflicting tuple before it ever
+ *    evaluates that `WHERE`, so taking it last would invert the order against `holdDraft` and
+ *    deadlock a tap-Approve-then-Undo;
+ *  - `holdDraft` takes the send row, then the draft;
+ *  - `resolveTicket` takes the live draft's send row, then the draft, then the ticket;
+ *  - `rejectDraft` takes the draft, then the ticket.
+ * The worker's `applyDraftOutcome` locks the ticket's live drafts before its ticket flip for the
+ * same reason.
  */
 import { and, eq, inArray, isNull, sql, type SQL } from 'drizzle-orm'
 import type pino from 'pino'
@@ -64,6 +71,9 @@ export interface RejectInput {
 
 /** The draft statuses the one-live-draft partial unique covers (migration 0011). */
 export const LIVE_DRAFT_STATUSES = ['pending', 'approved', 'held', 'sending'] as const
+
+/** The live-draft statuses `resolveTicket` may supersede (the two the draft matrix allows). */
+const SUPERSEDABLE_DRAFT_STATUSES = ['pending', 'approved'] as const
 
 /** The ticket statuses an owner may resolve from (spec: To review and its two neighbours). */
 const RESOLVABLE_TICKET_STATUSES = ['needs_owner', 'awaiting_review', 'triaged'] as const
@@ -192,6 +202,14 @@ export async function approveDraft(
 ): Promise<ApproveResult> {
   const now = clock(deps)
   const outcome = await deps.api.withOrg(orgId, async (tx): Promise<ApproveResult> => {
+    // Lock order `outbound_sends` → `drafts` → `tickets` (see this file's header): a no-op when this
+    // draft has never been approved, and the lock the upsert below would otherwise take second.
+    await tx.select({ id: outboundSends.id })
+      .from(outboundSends)
+      .where(and(eq(outboundSends.orgId, orgId), eq(outboundSends.draftId, input.draftId)))
+      .limit(1)
+      .for('update')
+
     const [draft] = await tx.select({
       id: drafts.id, ticketId: drafts.ticketId, agentId: drafts.agentId, status: drafts.status, body: drafts.body, viewedAt: drafts.viewedAt,
     }).from(drafts).where(and(eq(drafts.orgId, orgId), eq(drafts.id, input.draftId))).limit(1).for('update')
@@ -458,21 +476,26 @@ export async function rejectDraft(
     }
 
     const atLimit = resolution.kind === 'escalate_limit'
-    // Re-read the status the escalation has to be guarded on: under READ COMMITTED this statement
-    // gets a fresh snapshot, so it sees wherever a concurrent writer actually left the ticket.
+    // `awaiting_review` is the ONLY status a reject may escalate from: it is where a ticket with a
+    // live draft sits. Re-read under READ COMMITTED (a fresh snapshot per statement) — anything else
+    // means a concurrent writer already moved the ticket somewhere it owns (`resolved`, a fresh
+    // `triaged` cycle, an escalation of its own), and re-escalating that would undo their work, so
+    // the reject stops at the rejected draft (review Minor 5).
     const [current] = await tx.select({ status: tickets.status })
       .from(tickets).where(and(eq(tickets.orgId, orgId), eq(tickets.id, ticket.id))).limit(1)
-    const escalated = await escalateTicket(tx, {
-      orgId, ticketId: ticket.id, fromStatus: current?.status ?? ticket.status,
-      reason: atLimit ? 'redraft_limit_reached' : 'owner_handling',
-      day, now,
-      // The owner is looking at the ticket when they take it over — escalate quietly. Hitting the
-      // re-draft cap is news, so that one pages, under its own reason-scoped dedupe key.
-      quiet: !atLimit,
-      ...(atLimit ? { dedupeKey: `redraft_limit:${ticket.id}:${day}` } : {}),
-      draftId: draft.id, actor: actor.actor, auditAction: 'ticket.escalated',
-      detail: { draftId: draft.id, rejectAction: input.action },
-    })
+    const escalated = current?.status === 'awaiting_review'
+      ? await escalateTicket(tx, {
+        orgId, ticketId: ticket.id, fromStatus: 'awaiting_review',
+        reason: atLimit ? 'redraft_limit_reached' : 'owner_handling',
+        day, now,
+        // The owner is looking at the ticket when they take it over — escalate quietly. Hitting the
+        // re-draft cap is news, so that one pages, under its own reason-scoped dedupe key.
+        quiet: !atLimit,
+        ...(atLimit ? { dedupeKey: `redraft_limit:${ticket.id}:${day}` } : {}),
+        draftId: draft.id, actor: actor.actor, auditAction: 'ticket.escalated',
+        detail: { draftId: draft.id, rejectAction: input.action },
+      })
+      : { escalated: false, notificationId: undefined }
     const resolutionName: RejectResolution = atLimit ? 'escalate_limit' : 'escalate_terminal'
     await audit(tx, {
       actor: actor.actor, action: 'draft.rejected', entityType: 'draft', entityId: draft.id,
@@ -511,7 +534,7 @@ export async function markViewed(deps: DraftServiceDeps, orgId: string, draftId:
   return deps.api.withOrg(orgId, async (tx) => {
     const stamped = await tx.update(drafts)
       .set({ viewedAt: sql`COALESCE(${drafts.viewedAt}, ${now})` })
-      .where(and(eq(drafts.id, draftId), eq(drafts.status, 'pending')))
+      .where(and(eq(drafts.orgId, orgId), eq(drafts.id, draftId), eq(drafts.status, 'pending')))
       .returning({ id: drafts.id, ticketId: drafts.ticketId, viewedAt: drafts.viewedAt })
     const row = stamped[0]
     if (!row) return false
@@ -534,20 +557,32 @@ export async function markViewed(deps: DraftServiceDeps, orgId: string, draftId:
  */
 export async function resolveTicket(deps: DraftServiceDeps, orgId: string, ticketId: string, actor: DraftActor): Promise<boolean> {
   return deps.api.withOrg(orgId, async (tx) => {
-    // The live draft's send row first (see this file's header on lock order), then the ticket, then
-    // the draft — the order `applyDraftOutcome` takes.
+    // Lock order `outbound_sends` → `drafts` → `tickets` (see this file's header). The send rows go
+    // first, found through a subquery so no draft row has to be read (let alone locked) before them.
+    await tx.select({ id: outboundSends.id })
+      .from(outboundSends)
+      .where(and(
+        eq(outboundSends.orgId, orgId),
+        inArray(outboundSends.draftId, tx.select({ id: drafts.id })
+          .from(drafts)
+          .where(and(eq(drafts.orgId, orgId), eq(drafts.ticketId, ticketId), inArray(drafts.status, [...SUPERSEDABLE_DRAFT_STATUSES])))),
+      ))
+      .for('update')
+
+    // The live draft under a real lock, and its status re-read there: reading it unlocked meant a
+    // concurrent approve could flip `pending → approved` underneath, leaving the supersede below
+    // matching 0 rows on a ticket already marked resolved — an approved reply still queued to go out
+    // (review Important 1). `FOR UPDATE` re-checks the predicate after the wait, so an approve that
+    // won the race is still selected here, and superseded, and its send held.
     const [live] = await tx.select({ id: drafts.id, status: drafts.status })
       .from(drafts)
-      .where(and(eq(drafts.orgId, orgId), eq(drafts.ticketId, ticketId), inArray(drafts.status, ['pending', 'approved'])))
+      .where(and(eq(drafts.orgId, orgId), eq(drafts.ticketId, ticketId), inArray(drafts.status, [...SUPERSEDABLE_DRAFT_STATUSES])))
       .limit(1)
-    if (live) {
-      await tx.select({ id: outboundSends.id })
-        .from(outboundSends).where(and(eq(outboundSends.orgId, orgId), eq(outboundSends.draftId, live.id))).limit(1).for('update')
-    }
+      .for('update')
 
     const moved = await tx.update(tickets)
       .set({ status: 'resolved', ...clearRedraftCycle() })
-      .where(and(eq(tickets.id, ticketId), inArray(tickets.status, [...RESOLVABLE_TICKET_STATUSES])))
+      .where(and(eq(tickets.orgId, orgId), eq(tickets.id, ticketId), inArray(tickets.status, [...RESOLVABLE_TICKET_STATUSES])))
       .returning({ id: tickets.id })
     if (moved.length === 0) return false
 
@@ -556,14 +591,14 @@ export async function resolveTicket(deps: DraftServiceDeps, orgId: string, ticke
       draftTransitions.assert(live.status as DraftStatus, 'superseded')
       const superseded = await tx.update(drafts)
         .set({ status: 'superseded' })
-        .where(and(eq(drafts.id, live.id), eq(drafts.status, live.status)))
+        .where(and(eq(drafts.orgId, orgId), eq(drafts.id, live.id), inArray(drafts.status, [...SUPERSEDABLE_DRAFT_STATUSES])))
         .returning({ id: drafts.id })
       if (superseded.length > 0) {
         supersededDraftId = live.id
         outboundSendTransitions.assert('queued', 'held')
         await tx.update(outboundSends)
           .set({ status: 'held', lastError: 'held:ticket_resolved' })
-          .where(and(eq(outboundSends.draftId, live.id), eq(outboundSends.status, 'queued')))
+          .where(and(eq(outboundSends.orgId, orgId), eq(outboundSends.draftId, live.id), eq(outboundSends.status, 'queued')))
       }
     }
 

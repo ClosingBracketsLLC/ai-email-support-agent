@@ -19,7 +19,7 @@
  *    the run records that it threw its work away rather than anchoring a draft to a ticket that has
  *    moved on.
  */
-import { and, count, eq, gt } from 'drizzle-orm'
+import { and, count, eq, gt, inArray } from 'drizzle-orm'
 import type pino from 'pino'
 import type { UsageTotals } from '@aesa/agent'
 import type { DecisionReason, NeedsOwnerReason } from '@aesa/contracts'
@@ -208,6 +208,22 @@ export async function applyDraftOutcome(
   row: DraftRowInput,
 ): Promise<{ draftId: string; notificationId?: string }> {
   return withOrg(ctx.db, ctx.orgId, async (tx) => {
+    // Global lock order (task 17 review ruling): `outbound_sends` → `drafts` → `tickets`, one order
+    // across the worker and the api. This job never touches a send row, so the ticket's live drafts
+    // are locked FIRST — by BOTH landings, before the review landing's flip and before the escalate
+    // landing's probe — and the ticket statement below stays exactly what it was, the lost-race gate;
+    // it simply runs second. Without this the two landings raced the api's `rejectDraft` /
+    // `resolveTicket` (draft → ticket) in the opposite order and a pair could deadlock.
+    await tx
+      .select({ id: drafts.id })
+      .from(drafts)
+      .where(and(
+        eq(drafts.orgId, ctx.orgId),
+        eq(drafts.ticketId, ctx.ticketId),
+        inArray(drafts.status, ['pending', 'approved', 'held', 'sending']),
+      ))
+      .for('update')
+
     if (landing.kind === 'review') {
       const flipped = await tx
         .update(tickets)

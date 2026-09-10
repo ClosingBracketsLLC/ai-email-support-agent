@@ -2,9 +2,9 @@ import { randomUUID } from 'node:crypto'
 import { createTRPCClient, httpBatchLink } from '@trpc/client'
 import { eq } from 'drizzle-orm'
 import superjson from 'superjson'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, expectTypeOf, it } from 'vitest'
 import { drafts, messages, outboundSends, tickets, workspaces } from '@aesa/db'
-import { parseCursor } from '../src/trpc/routers/inbox.ts'
+import { loadTicketSummary, parseCursor, type TicketDraftSummary, type TicketSummary } from '../src/trpc/routers/inbox.ts'
 import type { AppRouter } from '../src/trpc/router.ts'
 import { SEED_DRAFT_BODY, WEB, createTestApi, insertAgent, insertConnectedMailbox, listen, seedPendingDraft, signInWithOtp } from './helpers/app.ts'
 
@@ -189,5 +189,35 @@ describe('inbox router (read-only)', () => {
     expect(res.degraded).toBe(false)
     expect(res.tickets.map((tk) => tk.id)).toEqual([ticket.id])
     await expect(c.inbox.list.query({ section: 'recent', cursor: '2026-02-31T00:00:00Z' })).rejects.toThrow(/Invalid ISO datetime/)
+  })
+
+  it('TicketSummary is a concrete type, not a bag of unknown — drafts.get hands it straight to the app', async () => {
+    // `export type TicketSummary = ReturnType<typeof toSummary>` on a GENERIC toSummary resolved every
+    // field to `unknown` (review Important 3): inbox.list/ticket were fine (T inferred from the real
+    // row) but `drafts.get`'s `ticket` payload reached the app untyped. These assertions are checked
+    // by `tsc --noEmit` over this file, so the alias cannot silently go back to `unknown`.
+    expectTypeOf<TicketSummary['id']>().toEqualTypeOf<string>()
+    expectTypeOf<TicketSummary['subject']>().toEqualTypeOf<string | null>()
+    expectTypeOf<TicketSummary['status']>().toEqualTypeOf<string>()
+    expectTypeOf<TicketSummary['lastInboundAt']>().toEqualTypeOf<Date | null>()
+    expectTypeOf<TicketSummary['inboundCount']>().toEqualTypeOf<number>()
+    expectTypeOf<TicketSummary['draft']>().toEqualTypeOf<TicketDraftSummary | null>()
+
+    const signed = await signInWithOtp(t.app, t.mail, 'owner-summary@example.com', 'Owner')
+    const c = client(base, signed.cookie)
+    const { orgId } = await c.workspace.create.mutate({ businessName: 'Acme', timezone: 'UTC' })
+    const connectionId = await insertConnectedMailbox(t.api, orgId, signed.user.id, 'support@summary.test')
+    const agentId = await insertAgent(t.api, orgId, connectionId, 'support@summary.test')
+    const ticket = await insertTicket(orgId, connectionId, { status: 'awaiting_review', agentId, subject: 'Where is my order?' })
+    const draft = await seedPendingDraft(t.api, orgId, ticket.id, { agentId, viewedAt: new Date() })
+
+    const summary = await t.api.withOrg(orgId, (tx) => loadTicketSummary(tx, orgId, ticket.id))
+    expect(summary).not.toBeNull()
+    const subject: string | null = summary!.subject          // compile-time proof: never `unknown`
+    const draftStatus: string | undefined = summary!.draft?.status
+    expect(subject).toBe('Where is my order?')
+    expect(draftStatus).toBe('pending')
+    expect(summary!.draft).toMatchObject({ id: draft.id, version: 1 })
+    expect(await t.api.withOrg(orgId, (tx) => loadTicketSummary(tx, orgId, randomUUID()))).toBeNull()
   })
 })

@@ -65,15 +65,58 @@ function toDraftSummary(row: DraftSummaryRow): TicketDraftSummary | null {
   }
 }
 
-/** Strips the internal `sortKey` field `list`'s own selection adds for pagination — never part of
- * the documented `TicketSummary` shape — and folds the joined draft columns into one `draft` object. */
-function toSummary<T extends Record<keyof typeof ticketSummaryColumns, unknown> & DraftSummaryRow>(row: T) {
-  const summary = {} as { [K in keyof typeof ticketSummaryColumns]: T[K] }
-  for (const key of Object.keys(ticketSummaryColumns) as (keyof typeof ticketSummaryColumns)[]) summary[key] = row[key]
-  return { ...summary, draft: toDraftSummary(row) }
+/**
+ * The documented inbox row. Spelled out rather than derived from `toSummary`: a generic function's
+ * `ReturnType` instantiates its type parameter with the constraint, which turned every field of this
+ * alias into `unknown` for `drafts.get`'s `ticket` payload (review Important 3). The row types below
+ * are the LEFT JOIN nullable unions, so a concrete drizzle row is always assignable to them.
+ */
+export interface TicketSummary {
+  id: string
+  subject: string | null
+  customerEmail: string | null
+  customerName: string | null
+  status: string
+  needsOwnerReason: string | null
+  categoryKey: string | null
+  categoryLabel: string | null
+  sentiment: string | null
+  lastInboundAt: Date | null
+  inboundCount: number
+  agentAddress: string | null
+  spamFlagged: boolean
+  hasAttachments: boolean
+  draft: TicketDraftSummary | null
 }
 
-export type TicketSummary = ReturnType<typeof toSummary>
+interface TicketSummaryRow extends DraftSummaryRow {
+  id: string
+  subject: string | null
+  customerEmail: string | null
+  customerName: string | null
+  status: string
+  needsOwnerReason: string | null
+  categoryKey: string | null
+  categoryLabel: string | null
+  sentiment: string | null
+  lastInboundAt: Date | null
+  inboundCount: number
+  agentAddress: string | null
+  spamFlagged: boolean
+  hasAttachments: boolean
+}
+
+/** Drops whatever else a caller's selection carries (`list` adds an internal `sortKey`) and folds the
+ * joined draft columns into one `draft` object. */
+function toSummary(row: TicketSummaryRow): TicketSummary {
+  return {
+    id: row.id, subject: row.subject, customerEmail: row.customerEmail, customerName: row.customerName,
+    status: row.status, needsOwnerReason: row.needsOwnerReason, categoryKey: row.categoryKey, categoryLabel: row.categoryLabel,
+    sentiment: row.sentiment, lastInboundAt: row.lastInboundAt, inboundCount: row.inboundCount,
+    agentAddress: row.agentAddress, spamFlagged: row.spamFlagged, hasAttachments: row.hasAttachments,
+    draft: toDraftSummary(row),
+  }
+}
 
 /**
  * A cursor that passed the input schema but is still not a real instant never reaches drizzle: the
