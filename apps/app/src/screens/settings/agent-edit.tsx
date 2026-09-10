@@ -13,6 +13,7 @@ import { TextField } from '@/components/text-field'
 import { Heading, Muted } from '@/components/typography'
 import { useTRPC } from '@/lib/trpc'
 import { radius, spacing, typeScale, useColors } from '@/theme'
+import { SandboxCard } from './sandbox-card'
 
 const PERSONA_LABEL: Record<PersonaPreset, string> = { support: 'Support', sales: 'Sales', concierge: 'Concierge', billing: 'Billing' }
 /** Shortened to one line for the radio cards — spec wording (design doc §"Persona presets"). */
@@ -162,6 +163,14 @@ export function AgentEditScreen() {
           </Pressable>
         ))}
       </View>
+
+      {/* Task 22's "Try it" — under the persona card, active agents only (task brief); a pending
+          agent has nothing to try until its address is verified. */}
+      {agent.status === 'active' ? (
+        <SandboxCard agentId={agent.id} />
+      ) : (
+        <Muted testID="sandbox-pending">Available once the address is verified.</Muted>
+      )}
 
       <View style={styles.field}>
         <TextField label="Custom persona (optional)" value={personaText} onChangeText={onPersonaTextChange} multiline numberOfLines={4} maxLength={MAX_FREEFORM} testID="persona-text" />
