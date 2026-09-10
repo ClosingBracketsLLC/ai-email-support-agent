@@ -30,6 +30,7 @@ export async function createSendOnlyBoss(connectionString: string): Promise<PgBo
   await createQueueRetrying(boss, JOB_NAMES.ticketDraft)
   await createQueueRetrying(boss, JOB_NAMES.agentSandbox)
   await createQueueRetrying(boss, JOB_NAMES.sendExecute)
+  await createQueueRetrying(boss, JOB_NAMES.notifyDispatch)
 
   return boss
 }

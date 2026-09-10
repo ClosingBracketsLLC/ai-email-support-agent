@@ -43,6 +43,7 @@ function buildFailingDeps(opts: { sessionThrows?: boolean } = {}): { deps: Serve
     resolveOauthFlow: base.api.resolveOauthFlow,
     resolveMailboxConnection: base.api.resolveMailboxConnection,
     resolveMailboxSubscription: base.api.resolveMailboxSubscription,
+    resolveDraftActionToken: base.api.resolveDraftActionToken,
     recordWebhookEvent: base.api.recordWebhookEvent,
     health: base.api.health,
   }
@@ -118,5 +119,35 @@ describe('/trpc error surface (init.ts isDev:false + errorFormatter)', () => {
     const body = res.json() as SuperjsonTrpcError
     expect(body.error.json.message).toBe('x')
     expect(body.error.json.data.code).toBe('FORBIDDEN')
+  })
+
+  it('(d) the guardrail cause passthrough never applies to a 500: an INTERNAL_SERVER_ERROR carrying { findings } exposes nothing', async () => {
+    // Task 17 extends the errorFormatter so a NON-500 error (drafts.approve's BAD_REQUEST 'guardrail')
+    // can hand the app its findings through `cause`. The 500 branch runs first and is untouched, so an
+    // internal error that happens to carry the same cause shape still says only "Internal Server Error".
+    const base = stubDeps()
+    const auth = {
+      handler: base.auth.handler,
+      api: {
+        getSession: async () => FAKE_SESSION,
+        getActiveMember: async () => ({ id: 'member1', organizationId: ORG_ID, role: 'owner' }),
+      },
+    } as unknown as ServerDeps['auth']
+    const api: ServerDeps['api'] = {
+      ...base.api,
+      withOrg: async () => {
+        throw new TRPCError({ code: 'INTERNAL_SERVER_ERROR', message: SECRET, cause: { findings: [{ code: 'secret_leak', severity: 'fail', detail: SECRET }] } })
+      },
+    }
+    const app = buildServer({ ...base, auth, api })
+    const res = await app.inject({ method: 'GET', url: '/trpc/devices.list', headers: { origin: WEB } })
+    await app.close()
+
+    expect(res.statusCode).toBe(500)
+    expect(res.body).not.toContain('findings')
+    expect(res.body).not.toContain(SECRET)
+    const body = res.json() as SuperjsonTrpcError
+    expect(body.error.json.message).toBe('Internal Server Error')
+    expect((body.error.json.data as { findings?: unknown }).findings).toBeUndefined()
   })
 })

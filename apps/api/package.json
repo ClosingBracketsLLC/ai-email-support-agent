@@ -2,7 +2,7 @@
   "name": "@aesa/api",
   "private": true,
   "type": "module",
-  "exports": { ".": "./src/trpc/router.ts" },
+  "exports": { ".": "./src/trpc/router.ts", "./drafts": "./src/drafts/service.ts" },
   "scripts": { "typecheck": "tsc --noEmit", "test": "vitest run", "dev": "tsx watch src/index.ts", "start": "tsx src/index.ts" },
   "dependencies": {
     "@aesa/contracts": "workspace:*", "@aesa/core": "workspace:*", "@aesa/crypto": "workspace:*", "@aesa/db": "workspace:*",

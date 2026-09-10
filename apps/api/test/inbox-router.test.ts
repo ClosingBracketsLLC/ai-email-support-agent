@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import { createTRPCClient, httpBatchLink } from '@trpc/client'
+import { eq } from 'drizzle-orm'
 import superjson from 'superjson'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { messages, tickets } from '@aesa/db'
+import { drafts, messages, outboundSends, tickets, workspaces } from '@aesa/db'
+import { parseCursor } from '../src/trpc/routers/inbox.ts'
 import type { AppRouter } from '../src/trpc/router.ts'
-import { WEB, createTestApi, insertConnectedMailbox, listen, signInWithOtp } from './helpers/app.ts'
+import { SEED_DRAFT_BODY, WEB, createTestApi, insertAgent, insertConnectedMailbox, listen, seedPendingDraft, signInWithOtp } from './helpers/app.ts'
 
 const client = (base: string, cookie?: string) => createTRPCClient<AppRouter>({
   links: [httpBatchLink({ url: `${base}/trpc`, transformer: superjson, headers: () => ({ origin: WEB, ...(cookie ? { cookie } : {}) }) })],
@@ -34,12 +36,13 @@ describe('inbox router (read-only)', () => {
     const autoSending = await insertTicket(orgId, connectionId, { status: 'auto_sending', lastInboundAt: new Date(now - 1_000) })
     const fresh = await insertTicket(orgId, connectionId, { status: 'new', lastInboundAt: new Date(now - 2_000) })
     const resolved = await insertTicket(orgId, connectionId, { status: 'resolved', lastInboundAt: new Date(now - 3_000) })
-    // A status this phase never surfaces in any of the three sections (Phase 3 adds it to to_review).
-    await insertTicket(orgId, connectionId, { status: 'awaiting_review', lastInboundAt: new Date(now - 4_000) })
+    // Phase 3: a ticket whose draft is waiting for a decision is `To review` too.
+    const awaitingReview = await insertTicket(orgId, connectionId, { status: 'awaiting_review', lastInboundAt: new Date(now - 4_000) })
 
     const toReview = await c.inbox.list.query({ section: 'to_review' })
-    expect(toReview.tickets.map((tk) => tk.id)).toEqual([needsOwner.id])
+    expect(toReview.tickets.map((tk) => tk.id)).toEqual([needsOwner.id, awaitingReview.id])
     expect(toReview.tickets[0]).toMatchObject({ status: 'needs_owner', needsOwnerReason: 'tripwire' })
+    expect(toReview.degraded).toBe(false)
 
     const autoSendingSection = await c.inbox.list.query({ section: 'auto_sending' })
     expect(autoSendingSection.tickets.map((tk) => tk.id)).toEqual([autoSending.id])
@@ -122,5 +125,69 @@ describe('inbox router (read-only)', () => {
     const other = client(base, otherOwner.cookie)
     await other.workspace.create.mutate({ businessName: 'Beta', timezone: 'UTC' })
     await expect(other.inbox.ticket.query({ ticketId: ticket.id })).rejects.toMatchObject({ data: { code: 'NOT_FOUND' } })
+  })
+
+  it('to_review carries the live draft summary (and null for a ticket with no draft); inbox.ticket returns the full draft view with undoUntil', async () => {
+    const signed = await signInWithOtp(t.app, t.mail, 'owner-drafts@example.com', 'Owner')
+    const c = client(base, signed.cookie)
+    const { orgId } = await c.workspace.create.mutate({ businessName: 'Acme', timezone: 'UTC' })
+    const connectionId = await insertConnectedMailbox(t.api, orgId, signed.user.id, 'support@drafts.test')
+    const agentId = await insertAgent(t.api, orgId, connectionId, 'support@drafts.test')
+    await t.api.withOrg(orgId, (tx) => tx.update(workspaces).set({ agentEnabled: true }).where(eq(workspaces.orgId, orgId)))
+    const now = Date.now()
+
+    const withDraft = await insertTicket(orgId, connectionId, { status: 'awaiting_review', agentId, redraftCount: 1, lastInboundAt: new Date(now) })
+    const withoutDraft = await insertTicket(orgId, connectionId, { status: 'needs_owner', needsOwnerReason: 'tripwire', lastInboundAt: new Date(now - 1_000) })
+    const draft = await seedPendingDraft(t.api, orgId, withDraft.id, { agentId, viewedAt: new Date() })
+    // A decided draft on the same ticket is not the live one — only pending/approved/held/sending join.
+    await t.api.withOrg(orgId, (tx) => tx.insert(drafts).values({
+      orgId, ticketId: withDraft.id, agentId, version: 2, body: 'older', decision: 'review', decisionReason: 'ok',
+      status: 'rejected', threadSnapshotAt: new Date(), expiresAt: new Date(now + 86_400_000),
+    }))
+
+    const list = await c.inbox.list.query({ section: 'to_review' })
+    expect(list.tickets.map((tk) => tk.id)).toEqual([withDraft.id, withoutDraft.id])
+    expect(list.tickets[0]!.draft).toMatchObject({ id: draft.id, status: 'pending', decisionReason: 'ok', version: 1 })
+    expect(list.tickets[0]!.draft!.confidence).toBeCloseTo(0.75, 5)
+    expect(list.tickets[0]!.draft!.expiresAt).toBeInstanceOf(Date)
+    expect(list.tickets[1]!.draft).toBeNull()
+
+    const one = await c.inbox.ticket.query({ ticketId: withDraft.id })
+    expect(one.ticket).toMatchObject({ id: withDraft.id, status: 'awaiting_review', redraftCount: 1 })
+    expect(one.draft).toMatchObject({ id: draft.id, status: 'pending', body: SEED_DRAFT_BODY, undoUntil: null, send: null })
+
+    const approved = await c.drafts.approve.mutate({ draftId: draft.id })
+    const afterApprove = await c.inbox.ticket.query({ ticketId: withDraft.id })
+    expect(afterApprove.draft).toMatchObject({ status: 'approved' })
+    expect(afterApprove.draft!.undoUntil?.getTime()).toBe(approved.sendAfter.getTime())
+    expect(afterApprove.draft!.send).toMatchObject({ id: approved.sendId, status: 'queued' })
+    const [send] = await t.api.withOrg(orgId, (tx) => tx.select().from(outboundSends).where(eq(outboundSends.draftId, draft.id)))
+    expect(send!.sendAfter.getTime()).toBe(approved.sendAfter.getTime())
+
+    const stillListed = await c.inbox.list.query({ section: 'to_review' })
+    expect(stillListed.tickets[0]!.draft).toMatchObject({ id: draft.id, status: 'approved' })
+  })
+
+  it('a cursor that passes zod but is not a real instant is served WITHOUT the cursor and flagged degraded', async () => {
+    // zod 4's own `.datetime()` rejects everything a Date cannot represent (an impossible calendar day
+    // included — and V8 would silently ROLL '2026-02-31' over to March rather than refusing it), so
+    // `degraded` is the belt on that brace, unit-tested at its source: whatever passes the input
+    // schema, `list` never hands drizzle an Invalid Date.
+    expect(parseCursor('9999-99-99T99:99:99Z')).toEqual({ cursorDate: null, degraded: true })
+    expect(parseCursor(undefined)).toEqual({ cursorDate: null, degraded: false })
+    const parsed = parseCursor('2026-01-01T00:00:00.000Z')
+    expect(parsed.degraded).toBe(false)
+    expect(parsed.cursorDate?.toISOString()).toBe('2026-01-01T00:00:00.000Z')
+
+    const signed = await signInWithOtp(t.app, t.mail, 'owner-degraded@example.com', 'Owner')
+    const c = client(base, signed.cookie)
+    const { orgId } = await c.workspace.create.mutate({ businessName: 'Acme', timezone: 'UTC' })
+    const connectionId = await insertConnectedMailbox(t.api, orgId, signed.user.id, 'support@degraded.test')
+    const ticket = await insertTicket(orgId, connectionId, { status: 'new', lastInboundAt: new Date() })
+
+    const res = await c.inbox.list.query({ section: 'recent' })
+    expect(res.degraded).toBe(false)
+    expect(res.tickets.map((tk) => tk.id)).toEqual([ticket.id])
+    await expect(c.inbox.list.query({ section: 'recent', cursor: '2026-02-31T00:00:00Z' })).rejects.toThrow(/Invalid ISO datetime/)
   })
 })
