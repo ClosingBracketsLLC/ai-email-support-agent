@@ -441,6 +441,23 @@ describe('draft service', () => {
     expect(await readTicket(org.orgId, ticket.id)).toMatchObject({ status: 'triaged', needsOwnerReason: null })
   })
 
+  // Round 2, re-review 1: `failed` is OUTSIDE `drafts_live_per_ticket_uidx` and the target `pending`
+  // is inside it, so a resume on a ticket that already got a re-draft used to raise a raw 23505 —
+  // a masked 500 on a button, not a soft outcome. (The `landStale` shape reaches exactly this: the
+  // draft fails, the ticket goes back to `triaged` and a re-draft is enqueued.)
+  it('refuses a resume when the ticket already has a live draft, writing nothing', async () => {
+    const org = await seedOrg()
+    const ticket = await insertTicket(t.api, org.orgId, { connectionId: org.connectionId, agentId: org.agentId, status: 'triaged' })
+    const failed = await seedPendingDraft(t.api, org.orgId, ticket.id, { agentId: org.agentId, viewedAt: new Date(), status: 'failed' })
+    const live = await seedPendingDraft(t.api, org.orgId, ticket.id, { agentId: org.agentId })   // the re-draft landed first
+
+    expect(await resumeDraft(deps, org.orgId, failed.id, org.actor)).toEqual({ ok: false, code: 'not_resumable' })
+    expect(await readDraft(org.orgId, failed.id)).toMatchObject({ status: 'failed' })
+    expect(await readDraft(org.orgId, live.id)).toMatchObject({ status: 'pending' })
+    expect(await readTicket(org.orgId, ticket.id)).toMatchObject({ status: 'triaged' })
+    expect(await readAudit(org.orgId, 'draft.resumed')).toEqual([])
+  })
+
   it('refuses a resume on a ticket escalated for some OTHER reason — only the send job\'s own escalation is walked back', async () => {
     const org = await seedOrg()
     const ticket = await insertTicket(t.api, org.orgId, {

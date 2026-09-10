@@ -168,6 +168,47 @@ describe('inbox router (read-only)', () => {
     expect(stillListed.tickets[0]!.draft).toMatchObject({ id: draft.id, status: 'approved' })
   })
 
+  // Round 2, re-review 2: the failed-draft return path A3 opened was unreachable from the app —
+  // `inbox.ticket` served live drafts only, and `failed` is not one, so the "Not sent — … Back to
+  // review" banner had nothing to render against.
+  it('inbox.ticket falls back to the NEWEST failed draft when no live draft is left, and still prefers a live one', async () => {
+    const signed = await signInWithOtp(t.app, t.mail, 'owner-failed-draft@example.com', 'Owner')
+    const c = client(base, signed.cookie)
+    const { orgId } = await c.workspace.create.mutate({ businessName: 'Acme', timezone: 'UTC' })
+    const connectionId = await insertConnectedMailbox(t.api, orgId, signed.user.id, 'support@failed.test')
+    const agentId = await insertAgent(t.api, orgId, connectionId, 'support@failed.test')
+    const now = Date.now()
+
+    // The state `landTerminal` leaves behind: draft `failed`, its ledger row `failed`, ticket paged.
+    const ticket = await insertTicket(orgId, connectionId, {
+      status: 'needs_owner', needsOwnerReason: 'send_failed', agentId, lastInboundAt: new Date(now),
+    })
+    const older = await seedPendingDraft(t.api, orgId, ticket.id, { agentId, status: 'failed' })
+    const failed = await seedPendingDraft(t.api, orgId, ticket.id, { agentId, status: 'failed' })
+    await t.api.withOrg(orgId, (tx) => tx.update(drafts)
+      .set({ decidedAt: new Date(now - 60_000) }).where(eq(drafts.id, older.id)))
+    await t.api.withOrg(orgId, (tx) => tx.update(drafts)
+      .set({ decidedAt: new Date(now) }).where(eq(drafts.id, failed.id)))
+    await t.api.withOrg(orgId, (tx) => tx.insert(outboundSends).values({
+      orgId, draftId: failed.id, ticketId: ticket.id, connectionId, agentId,
+      status: 'failed', sendAfter: new Date(now), attempts: 3, lastError: 'guardrail:trusted_text_leak',
+    }))
+
+    const one = await c.inbox.ticket.query({ ticketId: ticket.id })
+    expect(one.draft).toMatchObject({ id: failed.id, status: 'failed', undoUntil: null })
+    expect(one.draft!.send).toMatchObject({ status: 'failed', lastError: 'guardrail:trusted_text_leak' })
+
+    // The LIST join stays live-only: a needs_owner/send_failed row carries no draft chip.
+    const list = await c.inbox.list.query({ section: 'to_review' })
+    expect(list.tickets.find((tk) => tk.id === ticket.id)!.draft).toBeNull()
+
+    // And a live draft always wins: resume it and the fallback stands down.
+    expect(await c.drafts.resume.mutate({ draftId: failed.id })).toEqual({ resumed: true })
+    const afterResume = await c.inbox.ticket.query({ ticketId: ticket.id })
+    expect(afterResume.draft).toMatchObject({ id: failed.id, status: 'pending' })
+    expect(afterResume.ticket).toMatchObject({ status: 'awaiting_review' })
+  })
+
   it('a cursor that passes zod but is not a real instant is served WITHOUT the cursor and flagged degraded', async () => {
     // zod 4's own `.datetime()` rejects everything a Date cannot represent (an impossible calendar day
     // included — and V8 would silently ROLL '2026-02-31' over to March rather than refusing it), so

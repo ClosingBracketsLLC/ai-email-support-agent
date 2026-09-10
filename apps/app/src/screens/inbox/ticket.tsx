@@ -82,10 +82,12 @@ export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?:
       const data = q.state.data
       const status = data?.draft?.status
       if (status === 'approved' || status === 'sending') return pollMs
-      // `inbox.ticket` returns only the LIVE draft, so a reject→redraft leaves this screen with no
-      // draft at all while the ticket sits back on `triaged` — exactly the window the reject banner
-      // promises a new draft in. Without this the promise is one the screen cannot keep.
-      if (!data?.draft && data?.ticket?.status === 'triaged') return pollMs
+      // A reject→redraft leaves this screen with no draft at all while the ticket sits back on
+      // `triaged` — exactly the window the reject banner promises a new draft in. Without this the
+      // promise is one the screen cannot keep. A `failed` draft counts as none of it: `inbox.ticket`
+      // falls back to the newest failed draft when nothing is live, and the ticket is back on
+      // `triaged` precisely when `send.execute` found the reply stale and asked for a re-draft.
+      if ((!data?.draft || status === 'failed') && data?.ticket?.status === 'triaged') return pollMs
       return false
     },
   }))

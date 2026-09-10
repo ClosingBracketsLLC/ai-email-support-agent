@@ -25,7 +25,7 @@
  * The worker's `applyDraftOutcome` locks the ticket's live drafts before its ticket flip for the
  * same reason.
  */
-import { and, eq, inArray, isNull, sql, type SQL } from 'drizzle-orm'
+import { and, desc, eq, inArray, isNull, ne, sql, type SQL } from 'drizzle-orm'
 import type pino from 'pino'
 // The pure sub-path, never the package root: `@aesa/agent/policy` pulls in `@aesa/core` and this
 // package's prompt-TEXT modules only, so the Anthropic SDK never enters an api process (CLAUDE.md —
@@ -206,14 +206,14 @@ const draftViewColumns = {
 }
 
 /** ONE query behind both loaders: the draft, its agent address, its category label and its (single) send row. */
-function draftViewQuery(tx: OrgTx, orgId: string, predicate: SQL) {
-  return tx.select(draftViewColumns)
+function draftViewQuery(tx: OrgTx, orgId: string, predicate: SQL, orderBy?: SQL[]) {
+  const rows = tx.select(draftViewColumns)
     .from(drafts)
     .leftJoin(agents, eq(agents.id, drafts.agentId))
     .leftJoin(categories, eq(categories.id, drafts.categoryId))
     .leftJoin(outboundSends, eq(outboundSends.draftId, drafts.id))
     .where(and(eq(drafts.orgId, orgId), predicate))
-    .limit(1)
+  return (orderBy ? rows.orderBy(...orderBy) : rows).limit(1)
 }
 
 type DraftViewRow = Awaited<ReturnType<typeof draftViewQuery>>[number]
@@ -242,10 +242,31 @@ export async function loadDraftView(tx: OrgTx, orgId: string, draftId: string): 
   return row ? toDraftView(row) : null
 }
 
-/** The one live draft on a ticket (at most one, by the partial unique), or null. */
+/**
+ * The draft the ticket screen opens on: the one LIVE draft (at most one, by the partial unique) —
+ * or, when there is none, the ticket's most recent `failed` one.
+ *
+ * The fallback exists because A3's return path is otherwise unreachable from the app (round 2,
+ * re-review 2): a terminal send failure leaves the draft `failed`, which is outside
+ * `drafts_live_per_ticket_uidx`, so "Not sent — … Back to review" had nothing to render against and
+ * `drafts.resume` had no button. `failed` is the ONLY non-live status served this way — a `rejected`,
+ * `superseded`, `expired` or `sent` draft is finished business and stays out of the panel.
+ *
+ * `inbox.list`'s join is deliberately NOT widened: a `needs_owner/send_failed` row shows no draft
+ * chip, which keeps the list's "a draft is waiting for you" chip honest.
+ */
 export async function loadLiveDraftView(tx: OrgTx, orgId: string, ticketId: string): Promise<DraftView | null> {
-  const [row] = await draftViewQuery(tx, orgId, and(eq(drafts.ticketId, ticketId), inArray(drafts.status, [...LIVE_DRAFT_STATUSES]))!)
-  return row ? toDraftView(row) : null
+  const [live] = await draftViewQuery(tx, orgId, and(eq(drafts.ticketId, ticketId), inArray(drafts.status, [...LIVE_DRAFT_STATUSES]))!)
+  if (live) return toDraftView(live)
+
+  // `decided_at` is always set on a `failed` draft (both edges into it, `approved → failed` and
+  // `sending → failed`, run downstream of an approve), but NULLS LAST keeps the order total if that
+  // ever stops being true; `created_at` breaks a same-instant tie.
+  const [failed] = await draftViewQuery(
+    tx, orgId, and(eq(drafts.ticketId, ticketId), eq(drafts.status, 'failed'))!,
+    [sql`${drafts.decidedAt} DESC NULLS LAST`, desc(drafts.createdAt)],
+  )
+  return failed ? toDraftView(failed) : null
 }
 
 // ---------------------------------------------------------------------------
@@ -490,6 +511,13 @@ type ResumableDraftStatus = (typeof RESUMABLE_DRAFT_STATUSES)[number]
  * (`REQUEUEABLE_SEND_STATUSES` covers both), so the delivery keeps its history (attempts, provider
  * ids, `last_error`) instead of starting a second one.
  *
+ * ONE-LIVE-DRAFT: `held` is inside `drafts_live_per_ticket_uidx` and `failed` is OUTSIDE it, so a
+ * resume from `failed` MOVES A ROW INTO the partial unique. If a re-draft has already landed on that
+ * ticket the insert-side of that index is occupied and the UPDATE raises a raw 23505 — a masked 500
+ * on a button. The guarded scan below turns it into the ordinary soft outcome (round 2, re-review 1).
+ * It excludes the draft being resumed: a `held` draft is already in the index, so it is its own
+ * (harmless) hit, and the unique itself proves no other live row can exist beside it.
+ *
  * Lock order: drafts → tickets, the same order `rejectDraft` takes. No send row is read or written.
  */
 export async function resumeDraft(
@@ -501,6 +529,17 @@ export async function resumeDraft(
     if (!draft) return { ok: false, code: 'not_found' }
     const from = draft.status as ResumableDraftStatus
     if (!RESUMABLE_DRAFT_STATUSES.includes(from)) return { ok: false, code: 'not_resumable' }
+
+    // The one-live-draft guard (see the header). Locked, not merely read: a `ticket.draft` INSERT
+    // committing between this scan and the UPDATE would put the 23505 straight back.
+    const rivals = await tx.select({ id: drafts.id })
+      .from(drafts)
+      .where(and(
+        eq(drafts.orgId, orgId), eq(drafts.ticketId, draft.ticketId), ne(drafts.id, draft.id),
+        inArray(drafts.status, [...LIVE_DRAFT_STATUSES]),
+      ))
+      .for('update')
+    if (rivals.length > 0) return { ok: false, code: 'not_resumable' }
 
     draftTransitions.assert(from, 'pending')
     const resumed = await tx.update(drafts)

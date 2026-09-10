@@ -15,9 +15,10 @@
  * (e) is ENQUEUE ONLY — a plain SELECT, no write. An earlier revision of this file had this sweep
  * reset the ticket to `new` before enqueueing (on the theory that `runTicketTriage`'s `isSelectable`
  * gate excludes `needs_owner` outright); a `needs_owner -> new` write is not a legal edge in
- * `@aesa/core`'s `ticketTransitions` matrix (`needs_owner` only leads to `triaged`/`resolved`/
- * `waiting_on_customer`), and this platform-role sweep has no `OrgTx` to audit it through even if it
- * were. The fix is on the OTHER side: `runTicketTriage`'s `isSelectable` now accepts
+ * `@aesa/core`'s `ticketTransitions` matrix (`needs_owner` leads only to `triaged`/`resolved`/
+ * `waiting_on_customer`/`awaiting_review` — that last one is `drafts.resume`'s walk-back of a
+ * `send_failed` escalation, and not something this sweep may write either), and this platform-role
+ * sweep has no `OrgTx` to audit it through even if it were. The fix is on the OTHER side: `runTicketTriage`'s `isSelectable` now accepts
  * `needs_owner`+`needsOwnerReason: 'triage_cap'` as selectable (and no other needs_owner reason), so
  * re-selecting the SAME row this sweep found lets the verdict land through the legal
  * `needs_owner -> triaged/resolved` edges; a still-capped day just re-caps in place via triage's own
@@ -161,8 +162,9 @@ export async function runMailboxPollSweep(boss: PgBoss, deps: MailboxPollSweepDe
     for (const t of stuckNew) pending.push({ kind: 'triage', orgId: t.orgId, entityId: t.id })
 
     // (e) triage-cap re-entry — see file header. ENQUEUE ONLY: needs_owner -> new is not a legal
-    // edge in @aesa/core's ticketTransitions matrix, and this sweep runs as the platform role with
-    // no audit trail for a ticket-status write anyway. ticket.triage itself now accepts
+    // edge in @aesa/core's ticketTransitions matrix (the edges out of needs_owner are triaged,
+    // resolved, waiting_on_customer and awaiting_review), and this sweep runs as the platform role
+    // with no audit trail for a ticket-status write anyway. ticket.triage itself now accepts
     // needs_owner/triage_cap as selectable (its own guarded write lands the verdict through the
     // legal needs_owner -> triaged/resolved edges); a still-capped day just re-caps in place via the
     // same-status guarded write, so this sweep never needs to touch the row at all.

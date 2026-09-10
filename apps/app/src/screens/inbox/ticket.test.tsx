@@ -263,6 +263,10 @@ test('the ticket query polls only while the reply is on its way out', async () =
   expect(refetchInterval({ state: { data: { draft: null, ticket: { status: 'triaged' } } } })).toBe(10_000)
   expect(refetchInterval({ state: { data: { draft: null, ticket: { status: 'resolved' } } } })).toBe(false)
   expect(refetchInterval({ state: { data: { draft: null, ticket: { status: 'needs_owner' } } } })).toBe(false)
+  // A stale send fails the draft and sends the ticket back to `triaged` for a re-draft; the api
+  // serves that failed draft in the live one's place, so it must not stop the poll.
+  expect(refetchInterval({ state: { data: { draft: { status: 'failed' }, ticket: { status: 'triaged' } } } })).toBe(10_000)
+  expect(refetchInterval({ state: { data: { draft: { status: 'failed' }, ticket: { status: 'needs_owner' } } } })).toBe(false)
   // Once the re-draft lands the ordinary rule takes over again.
   expect(refetchInterval({ state: { data: { draft: { status: 'pending' }, ticket: { status: 'triaged' } } } })).toBe(false)
 })
