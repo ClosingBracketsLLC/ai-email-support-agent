@@ -31,6 +31,8 @@ function page(body: string): string {
     + '<link rel="icon" href="/favicon.svg" type="image/svg+xml">'
     + '<link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png">'
     + '<link rel="apple-touch-icon" href="/apple-touch-icon.png">'
+    // REVIEW_CSS and WORDMARK_SVG are compile-time constants built from BRAND (src/brand/css.ts) —
+    // never request data — so, unlike every other interpolation in this file, they run outside esc().
     + `<title>aesa</title><style>${REVIEW_CSS}</style></head>`
     + `<body><main><header>${WORDMARK_SVG}</header>${body}</main></body></html>`
 }
