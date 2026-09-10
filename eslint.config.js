@@ -32,7 +32,7 @@ const appImports = {
 }
 
 export default tseslint.config(
-  { ignores: ['**/node_modules/**', '**/dist/**', '**/migrations/**', '**/.expo/**', '**/playwright-report/**', '**/test-results/**'] },
+  { ignores: ['**/node_modules/**', '**/dist/**', '**/migrations/**', '**/.expo/**', '**/playwright-report/**', '**/test-results/**', '**/.venv/**'] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
