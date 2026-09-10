@@ -3,6 +3,11 @@ import { useRouter, type Href } from 'expo-router'
 import { useEffect, useReducer, useRef } from 'react'
 import type { NotificationKind } from '@aesa/contracts'
 import { setNextPath } from './next-path'
+import { useTRPCClient } from './trpc'
+
+/** The Hold button `registerNotificationCategories` (push.ts) puts on a `draft_review` push — the
+ * only one of its two actions that does anything beyond opening the ticket. */
+const HOLD_ACTION = 'hold'
 
 /**
  * Maps a push notification's `data` payload to the screen it's about.
@@ -22,7 +27,7 @@ export function pathForNotification(data: Record<string, unknown> | undefined | 
   const ticketId = typeof data?.ticketId === 'string' && data.ticketId ? data.ticketId : undefined
   const connectionId = typeof data?.connectionId === 'string' && data.connectionId ? data.connectionId : undefined
 
-  if (kind === 'escalation') return ticketId ? `/ticket/${ticketId}` : '/inbox'
+  if (kind === 'escalation' || kind === 'draft_review') return ticketId ? `/ticket/${ticketId}` : '/inbox'
   if (kind === 'mailbox_reauth') return '/settings/mailboxes'
   if (kind === 'digest') return '/inbox'
 
@@ -30,6 +35,23 @@ export function pathForNotification(data: Record<string, unknown> | undefined | 
   if (ticketId) return `/ticket/${ticketId}`
   if (connectionId) return '/settings/mailboxes'
   return '/inbox'
+}
+
+/**
+ * What one tap on a notification means: where it goes, and whether it also holds a draft.
+ *
+ * `Hold` is the second button on a `draft_review` push. It only ever succeeds on an approved,
+ * not-yet-sent draft (the undo window) — a pending draft has nothing to hold, and the server answers
+ * `not_holdable`, so that tap simply opens the ticket (plan deviation 12). `Review` and a plain tap
+ * on the notification body carry no hold at all.
+ */
+export function actionForResponse(r: {
+  actionIdentifier?: string
+  notification: { request: { content: { data?: Record<string, unknown> | null } } }
+}): { path: string; holdDraftId: string | null } {
+  const data = r.notification.request.content.data
+  const draftId = typeof data?.draftId === 'string' && data.draftId ? data.draftId : null
+  return { path: pathForNotification(data), holdDraftId: r.actionIdentifier === HOLD_ACTION ? draftId : null }
 }
 
 /**
@@ -53,6 +75,7 @@ export function pathForNotification(data: Record<string, unknown> | undefined | 
  */
 export function usePushRouting(): void {
   const router = useRouter()
+  const trpcClient = useTRPCClient()
   const lastResponse = Notifications.useLastNotificationResponse()
   const resolvedOnce = useRef(false)
   // Guards against reprocessing the same response twice if the effect below re-fires for an
@@ -68,7 +91,11 @@ export function usePushRouting(): void {
     resolvedOnce.current = true
     if (!lastResponse) return
 
-    const path = pathForNotification(lastResponse.notification.request.content.data)
+    const { path, holdDraftId } = actionForResponse(lastResponse)
+    // Fire-and-forget, and before the routing: the tap's job is to hold, and the screen it opens
+    // refetches the draft anyway. A refusal (`not_holdable`) or a network failure must not stop the
+    // ticket from opening.
+    if (holdDraftId) void trpcClient.drafts.hold.mutate({ draftId: holdDraftId }).catch(() => { /* the ticket screen shows the real state */ })
     Notifications.clearLastNotificationResponse()
     if (isColdStart) {
       setNextPath(path)
@@ -76,5 +103,5 @@ export function usePushRouting(): void {
     } else {
       router.push(path as Href)
     }
-  }, [lastResponse, router])
+  }, [lastResponse, router, trpcClient])
 }

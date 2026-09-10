@@ -10,6 +10,7 @@ import { Loading } from '@/components/loading'
 import { Muted } from '@/components/typography'
 import { useTRPC } from '@/lib/trpc'
 import { WIDE_BREAKPOINT, radius, spacing, typeScale, useColors } from '@/theme'
+import { AgentOffBanner } from './agent-off-banner'
 import { TicketRow, type TicketSummary } from './ticket-row'
 
 const SECTION_LABEL: Record<InboxSection, string> = { to_review: 'To review', auto_sending: 'Auto-sending', recent: 'Recent' }
@@ -45,6 +46,7 @@ export function InboxScreen() {
     <SafeAreaView style={[styles.safe, { backgroundColor: c.bg }]} testID="inbox">
       <View style={[styles.body, wide && styles.wideBody]}>
         <View style={styles.column}>
+          <AgentOffBanner />
           <View style={styles.segmented} accessibilityRole="tablist" testID="inbox-tabs">
             {INBOX_SECTIONS.map((s) => (
               <Pressable

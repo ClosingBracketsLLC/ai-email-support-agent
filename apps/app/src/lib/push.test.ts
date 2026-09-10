@@ -8,23 +8,46 @@ jest.mock('expo-constants', () => ({ __esModule: true, default: { expoConfig: { 
 // run (including a `const` a factory might close over) — so the factory itself must carry everything it needs.
 jest.mock('expo-notifications', () => ({
   getPermissionsAsync: jest.fn(), requestPermissionsAsync: jest.fn(), getExpoPushTokenAsync: jest.fn(), setNotificationChannelAsync: jest.fn(),
+  setNotificationCategoryAsync: jest.fn(),
   AndroidImportance: { HIGH: 4 },
 }))
 // jest-expo's default preset runs as iOS, so Platform.OS is already 'ios'; no Platform mock is needed
 // except in the one test below that deliberately switches it to 'web'.
 
 import * as Notifications from 'expo-notifications'
-import { registerForPush } from './push'
+import { DRAFT_REVIEW_CATEGORY, registerForPush } from './push'
 
 const getPermissionsAsync = jest.mocked(Notifications.getPermissionsAsync)
 const requestPermissionsAsync = jest.mocked(Notifications.requestPermissionsAsync)
 const getExpoPushTokenAsync = jest.mocked(Notifications.getExpoPushTokenAsync)
+const setNotificationCategoryAsync = jest.mocked(Notifications.setNotificationCategoryAsync)
 
 function permissions(status: 'granted' | 'undetermined' | 'denied') {
   return { status, granted: status === 'granted', expires: 'never', canAskAgain: true } as Awaited<ReturnType<typeof Notifications.getPermissionsAsync>>
 }
 
 beforeEach(() => jest.clearAllMocks())
+
+// This test MUST stay first in the file: the category registration is memoized per process (one
+// native call per app launch, not one per `registerForPush`), so whichever test reaches it first is
+// the only one that can observe the call itself.
+test('registers the draft_review actions before asking for a token, and only once per process', async () => {
+  getPermissionsAsync.mockResolvedValue(permissions('granted'))
+  getExpoPushTokenAsync.mockResolvedValue({ type: 'expo', data: 'ExponentPushToken[abc]' })
+
+  await registerForPush({ ask: false })
+  expect(setNotificationCategoryAsync).toHaveBeenCalledWith(DRAFT_REVIEW_CATEGORY, [
+    { identifier: 'review', buttonTitle: 'Review', options: { opensAppToForeground: true } },
+    { identifier: 'hold', buttonTitle: 'Hold', options: { opensAppToForeground: true } },
+  ])
+  expect(DRAFT_REVIEW_CATEGORY).toBe('draft_review')
+  // The push's action buttons must exist before a push can arrive, i.e. before the token this call
+  // hands the server.
+  expect(setNotificationCategoryAsync.mock.invocationCallOrder[0]!).toBeLessThan(getExpoPushTokenAsync.mock.invocationCallOrder[0]!)
+
+  await registerForPush({ ask: false })
+  expect(setNotificationCategoryAsync).toHaveBeenCalledTimes(1)
+})
 
 test('does not prompt when not asked and permission is missing', async () => {
   getPermissionsAsync.mockResolvedValue(permissions('undetermined'))
@@ -45,6 +68,7 @@ test('on web, push is unsupported and never touches expo-notifications', async (
   try {
     expect(await registerForPush({ ask: false })).toEqual({ kind: 'unsupported' })
     expect(getPermissionsAsync).not.toHaveBeenCalled()
+    expect(setNotificationCategoryAsync).not.toHaveBeenCalled()
   } finally {
     os.restore()
   }

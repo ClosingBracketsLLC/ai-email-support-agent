@@ -1,6 +1,6 @@
 import { renderHook } from '@testing-library/react-native'
 import { setNextPath as mockSetNextPath } from './next-path'
-import { pathForNotification, usePushRouting } from './push-routing'
+import { actionForResponse, pathForNotification, usePushRouting } from './push-routing'
 
 describe('pathForNotification', () => {
   test('escalation kind with a ticketId routes to the ticket thread', () => {
@@ -11,6 +11,12 @@ describe('pathForNotification', () => {
   })
   test('digest kind routes to the inbox', () => {
     expect(pathForNotification({ kind: 'digest' })).toBe('/inbox')
+  })
+  test('draft_review kind with a ticketId routes to the ticket thread', () => {
+    expect(pathForNotification({ kind: 'draft_review', ticketId: 't3', draftId: 'd3' })).toBe('/ticket/t3')
+  })
+  test('draft_review kind with no ticketId falls back to the inbox', () => {
+    expect(pathForNotification({ kind: 'draft_review', draftId: 'd3' })).toBe('/inbox')
   })
 
   // The worker now stamps `kind` onto every push's `data` (notify-dispatch.ts / notify-digest.ts),
@@ -33,9 +39,29 @@ describe('pathForNotification', () => {
   })
 })
 
+describe('actionForResponse', () => {
+  test("the notification's Hold button carries the draft id to hold, alongside the path it opens", () => {
+    expect(actionForResponse({ actionIdentifier: 'hold', ...response({ kind: 'draft_review', ticketId: 't1', draftId: 'd1' }) }))
+      .toEqual({ path: '/ticket/t1', holdDraftId: 'd1' })
+  })
+  test("the notification's Review button only opens the ticket", () => {
+    expect(actionForResponse({ actionIdentifier: 'review', ...response({ kind: 'draft_review', ticketId: 't1', draftId: 'd1' }) }))
+      .toEqual({ path: '/ticket/t1', holdDraftId: null })
+  })
+  test('a plain tap on the notification body holds nothing', () => {
+    expect(actionForResponse({ actionIdentifier: 'expo.modules.notifications.actions.DEFAULT', ...response({ kind: 'draft_review', ticketId: 't1', draftId: 'd1' }) }))
+      .toEqual({ path: '/ticket/t1', holdDraftId: null })
+  })
+  test('Hold on a payload that carries no draft id holds nothing', () => {
+    expect(actionForResponse({ actionIdentifier: 'hold', ...response({ kind: 'escalation', ticketId: 't1' }) }))
+      .toEqual({ path: '/ticket/t1', holdDraftId: null })
+  })
+})
+
 let mockLastResponse: unknown = undefined
 const mockPush = jest.fn()
 const mockClearLastNotificationResponse = jest.fn()
+const mockHold = jest.fn<Promise<{ held: boolean }>, [unknown]>(async () => ({ held: true }))
 
 // A stable object across renders, matching the real `useRouter()` — see push-routing.ts's own
 // defensive note about why the effect must not rely on that stability regardless.
@@ -48,6 +74,9 @@ jest.mock('expo-notifications', () => ({
   clearLastNotificationResponse: () => mockClearLastNotificationResponse(),
 }))
 jest.mock('./next-path', () => ({ setNextPath: jest.fn() }))
+// The factory itself never touches `mockHold` — only the nested arrow does, and that runs at render
+// time, long after this file's own top-level declarations.
+jest.mock('./trpc', () => ({ useTRPCClient: () => ({ drafts: { hold: { mutate: (input: unknown) => mockHold(input) } } }) }))
 const setNextPathMock = jest.mocked(mockSetNextPath)
 
 function response(data: Record<string, unknown>) {
@@ -59,6 +88,7 @@ beforeEach(() => {
   mockPush.mockClear()
   mockClearLastNotificationResponse.mockClear()
   setNextPathMock.mockClear()
+  mockHold.mockClear()
 })
 
 test('undefined (native has not reported in yet) does nothing', async () => {
@@ -105,4 +135,48 @@ test('a later change, after the cold-start state is already known, is a warm tap
   expect(mockPush).toHaveBeenCalledWith('/ticket/t9')
   expect(setNextPathMock).not.toHaveBeenCalled()
   expect(mockClearLastNotificationResponse).toHaveBeenCalledTimes(1)
+})
+
+test('a warm Hold tap holds the draft BEFORE it opens the ticket', async () => {
+  const { rerender } = await renderHook(() => usePushRouting())
+  mockLastResponse = null // cold-start resolution: no tap
+  await rerender(undefined)
+
+  mockLastResponse = { actionIdentifier: 'hold', ...response({ kind: 'draft_review', ticketId: 't7', draftId: 'd7' }) }
+  await rerender(undefined)
+  expect(mockHold).toHaveBeenCalledWith({ draftId: 'd7' })
+  expect(mockPush).toHaveBeenCalledWith('/ticket/t7')
+  expect(mockHold.mock.invocationCallOrder[0]!).toBeLessThan(mockPush.mock.invocationCallOrder[0]!)
+})
+
+test('a warm Review tap opens the ticket without holding anything', async () => {
+  const { rerender } = await renderHook(() => usePushRouting())
+  mockLastResponse = null
+  await rerender(undefined)
+
+  mockLastResponse = { actionIdentifier: 'review', ...response({ kind: 'draft_review', ticketId: 't8', draftId: 'd8' }) }
+  await rerender(undefined)
+  expect(mockHold).not.toHaveBeenCalled()
+  expect(mockPush).toHaveBeenCalledWith('/ticket/t8')
+})
+
+test('a cold-start Hold tap still holds, and queues the ticket through next-path', async () => {
+  mockLastResponse = { actionIdentifier: 'hold', ...response({ kind: 'draft_review', ticketId: 't9', draftId: 'd9' }) }
+  await renderHook(() => usePushRouting())
+  expect(mockHold).toHaveBeenCalledWith({ draftId: 'd9' })
+  expect(setNextPathMock).toHaveBeenCalledWith('/ticket/t9')
+  expect(mockPush).not.toHaveBeenCalled()
+})
+
+// The hold is fire-and-forget on purpose: the server may answer `not_holdable` (a pending draft has
+// nothing to hold) or the request may fail outright — either way the tap still opens the ticket.
+test('a hold that the server refuses never blocks the routing', async () => {
+  mockHold.mockRejectedValueOnce(new Error('not_holdable'))
+  const { rerender } = await renderHook(() => usePushRouting())
+  mockLastResponse = null
+  await rerender(undefined)
+
+  mockLastResponse = { actionIdentifier: 'hold', ...response({ kind: 'draft_review', ticketId: 't10', draftId: 'd10' }) }
+  await rerender(undefined)
+  expect(mockPush).toHaveBeenCalledWith('/ticket/t10')
 })

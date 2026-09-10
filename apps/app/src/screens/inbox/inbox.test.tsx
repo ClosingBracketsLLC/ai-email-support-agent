@@ -22,6 +22,7 @@ type ListInput = { section: string }
 let mockTicketsBySection: Record<string, Ticket[]> = {}
 let mockDegraded = false
 let mockListInputs: ListInput[] = []
+let mockWorkspace = { agentEnabled: true, role: 'owner' }
 const mockPush = jest.fn()
 
 jest.mock('expo-router', () => ({
@@ -30,6 +31,11 @@ jest.mock('expo-router', () => ({
 
 jest.mock('@/lib/trpc', () => ({
   useTRPC: () => ({
+    // <AgentOffBanner /> sits at the top of the screen and reads the workspace for itself.
+    workspace: {
+      get: { queryOptions: () => ({ queryKey: ['workspace', 'get'], queryFn: () => Promise.resolve(mockWorkspace) }), queryKey: () => ['workspace', 'get'] },
+      setAgentEnabled: { mutationOptions: (o: object) => ({ mutationFn: () => Promise.resolve(mockWorkspace), ...o }) },
+    },
     inbox: {
       list: {
         infiniteQueryOptions: (
@@ -75,6 +81,7 @@ beforeEach(() => {
   mockTicketsBySection = { to_review: [], auto_sending: [], recent: [] }
   mockDegraded = false
   mockListInputs = []
+  mockWorkspace = { agentEnabled: true, role: 'owner' }
   mockPush.mockClear()
 })
 afterEach(async () => { for (const teardown of teardowns.splice(0)) await teardown() })
@@ -139,4 +146,10 @@ test('no degraded banner on an ordinary page', async () => {
 
   await waitFor(() => expect(screen.getByTestId('ticket-row-t1')).toBeTruthy())
   expect(screen.queryByTestId('inbox-degraded')).toBeNull()
+})
+
+test('an agent that is switched off is called out above the list', async () => {
+  mockWorkspace = { agentEnabled: false, role: 'owner' }
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('agent-off')).toBeTruthy())
 })
