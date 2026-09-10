@@ -27,10 +27,13 @@ const noopEnqueue: EnqueueFn = async () => null
 
 /** A complete api over a throwaway database; `close()` drops it. `depsOverrides` lets a suite replace
  * `enqueue` with a recording fake and/or `mailProviders` with stubbed adapters (connect-flow.test.ts) —
- * every other suite gets the same behavior as before this parameter existed. */
+ * every other suite gets the same behavior as before this parameter existed. `opts.logLevel` lifts the
+ * default 'warn' so a suite can assert on Fastify's own (info-level) request line — the only way to see
+ * what the `req` serializer's redactUrl() actually emitted (review-pages.test.ts). */
 export async function createTestApi(
   overrides: Partial<NodeJS.ProcessEnv> = {},
   depsOverrides: Partial<Pick<ServerDeps, 'enqueue' | 'mailProviders' | 'verifyGoogleJwt'>> = {},
+  opts: { logLevel?: string } = {},
 ) {
   const t = await createTestDatabase()
   const config = loadConfig({ ...TEST_ENV, ...overrides, DATABASE_URL: t.url })
@@ -38,7 +41,7 @@ export async function createTestApi(
   const api = createApiFacade(handle)
   const mail = createDevSink()
   const lines: string[] = []
-  const logger = createAppLogger({ level: 'warn', stream: { write: (line: string) => void lines.push(line) } })
+  const logger = createAppLogger({ level: opts.logLevel ?? 'warn', stream: { write: (line: string) => void lines.push(line) } })
   const auth = createAuth({ db: handle.db, config, mail, logger, audit: (orgId, entry) => api.withOrg(orgId, (tx) => audit(tx, entry)) })
   const enqueue = depsOverrides.enqueue ?? noopEnqueue
   const app = buildServer({
