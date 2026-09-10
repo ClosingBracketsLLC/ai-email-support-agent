@@ -76,10 +76,17 @@ export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?:
   const queryClient = useQueryClient()
 
   const query = useQuery(trpc.inbox.ticket.queryOptions({ ticketId: id }, {
-    // Only while a reply is actually on its way out; an idle ticket costs nothing (spec §Send).
+    // While a reply is on its way out, and while one is being written; an idle ticket costs nothing
+    // (spec §Send).
     refetchInterval: (q) => {
-      const status = q.state.data?.draft?.status
-      return status === 'approved' || status === 'sending' ? pollMs : false
+      const data = q.state.data
+      const status = data?.draft?.status
+      if (status === 'approved' || status === 'sending') return pollMs
+      // `inbox.ticket` returns only the LIVE draft, so a reject→redraft leaves this screen with no
+      // draft at all while the ticket sits back on `triaged` — exactly the window the reject banner
+      // promises a new draft in. Without this the promise is one the screen cannot keep.
+      if (!data?.draft && data?.ticket?.status === 'triaged') return pollMs
+      return false
     },
   }))
   const draft = query.data?.draft ?? null
@@ -87,9 +94,12 @@ export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?:
   // Keyed to the draft, never a bare boolean: a reject→redraft puts a DIFFERENT draft on this same
   // mounted screen, and it has to be opened on its own before Approve comes back.
   const [markedViewedId, setMarkedViewedId] = useState<string | null>(null)
+  // Bumped to re-run the viewed-gate effect after a failure: once automatically, then on every tap of
+  // the note's Retry.
+  const [viewRetryKey, setViewRetryKey] = useState(0)
   const [undoUntil, setUndoUntil] = useState<Date | null>(null)
   const [approveError, setApproveError] = useState<{ code: string; findings?: string[] } | null>(null)
-  const [note, setNote] = useState<{ tone: 'info' | 'error'; text: string } | null>(null)
+  const [note, setNote] = useState<{ tone: 'info' | 'error'; text: string; retryView?: boolean } | null>(null)
   const [confirmingResolve, setConfirmingResolve] = useState(false)
   const panel = useRef<DraftPanelHandle | null>(null)
 
@@ -102,7 +112,24 @@ export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?:
   ])
 
   const markViewed = useMutation(trpc.drafts.markViewed.mutationOptions({
-    onSuccess: (_data, variables) => { setMarkedViewedId(variables.draftId); void invalidateTicket() },
+    onSuccess: (_data, variables) => {
+      setMarkedViewedId(variables.draftId)
+      setNote((current) => (current?.retryView === true ? null : current))
+      void invalidateTicket()
+    },
+    // Without this the owner is left with a greyed-out Approve and no explanation: the mutation does
+    // not retry (TanStack's `retry: 1` in providers.tsx is scoped to queries), `marked` already holds
+    // this draft's id, and none of the effect's other deps can change on the failure path.
+    onError: (_error, variables) => {
+      marked.current = null
+      // Exactly one automatic retry per draft — a transient 502 or a dropped connection is the common
+      // case and should never reach the owner; anything worse gets a button rather than a retry loop.
+      if (autoRetried.current !== variables.draftId) {
+        autoRetried.current = variables.draftId
+        setViewRetryKey((key) => key + 1)
+      }
+      setNote({ tone: 'error', text: 'Could not open the draft — tap to retry', retryView: true })
+    },
   }))
   const approve = useMutation(trpc.drafts.approve.mutationOptions({
     onSuccess: (data) => {
@@ -161,12 +188,19 @@ export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?:
   // Exactly once per draft: the approve gate refuses a draft no human has opened (`not_viewed`), and
   // the ref survives the refetch this very mutation's invalidation triggers.
   const marked = useRef<string | null>(null)
+  const autoRetried = useRef<string | null>(null)
   useEffect(() => {
     if (!draft || draft.status !== 'pending' || draft.viewedAt !== null) return
     if (marked.current === draft.id) return
     marked.current = draft.id
     markViewed.mutate({ draftId: draft.id })
-  }, [draft?.id, draft?.status, draft?.viewedAt])
+  }, [draft?.id, draft?.status, draft?.viewedAt, viewRetryKey])
+
+  // A banner about the draft that WAS on screen must not sit under its replacement. Only a real draft
+  // clears it: after a reject the live draft is gone (`draft` is null) and "The agent is re-drafting"
+  // is exactly the sentence that has to stay until the re-draft lands.
+  const draftId = draft?.id ?? null
+  useEffect(() => { if (draftId !== null) setNote(null) }, [draftId])
 
   // The undo window outlives this screen: `DraftView.undoUntil` is set for as long as an approved
   // draft's send is still `queued`, so a reload (or a second device) inside those 15 seconds still
@@ -242,7 +276,20 @@ export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?:
         </View>
       ) : null}
 
-      {note ? <View style={styles.padded}><Banner tone={note.tone} testID="ticket-note">{note.text}</Banner></View> : null}
+      {note ? (
+        <View style={[styles.padded, styles.noteBox]}>
+          <Banner tone={note.tone} testID="ticket-note">{note.text}</Banner>
+          {note.retryView ? (
+            <Button
+              label="Retry"
+              variant="secondary"
+              onPress={() => { if (!markViewed.isPending) setViewRetryKey((key) => key + 1) }}
+              loading={markViewed.isPending}
+              testID="retry-view"
+            />
+          ) : null}
+        </View>
+      ) : null}
 
       {ticket.status === 'needs_owner' ? (
         <View style={styles.padded}>
@@ -295,6 +342,7 @@ function BackRow({ onBack }: { onBack: () => void }) {
 const styles = StyleSheet.create({
   safe: { flex: 1 },
   padded: { paddingHorizontal: spacing.md, paddingBottom: spacing.sm },
+  noteBox: { gap: spacing.sm },
   header: { padding: spacing.md, gap: spacing.xs, borderBottomWidth: StyleSheet.hairlineWidth },
   backRow: { paddingVertical: spacing.xs },
   headerMeta: { flexDirection: 'row', gap: spacing.sm, flexWrap: 'wrap', alignItems: 'center' },

@@ -3,6 +3,7 @@ import { useRouter } from 'expo-router'
 import { useEffect, useState } from 'react'
 import { Banner } from '@/components/banner'
 import { Button } from '@/components/button'
+import { Loading } from '@/components/loading'
 import { Screen } from '@/components/screen'
 import { SwitchRow } from '@/components/switch-row'
 import { Title } from '@/components/typography'
@@ -44,11 +45,17 @@ export function GoLiveStep({ pollMs = GO_LIVE_POLL_MS }: { pollMs?: number } = {
     <Screen testID="onboarding-go-live">
       <Stepper current="go_live" />
       <Title>Go live</Title>
-      <TestEmailBox
-        address={status.data?.agentAddresses[0] ?? '(no agent yet)'}
-        firstDraft={firstDraft}
-        onReview={(ticketId) => router.push(`/ticket/${ticketId}`)}
-      />
+      {/* "(no agent yet)" is a real answer, not a placeholder for one — so it is only ever said once
+          the query has actually come back and reported no address. */}
+      {status.isPending ? <Loading testID="go-live-loading" /> : null}
+      {status.error ? <Banner tone="error" testID="go-live-error">Could not check your agent. Trying again…</Banner> : null}
+      {status.data ? (
+        <TestEmailBox
+          address={status.data.agentAddresses[0] ?? '(no agent yet)'}
+          firstDraft={firstDraft}
+          onReview={(ticketId) => router.push(`/ticket/${ticketId}`)}
+        />
+      ) : null}
       <SwitchRow
         label="Agent is ON"
         hint="Every category starts in Review — the agent drafts, you approve."

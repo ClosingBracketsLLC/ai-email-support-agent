@@ -95,6 +95,11 @@ test("formatUsd follows the brief's exact table", () => {
   expect(formatUsd(1_234_567)).toBe('$1.23')
 })
 
+test('formatUsd clamps a negative to zero rather than rendering "$-0.00"', () => {
+  expect(formatUsd(-1)).toBe('$0.00')
+  expect(formatUsd(-420_000)).toBe('$0.00')
+})
+
 test('renders the tiles from a mocked summary, including the AI cost and the approved unchanged/edited subtitle', async () => {
   await setup()
   await waitFor(() => expect(screen.getByTestId('stat-drafted')).toBeTruthy())

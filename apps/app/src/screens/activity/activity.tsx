@@ -16,12 +16,15 @@ const DAY_OPTIONS: readonly ActivityDays[] = [7, 30]
 
 /**
  * The task brief's exact table: `'$0.00'` for zero, `'<$0.01'` for a nonzero amount under a cent
- * (1..9999 micros — cheap sandbox/draft calls routinely land here), otherwise two decimals.
+ * (1..9999 micros — cheap sandbox/draft calls routinely land here), otherwise two decimals. A negative
+ * is clamped to zero: the api sums non-negative cost micros, so it cannot happen today, and `$-0.00`
+ * is not a thing to show an owner if it ever does.
  */
 export function formatUsd(micros: number): string {
-  if (micros === 0) return '$0.00'
-  if (micros > 0 && micros < 10_000) return '<$0.01'
-  return `$${(micros / 1_000_000).toFixed(2)}`
+  const value = Math.max(0, micros)
+  if (value === 0) return '$0.00'
+  if (value < 10_000) return '<$0.01'
+  return `$${(value / 1_000_000).toFixed(2)}`
 }
 
 /** Same shape/rounding as `ticket-row.tsx`'s and `mailboxes.tsx`'s own `relativeTime` — each of

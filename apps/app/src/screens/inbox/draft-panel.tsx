@@ -7,7 +7,7 @@ import { Card } from '@/components/card'
 import { TextField } from '@/components/text-field'
 import { Heading, Muted } from '@/components/typography'
 import { radius, spacing, typeScale, useColors } from '@/theme'
-import { REASON_SENTENCE, decisionReasonLabel, holdReasonLabel } from './reason-labels'
+import { REASON_SENTENCE, decisionReasonLabel, holdReasonLabel, sendFailureLabel } from './reason-labels'
 import { RejectSheet } from './reject-sheet'
 import { UndoBar } from './undo-bar'
 
@@ -64,7 +64,8 @@ const APPROVE_ERROR_COPY: Record<string, string> = {
 }
 const APPROVE_ERROR_FALLBACK = 'Could not approve this reply. Try again.'
 
-/** Statuses the panel can be looking at once the decision is behind it (`held` has its own branch). */
+/** Statuses the panel can be looking at once the decision is behind it. `held` and `failed` are absent
+ * on purpose: both have their own branch below, because both can still be brought Back to review. */
 const DECIDED_COPY: Partial<Record<DraftStatus, string>> = {
   approved: 'Approved — going out shortly.',
   sending: 'Sending…',
@@ -72,7 +73,6 @@ const DECIDED_COPY: Partial<Record<DraftStatus, string>> = {
   rejected: 'Rejected.',
   superseded: 'Replaced by a newer draft.',
   expired: 'This draft expired unreviewed.',
-  failed: 'This reply could not be sent.',
 }
 
 interface Finding { code: string; severity: string; detail: string }
@@ -102,6 +102,15 @@ export function DraftPanel({
   const [expiredWindow, setExpiredWindow] = useState<number | null>(null)
   const undoAt = undoUntil === null ? null : undoUntil.getTime()
   const undoExpired = undoAt !== null && expiredWindow === undoAt
+
+  // A reject→redraft (or any other handover) puts a DIFFERENT draft on this same mounted panel: an
+  // editor left open would otherwise still hold — and "Approve edited" would submit — the previous
+  // draft's text against the new draft's id. Declared before the guardrail effect below so that a
+  // refusal that arrives with the new draft still wins.
+  useEffect(() => {
+    setEditing(false)
+    setEdited(draft.finalBody ?? draft.body)
+  }, [draft.id])
 
   // A guardrail refusal is only answerable with an edit, so the editor opens itself on one.
   const guardrailRefused = approveError?.code === 'guardrail'
@@ -195,6 +204,14 @@ export function DraftPanel({
       ) : draft.status === 'held' ? (
         <>
           <Banner tone="info" testID="draft-held">{`On hold — ${holdReasonLabel(draft.send?.lastError ?? null)}.`}</Banner>
+          <Button label="Back to review" onPress={onResume} loading={busy} testID="resume" />
+        </>
+      ) : draft.status === 'failed' ? (
+        // The same way back as a hold: `drafts.resume` returns a failed draft to `pending` (and a
+        // `send_failed` ticket to `awaiting_review`), and the re-approve revives the same send row.
+        // `lastError` here is free text, so it is always spoken through `sendFailureLabel`.
+        <>
+          <Banner tone="error" testID="draft-failed">{`Not sent — ${sendFailureLabel(draft.send?.lastError ?? null)}.`}</Banner>
           <Button label="Back to review" onPress={onResume} loading={busy} testID="resume" />
         </>
       ) : rejecting ? (

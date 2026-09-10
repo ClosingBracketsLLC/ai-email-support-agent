@@ -165,11 +165,14 @@ export function AgentEditScreen() {
       </View>
 
       {/* Task 22's "Try it" — under the persona card, active agents only (task brief); a pending
-          agent has nothing to try until its address is verified. */}
+          agent has nothing to try until its address is verified, and a DISABLED one has nothing to try
+          until it is switched back on (its address is long since verified). */}
       {agent.status === 'active' ? (
         <SandboxCard agentId={agent.id} />
       ) : (
-        <Muted testID="sandbox-pending">Available once the address is verified.</Muted>
+        <Muted testID="sandbox-pending">
+          {agent.status === 'pending_verification' ? 'Available once the address is verified.' : 'Available once the agent is active.'}
+        </Muted>
       )}
 
       <View style={styles.field}>

@@ -205,6 +205,49 @@ test('a held draft that was approved earlier still shows Back to review (status,
   expect(screen.getByTestId('resume')).toBeTruthy()
 })
 
+test('a failed draft says it was not sent, in the owner\'s words, and offers Back to review', async () => {
+  const send = { id: 'send-1', status: 'failed', sendAfter: new Date(), sentAt: null, lastError: 'stale: newer customer message' }
+  await render(<DraftPanel {...props({ draft: { ...BASE, status: 'failed', send } })} />)
+
+  expect(screen.getByText('Not sent — the customer wrote again first.')).toBeTruthy()
+  expect(screen.queryByTestId('approve')).toBeNull()
+
+  await fireEvent.press(screen.getByTestId('resume'))
+  expect(mockResume).toHaveBeenCalledTimes(1)
+})
+
+test('a send blocked by the guardrails names them', async () => {
+  const send = { id: 'send-1', status: 'failed', sendAfter: new Date(), sentAt: null, lastError: 'guardrail:url_not_allowed,secret_leak' }
+  await render(<DraftPanel {...props({ draft: { ...BASE, status: 'failed', send } })} />)
+
+  expect(screen.getByText('Not sent — the guardrails blocked the reply.')).toBeTruthy()
+  expect(screen.queryByText(/url_not_allowed/)).toBeNull()
+})
+
+test("a dead-lettered send's raw provider error never reaches the screen", async () => {
+  const send = { id: 'send-1', status: 'failed', sendAfter: new Date(), sentAt: null, lastError: 'getaddrinfo ENOTFOUND smtp.acme.test' }
+  await render(<DraftPanel {...props({ draft: { ...BASE, status: 'failed', send } })} />)
+
+  expect(screen.getByText('Not sent — the reply could not be sent.')).toBeTruthy()
+  expect(screen.queryByText(/ENOTFOUND/)).toBeNull()
+  expect(screen.getByTestId('resume')).toBeTruthy()
+})
+
+test('the editor is closed and re-seeded when a different draft takes the panel over', async () => {
+  const rendered = await render(<DraftPanel {...props()} />)
+
+  await fireEvent.press(screen.getByTestId('edit'))
+  await fireEvent.changeText(screen.getByTestId('draft-editor'), 'half-written edit of the FIRST draft')
+
+  await rendered.rerender(<DraftPanel {...props({ draft: { ...BASE, id: 'draft-2', version: 2, body: 'A newer reply.' } })} />)
+
+  expect(screen.queryByTestId('draft-editor')).toBeNull()
+  expect(screen.getByTestId('draft-body').props.children).toBe('A newer reply.')
+
+  await fireEvent.press(screen.getByTestId('edit'))
+  expect(screen.getByTestId('draft-editor').props.value).toBe('A newer reply.')
+})
+
 describe("the web shortcuts' handle", () => {
   async function renderWithHandle(overrides: Partial<DraftPanelProps> = {}) {
     const handle: { current: DraftPanelHandle | null } = { current: null }

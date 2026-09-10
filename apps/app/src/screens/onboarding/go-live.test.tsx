@@ -19,6 +19,8 @@ interface GoLiveStatus {
 // read them from inside a nested function, i.e. after this file's own top-level statements have run.
 let mockStatus: GoLiveStatus = { agentEnabled: false, agentAddresses: [], firstDraft: null, ticketsSeen: 0 }
 let mockStatusOpts: { refetchInterval?: unknown }[] = []
+/** The seam the loading/error cases drive: by default it just answers with `mockStatus`. */
+let mockStatusImpl: () => Promise<GoLiveStatus> = () => Promise.resolve(mockStatus)
 const mockSetEnabledCalls: unknown[] = []
 const mockAdvanceCalls: unknown[] = []
 let mockSetEnabledImpl: (input: unknown) => Promise<unknown> = () =>
@@ -41,7 +43,7 @@ jest.mock('@/lib/trpc', () => ({
       goLiveStatus: {
         queryOptions: (_input: undefined, opts: { refetchInterval?: unknown }) => {
           mockStatusOpts.push(opts)
-          return { queryKey: ['workspace', 'goLiveStatus'], queryFn: () => Promise.resolve(mockStatus), ...opts }
+          return { queryKey: ['workspace', 'goLiveStatus'], queryFn: () => mockStatusImpl(), ...opts }
         },
       },
       get: { queryKey: () => ['workspace', 'get'] },
@@ -77,6 +79,7 @@ const lastOpts = () => mockStatusOpts[mockStatusOpts.length - 1]!
 beforeEach(() => {
   mockStatus = { agentEnabled: false, agentAddresses: [], firstDraft: null, ticketsSeen: 0 }
   mockStatusOpts = []
+  mockStatusImpl = () => Promise.resolve(mockStatus)
   mockSetEnabledCalls.length = 0
   mockAdvanceCalls.length = 0
   mockSetEnabledImpl = () => Promise.resolve({ agentEnabled: true, onboardingStep: 'done', role: 'owner' })
@@ -97,6 +100,34 @@ test('asks the owner to email the first agent address, and keeps polling while n
 test('with no agent yet it still renders, saying so', async () => {
   await setup()
   await waitFor(() => expect(screen.getByText(/email \(no agent yet\) with a question/)).toBeTruthy())
+})
+
+test('while the status is still loading it shows a spinner rather than flashing "(no agent yet)"', async () => {
+  // Held open across the assertions, then settled before teardown — an in-flight query at the end of
+  // the suite leaves jest with a handle it cannot close.
+  let release = () => { /* replaced below */ }
+  mockStatus = { ...mockStatus, agentAddresses: ['support@acme.com'] }
+  mockStatusImpl = () => new Promise((resolve) => { release = () => resolve(mockStatus) })
+  await setup()
+
+  expect(screen.getByTestId('go-live-loading')).toBeTruthy()
+  expect(screen.queryByText(/no agent yet/)).toBeNull()
+  expect(screen.queryByTestId('test-email-box')).toBeNull()
+
+  await act(async () => { release() })
+  await waitFor(() => expect(screen.getByTestId('test-email-box')).toBeTruthy())
+  expect(screen.queryByTestId('go-live-loading')).toBeNull()
+})
+
+test('a status query that failed says so instead of claiming there is no agent', async () => {
+  mockStatusImpl = () => Promise.reject(new Error('offline'))
+  await setup()
+
+  await waitFor(() => expect(screen.getByTestId('go-live-error')).toBeTruthy())
+  expect(screen.queryByText(/no agent yet/)).toBeNull()
+  expect(screen.queryByTestId('go-live-loading')).toBeNull()
+  // The switch is still there: a failed status read must not strand the owner on the step.
+  expect(screen.getByTestId('agent-switch')).toBeTruthy()
 })
 
 test('the poll stops for good once the first draft exists', async () => {

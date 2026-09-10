@@ -69,6 +69,22 @@ const HOLD_REASON_LABEL: Record<string, string> = {
 }
 const HOLD_REASON_FALLBACK = 'sending was paused'
 
+/**
+ * Why an approved reply was never sent. Unlike the hold keys above, `outbound_sends.last_error` on a
+ * FAILED send is not a closed vocabulary: `landTerminal` writes `guardrail:<code>[,<code>…]` and four
+ * fixed sentences, `landStale` writes `stale: newer customer message`, and `landDeadLetter` writes an
+ * arbitrary `errorMessage(err)` — a provider or network string that may carry anything at all. So the
+ * raw value is NEVER rendered: the two prefixes and the four fixed sentences are mapped, and
+ * everything else falls back. These read as the tail of "Not sent — …".
+ */
+const FAILED_REASON_LABEL: Record<string, string> = {
+  'draft has no final body': 'the reply had no body',
+  'ticket has no customer email': 'there is no customer address to reply to',
+  'no inbound message to reply to': 'there is no customer message to reply to',
+  'no rfc message id to thread the reply onto': 'the reply could not be threaded onto the conversation',
+}
+const FAILED_REASON_FALLBACK = 'the reply could not be sent'
+
 export function decisionReasonLabel(reason: string | null): string | null {
   if (!reason) return null
   return (DECISION_REASON_LABEL as Record<string, string>)[reason] ?? null
@@ -84,4 +100,12 @@ export function holdReasonLabel(lastError: string | null): string {
   if (!lastError) return HOLD_REASON_FALLBACK
   if (lastError.startsWith('reauth')) return 'the mailbox needs reconnecting'
   return HOLD_REASON_LABEL[lastError] ?? HOLD_REASON_FALLBACK
+}
+
+/** The tail of "Not sent — …" for a `failed` draft, whose send's `lastError` is free text. */
+export function sendFailureLabel(lastError: string | null): string {
+  if (!lastError) return FAILED_REASON_FALLBACK
+  if (lastError.startsWith('guardrail:')) return 'the guardrails blocked the reply'
+  if (lastError.startsWith('stale:')) return 'the customer wrote again first'
+  return FAILED_REASON_LABEL[lastError] ?? FAILED_REASON_FALLBACK
 }

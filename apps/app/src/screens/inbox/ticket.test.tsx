@@ -25,8 +25,9 @@ interface MockTicket {
 }
 
 let mockDraft: MockDraft | null = null
-/** When set, every query after the first returns THIS draft — the reject→redraft handover. */
-let mockLaterDraft: MockDraft | null = null
+/** When set, every query after the first returns THIS view — the reject→redraft handover (and the
+ * window in between, where the live draft is gone and the ticket is back on `triaged`). */
+let mockLater: { draft: MockDraft | null; ticket?: MockTicket } | null = null
 let mockTicket: MockTicket = {} as MockTicket
 let mockTicketQueries = 0
 let mockTicketOpts: { refetchInterval?: unknown } = {}
@@ -62,8 +63,12 @@ jest.mock('@/lib/trpc', () => ({
             queryKey: ['inbox', 'ticket', input.ticketId],
             queryFn: () => {
               mockTicketQueries += 1
-              const draft = mockTicketQueries > 1 && mockLaterDraft ? mockLaterDraft : mockDraft
-              return Promise.resolve({ ticket: mockTicket, messages: [], draft })
+              const later = mockTicketQueries > 1 ? mockLater : null
+              return Promise.resolve({
+                ticket: later?.ticket ?? mockTicket,
+                messages: [],
+                draft: later ? later.draft : mockDraft,
+              })
             },
             ...opts,
           }
@@ -119,7 +124,7 @@ beforeEach(() => {
     agentAddress: 'support@acme.com', categoryLabel: 'Shipping', redraftCount: 0,
   }
   mockDraft = pendingDraft({ viewedAt: new Date('2026-01-01T00:00:00Z') })
-  mockLaterDraft = null
+  mockLater = null
   mockTicketQueries = 0
   mockTicketOpts = {}
   mockUndoUntil = new Date(Date.now() + 15_000)
@@ -254,6 +259,79 @@ test('the ticket query polls only while the reply is on its way out', async () =
   expect(refetchInterval({ state: { data: { draft: { status: 'pending' } } } })).toBe(false)
   expect(refetchInterval({ state: { data: { draft: null } } })).toBe(false)
   expect(refetchInterval({ state: { data: undefined } })).toBe(false)
+  // No live draft while the ticket is back on `triaged`: a draft (or a re-draft) is being written.
+  expect(refetchInterval({ state: { data: { draft: null, ticket: { status: 'triaged' } } } })).toBe(10_000)
+  expect(refetchInterval({ state: { data: { draft: null, ticket: { status: 'resolved' } } } })).toBe(false)
+  expect(refetchInterval({ state: { data: { draft: null, ticket: { status: 'needs_owner' } } } })).toBe(false)
+  // Once the re-draft lands the ordinary rule takes over again.
+  expect(refetchInterval({ state: { data: { draft: { status: 'pending' }, ticket: { status: 'triaged' } } } })).toBe(false)
+})
+
+test('the poll covers the re-draft window a reject opens, and the promise stays on screen until it lands', async () => {
+  mockLater = { draft: null, ticket: { ...mockTicket, status: 'triaged' } }
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('reject')).toBeTruthy())
+
+  await fireEvent.press(screen.getByTestId('reject'))
+  await fireEvent.changeText(screen.getByTestId('reject-reason'), 'Too formal')
+  await fireEvent.press(screen.getByTestId('reject-redraft'))
+
+  // The live draft is gone (the api returns only live drafts), so the panel goes with it.
+  await waitFor(() => expect(screen.queryByTestId('draft-panel')).toBeNull())
+  expect(screen.getByText('The agent is re-drafting — a new draft will appear here.')).toBeTruthy()
+
+  const refetchInterval = mockTicketOpts.refetchInterval as (q: { state: { data: unknown } }) => number | false
+  expect(refetchInterval({ state: { data: { draft: null, ticket: { status: 'triaged' } } } })).toBe(10_000)
+})
+
+test('a stale banner clears when a different draft takes the panel over', async () => {
+  mockLater = { draft: pendingDraft({ id: mockRedraftId, version: 2, viewedAt: new Date('2026-01-01T00:00:00Z') }) }
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('reject')).toBeTruthy())
+
+  await fireEvent.press(screen.getByTestId('reject'))
+  await fireEvent.changeText(screen.getByTestId('reject-reason'), 'Too formal')
+  await fireEvent.press(screen.getByTestId('reject-redraft'))
+
+  await waitFor(() => expect(screen.getByText('Draft reply · v2')).toBeTruthy())
+  expect(screen.queryByTestId('ticket-note')).toBeNull()
+})
+
+test('a viewed-mark that fails retries itself once, and Approve comes back when the retry lands', async () => {
+  let attempts = 0
+  mockMarkViewedImpl = () => {
+    attempts += 1
+    return attempts === 1 ? Promise.reject(new Error('offline')) : Promise.resolve({ viewed: true })
+  }
+  mockDraft = pendingDraft({ viewedAt: null })
+  await setup()
+
+  await waitFor(() => expect(screen.getByTestId('approve').props.accessibilityState.disabled).toBe(false))
+  expect(mockMarkViewedCalls).toHaveLength(2)
+  expect(screen.queryByTestId('ticket-note')).toBeNull()
+  expect(screen.queryByTestId('retry-view')).toBeNull()
+})
+
+test('a viewed-mark that fails twice says so and offers a retry that re-fires it', async () => {
+  let attempts = 0
+  mockMarkViewedImpl = () => {
+    attempts += 1
+    return attempts <= 2 ? Promise.reject(new Error('offline')) : Promise.resolve({ viewed: true })
+  }
+  mockDraft = pendingDraft({ viewedAt: null })
+  await setup()
+
+  await waitFor(() => expect(screen.getByTestId('retry-view')).toBeTruthy())
+  expect(screen.getByText('Could not open the draft — tap to retry')).toBeTruthy()
+  // The one button the whole review flow exists for stays shut until the server has recorded the read.
+  expect(screen.getByTestId('approve').props.accessibilityState.disabled).toBe(true)
+  expect(mockMarkViewedCalls).toHaveLength(2)
+
+  await fireEvent.press(screen.getByTestId('retry-view'))
+
+  await waitFor(() => expect(screen.getByTestId('approve').props.accessibilityState.disabled).toBe(false))
+  expect(mockMarkViewedCalls).toHaveLength(3)
+  expect(screen.queryByTestId('ticket-note')).toBeNull()
 })
 
 describe('shortcutFor', () => {
@@ -291,7 +369,7 @@ test('a second draft on the same screen has to be opened on its own before Appro
     return new Promise((res) => { resolveRedraftView = () => res({ viewed: true }) })
   }
   mockDraft = pendingDraft({ viewedAt: null })
-  mockLaterDraft = pendingDraft({ id: mockRedraftId, version: 2, viewedAt: null })
+  mockLater = { draft: pendingDraft({ id: mockRedraftId, version: 2, viewedAt: null }) }
   await setup()
 
   await waitFor(() => expect(mockMarkViewedCalls).toEqual([{ draftId: mockDraftId }, { draftId: mockRedraftId }]))

@@ -257,6 +257,14 @@ test('an active agent gets the "Try it" sandbox card under the persona card (Tas
   expect(screen.queryByTestId('sandbox-pending')).toBeNull()
 })
 
+test('a disabled agent is told to switch the agent on, not to verify an address it already verified', async () => {
+  mockAgents = [baseAgent({ status: 'disabled' })]
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('sandbox-pending')).toBeTruthy())
+  expect(screen.getByText('Available once the agent is active.')).toBeTruthy()
+  expect(screen.queryByTestId('sandbox-card')).toBeNull()
+})
+
 test('a pending-verification agent sees "Available once the address is verified" instead of the sandbox', async () => {
   mockAgents = [baseAgent({ status: 'pending_verification' })]
   await setup()
