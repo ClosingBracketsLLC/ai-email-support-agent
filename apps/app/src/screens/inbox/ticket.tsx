@@ -84,7 +84,9 @@ export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?:
   }))
   const draft = query.data?.draft ?? null
 
-  const [markedViewed, setMarkedViewed] = useState(false)
+  // Keyed to the draft, never a bare boolean: a reject→redraft puts a DIFFERENT draft on this same
+  // mounted screen, and it has to be opened on its own before Approve comes back.
+  const [markedViewedId, setMarkedViewedId] = useState<string | null>(null)
   const [undoUntil, setUndoUntil] = useState<Date | null>(null)
   const [approveError, setApproveError] = useState<{ code: string; findings?: string[] } | null>(null)
   const [note, setNote] = useState<{ tone: 'info' | 'error'; text: string } | null>(null)
@@ -100,7 +102,7 @@ export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?:
   ])
 
   const markViewed = useMutation(trpc.drafts.markViewed.mutationOptions({
-    onSuccess: () => { setMarkedViewed(true); void invalidateTicket() },
+    onSuccess: (_data, variables) => { setMarkedViewedId(variables.draftId); void invalidateTicket() },
   }))
   const approve = useMutation(trpc.drafts.approve.mutationOptions({
     onSuccess: (data) => {
@@ -137,11 +139,22 @@ export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?:
     onError: () => setNote({ tone: 'error', text: 'Could not reject this draft. Try again.' }),
   }))
   const resume = useMutation(trpc.drafts.resume.mutationOptions({
-    onSuccess: () => { setApproveError(null); setNote(null); void invalidateAll() },
+    // `resumed: false` is a race, not an error (the api soft-fails a draft that is no longer `held`).
+    onSuccess: (data) => {
+      if (!data.resumed) { setNote({ tone: 'info', text: 'This draft is no longer on hold.' }); void invalidateAll(); return }
+      setApproveError(null)
+      setNote(null)
+      void invalidateAll()
+    },
     onError: () => setNote({ tone: 'error', text: 'Could not bring this draft back. Try again.' }),
   }))
   const resolve = useMutation(trpc.inbox.resolve.mutationOptions({
-    onSuccess: () => { setConfirmingResolve(false); void invalidateAll() },
+    // Likewise `resolved: false`: a foreign or already-resolved ticket resolves nothing and throws nothing.
+    onSuccess: (data) => {
+      if (!data.resolved) { setNote({ tone: 'info', text: 'This ticket was already resolved.' }); void invalidateAll(); return }
+      setConfirmingResolve(false)
+      void invalidateAll()
+    },
     onError: () => setNote({ tone: 'error', text: 'Could not mark this resolved. Try again.' }),
   }))
 
@@ -154,6 +167,16 @@ export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?:
     marked.current = draft.id
     markViewed.mutate({ draftId: draft.id })
   }, [draft?.id, draft?.status, draft?.viewedAt])
+
+  // The undo window outlives this screen: `DraftView.undoUntil` is set for as long as an approved
+  // draft's send is still `queued`, so a reload (or a second device) inside those 15 seconds still
+  // gets the Undo button. Keyed on the server value's CHANGES, so `hold`'s optimistic clear below is
+  // not undone by the refetch it triggers; the approve mutation's own `undoUntil` overrides it.
+  const serverUndoUntil = draft?.undoUntil ?? null
+  const serverUndoMs = serverUndoUntil === null ? null : serverUndoUntil.getTime()
+  useEffect(() => {
+    setUndoUntil(serverUndoMs === null ? null : new Date(serverUndoMs))
+  }, [serverUndoMs])
 
   useEffect(() => {
     if (Platform.OS !== 'web' || typeof window === 'undefined') return
@@ -205,7 +228,7 @@ export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?:
           <DraftPanel
             draft={draft}
             ticket={{ id: ticket.id, redraftCount: ticket.redraftCount, status: ticket.status }}
-            viewed={draft.viewedAt !== null || markedViewed}
+            viewed={draft.viewedAt !== null || markedViewedId === draft.id}
             onApprove={(body) => approve.mutate(body === undefined ? { draftId: draft.id } : { draftId: draft.id, body })}
             onHold={() => hold.mutate({ draftId: draft.id })}
             onReject={(action: RejectAction, reason: string) => reject.mutate({ draftId: draft.id, action, reason })}

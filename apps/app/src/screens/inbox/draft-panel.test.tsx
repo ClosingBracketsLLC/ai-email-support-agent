@@ -1,5 +1,5 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react-native'
-import { DraftPanel, type DraftPanelProps, type DraftView } from './draft-panel'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native'
+import { DraftPanel, type DraftPanelHandle, type DraftPanelProps, type DraftView } from './draft-panel'
 
 const BODY = 'Hi Jane,\n\nYour order ships tomorrow.\n\nThanks!'
 
@@ -203,4 +203,47 @@ test('a held draft that was approved earlier still shows Back to review (status,
   expect(screen.getByText('On hold — the ticket was resolved.')).toBeTruthy()
   expect(screen.getByTestId('draft-body').props.children).toBe('An edited reply')
   expect(screen.getByTestId('resume')).toBeTruthy()
+})
+
+describe("the web shortcuts' handle", () => {
+  async function renderWithHandle(overrides: Partial<DraftPanelProps> = {}) {
+    const handle: { current: DraftPanelHandle | null } = { current: null }
+    await render(<DraftPanel {...props({ panelRef: handle, ...overrides })} />)
+    return handle
+  }
+
+  test('approve, edit and reject drive the panel', async () => {
+    const handle = await renderWithHandle()
+
+    await act(async () => { handle.current?.reject() })
+    expect(screen.getByTestId('reject-sheet')).toBeTruthy()
+  })
+
+  test('approve fires only once the draft has been viewed', async () => {
+    const handle = await renderWithHandle({ viewed: false })
+    await act(async () => { handle.current?.approve() })
+    expect(mockApprove).not.toHaveBeenCalled()
+  })
+
+  test('nothing stacks on top of the open editor', async () => {
+    const handle = await renderWithHandle()
+
+    await act(async () => { handle.current?.edit() })
+    expect(screen.getByTestId('draft-editor')).toBeTruthy()
+
+    // 'r' and 'a' are both no-ops while the owner is editing — the sheet must not cover the editor.
+    await act(async () => { handle.current?.reject() })
+    expect(screen.queryByTestId('reject-sheet')).toBeNull()
+
+    await act(async () => { handle.current?.approve() })
+    expect(mockApprove).not.toHaveBeenCalled()
+  })
+
+  test('a blocked draft cannot be approved through the shortcut either', async () => {
+    const guardrailResult = { ok: false, findings: [{ code: 'secret_leak', severity: 'fail', detail: 'an API key' }] }
+    const handle = await renderWithHandle({ draft: { ...BASE, decisionReason: 'guardrail_failed', guardrailResult } })
+
+    await act(async () => { handle.current?.approve() })
+    expect(mockApprove).not.toHaveBeenCalled()
+  })
 })

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider, notifyManager } from '@tanstack/react-query'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react-native'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native'
 import type { ReactNode } from 'react'
 import { TicketScreen, shortcutFor } from './ticket'
 
@@ -11,11 +11,13 @@ notifyManager.setScheduler((callback) => callback())
 // babel-plugin-jest-hoist hoists jest.mock() above these declarations.
 const mockTicketId = '11111111-1111-4111-8111-111111111111'
 const mockDraftId = '22222222-2222-4222-8222-222222222222'
+/** The draft a reject→redraft puts on this same mounted screen. */
+const mockRedraftId = '33333333-3333-4333-8333-333333333333'
 
 interface MockDraft {
   id: string; version: number; status: string; body: string; finalBody: string | null
   decisionReason: string; confidence: number | null; guardrailResult: unknown
-  send: unknown; viewedAt: Date | null
+  send: unknown; viewedAt: Date | null; undoUntil: Date | null
 }
 interface MockTicket {
   id: string; subject: string | null; status: string; needsOwnerReason: string | null
@@ -23,6 +25,8 @@ interface MockTicket {
 }
 
 let mockDraft: MockDraft | null = null
+/** When set, every query after the first returns THIS draft — the reject→redraft handover. */
+let mockLaterDraft: MockDraft | null = null
 let mockTicket: MockTicket = {} as MockTicket
 let mockTicketQueries = 0
 let mockTicketOpts: { refetchInterval?: unknown } = {}
@@ -39,6 +43,9 @@ const mockResolveCalls: unknown[] = []
 let mockApproveImpl: (input: unknown) => Promise<unknown> = () => Promise.resolve({})
 let mockHoldImpl: (input: unknown) => Promise<unknown> = () => Promise.resolve({ held: true })
 let mockRejectImpl: (input: unknown) => Promise<unknown> = () => Promise.resolve({ resolution: 'redraft' })
+let mockMarkViewedImpl: (input: unknown) => Promise<unknown> = () => Promise.resolve({ viewed: true })
+let mockResumeImpl: (input: unknown) => Promise<unknown> = () => Promise.resolve({ resumed: true })
+let mockResolveImpl: (input: unknown) => Promise<unknown> = () => Promise.resolve({ resolved: true })
 
 jest.mock('expo-router', () => ({
   useLocalSearchParams: () => ({ id: mockTicketId }),
@@ -55,7 +62,8 @@ jest.mock('@/lib/trpc', () => ({
             queryKey: ['inbox', 'ticket', input.ticketId],
             queryFn: () => {
               mockTicketQueries += 1
-              return Promise.resolve({ ticket: mockTicket, messages: [], draft: mockDraft })
+              const draft = mockTicketQueries > 1 && mockLaterDraft ? mockLaterDraft : mockDraft
+              return Promise.resolve({ ticket: mockTicket, messages: [], draft })
             },
             ...opts,
           }
@@ -63,29 +71,14 @@ jest.mock('@/lib/trpc', () => ({
         queryKey: (input: { ticketId: string }) => ['inbox', 'ticket', input.ticketId],
       },
       list: { queryKey: () => ['inbox', 'list'] },
-      resolve: {
-        mutationOptions: (o: object) => ({
-          mutationFn: (v: unknown) => { mockResolveCalls.push(v); return Promise.resolve({ resolved: true }) },
-          ...o,
-        }),
-      },
+      resolve: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => { mockResolveCalls.push(v); return mockResolveImpl(v) }, ...o }) },
     },
     drafts: {
-      markViewed: {
-        mutationOptions: (o: object) => ({
-          mutationFn: (v: unknown) => { mockMarkViewedCalls.push(v); return Promise.resolve({ viewed: true }) },
-          ...o,
-        }),
-      },
+      markViewed: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => { mockMarkViewedCalls.push(v); return mockMarkViewedImpl(v) }, ...o }) },
       approve: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => { mockApproveCalls.push(v); return mockApproveImpl(v) }, ...o }) },
       hold: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => { mockHoldCalls.push(v); return mockHoldImpl(v) }, ...o }) },
       reject: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => { mockRejectCalls.push(v); return mockRejectImpl(v) }, ...o }) },
-      resume: {
-        mutationOptions: (o: object) => ({
-          mutationFn: (v: unknown) => { mockResumeCalls.push(v); return Promise.resolve({ resumed: true }) },
-          ...o,
-        }),
-      },
+      resume: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => { mockResumeCalls.push(v); return mockResumeImpl(v) }, ...o }) },
     },
   }),
 }))
@@ -94,7 +87,7 @@ function pendingDraft(overrides: Partial<MockDraft> = {}): MockDraft {
   return {
     id: mockDraftId, version: 1, status: 'pending', body: 'Your order ships tomorrow.', finalBody: null,
     decisionReason: 'cold_start', confidence: 0.82, guardrailResult: { ok: true, findings: [] },
-    send: null, viewedAt: null, ...overrides,
+    send: null, viewedAt: null, undoUntil: null, ...overrides,
   }
 }
 
@@ -126,6 +119,7 @@ beforeEach(() => {
     agentAddress: 'support@acme.com', categoryLabel: 'Shipping', redraftCount: 0,
   }
   mockDraft = pendingDraft({ viewedAt: new Date('2026-01-01T00:00:00Z') })
+  mockLaterDraft = null
   mockTicketQueries = 0
   mockTicketOpts = {}
   mockUndoUntil = new Date(Date.now() + 15_000)
@@ -134,6 +128,9 @@ beforeEach(() => {
   mockApproveImpl = () => Promise.resolve({ sendId: 'send-1', sendAfter: mockUndoUntil, undoUntil: mockUndoUntil })
   mockHoldImpl = () => Promise.resolve({ held: true })
   mockRejectImpl = () => Promise.resolve({ resolution: 'redraft' })
+  mockMarkViewedImpl = () => Promise.resolve({ viewed: true })
+  mockResumeImpl = () => Promise.resolve({ resumed: true })
+  mockResolveImpl = () => Promise.resolve({ resolved: true })
 })
 afterEach(async () => { for (const teardown of teardowns.splice(0)) await teardown() })
 
@@ -283,4 +280,72 @@ describe('shortcutFor', () => {
   ])('ignores %s', (_label, event) => {
     expect(shortcutFor(event)).toBeNull()
   })
+})
+
+test('a second draft on the same screen has to be opened on its own before Approve comes back', async () => {
+  // The reject→redraft handover: the screen never unmounts, so a viewed flag that is not keyed to the
+  // draft would hand the new draft an enabled Approve nobody had read.
+  let resolveRedraftView: (() => void) | undefined
+  mockMarkViewedImpl = (input) => {
+    if ((input as { draftId: string }).draftId !== mockRedraftId) return Promise.resolve({ viewed: true })
+    return new Promise((res) => { resolveRedraftView = () => res({ viewed: true }) })
+  }
+  mockDraft = pendingDraft({ viewedAt: null })
+  mockLaterDraft = pendingDraft({ id: mockRedraftId, version: 2, viewedAt: null })
+  await setup()
+
+  await waitFor(() => expect(mockMarkViewedCalls).toEqual([{ draftId: mockDraftId }, { draftId: mockRedraftId }]))
+  expect(screen.getByText('Draft reply · v2')).toBeTruthy()
+  expect(screen.getByTestId('approve').props.accessibilityState.disabled).toBe(true)
+
+  await act(async () => { resolveRedraftView?.() })
+  await waitFor(() => expect(screen.getByTestId('approve').props.accessibilityState.disabled).toBe(false))
+  expect(mockMarkViewedCalls).toHaveLength(2)
+})
+
+test('a resume that found nothing on hold says so instead of pretending it worked', async () => {
+  mockResumeImpl = () => Promise.resolve({ resumed: false })
+  mockDraft = pendingDraft({ status: 'held', send: { id: 'send-1', status: 'held', sendAfter: new Date(), sentAt: null, lastError: 'held:category_off' } })
+  await setup()
+
+  await waitFor(() => expect(screen.getByTestId('resume')).toBeTruthy())
+  await fireEvent.press(screen.getByTestId('resume'))
+
+  await waitFor(() => expect(screen.getByText('This draft is no longer on hold.')).toBeTruthy())
+})
+
+test('a resolve that resolved nothing says so instead of pretending it worked', async () => {
+  mockResolveImpl = () => Promise.resolve({ resolved: false })
+  mockDraft = null
+  mockTicket = { ...mockTicket, status: 'needs_owner', needsOwnerReason: 'tripwire' }
+  await setup()
+
+  await waitFor(() => expect(screen.getByTestId('resolve')).toBeTruthy())
+  await fireEvent.press(screen.getByTestId('resolve'))
+  await fireEvent.press(screen.getByTestId('resolve'))
+
+  await waitFor(() => expect(screen.getByText('This ticket was already resolved.')).toBeTruthy())
+})
+
+test('an approved draft still inside its undo window shows the undo bar without an approve press', async () => {
+  mockDraft = pendingDraft({
+    status: 'approved', viewedAt: new Date('2026-01-01T00:00:00Z'), undoUntil: new Date(Date.now() + 10_000),
+    send: { id: 'send-1', status: 'queued', sendAfter: new Date(Date.now() + 10_000), sentAt: null, lastError: null },
+  })
+  await setup()
+
+  await waitFor(() => expect(screen.getByTestId('undo-bar')).toBeTruthy())
+  expect(mockApproveCalls).toHaveLength(0)
+})
+
+test('an undo window that has already closed shows no undo bar', async () => {
+  mockDraft = pendingDraft({
+    status: 'approved', viewedAt: new Date('2026-01-01T00:00:00Z'), undoUntil: new Date(Date.now() - 1_000),
+    send: { id: 'send-1', status: 'queued', sendAfter: new Date(Date.now() - 1_000), sentAt: null, lastError: null },
+  })
+  await setup()
+
+  await waitFor(() => expect(screen.getByTestId('draft-panel')).toBeTruthy())
+  expect(screen.queryByTestId('undo-bar')).toBeNull()
+  expect(screen.getByText('Approved — going out shortly.')).toBeTruthy()
 })

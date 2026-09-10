@@ -95,11 +95,13 @@ export function DraftPanel({
   const [editing, setEditing] = useState(false)
   const [edited, setEdited] = useState(seed)
   const [rejecting, setRejecting] = useState(false)
-  // The undo bar renders nothing once its window closes; without this the panel would show no
-  // actions at all until the next poll landed.
-  const [undoExpired, setUndoExpired] = useState(false)
+  // The undo bar renders nothing once its window closes; without this the panel would show no actions
+  // at all until the next poll landed. Keyed BY the window rather than reset by an effect: a child's
+  // effect runs before its parent's, so a reset effect would undo an already-closed window's own
+  // `onExpired` on the very first commit (a draft loaded mid-flight with a window already past).
+  const [expiredWindow, setExpiredWindow] = useState<number | null>(null)
   const undoAt = undoUntil === null ? null : undoUntil.getTime()
-  useEffect(() => { setUndoExpired(false) }, [undoAt])
+  const undoExpired = undoAt !== null && expiredWindow === undoAt
 
   // A guardrail refusal is only answerable with an edit, so the editor opens itself on one.
   const guardrailRefused = approveError?.code === 'guardrail'
@@ -135,7 +137,7 @@ export function DraftPanel({
   useImperativeHandle(panelRef, () => ({
     approve: () => { if (canApprove && !showEditor) onApprove(undefined) },
     edit: () => { if (decisionOpen && !showEditor) startEdit() },
-    reject: () => { if (decisionOpen) setRejecting(true) },
+    reject: () => { if (decisionOpen && !showEditor) setRejecting(true) },
   }))
 
   const pct = draft.confidence === null ? null : Math.round(draft.confidence * 100)
@@ -189,7 +191,7 @@ export function DraftPanel({
       )}
 
       {undoUntil !== null && !undoExpired ? (
-        <UndoBar untilAt={undoUntil} onUndo={onHold} busy={busy} tickMs={undoTickMs} onExpired={() => setUndoExpired(true)} />
+        <UndoBar untilAt={undoUntil} onUndo={onHold} busy={busy} tickMs={undoTickMs} onExpired={() => setExpiredWindow(undoAt)} />
       ) : draft.status === 'held' ? (
         <>
           <Banner tone="info" testID="draft-held">{`On hold — ${holdReasonLabel(draft.send?.lastError ?? null)}.`}</Banner>
