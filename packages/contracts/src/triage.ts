@@ -6,7 +6,11 @@ export type Sentiment = (typeof SENTIMENTS)[number]
 export const ESCALATION_FLAGS = ['legal_threat', 'chargeback_threat', 'injury', 'recall_mention'] as const
 export type EscalationFlag = (typeof ESCALATION_FLAGS)[number]
 
-export const NEEDS_OWNER_REASONS = ['tripwire', 'triage_flags', 'sentiment_angry', 'triage_failed', 'triage_cap'] as const
+export const NEEDS_OWNER_REASONS = [
+  'tripwire', 'triage_flags', 'sentiment_angry', 'triage_failed', 'triage_cap',
+  'agent_escalated', 'agent_failed', 'agent_run_cap', 'guardrail_failed', 'redraft_limit_reached',
+  'redraft_unfulfilled', 'owner_handling', 'orphaned', 'draft_expired', 'send_failed', 'category_off', 'no_agent',
+] as const
 export type NeedsOwnerReason = (typeof NEEDS_OWNER_REASONS)[number]
 
 export const TriageVerdict = z.object({

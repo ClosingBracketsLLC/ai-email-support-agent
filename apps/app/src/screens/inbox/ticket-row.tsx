@@ -23,13 +23,26 @@ export interface TicketSummary {
   hasAttachments: boolean
 }
 
-/** Spec's four reason words plus 'Capped' for the cap reason (task brief). */
+/** Spec's four reason words plus 'Capped' for the cap reason (task brief), plus Phase 3's twelve
+ * drafting/review reasons (Task 2 controller ruling). */
 const REASON_CHIP: Record<NeedsOwnerReason, string> = {
   tripwire: 'Tripwire',
   triage_flags: 'Flagged',
   sentiment_angry: 'Angry',
   triage_failed: 'Failed',
   triage_cap: 'Capped',
+  agent_escalated: 'Escalated',
+  agent_failed: 'Failed',
+  agent_run_cap: 'Capped',
+  guardrail_failed: 'Blocked',
+  redraft_limit_reached: 'Re-drafted 2×',
+  redraft_unfulfilled: 'Needs you',
+  owner_handling: 'Yours',
+  orphaned: 'Lost draft',
+  draft_expired: 'Expired',
+  send_failed: 'Not sent',
+  category_off: 'Off',
+  no_agent: 'No agent',
 }
 
 /** `needsOwnerReason` is a plain `text` column (checked by the API, not a drizzle `pgEnum`), so the

@@ -55,6 +55,25 @@ describe.each([
   })
 })
 
+it.each([
+  ['agent_escalated', 'Escalated'],
+  ['agent_failed', 'Failed'],
+  ['agent_run_cap', 'Capped'],
+  ['guardrail_failed', 'Blocked'],
+  ['redraft_limit_reached', 'Re-drafted 2×'],
+  ['redraft_unfulfilled', 'Needs you'],
+  ['owner_handling', 'Yours'],
+  ['orphaned', 'Lost draft'],
+  ['draft_expired', 'Expired'],
+  ['send_failed', 'Not sent'],
+  ['category_off', 'Off'],
+  ['no_agent', 'No agent'],
+] as const)('needs_owner reason %s renders the one-word chip "%s"', async (reason, chip) => {
+  await render(<TicketRow ticket={ticket({ needsOwnerReason: reason })} onPress={mockOnPress} />)
+  expect(screen.getByTestId('ticket-reason-ticket-1')).toBeTruthy()
+  expect(screen.getByText(chip)).toBeTruthy()
+})
+
 test('no reason chip when needsOwnerReason is null', async () => {
   await render(<TicketRow ticket={ticket({ needsOwnerReason: null })} onPress={mockOnPress} />)
   expect(screen.queryByTestId('ticket-reason-ticket-1')).toBeNull()

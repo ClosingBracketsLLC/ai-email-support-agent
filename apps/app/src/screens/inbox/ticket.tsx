@@ -9,13 +9,26 @@ import { Heading, Muted } from '@/components/typography'
 import { useTRPC } from '@/lib/trpc'
 import { radius, spacing, typeScale, useColors } from '@/theme'
 
-/** One sentence per `NeedsOwnerReason` (task brief: "needs_owner banner with the reason sentence"). */
+/** One sentence per `NeedsOwnerReason` (task brief: "needs_owner banner with the reason sentence"),
+ * plus Phase 3's twelve drafting/review reasons (Task 2 controller ruling). */
 const REASON_SENTENCE: Record<NeedsOwnerReason, string> = {
   tripwire: 'A tripwire term was found in this thread — it needs your review before anything is sent.',
   triage_flags: 'Triage flagged this message — it needs your review.',
   sentiment_angry: 'This customer sounds angry — it needs your review.',
   triage_failed: 'Triage could not read this message, so it needs your review.',
   triage_cap: "This category has hit today's review cap, so it needs your review.",
+  agent_escalated: 'The agent asked for a human on this one — it needs your reply.',
+  agent_failed: 'Drafting failed twice, so this ticket needs your reply.',
+  agent_run_cap: "This ticket hit today's drafting limit — it needs your reply.",
+  guardrail_failed: 'The guardrails blocked this draft. Edit it — the edited version has to pass before it can send.',
+  redraft_limit_reached: 'Re-drafted twice already — please reply yourself.',
+  redraft_unfulfilled: 'The agent could not act on your feedback — it needs your reply.',
+  owner_handling: 'You chose to handle this one yourself.',
+  orphaned: 'This ticket lost its draft — it needs your review.',
+  draft_expired: 'A draft expired unreviewed — it needs your review.',
+  send_failed: 'An approved reply could not be sent — check the mailbox and try again.',
+  category_off: 'This category is switched off, so replies wait for you.',
+  no_agent: 'No agent is set up for this address yet.',
 }
 
 /** `needsOwnerReason` is a plain `text` column, so the tRPC-inferred type is a bare `string | null`

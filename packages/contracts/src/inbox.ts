@@ -12,3 +12,6 @@ export type InboxListInput = z.infer<typeof InboxListInput>
 
 export const TicketIdInput = z.object({ ticketId: z.uuid() })
 export type TicketIdInput = z.infer<typeof TicketIdInput>
+
+export const ResolveTicketInput = z.object({ ticketId: z.uuid() })
+export type ResolveTicketInput = z.infer<typeof ResolveTicketInput>
