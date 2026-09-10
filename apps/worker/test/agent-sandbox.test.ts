@@ -14,7 +14,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { emptyRetriever, type DraftDecision } from '@aesa/agent'
 import {
   agentRunEvents, agentRuns, agents, categories, drafts, ensureDefaultCategories, mailboxConnections,
-  tickets, user, withOrg, workspaces,
+  tickets, user, withOrg, workspaces, type Db,
 } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
@@ -139,6 +139,27 @@ function makeDeps(provider: LlmProvider, over: Partial<AgentSandboxDeps> = {}): 
 }
 
 const run = (deps: AgentSandboxDeps, runId: string) => runAgentSandbox(deps, { orgId: fx.orgId, runId }, new AbortController().signal)
+
+/**
+ * A `Db` that rejects the FIRST `.transaction()` call for which `shouldFail()` is true, then
+ * behaves normally forever after — including for the very next transaction, so the top-level
+ * catch's OWN recovery write (`recordUnexpectedFailure`) still succeeds. `Object.create(db)`
+ * shadows only `.transaction`; every other method (and every field a query builder reads off
+ * `this`) still resolves through the prototype chain to the real `db`.
+ */
+function withOneFailingTransaction(db: Db, shouldFail: () => boolean): Db {
+  let firedOnce = false
+  const original = db.transaction.bind(db)
+  const proxy = Object.create(db) as Db
+  ;(proxy as unknown as { transaction: unknown }).transaction = (...args: unknown[]) => {
+    if (!firedOnce && shouldFail()) {
+      firedOnce = true
+      return Promise.reject(new Error('simulated DB failure after the model call'))
+    }
+    return (original as (...a: unknown[]) => unknown)(...args)
+  }
+  return proxy
+}
 
 describe('runAgentSandbox', () => {
   it('a reply succeeds with the normalized body, an ok guardrail, an informational review decision, and usage/cost on the run row', async () => {
@@ -336,5 +357,36 @@ describe('runAgentSandbox', () => {
     const userMessage = call!.messages.find((m) => m.role === 'user')!.content
     const cats = await withOrg(app.db, fx.orgId, (tx) => tx.select({ key: categories.key }).from(categories))
     for (const c of cats) expect(userMessage).toContain(c.key)
+  })
+
+  it('a running sandbox row with no agent fails as no_agent, without throwing', async () => {
+    const runId = await seedSandboxRun({ agentId: null })
+    const provider = createFakeProvider([{ parsed: REPLY }])
+    const deps = makeDeps(provider)
+
+    await expect(run(deps, runId)).resolves.toBeUndefined()
+
+    const row = await getRun(runId)
+    expect(row.status).toBe('failed')
+    expect(row.errorCode).toBe('no_agent')
+    expect(provider.calls).toHaveLength(0)
+    expect((await eventsFor(runId)).map((e) => e.kind)).toContain('error')
+  })
+
+  it('a DB failure AFTER the model call is caught once at the top: the run fails as errorCode `internal` and the handler still resolves', async () => {
+    const runId = await seedSandboxRun()
+    const provider = createFakeProvider([{ parsed: REPLY }])
+    const flakyDb = withOneFailingTransaction(app.db, () => provider.calls.length > 0)
+    const deps = makeDeps(provider, { db: flakyDb })
+
+    await expect(run(deps, runId)).resolves.toBeUndefined()
+
+    const row = await getRun(runId)
+    expect(row.status).toBe('failed')
+    expect(row.errorCode).toBe('internal')
+    expect((await eventsFor(runId)).map((e) => e.kind)).toContain('error')
+    // The model WAS called before the injected failure — proves the gap this closes is downstream
+    // of the call, not a re-run of an earlier, already-covered failure path.
+    expect(provider.calls).toHaveLength(1)
   })
 })

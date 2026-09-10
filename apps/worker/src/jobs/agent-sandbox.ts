@@ -88,6 +88,16 @@ export async function registerAgentSandbox(boss: PgBoss, deps: AgentSandboxDeps)
   await registerJob(boss, wired)
 }
 
+/** Carries a specific `errorCode` out of `loadPreload`'s defensive invariant checks, so the
+ *  top-level catch in `runAgentSandbox` can record something more useful than the generic
+ *  `internal` fallback for a case that is really "this run has no agent to try". */
+class SandboxLoadError extends Error {
+  constructor(message: string, readonly code: string) {
+    super(message)
+    this.name = 'SandboxLoadError'
+  }
+}
+
 const AGENT_COLUMNS = {
   id: agents.id,
   connectionId: agents.connectionId,
@@ -124,10 +134,10 @@ async function loadPreload(db: Db, orgId: string, runId: string): Promise<Preloa
       .from(agentRuns)
       .where(eq(agentRuns.id, runId))
     if (!run || run.status !== 'running' || run.kind !== 'sandbox') return null
-    if (!run.agentId) throw new Error(`agent.sandbox: run ${runId} has no agent`)
+    if (!run.agentId) throw new SandboxLoadError(`agent.sandbox: run ${runId} has no agent`, 'no_agent')
 
     const [agent] = await tx.select(AGENT_COLUMNS).from(agents).where(eq(agents.id, run.agentId))
-    if (!agent) throw new Error(`agent.sandbox: run ${runId}'s agent ${run.agentId} is missing`)
+    if (!agent) throw new SandboxLoadError(`agent.sandbox: run ${runId}'s agent ${run.agentId} is missing`, 'no_agent')
 
     const shared = await loadSharedDraftContext(tx, orgId)
 
@@ -207,7 +217,61 @@ async function screenSandboxReply(
 
 const CUSTOMER_ADDRESS = 'customer@example.com'
 
+/**
+ * The never-throws contract's outer belt: `retryLimit: 0` means the ONLY way a failed run tells
+ * its story is a `finishRun`/`error` event this job writes itself, so ANY exception that escapes
+ * the run — a defensive invariant throw out of `loadPreload`, a DB error in the final `decide()` +
+ * `finishRun` transaction, or even a failure inside `fail()`'s own write — is caught HERE, once,
+ * rather than at each call site. Without this, that exception would propagate out of the pg-boss
+ * handler and leave `agent_runs` stuck `running` until the backstop sweep's `markStuckRuns` gets to
+ * it, long after the owner's "Try it" spinner has given up.
+ */
 export async function runAgentSandbox(deps: AgentSandboxDeps, payload: AgentSandboxPayload, signal: AbortSignal): Promise<void> {
+  const { orgId, runId } = payload
+  const usage = createUsageAccumulator()
+  try {
+    await runAgentSandboxUnsafe(deps, payload, signal, usage)
+  } catch (err) {
+    await recordUnexpectedFailure(deps, orgId, runId, usage, err)
+  }
+}
+
+/**
+ * Best-effort failure record for anything `runAgentSandboxUnsafe` let escape. `code` is the
+ * specific `SandboxLoadError.code` when the escape came from `loadPreload`'s own invariant checks
+ * (today, always `no_agent`), else the generic `internal` — either way `errorMessage` is the
+ * caught error's own message, never anything built from the run's question text. If even this
+ * write throws (the DB is genuinely unreachable), log and give up: the handler must resolve either
+ * way, never rethrow a second time.
+ */
+async function recordUnexpectedFailure(
+  deps: AgentSandboxDeps,
+  orgId: string,
+  runId: string,
+  usage: ReturnType<typeof createUsageAccumulator>,
+  err: unknown,
+): Promise<void> {
+  const code = err instanceof SandboxLoadError ? err.code : 'internal'
+  const detail = errorToDetail(err)
+  deps.logger.error({ runId, orgId, err }, 'agent.sandbox: run failed unexpectedly')
+  try {
+    const finishedAt = deps.now?.() ?? new Date()
+    await withOrg(deps.db, orgId, async (tx) => {
+      const settled = await finishRun(tx, { runId, status: 'failed', errorCode: code, errorMessage: detail.slice(0, 500), usage: usage.totals(), now: finishedAt })
+      if (!settled) deps.logger.warn({ runId }, 'agent.sandbox: run was already settled')
+      await appendRunEvent(tx, runId, 'error', { code, detail })
+    })
+  } catch (recordErr) {
+    deps.logger.error({ runId, orgId, err: recordErr }, 'agent.sandbox: failed to record the run failure itself; giving up')
+  }
+}
+
+async function runAgentSandboxUnsafe(
+  deps: AgentSandboxDeps,
+  payload: AgentSandboxPayload,
+  signal: AbortSignal,
+  usage: ReturnType<typeof createUsageAccumulator>,
+): Promise<void> {
   const { orgId, runId } = payload
   const now = deps.now?.() ?? new Date()
 
@@ -218,8 +282,6 @@ export async function runAgentSandbox(deps: AgentSandboxDeps, payload: AgentSand
   // The synthetic one-message thread and ticket stub the spec pins: a "Try it" run has no real
   // thread, so it builds the smallest one the draft prompt can consume.
   const thread: ThreadMessage[] = [{ direction: 'inbound', at: now, from: CUSTOMER_ADDRESS, body: input.question }]
-
-  const usage = createUsageAccumulator()
 
   const blocks = [
     platformRulesBlock(),
