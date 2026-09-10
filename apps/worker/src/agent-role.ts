@@ -62,7 +62,10 @@ export async function maybeRegisterAgentRole(deps: AgentRoleDeps, register: Agen
     return
   }
 
-  const provider = createManagedProvider({ apiKey: deps.config.anthropicApiKey, sink: createMeterSink(deps.db) })
+  const provider = createManagedProvider({
+    apiKey: deps.config.anthropicApiKey,
+    sink: createMeterSink(deps.db, { onError: (err) => deps.logger.warn({ err }, 'llm metering write failed') }),
+  })
   await register.registerTriage(deps.boss, {
     db: deps.db, provider, logger: deps.logger, enqueueNotify: deps.enqueueNotify, enqueueDraft: deps.enqueueDraft,
   })

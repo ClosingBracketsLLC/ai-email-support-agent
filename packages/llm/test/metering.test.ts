@@ -164,6 +164,50 @@ describe('withMetering', () => {
     expect(sink.records[0]?.costMicros).toBe(0)
   })
 
+  it('reports an integer latencyMs on the success path even when the inner provider timed itself with performance.now()', async () => {
+    const sink = recordingSink()
+    // Mimics a real adapter (e.g. the Anthropic one): times itself with performance.now() across a
+    // genuine delay, so the raw elapsed value is almost certainly a non-integer float.
+    const timedProvider: LlmProvider = {
+      kind: 'fake',
+      capabilities: () => ({ structuredOutput: 'native', tools: true, effort: true, cacheMinTokens: null }),
+      async chat<T>(req: ChatRequest<T>): Promise<ChatResult<T>> {
+        const start = performance.now()
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        const latencyMs = Math.round(performance.now() - start)
+        return {
+          text: '', parsed: null, parseStrategy: 'none', usage: usage(), finish: 'stop',
+          provider: 'anthropic', model: req.model, latencyMs,
+        } as ChatResult<T>
+      },
+    }
+    const provider = withMetering(timedProvider, sink, { cacheTtl: '1h' })
+
+    await provider.chat(baseRequest())
+
+    expect(sink.records).toHaveLength(1)
+    expect(Number.isInteger(sink.records[0]!.latencyMs)).toBe(true)
+  })
+
+  it('reports an integer latencyMs on the error path — performance.now() - start is a float, and withMetering must round it', async () => {
+    const sink = recordingSink()
+    const err = new LlmError('boom', 'rate_limit', true)
+    const slowThrowingProvider: LlmProvider = {
+      kind: 'fake',
+      capabilities: () => ({ structuredOutput: 'native', tools: true, effort: true, cacheMinTokens: null }),
+      async chat(): Promise<never> {
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        throw err
+      },
+    }
+    const provider = withMetering(slowThrowingProvider, sink, { cacheTtl: '1h' })
+
+    await expect(provider.chat(baseRequest())).rejects.toBe(err)
+
+    expect(sink.records).toHaveLength(1)
+    expect(Number.isInteger(sink.records[0]!.latencyMs)).toBe(true)
+  })
+
   it('forwards kind and capabilities to the inner provider', () => {
     const inner = successProvider()
     const provider = withMetering(inner, recordingSink())

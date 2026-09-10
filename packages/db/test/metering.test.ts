@@ -75,6 +75,25 @@ describe('createMeterSink', () => {
     expect((await meterRow(LLM_METERS.outputTokens))?.value).toBe(50)
   })
 
+  it('rounds a fractional latencyMs before insert (12.7 -> 13) and still bumps the meters', async () => {
+    // Regression for the production defect: `llm_calls.latency_ms` is `integer`, but a caller can
+    // hand the sink a float (`performance.now()` never returns a whole number). Before the fix, the
+    // insert throws a Postgres "invalid input syntax for type integer" error that `createMeterSink`
+    // swallows by design — so this exercises the REAL sink against Postgres, not a mock, because the
+    // bug lives in what Postgres does with the value, not in any JS-level type check.
+    const now = new Date()
+    const sink = createMeterSink(app.db, { now: () => now })
+    const rec = makeRecord(orgId, { latencyMs: 12.7 })
+    const callsBefore = (await meterRow(LLM_METERS.calls))?.value ?? 0
+
+    await sink.record(rec)
+
+    const rows = await withOrg(app.db, orgId, (tx) => tx.select().from(llmCalls).where(eq(llmCalls.idempotencyKey, rec.idempotencyKey)))
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.latencyMs).toBe(13)
+    expect((await meterRow(LLM_METERS.calls))?.value).toBe(callsBefore + 1)
+  })
+
   it('the same idempotencyKey again inserts nothing and leaves the meters unchanged', async () => {
     const now = new Date()
     const sink = createMeterSink(app.db, { now: () => now })

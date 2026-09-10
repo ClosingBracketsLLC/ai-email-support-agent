@@ -132,6 +132,9 @@ describe('createAnthropicProvider', () => {
     expect(result.model).toBe('claude-haiku-4-5')
     expect(result.providerRequestId).toBe('msg_123')
     expect(result.usage).toEqual({ inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0, apiCalls: 1 })
+    // Regression: `llm_calls.latency_ms` is an integer column downstream; performance.now() - start
+    // is a float, so the adapter must round before handing latencyMs to the caller.
+    expect(Number.isInteger(result.latencyMs)).toBe(true)
   })
 
   it('returns parsed null with no throw when the enveloped tool_use input violates the schema', async () => {

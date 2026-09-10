@@ -306,7 +306,9 @@ export function createAnthropicProvider(opts: CreateAnthropicProviderOptions): L
       } catch (err) {
         throw mapError(err)
       }
-      const latencyMs = performance.now() - start
+      // `llm_calls.latency_ms` is an integer column — performance.now() - start is a float, so it
+      // must be rounded here, not left for the sink to reject.
+      const latencyMs = Math.round(performance.now() - start)
 
       return buildResult(req, mode, response, latencyMs)
     },

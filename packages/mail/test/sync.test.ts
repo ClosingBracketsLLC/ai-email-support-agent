@@ -341,6 +341,9 @@ describe('runSync — the provider-agnostic walk (gmail mode)', () => {
       agentFailureCount: 2,
       ownerRedraftFeedback: 'be warmer',
       redraftCount: 4,
+      // A wall-clock stamp OLDER than the follow-up's provider timestamp, so the never-run branch
+      // (not the newInbound branch) is what proves the reopen itself clears the stamp.
+      lastAgentRunAt: new Date('2020-01-01T00:00:00Z'),
     })
     f.newInbound.length = 0
 
@@ -354,6 +357,11 @@ describe('runSync — the provider-agnostic walk (gmail mode)', () => {
     expect(ticket.ownerRedraftFeedback).toBeNull()
     expect(ticket.redraftCount).toBe(0)
     expect(ticket.inboundCount).toBe(2)
+    // Regression: a reopen must also clear the claim stamp. Left standing, a follow-up whose
+    // provider timestamp lands BEFORE the previous run's wall-clock claim stamp (the run finished
+    // after the customer sent but before sync ingested it) would never satisfy the draft claim's
+    // `last_inbound_at > last_agent_run_at` predicate, and the ticket would never be re-drafted.
+    expect(ticket.lastAgentRunAt).toBeNull()
     expect(f.newInbound).toEqual([ticketId])
     expect(result.newInboundTicketIds).toEqual([ticketId])
   })

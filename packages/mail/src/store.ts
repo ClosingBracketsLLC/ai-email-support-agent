@@ -211,12 +211,22 @@ export async function recordInboundOnTicket(tx: OrgTx, input: RecordInboundInput
  * inheriting a stale count. The redraft-cycle clear is defence in depth — both source states
  * already cleared those columns on entry, but repeating it here makes "a `new` ticket never carries
  * a stale redraft cycle" self-contained instead of transitive through every upstream writer.
+ *
+ * `last_agent_run_at` is also cleared, for the same reason `send.execute`'s `landStale` clears it
+ * (see that function's comment): the claim CAS compares `last_inbound_at > last_agent_run_at`, and
+ * both are ordinary timestamps from two different clocks — the follow-up's PROVIDER timestamp can
+ * predate the previous run's WALL-CLOCK claim stamp when the run finished after the customer sent
+ * but before sync ingested it. Left standing, that stamp would make the reopened ticket permanently
+ * unclaimable by the newInbound branch, and the stuck branch can never rescue it either (that run
+ * already finished). Clearing it puts the ticket back in "never run" territory so the claim fires on
+ * the never-run branch instead. `last_agent_finished_at`/`last_agent_prompted_at` are left alone —
+ * the never-run branch keys off `last_agent_run_at IS NULL` alone.
  */
 export async function reopenIfEligible(tx: OrgTx, ticketId: string, dmarcPass: boolean): Promise<boolean> {
   if (!dmarcPass) return false
   const rows = await tx
     .update(tickets)
-    .set({ status: 'new', triageFailureCount: 0, agentFailureCount: 0, ownerRedraftFeedback: null, redraftCount: 0 })
+    .set({ status: 'new', triageFailureCount: 0, agentFailureCount: 0, ownerRedraftFeedback: null, redraftCount: 0, lastAgentRunAt: null })
     .where(and(eq(tickets.id, ticketId), inArray(tickets.status, ['resolved', 'waiting_on_customer'])))
     .returning({ id: tickets.id })
   return rows.length > 0

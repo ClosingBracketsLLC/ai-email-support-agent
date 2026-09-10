@@ -79,7 +79,10 @@ export function createMeterSink(db: Db, opts?: { now?: () => Date; onError?: (er
             cacheWriteTokens: rec.usage.cacheWriteTokens,
             apiCalls: rec.usage.apiCalls,
             costMicros: rec.costMicros,
-            latencyMs: rec.latencyMs,
+            // `latency_ms` is an integer column; both current producers already round before
+            // handing this off, but round again here so a future producer cannot silently regress
+            // every insert into the swallowed-by-design failure path this defended against.
+            latencyMs: Math.round(rec.latencyMs),
             finish: rec.finish,
             parseStrategy: rec.parseStrategy,
             errorCode: rec.errorCode,
