@@ -50,6 +50,10 @@ export interface SendReplyInput {
   replyToProviderMessageId?: string
   /** Graph crash re-entry: a persisted createReply draft id skips re-creation. */
   existingDraftId?: string
+  /** Graph two-phase send: called with the createReply draft id BEFORE the PATCH/send so the
+   * caller can persist it (a crash after this point is recoverable through `existingDraftId`).
+   * Not called on an `existingDraftId` re-entry. Gmail never calls it. A throw aborts the send. */
+  onDraftCreated?: (providerDraftId: string) => Promise<void>
 }
 
 export interface MailboxClient {

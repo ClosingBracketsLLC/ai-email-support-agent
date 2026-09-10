@@ -14,11 +14,23 @@
  *    the real Graph adapter's concern, Task 10). The two modes differ only in: the cursor's on-the-
  *    wire shape (`{ historyId }` vs the opaque `{ deltaTokens }`), subscription expiry (7 days vs 3),
  *    and `sendReply`'s capture shape (gmail routes through the real `buildReplyRaw` for byte-exact
- *    header validation; graph models only the two-phase send's OBSERVABLE result — a SENT message
- *    carrying the marker).
+ *    header validation; graph models the two-phase send AGAINST A REAL LEDGER — see point 2c).
  * 2b. **Body scrubbing is shared with the adapters.** A `format: 'full'` fetch runs the stored body
  *    through `scrubCardNumbers`, exactly as `normalizeGmailMessage`/`normalizeGraphMessage` do, so
  *    no caller can observe through the mock a card number the real clients would have masked.
+ * 2c. **Graph-mode draft ledger + one-shot crash hooks (Task 12).** A fresh graph `sendReply` mints
+ *    a `providerDraftId`, records it in a `providerDraftId -> { threadId, sent }` ledger (`drafts()`)
+ *    BEFORE calling `onDraftCreated`, then stores the SENT message with its `id` SET TO that same
+ *    `providerDraftId` — matching the real adapter's `Prefer: IdType="ImmutableId"` behavior, where
+ *    the draft's id survives the send. `existingDraftId` re-entry reads the ledger: an unknown id is
+ *    `MailApiError('draft not found', 404)`; an already-`sent` entry is echoed back with nothing
+ *    stored twice; an unsent entry completes the send. `failAfter(phase, err)` is a one-shot fault
+ *    per phase (same semantics as `maybeThrowPending`, scoped to `sendReply`'s two checkpoints
+ *    instead of a whole method): `'createReply'` fires once the draft is ledgered and
+ *    `onDraftCreated` has run but nothing is sent yet; `'send'` fires once the SENT message is
+ *    already stored (the customer has it — this models a lost response, not a lost send). Gmail has
+ *    no draft phase, so `failAfter('createReply', ...)` on a gmail-mode mailbox is checked nowhere
+ *    and never fires; `failAfter('send', ...)` applies identically to both modes.
  * 3. **No labels API.** This port never mutates a real mailbox (no `modifyMessage`/`createLabel`
  *    equivalent), so there is only one 404 shape here (`MessageGoneError` from `getMessage`), not the
  *    reference's two. Spam is modeled by passing `labelIds: ['JUNK']` to `receiveInbound`, not by a
@@ -30,6 +42,10 @@ import { buildReplyRaw } from './rfc2822.ts'
 import { scrubCardNumbers } from './scrub.ts'
 import { tokenizeReferences } from './threading.ts'
 import { MARKER_HEADER, type MailboxClient, type NormalizedMessage } from './types.ts'
+
+/** The two checkpoints inside graph-mode `sendReply` that `failAfter` can target — see the file
+ * header, point 2c. */
+export type SendPhase = 'createReply' | 'send'
 
 export interface MockMailboxOptions {
   mode: 'gmail' | 'graph'
@@ -85,6 +101,12 @@ export interface MockMailbox extends MailboxClient {
   sentMessages(): { raw?: string; to: string; bodyText: string; threadId: string; markerDraftId: string | null }[]
   /** The current watch/subscription, or `null` before the first `subscribe` / after `unsubscribe`. */
   subscriptionState(): { subscriptionId: string; expiresAt: Date; clientState?: string } | null
+  /** One-shot: the next `sendReply` throws `err` AFTER the named phase completed — `'createReply'`
+   * = the draft exists and `onDraftCreated` ran, nothing sent; `'send'` = the SENT message is
+   * stored (the customer has it) and the response was lost. */
+  failAfter(phase: SendPhase, err: Error): void
+  /** Graph-mode draft ledger: `providerDraftId -> { threadId, sent }`. */
+  drafts(): ReadonlyMap<string, { threadId: string; sent: boolean }>
 }
 
 const DEFAULT_SELF_ADDRESS = 'me@mock.aesa'
@@ -144,6 +166,11 @@ export function createMockMailbox(opts: MockMailboxOptions): MockMailbox {
   const historyLog: ChangeLogEntry[] = []
   const pendingMethodFailures = new Map<keyof MailboxClient, Error>()
   const sentReplyLog: { raw?: string; to: string; bodyText: string; threadId: string; markerDraftId: string | null }[] = []
+  /** Graph-mode draft ledger (file header, point 2c) — untouched by gmail mode, which has no
+   * draft phase to ledger. */
+  const draftLedger = new Map<string, { threadId: string; sent: boolean }>()
+  /** One-shot `failAfter` faults, keyed by the `sendReply` checkpoint they fire at. */
+  const pendingSendFailures = new Map<SendPhase, Error>()
 
   let historyCounter = 0n
   let idCounter = 0
@@ -197,6 +224,18 @@ export function createMockMailbox(opts: MockMailboxOptions): MockMailbox {
     }
   }
 
+  /** Same one-shot shape as `maybeThrowPending`, scoped to a `sendReply` checkpoint instead of a
+   * whole method. Checked ONLY at the checkpoint that literally exists for the current mode/path —
+   * gmail's `sendReply` never calls this with `'createReply'`, so a pending fault set for that
+   * phase simply sits unconsumed (the file header's "no-op" behavior). */
+  function maybeThrowFailAfter(phase: SendPhase): void {
+    const err = pendingSendFailures.get(phase)
+    if (err) {
+      pendingSendFailures.delete(phase)
+      throw err
+    }
+  }
+
   function normalizeAddrList(addrs: string[]): string[] {
     return parseAddrSpecs(addrs.join(', '))
   }
@@ -217,6 +256,9 @@ export function createMockMailbox(opts: MockMailboxOptions): MockMailbox {
   }
 
   function storeMessage(input: {
+    /** Graph-mode sent copies use this to force the stored id to the providerDraftId (file
+     * header, point 2c) instead of minting a fresh one — every other caller omits it. */
+    id?: string
     threadId: string
     labelIds: string[]
     fromRaw: string | null
@@ -234,7 +276,7 @@ export function createMockMailbox(opts: MockMailboxOptions): MockMailbox {
     markerDraftId?: string | null
     attachments?: { filename: string; mime: string; size: number }[]
   }): StoredMessage {
-    const id = nextMessageId()
+    const id = input.id ?? nextMessageId()
     const stored: StoredMessage = {
       id,
       threadId: input.threadId,
@@ -399,21 +441,61 @@ export function createMockMailbox(opts: MockMailboxOptions): MockMailbox {
         })
         sentReplyLog.push({ raw, to: r.to, bodyText: r.bodyText, threadId: msg.threadId, markerDraftId })
         pushHistory([{ id: msg.id, threadId: msg.threadId }])
+        // Gmail has no draft phase — only the 'send' checkpoint can ever fire here (file header,
+        // point 2c); 'createReply' is never checked, so a pending fault for it is a true no-op.
+        maybeThrowFailAfter('send')
         return { id: msg.id, threadId: msg.threadId }
       }
 
-      // graph: models only the two-phase createReply -> PATCH -> send OBSERVABLE result — a SENT
-      // message whose markerDraftId is the input's extra header. `existingDraftId` (crash re-entry)
-      // is echoed back rather than a fresh id generated, matching "skip re-creation".
-      //
+      // graph: models the real two-phase createReply -> PATCH -> send against a providerDraftId
+      // ledger (`draftLedger`, file header point 2c), so `existingDraftId` re-entry can distinguish
+      // the same three states the real adapter's re-entry branch does: unknown, already sent,
+      // created-but-unsent.
+      if (r.existingDraftId) {
+        const record = draftLedger.get(r.existingDraftId)
+        if (!record) throw new MailApiError('draft not found', 404)
+        if (record.sent) {
+          // Already went out by an earlier, interrupted attempt — return without a second send.
+          return { id: r.existingDraftId, threadId: record.threadId, providerDraftId: r.existingDraftId }
+        }
+        const msg = storeMessage({
+          id: r.existingDraftId,
+          threadId: record.threadId,
+          labelIds: ['SENT'],
+          fromRaw: r.from ?? selfAddress,
+          to: [r.to],
+          subject: r.subject,
+          bodyText: r.bodyText,
+          inReplyTo: r.inReplyTo,
+          references: r.references,
+          markerDraftId,
+        })
+        draftLedger.set(r.existingDraftId, { threadId: record.threadId, sent: true })
+        sentReplyLog.push({ to: r.to, bodyText: r.bodyText, threadId: msg.threadId, markerDraftId })
+        pushHistory([{ id: msg.id, threadId: msg.threadId }])
+        maybeThrowFailAfter('send')
+        return { id: msg.id, threadId: msg.threadId, providerDraftId: r.existingDraftId }
+      }
+
       // `replyToProviderMessageId` is Graph's reply target (createReply operates on a MESSAGE id,
-      // not a thread id) — required UNLESS a crash re-entry already has a persisted draft to resume
-      // (`existingDraftId`), matching the real adapter's (Task 10) validation.
-      if (!r.replyToProviderMessageId && !r.existingDraftId) {
+      // not a thread id) — required for a fresh send, matching the real adapter's (Task 10)
+      // validation.
+      if (!r.replyToProviderMessageId) {
         throw new MailApiError('replyToProviderMessageId required', 400)
       }
-      const providerDraftId = r.existingDraftId ?? `mock-draft-${(subCounter += 1)}`
+      const providerDraftId = `mock-draft-${(subCounter += 1)}`
+      draftLedger.set(providerDraftId, { threadId: r.threadId, sent: false })
+      // Persist BEFORE the (simulated) PATCH/send below — mirrors the real Graph adapter's
+      // `onDraftCreated` call, which fires right after `createReply` returns. A throw here aborts
+      // the send before anything is stored.
+      await r.onDraftCreated?.(providerDraftId)
+      maybeThrowFailAfter('createReply')
+
+      // The stored SENT message's id is SET TO the providerDraftId — Graph's `Prefer:
+      // IdType="ImmutableId"` keeps the draft's id after send, exactly like the real adapter's
+      // `{ id: draftId }` return (file header, point 2c).
       const msg = storeMessage({
+        id: providerDraftId,
         threadId: r.threadId,
         labelIds: ['SENT'],
         fromRaw: r.from ?? selfAddress,
@@ -424,8 +506,10 @@ export function createMockMailbox(opts: MockMailboxOptions): MockMailbox {
         references: r.references,
         markerDraftId,
       })
+      draftLedger.set(providerDraftId, { threadId: r.threadId, sent: true })
       sentReplyLog.push({ to: r.to, bodyText: r.bodyText, threadId: msg.threadId, markerDraftId })
       pushHistory([{ id: msg.id, threadId: msg.threadId }])
+      maybeThrowFailAfter('send')
       return { id: msg.id, threadId: msg.threadId, providerDraftId }
     },
 
@@ -522,6 +606,10 @@ export function createMockMailbox(opts: MockMailboxOptions): MockMailbox {
       pendingMethodFailures.set(method, err)
     },
 
+    failAfter(phase, err) {
+      pendingSendFailures.set(phase, err)
+    },
+
     deleteMessage(id) {
       const msg = messages.get(id)
       if (!msg) throw new Error(`MockMailbox.deleteMessage: unknown message id "${id}"`)
@@ -540,6 +628,10 @@ export function createMockMailbox(opts: MockMailboxOptions): MockMailbox {
 
     subscriptionState() {
       return subscription ? { ...subscription } : null
+    },
+
+    drafts() {
+      return new Map([...draftLedger].map(([id, record]) => [id, { ...record }]))
     },
   }
 

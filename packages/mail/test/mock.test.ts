@@ -189,6 +189,42 @@ describe('createMockMailbox: gmail mode', () => {
     ).rejects.toThrow(/invalid extra header name/)
   })
 
+  it('failAfter("send"): stores the message then throws; failAfter("createReply") is a no-op (gmail has no draft phase)', async () => {
+    const mailbox = createMockMailbox({ mode: 'gmail', selfAddress: SELF })
+    const inbound = mailbox.receiveInbound({ from: 'jane@example.com', subject: 'Help', bodyText: 'help me' })
+
+    // Gmail's sendReply never reaches a 'createReply' phase, so pending fault never fires.
+    mailbox.failAfter('createReply', new Error('must never throw in gmail mode'))
+    await expect(
+      mailbox.sendReply({
+        threadId: inbound.threadId,
+        to: 'jane@example.com',
+        subject: 'Help',
+        inReplyTo: '<x@mail.example.com>',
+        references: '<x@mail.example.com>',
+        bodyText: 'first',
+      }),
+    ).resolves.toBeDefined()
+
+    const boom = new Error('crash after send')
+    mailbox.failAfter('send', boom)
+    await expect(
+      mailbox.sendReply({
+        threadId: inbound.threadId,
+        to: 'jane@example.com',
+        subject: 'Help',
+        inReplyTo: '<x@mail.example.com>',
+        references: '<x@mail.example.com>',
+        bodyText: 'second',
+        extraHeaders: { [MARKER_HEADER]: 'draft-gmail-crash' },
+      }),
+    ).rejects.toBe(boom)
+
+    expect(mailbox.sentMessages()).toHaveLength(2) // first, plus the crashed-but-stored second
+    const found = await mailbox.findSentByMarker(inbound.threadId, 'draft-gmail-crash', 50)
+    expect(found).not.toBeNull()
+  })
+
   it('receiveOutbound: lands with SENT label, no marker, visible via listChanges', async () => {
     const mailbox = createMockMailbox({ mode: 'gmail', selfAddress: SELF })
     const before = await mailbox.profile()
@@ -432,7 +468,7 @@ describe('createMockMailbox: graph mode', () => {
     expect(records).toHaveLength(1)
   })
 
-  it('sendReply: models the two-phase send result only — SENT message carrying the marker, no raw MIME', async () => {
+  it('sendReply: models the two-phase send result — SENT message carrying the marker, id === providerDraftId (Graph keeps the draft id after send), no raw MIME', async () => {
     const mailbox = createMockMailbox({ mode: 'graph', selfAddress: SELF })
     const inbound = mailbox.receiveInbound({ from: 'jane@example.com', subject: 'Help', bodyText: 'help me' })
 
@@ -447,19 +483,27 @@ describe('createMockMailbox: graph mode', () => {
       extraHeaders: { [MARKER_HEADER]: 'draft-graph-1' },
     })
 
+    // Graph's `Prefer: IdType="ImmutableId"` keeps the draft's id after send — the real adapter
+    // returns `{ id: draftId }`, so the mock's stored message id must equal the draft id too
+    // (unlike gmail mode's fresh mock-msg-N, which has no draft phase to keep an id from).
     expect(reply.providerDraftId).toBeDefined()
-    const sentMsg = await mailbox.getMessage(reply.id, { format: 'full' })
+    expect(reply.id).toBe(reply.providerDraftId)
+    const sentMsg = await mailbox.getMessage(reply.providerDraftId!, { format: 'full' })
     expect(sentMsg.labelIds).toEqual(['SENT'])
     expect(sentMsg.markerDraftId).toBe('draft-graph-1')
 
     const [sent] = mailbox.sentMessages()
     expect(sent!.raw).toBeUndefined() // graph never produces an RFC 2822 blob
     expect(sent!.markerDraftId).toBe('draft-graph-1')
+
+    // The draft ledger reflects the completed send.
+    expect(mailbox.drafts().get(reply.providerDraftId!)).toEqual({ threadId: inbound.threadId, sent: true })
   })
 
-  it('sendReply: existingDraftId (crash re-entry) is echoed back rather than regenerated', async () => {
+  it('sendReply: onDraftCreated is awaited with the fresh providerDraftId before anything is sent', async () => {
     const mailbox = createMockMailbox({ mode: 'graph', selfAddress: SELF })
     const inbound = mailbox.receiveInbound({ from: 'jane@example.com', subject: 'Help', bodyText: 'help me' })
+    const seen: string[] = []
 
     const reply = await mailbox.sendReply({
       threadId: inbound.threadId,
@@ -468,10 +512,124 @@ describe('createMockMailbox: graph mode', () => {
       inReplyTo: '<x@mail.example.com>',
       references: '<x@mail.example.com>',
       bodyText: 'On it!',
-      existingDraftId: 'persisted-draft-id',
+      replyToProviderMessageId: inbound.id,
+      onDraftCreated: async (id) => {
+        seen.push(id)
+        expect(mailbox.sentMessages()).toHaveLength(0) // nothing sent yet at this point
+      },
     })
 
-    expect(reply.providerDraftId).toBe('persisted-draft-id')
+    expect(seen).toEqual([reply.providerDraftId])
+  })
+
+  it('sendReply: re-entry on a sent draft stores nothing new and returns the same ids', async () => {
+    const mailbox = createMockMailbox({ mode: 'graph', selfAddress: SELF })
+    const inbound = mailbox.receiveInbound({ from: 'jane@example.com', subject: 'Help', bodyText: 'help me' })
+
+    const first = await mailbox.sendReply({
+      threadId: inbound.threadId,
+      to: 'jane@example.com',
+      subject: 'Help',
+      inReplyTo: '<x@mail.example.com>',
+      references: '<x@mail.example.com>',
+      bodyText: 'On it!',
+      replyToProviderMessageId: inbound.id,
+    })
+
+    const again = await mailbox.sendReply({
+      threadId: inbound.threadId,
+      to: 'jane@example.com',
+      subject: 'Help',
+      inReplyTo: '<x@mail.example.com>',
+      references: '<x@mail.example.com>',
+      bodyText: 'On it!',
+      existingDraftId: first.providerDraftId,
+    })
+
+    expect(again).toEqual({ id: first.id, threadId: first.threadId, providerDraftId: first.providerDraftId })
+    expect(mailbox.sentMessages()).toHaveLength(1) // no second message stored
+  })
+
+  it('sendReply: re-entry on an unknown draft id throws MailApiError(404)', async () => {
+    const mailbox = createMockMailbox({ mode: 'graph', selfAddress: SELF })
+    const inbound = mailbox.receiveInbound({ from: 'jane@example.com', subject: 'Help', bodyText: 'help me' })
+
+    await expect(
+      mailbox.sendReply({
+        threadId: inbound.threadId,
+        to: 'jane@example.com',
+        subject: 'Help',
+        inReplyTo: '<x@mail.example.com>',
+        references: '<x@mail.example.com>',
+        bodyText: 'On it!',
+        existingDraftId: 'never-created',
+      }),
+    ).rejects.toMatchObject({ name: 'MailApiError', status: 404 })
+  })
+
+  it('failAfter("createReply"): throws after the draft exists and onDraftCreated ran; existingDraftId then completes it', async () => {
+    const mailbox = createMockMailbox({ mode: 'graph', selfAddress: SELF })
+    const inbound = mailbox.receiveInbound({ from: 'jane@example.com', subject: 'Help', bodyText: 'help me' })
+    const boom = new Error('crash after createReply')
+    let seenDraftId: string | undefined
+
+    mailbox.failAfter('createReply', boom)
+    await expect(
+      mailbox.sendReply({
+        threadId: inbound.threadId,
+        to: 'jane@example.com',
+        subject: 'Help',
+        inReplyTo: '<x@mail.example.com>',
+        references: '<x@mail.example.com>',
+        bodyText: 'On it!',
+        replyToProviderMessageId: inbound.id,
+        onDraftCreated: async (id) => {
+          seenDraftId = id
+        },
+      }),
+    ).rejects.toBe(boom)
+
+    expect(seenDraftId).toBeDefined()
+    expect(mailbox.drafts().get(seenDraftId!)).toEqual({ threadId: inbound.threadId, sent: false })
+    expect(mailbox.sentMessages()).toHaveLength(0)
+
+    const completed = await mailbox.sendReply({
+      threadId: inbound.threadId,
+      to: 'jane@example.com',
+      subject: 'Help',
+      inReplyTo: '<x@mail.example.com>',
+      references: '<x@mail.example.com>',
+      bodyText: 'On it!',
+      existingDraftId: seenDraftId!,
+    })
+
+    expect(completed.providerDraftId).toBe(seenDraftId)
+    expect(mailbox.sentMessages()).toHaveLength(1)
+    expect(mailbox.drafts().get(seenDraftId!)).toEqual({ threadId: inbound.threadId, sent: true })
+  })
+
+  it('failAfter("send"): throws AFTER the SENT message is stored, and findSentByMarker still finds it', async () => {
+    const mailbox = createMockMailbox({ mode: 'graph', selfAddress: SELF })
+    const inbound = mailbox.receiveInbound({ from: 'jane@example.com', subject: 'Help', bodyText: 'help me' })
+    const boom = new Error('crash after send')
+
+    mailbox.failAfter('send', boom)
+    await expect(
+      mailbox.sendReply({
+        threadId: inbound.threadId,
+        to: 'jane@example.com',
+        subject: 'Help',
+        inReplyTo: '<x@mail.example.com>',
+        references: '<x@mail.example.com>',
+        bodyText: 'On it!',
+        replyToProviderMessageId: inbound.id,
+        extraHeaders: { [MARKER_HEADER]: 'draft-crash-1' },
+      }),
+    ).rejects.toBe(boom)
+
+    expect(mailbox.sentMessages()).toHaveLength(1) // the customer already has it
+    const found = await mailbox.findSentByMarker(inbound.threadId, 'draft-crash-1', 50)
+    expect(found).not.toBeNull()
   })
 
   it('sendReply: throws MailApiError(400) when both replyToProviderMessageId and existingDraftId are absent', async () => {

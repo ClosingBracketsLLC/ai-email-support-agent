@@ -9,7 +9,7 @@
  *
  * Scenario numbering follows the task brief's list; each `it(...)` names its number.
  */
-import { randomBytes } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { and, eq } from 'drizzle-orm'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { hashToken } from '@aesa/crypto'
@@ -19,7 +19,7 @@ import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
 import { CursorExpiredError } from '../src/errors.ts'
 import { createMockMailbox, type MockMailbox } from '../src/mock.ts'
 import { runSync, type SyncDeps } from '../src/sync.ts'
-import type { MailboxClient } from '../src/types.ts'
+import { MARKER_HEADER, type MailboxClient } from '../src/types.ts'
 
 const PLATFORM_SENDER = 'no-reply@aesa.test'
 const rand = () => randomBytes(4).toString('hex')
@@ -1043,6 +1043,61 @@ describe('runSync — the provider-agnostic walk (gmail mode)', () => {
     expect(result.insertedMessages).toBe(0)
     expect(await ticketsFor(f.connectionId)).toHaveLength(0)
     expect(await messagesFor(f.connectionId)).toHaveLength(0)
+  })
+
+  // Task 12: the sync walk stamps `draft_id` on an ingested outbound (sent) copy from its
+  // `X-Aesa-Draft` marker — but only when the marker is a syntactically valid uuid, since
+  // `messages.draft_id` is a `uuid` column and a malformed marker must not fail the whole walk.
+
+  it('23. an outbound sent message with a valid marker is stamped draft_id on the row', async () => {
+    const f = await makeFixture()
+    await runSync(f.deps) // seed-on-null
+    const customer = `jane-${rand()}@example.com`
+    const { threadId } = f.mailbox.receiveInbound({ from: customer, to: [f.addresses[0]!], subject: 'Hi', bodyText: 'hello' })
+    await runSync(f.deps)
+
+    const draftId = randomUUID()
+    await f.mailbox.sendReply({
+      threadId,
+      to: customer,
+      subject: 'Re: Hi',
+      inReplyTo: '<x@mail.example.com>',
+      references: '<x@mail.example.com>',
+      bodyText: 'All sorted.',
+      extraHeaders: { [MARKER_HEADER]: draftId },
+    })
+    const result = await runSync(f.deps)
+
+    expect(result.insertedMessages).toBe(1)
+    const msgs = await messagesFor(f.connectionId)
+    expect(msgs).toHaveLength(2)
+    expect(msgs[1]!.direction).toBe('outbound')
+    expect(msgs[1]!.draftId).toBe(draftId)
+  })
+
+  it('24. an outbound sent message with a malformed marker ingests with draft_id NULL and the walk completes', async () => {
+    const f = await makeFixture()
+    await runSync(f.deps) // seed-on-null
+    const customer = `jane-${rand()}@example.com`
+    const { threadId } = f.mailbox.receiveInbound({ from: customer, to: [f.addresses[0]!], subject: 'Hi', bodyText: 'hello' })
+    await runSync(f.deps)
+
+    await f.mailbox.sendReply({
+      threadId,
+      to: customer,
+      subject: 'Re: Hi',
+      inReplyTo: '<x@mail.example.com>',
+      references: '<x@mail.example.com>',
+      bodyText: 'All sorted.',
+      extraHeaders: { [MARKER_HEADER]: 'not-a-uuid' },
+    })
+    const result = await runSync(f.deps)
+
+    expect(result.insertedMessages).toBe(1)
+    const msgs = await messagesFor(f.connectionId)
+    expect(msgs).toHaveLength(2)
+    expect(msgs[1]!.direction).toBe('outbound')
+    expect(msgs[1]!.draftId).toBeNull()
   })
 })
 
