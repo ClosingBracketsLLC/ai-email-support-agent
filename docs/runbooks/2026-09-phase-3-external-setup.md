@@ -4,8 +4,8 @@ Everything in this file happens OUTSIDE the codebase: environment values on the 
 one live send/reply walk against real Gmail and Microsoft 365 accounts, one recorded fixture, and
 two device checks. Phase 3's code is complete and gated without any of it — the mock-tier E2E
 (`apps/worker/test/e2e-phase3.test.ts`) drives all twenty verification scenarios through real
-pg-boss jobs and the real api draft service, and nothing here blocks `pnpm test`. What it blocks is
-letting a real reply leave the building.
+pg-boss jobs and the real api draft service in **21 cases** (scenario 6 is split into 6a and 6b),
+and nothing here blocks `pnpm test`. What it blocks is letting a real reply leave the building.
 
 Read `docs/runbooks/2026-09-phase-2-external-setup.md` first if the mailbox side is not already
 live: the Google Cloud OAuth client + Pub/Sub topic, the CASA Tier 2 submission, the Entra app
@@ -145,7 +145,11 @@ Then, on **both** iOS and Android, with the app backgrounded:
   `insert into platform_state (key, value) values ('killswitch.global', 'true') on conflict (key)
   do update set value = 'true';` and clear it by deleting the row. Per-workspace equivalents:
   `workspaces.kill_switch` (read but not yet exposed in Settings — Phase 7) and
-  `workspaces.agent_enabled` (the master switch the owner controls in-app).
+  `workspaces.agent_enabled` (the master switch the owner controls in-app). While the lever is set,
+  `ticket.backstop-sweep` also stops selecting tickets for new draft runs (it logs
+  `ticket.backstop_sweep_draft_selection_skipped_killswitch` once per pass); its recovery arms —
+  stuck runs, orphaned tickets, tickets stranded at the failure ceiling, and due sends — keep
+  running, so the lever pauses the agent without blinding the owner to what is stuck.
 - **The daily-budget notification.** When an org's `llm_cost_micros` for the UTC day reaches
   `autonomy.daily_llm_usd_cap` (default $60), drafting stops for that org and the owner is paged
   ONCE per day, "Daily AI budget reached". Tickets are left `triaged` and untouched, so they are
@@ -157,9 +161,17 @@ Then, on **both** iOS and Android, with the app backgrounded:
   again.
 - **A dead-lettered send lands the ticket in `needs_owner/send_failed`.** That is the last pg-boss
   attempt giving up; `outbound_sends.last_error` carries the real reason and the owner is paged.
-  Fix the cause, then **approve the draft again** — the same ledger row re-queues. Never insert a
-  second `outbound_sends` row for a draft: the unique on `draft_id` is what makes a double send
-  impossible.
+  The way back: **fix the cause, open the ticket, tap Back to review, then Approve — the same send
+  row re-queues.** "Back to review" is `drafts.resume`, which now accepts a `failed` draft as well
+  as a `held` one (`failed → pending`), and — when the ticket is sitting on
+  `needs_owner/send_failed` — walks the ticket back to `awaiting_review` at the same time. The
+  ticket screen surfaces the failed draft with a "Not sent — …" banner and that button (the send
+  row's `last_error` chooses the sentence). Never insert a second `outbound_sends` row for a draft:
+  the unique on `draft_id` is what makes a double send impossible, and the re-approve revives the
+  same row (`attempts` back to 0, `last_error` cleared) instead of starting a second one.
+  Refusals to know about: a resume is refused (`resumed: false`, an in-app note) while another live
+  draft already exists on that ticket — a re-draft that landed in the meantime is the reply to work
+  with instead.
 - **Nothing sends twice.** Every reply carries `X-Aesa-Draft: <draftId>`, and any re-entered run
   scans the thread for its own marker BEFORE anything else. If you ever have to reason about
   "did it actually go out?", search the connected mailbox for that header value — that, not our

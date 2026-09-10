@@ -65,8 +65,11 @@ instruction from him in the session.
   production when `WORKER_ROLES` includes `sync` or `send`), `ANTHROPIC_API_KEY` (required in
   production when `WORKER_ROLES` includes `agent` — `ticket.triage`, `ticket.draft`,
   `agent.sandbox`), `GMAIL_OAUTH_CLIENT_ID`/`_SECRET` and `MS_OAUTH_CLIENT_ID`/`_SECRET`
-  (all-or-none pairs, one per provider; at least one required in production when `WORKER_ROLES`
-  includes `sync` or `send`), `MAIL_FROM`, and — because the worker now sends the daily digest email
+  (all-or-none pairs, one per provider; **at least one is required in production only for the
+  `send` role**, refused at boot by `maybeRegisterSendRole` in `apps/worker/src/send-role.ts`
+  together with the ring — `loadConfig` gates `sync` on the ring and `MAIL_FROM` and never on a
+  pair, so a `sync` replica with no pair boots and throws at the first token refresh instead),
+  `MAIL_FROM`, and — because the worker now sends the daily digest email
   through the same `@aesa/platform-mail` transport the api uses — `EMAIL_TRANSPORT` +
   `RESEND_API_KEY` (required in production on a `cron` replica) plus `APP_BASE_URL` and
   `APP_WEB_ORIGIN` (the digest links' two bases; **either one unset disables the digest email
@@ -93,7 +96,9 @@ instruction from him in the session.
 - `packages/core` — tripwire, state-transition matrices, settings catalog, plans, startup
   invariants, `loadDotEnv`, and Phase 3's pure decision logic: the guardrails validator and its
   screens (`guardrails/{validator,screens,policy,shingles}.ts` — one implementation run at all three
-  gates, over a per-tenant `WorkspacePolicy`), `decide()` (`autonomy.ts`), the redraft policy
+  gates, over a per-tenant `WorkspacePolicy` built in one place, `@aesa/agent/policy`, so the draft,
+  approve and send gates screen against the SAME four trusted texts and the same allowed hosts),
+  `decide()` (`autonomy.ts`), the redraft policy
   (`redraft.ts`: `resolveRejectAction`, `clearRedraftCycle`, `REDRAFT_MAX`) and `appendSignature`.
 - `packages/queue` — pg-boss wrappers (`startBoss`, `registerCron`), `defineJob` / `registerJob`,
   `enqueue`, `fairSelectSql`.
@@ -107,7 +112,14 @@ instruction from him in the session.
 - `packages/agent` — the triage prompt and one-model-call (`runTriageCall`), the six-layer draft
   prompt with its stability hints and `runDraftCall`, the `Retriever` seam (empty until Phase 4),
   the usage accumulator and the run watchdog; no database dependency — `apps/worker`'s
-  `ticket.triage` / `ticket.draft` jobs own every read and write around it.
+  `ticket.triage` / `ticket.draft` jobs own every read and write around it. Its second entry point
+  `@aesa/agent/policy` (`src/policy.ts`) is the ONE builder of a tenant's `WorkspacePolicy` —
+  `buildReplyPolicy` / `personaFor`, the four trusted texts in a fixed order (platform hard rules,
+  persona block, workspace operating guidance, agent guidance extra) — used by all three guardrail
+  gates including the api's approve gate. It is deliberately pure: `@aesa/core` plus this package's
+  own prompt-text modules and nothing else, so the api can build the identical policy without the
+  Anthropic SDK entering its module graph (held by `packages/agent/test/policy.test.ts` and
+  `apps/api/test/error-surface.test.ts`, which both walk the real module graph).
 - `packages/platform-mail` — the platform's own outbound mail (sign-in codes, invitations,
   address-verification codes, the daily digest): the `MailTransport` port with a Resend transport
   and a devsink, plus the templates. Shared by `apps/api` and `apps/worker`; no database dependency.
@@ -119,7 +131,10 @@ instruction from him in the session.
   redraft, mark viewed) — which shares ONE service module (`src/drafts/service.ts`, exported as
   `@aesa/api/drafts`) with the session-less `/a/:draftId?t=` one-click review pages and with
   `inbox`'s draft view and resolve — plus a separate `activity` router (counts, cost, recent sends)
-  that reads its own aggregates and touches no draft service. The api never holds the KEK, never calls a model, never
+  that reads its own aggregates and touches no draft service. The approve gate screens the owner's
+  body through the SAME policy the draft and send gates use — the api depends on `@aesa/agent`, but
+  only through the pure `@aesa/agent/policy` sub-path, never the package root. The api never holds
+  the KEK, never calls a model, never
   touches customer mail (it sends platform email — sign-in codes, invitations, address-verification
   codes — through `@aesa/platform-mail`'s `MailTransport`; Resend in production, the devsink
   elsewhere). It never touches `mailbox_credentials` either (platform-role only) — a connect flow's
@@ -132,8 +147,10 @@ instruction from him in the session.
   context, the outcome table and the reply policy), `send.execute` (`send` role — the only process
   that ever sends a customer reply), `notify.dispatch` / `notify.digest` (escalation and
   collapsed-overflow push, plus the daily digest EMAIL via `digest-email.ts`), and the crons
-  `ticket.backstop-sweep` (every minute: missed/stuck draft runs, stuck run rows, orphaned tickets,
-  due sends) and `sweeps.daily` (draft expiry and run-event/action-token retention).
+  `ticket.backstop-sweep` (every minute, five arms: (a) missed/stuck draft runs, (a2) tickets
+  stranded at the agent failure ceiling, (b) stuck run rows, (c) orphaned tickets, (d) due sends —
+  the pass reads `platform_state['killswitch.global']` once and skips (a), and only (a), while it
+  is set) and `sweeps.daily` (draft expiry and run-event/action-token retention).
 - `apps/app` — the Expo universal app (`@aesa/app`, SDK 57, Expo Router, `web.output` server):
   `src/app` routes only, `src/screens` bodies, `src/lib` clients and the session gate, `src/components`
   primitives; jest-expo + RNTL for units, Playwright for the signup smoke.
@@ -159,7 +176,20 @@ instruction from him in the session.
   asserted by a test), so a violation fails loudly at runtime.
 - **Jobs.** Payload schemas include `orgId`; `enqueue` sets `singletonKey` to `${orgId}:${entityId}`;
   `registerJob` hands the handler an `AbortSignal` that fires at `expireInSeconds` minus
-  `JOB_SIGNAL_MARGIN_SECONDS` (owned by `@aesa/core`). **A new queue is added in FOUR places** —
+  `JOB_SIGNAL_MARGIN_SECONDS` (owned by `@aesa/core`). **`singletonKey` only does something on a
+  queue whose `policy` says so.** pg-boss 10 gates its singleton indexes on the queue's policy, and
+  `defineJob` defaults to `standard`, on which no index applies and the key is inert. The four
+  Phase 3 queues — `ticket.draft`, `send.execute`, `agent.sandbox`, `notify.dispatch` — declare
+  `policy: 'short'` in `defineJob`'s `queue` options, which collapses a duplicate only while the
+  first job is still `created` (a job that has gone `active`, or that is sitting in `retry`, never
+  swallows a newer event; `enqueue` returns `null` when a duplicate was collapsed).
+  `ticket.triage` and `mailbox.sync` stay `standard` on purpose: their burst source is a push
+  webhook, and those enqueues pass `enqueue`'s `debounceSeconds` (pg-boss `singletonSeconds`),
+  which is policy-independent — and `mailbox.sync`'s own per-connection lease serializes whatever
+  still gets through. `short`'s
+  index keys on `COALESCE(singleton_key,'')`, so two KEYLESS `boss.send` calls on one of those four
+  queues collapse into one — always enqueue through `enqueue`. **A new queue is added in FOUR
+  places** —
   `JOB_NAMES` (`packages/queue/src/names.ts`), the worker's `apps/worker/src/index.ts` pre-create
   list (any queue another role or a cron enqueues), the api's `apps/api/src/boss.ts` pre-create list
   (any queue the api sends), and `apps/worker/test/queue-preflight.test.ts`'s `it.each`. pg-boss 10
@@ -179,15 +209,26 @@ instruction from him in the session.
   `drafts.thread_snapshot_at` (the claiming run's `tickets.last_inbound_at`, never a wall-clock read)
   is the ONE staleness anchor: `send.execute` refuses any send whose thread has an inbound strictly
   newer than it, and nothing else is allowed to stand in for that comparison.
+- **Guardrail gates.** All three gates — `ticket.draft`/`agent.sandbox` on the model's body,
+  `drafts.approve` (tRPC and the `/a/:draftId` review pages) on the owner's, and `send.execute` on
+  the `final_body` about to go out — run `validateReplyBody` from `@aesa/core` against a
+  `WorkspacePolicy` built by `buildReplyPolicy` from `@aesa/agent/policy`. Never hand a gate a
+  hand-rolled policy: a gate screening against fewer trusted texts than the one after it either
+  waves through the edit the later gate exists to catch, or destroys a reply an earlier gate already
+  cleared. The approve gate differs from the send gate in exactly one deliberate way — it passes no
+  `groundedNumbers` (the owner is the grounding for their own edit, and `unbacked_number` is a
+  `warn` that flips no outcome).
 - **Lock order.** Any transaction touching more than one of the three row kinds takes them in ONE
   global order, in the api AND the worker: **`outbound_sends` → `drafts` → `tickets`**. That is the
   order every `send.execute` path already takes; `approveDraft`, `holdDraft` and `resolveTicket`
   follow it, and the worker's draft landings lock the ticket's live drafts before the ticket flip.
 - **Secrets.** Never logged, never returned by an API. `Secret` serializes as `[redacted]`; the api
   error handler strips SQL parameters and redacts URLs before anything reaches a log or a client.
-- **App bundle.** `apps/app` never imports `@aesa/db`, `@aesa/core`, `@aesa/crypto`, `@aesa/queue`,
-  `drizzle-orm` or `node:*` as values, and `@aesa/api` only as `import type` (ESLint block for
-  `apps/app/**`). Share types through `@aesa/contracts`.
+- **App bundle.** `apps/app` never value-imports a server package — `@aesa/db`, `@aesa/core`,
+  `@aesa/crypto`, `@aesa/queue`, `@aesa/mail`, `@aesa/platform-mail`, `@aesa/llm`, `@aesa/agent`,
+  `@aesa/test-kit`, `@aesa/api`, `drizzle-orm`, `fastify` or `node:*` — nor any of their sub-paths
+  (`@aesa/db/*`, `@aesa/api/*`, `@aesa/agent/*`, `drizzle-orm/*`); `import type` is allowed
+  throughout (ESLint block for `apps/app/**`). Share types through `@aesa/contracts`.
 - **Auth tables.** Better Auth's `user`/`session`/`account`/`verification`/`organization`/`member`/
   `invitation` are `RLS_EXEMPT` with uuid ids minted by Postgres (`generateId: false`); the api
   reaches them only through Better Auth; tRPC's `orgProcedure` derives `orgId` from the session's

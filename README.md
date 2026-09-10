@@ -42,7 +42,9 @@ already set in the process environment.
   reach a provider.
 - `ANTHROPIC_API_KEY` — required in production when `WORKER_ROLES` includes `agent`.
 - `GMAIL_OAUTH_CLIENT_ID`/`_SECRET`, `MS_OAUTH_CLIENT_ID`/`_SECRET` — all-or-none pairs, one per
-  provider; at least one is required in production for `sync` or `send`.
+  provider. At least one is required in production for **`send`** — `maybeRegisterSendRole`
+  (`apps/worker/src/send-role.ts`) refuses to boot without one. `sync` is not gated on a pair at
+  boot, but needs one all the same: without it the mailbox jobs throw at the first token refresh.
 - `GMAIL_PUBSUB_TOPIC`, `WEBHOOK_PUBLIC_URL` — optional push-subscription plumbing; without them the
   poll cadence still keeps mailboxes synced.
 - `EMAIL_TRANSPORT` / `RESEND_API_KEY` / `MAIL_FROM` — platform mail. The worker sends the daily

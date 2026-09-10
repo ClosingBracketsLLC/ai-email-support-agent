@@ -377,24 +377,29 @@ the record)</summary>
 ### Phase 3 — draft, review, send (complete on branch `phase-3`; PR not yet opened)
 
 - Plan: `docs/superpowers/plans/2026-09-09-phase-3-draft-review-send.md` (23 tasks, executed with
-  subagent-driven development). Commits `acf1f4f..883ecac` on `phase-3`, branched from `main` at
+  subagent-driven development). Commits `acf1f4f..HEAD` on `phase-3`, branched from `main` at
   `a613a22` — the plan, the Phase 2 carry-over task, the 23 tasks' implementation and fix-round
   commits, the Task 23 close-out (the mock-tier E2E, the cache-hit recorder, the external-setup
-  runbook and the docs) and the two pre-final fixes that E2E surfaced (`883ecac`, below) — plus this
-  review-fix commit. The per-task execution ledger was an ephemeral SDD workspace
-  artifact; everything load-bearing from it is distilled below, and the git history plus the
-  forthcoming review record are the durable account. Gate on the branch at close: typecheck and lint
-  clean across all 13 packages/apps; `pnpm test` green with **1,572 tests** (`@aesa/contracts` 21,
-  `@aesa/crypto` 42, `@aesa/platform-mail` 17, `@aesa/core` 189, `@aesa/llm` 90, `@aesa/agent` 58,
-  `@aesa/db` 70, `@aesa/queue` 15, `@aesa/mail` 237, `@aesa/test-kit` 43 [39 run + 4 conditional
-  skips], `apps/api` 195, `apps/worker` 347 [including the 8-scenario `e2e-phase2.test.ts` and the
-  21-case `e2e-phase3.test.ts`], `apps/app` 248 jest across 33 suites — no database); `db:check`
-  reports no drift; the Expo web export produces **21 static routes** (unchanged — Phase 3 added no
-  route file; `activity.tsx` already existed); the Playwright signup smoke passes (still ending at
-  the gated mailbox step — providerless CI cannot reach go-live, per Phase 2's Task 20 ruling).
-- Review: the whole-branch review record lands at
-  `docs/superpowers/reviews/2026-09-10-phase-3-final-review.md` after this commit, per
-  `superpowers:subagent-driven-development`.
+  runbook and the docs), the two pre-final fixes that E2E surfaced (`883ecac`), the review-fix
+  commit (`3c76a8a`) and the whole-branch fix wave's five commits (`176f717`, `b776159`, `2aebfde`,
+  `0e444c6`, `0cf7c1c` — see the fix-wave paragraph at the end of this record) plus this docs
+  commit. The per-task execution ledger and the fix-wave workspace were ephemeral SDD artifacts;
+  everything load-bearing from them is distilled below, and the git history plus the review record
+  are the durable account. Gate on the branch after the fix wave: typecheck and lint clean across
+  all 13 packages/apps; `pnpm test` green with **1,637 tests** (`@aesa/contracts` 21,
+  `@aesa/crypto` 42, `@aesa/platform-mail` 18, `@aesa/core` 204, `@aesa/llm` 98, `@aesa/agent` 65,
+  `@aesa/db` 72, `@aesa/queue` 17, `@aesa/mail` 237, `@aesa/test-kit` 43 [39 run + 4 conditional
+  skips], `apps/api` 207, `apps/worker` 357 [including the 8-scenario `e2e-phase2.test.ts` and
+  `e2e-phase3.test.ts`, 21 cases covering the twenty scenarios of the spec's Phase 3 *Verify* list
+  — scenario 6 is split into 6a and 6b], `apps/app` 260 jest across 33 suites — no database);
+  `db:check` reports no drift; the Expo web export produces **21 static routes** (unchanged — Phase
+  3 added no route file; `activity.tsx` already existed); the Playwright signup smoke passes (still
+  ending at the gated mailbox step — providerless CI cannot reach go-live, per Phase 2's Task 20
+  ruling).
+- Review: `docs/superpowers/reviews/2026-09-10-phase-3-final-review.md` — the six-way whole-branch
+  verdict ("approve with fixes": 0 Critical, 13 Important), the fix wave that resolved every
+  Important finding, the deferred-minors triage and the Phase 4 carries. It is written after this
+  docs commit, per `superpowers:subagent-driven-development`.
 - What exists now:
   - `packages/contracts` — the draft/decision/reject/sandbox/activity contracts, twelve new
     `needs_owner` reasons, the `draft_review` notification kind, `APPROVE_UNDO_SECONDS` and
@@ -405,7 +410,8 @@ the record)</summary>
     into `needs_owner`), `withOrgIdentity`, and the meter home (`LLM_METERS`, `SEND_METERS`,
     `SANDBOX_METERS`, `bumpMeter`, `createMeterSink`).
   - `packages/core` — the guardrails validator (eight screens over a per-tenant `WorkspacePolicy`,
-    one implementation run at three gates), `decide()` (the spec's autonomy order, with the `auto`
+    one implementation run at all three gates, over one policy built in one place —
+    `@aesa/agent/policy`), `decide()` (the spec's autonomy order, with the `auto`
     branch written, table-tested and unreachable), the reject resolver, `clearRedraftCycle`,
     `appendSignature`, and the outbound-send/draft/agent-run transition matrices.
   - `packages/llm` — the structured-output fallback ladder, the per-model limiter, the metering
@@ -413,7 +419,12 @@ the record)</summary>
     native structured output, `effort` and stability-driven `cache_control` placement.
   - `packages/agent` — the six prompt layers (platform hard rules → workspace profile → persona →
     knowledge → guidance → the thread as untrusted JSON lines), `DraftDecision`, `runDraftCall`, the
-    usage accumulator, the run watchdog, and the `Retriever` seam (`emptyRetriever` until Phase 4).
+    usage accumulator, the run watchdog, the `Retriever` seam (`emptyRetriever` until Phase 4), and
+    the pure second entry point `@aesa/agent/policy` (`buildReplyPolicy` / `personaFor` — the one
+    construction of a tenant's `WorkspacePolicy`, reached by `ticket.draft`, `agent.sandbox` and
+    `send.execute` through a one-line re-export shim at `apps/worker/src/drafting/policy.ts`, and
+    directly by the api's approve gate; it pulls in `@aesa/core` and this package's own prompt-text
+    modules and nothing else, which is what keeps the Anthropic SDK out of the api's module graph).
   - `packages/mail` — `SendReplyInput.onDraftCreated` on the port, the Graph two-phase send's
     `existingDraftId` re-entry, the mock's draft ledger and crash hooks, and `draft_id` on ingested
     sent copies.
@@ -426,16 +437,25 @@ the record)</summary>
     `approved` draft, but deferred past that scan on a crash re-entry so a delivered reply is never
     reported as held; staleness on `thread_snapshot_at`, the atomic pre-send flip, the `Message-ID`
     read-back, one outbound row, the dead-letter),
-    `agent.sandbox`, the crons `ticket.backstop-sweep` and `sweeps.daily`, and the daily digest
-    email with per-recipient single-use action tokens.
-  - `apps/api` — the `drafts` router, the session-less `/a/:draftId?t=` review pages and `inbox`'s
-    draft view/resolve over ONE service module; a separate `activity` router reading its own
-    aggregates; the master switch and go-live completion; and the sandbox start/get procedures.
+    `agent.sandbox`, the crons `ticket.backstop-sweep` (five arms: missed/stuck draft runs, tickets
+    stranded at the agent failure ceiling, stuck run rows, orphaned tickets, due sends — the pass
+    reads `platform_state['killswitch.global']` once and skips the first arm, and only that arm,
+    while it is set) and `sweeps.daily` (draft expiry, run-event and action-token retention), and
+    the daily digest email with per-recipient single-use action tokens.
+  - `apps/api` — the `drafts` router (approve, hold, resume, reject, mark viewed), the session-less
+    `/a/:draftId?t=` review pages and `inbox`'s draft view/resolve over ONE service module — whose
+    approve gate screens the owner's body through the same `@aesa/agent/policy` the draft and send
+    gates use; a separate `activity` router reading its own aggregates; the master switch and
+    go-live completion; and the sandbox start/get procedures.
   - `apps/app` — the review panel on the ticket screen (viewed-before-approve, inline Edit, the
     reject sheet with redraft-with-reason and "I'll handle it", the 15-second undo, `A`/`E`/`R` on
-    web), draft rows in To review, Review/Hold notification actions, the go-live test-email box and
-    master switch, Activity v1 and the "Try it" sandbox card.
-  - Verification: `apps/worker/test/e2e-phase3.test.ts` — the spec's twenty Phase-3 scenarios driven
+    web), the "On hold — …" and "Not sent — …" banners with their one "Back to review" button
+    (`holdReasonLabel` / `sendFailureLabel` turn the send row's machine `last_error` into copy, and
+    a raw `last_error` is never rendered), draft rows in To review, Review/Hold notification
+    actions, the go-live test-email box and master switch, Activity v1 and the "Try it" sandbox
+    card.
+  - Verification: `apps/worker/test/e2e-phase3.test.ts` — the twenty scenarios of the spec's Phase 3
+    *Verify* list in 21 cases (scenario 6 is split into 6a and 6b), driven
     through real pg-boss jobs and the real api draft service; `packages/llm/scripts/record-cache-hit.ts`
     — the live, hand-run recorder for the one fixture CI cannot fake; and
     `docs/runbooks/2026-09-phase-3-external-setup.md`.
@@ -527,10 +547,13 @@ the record)</summary>
     the identity feeds only `audit()`/`escalateTicket`, whose writes are keyed by ticket id.
   - **api (Tasks 16-19)**: ONE lock order for every transaction touching more than one of the three
     row kinds, in the api AND the worker — **`outbound_sends → drafts → tickets`** — chosen over the
-    reviewer's `send → ticket → draft` because it leaves `send.execute` untouched; the approve gate
-    screens FAILS only (`trustedTexts: []`, no `groundedNumbers`), since an owner may legitimately
-    paste the workspace's own guidance wording into a reply and the draft gate already screened the
-    model's body against the full policy; tRPC's default error shape carries no `cause`, so
+    reviewer's `send → ticket → draft` because it leaves `send.execute` untouched; ~~the approve
+    gate screens FAILS only (`trustedTexts: []`, no `groundedNumbers`), since an owner may
+    legitimately paste the workspace's own guidance wording into a reply and the draft gate already
+    screened the model's body against the full policy~~ — **REVERSED by the fix wave** (see the
+    whole-branch paragraph below): the send gate screened the same body against the full policy
+    moments later, so this only moved the refusal to where it destroyed the reply instead of letting
+    the owner fix it; tRPC's default error shape carries no `cause`, so
     `drafts.approve`'s BAD_REQUEST `guardrail` surfaces its findings through an `errorFormatter`
     branch that copies them to `data.findings` for a non-500 error (the 500 masking untouched, with
     an error-surface test pinning it); the digest email pluralises its subject, renders the
@@ -555,7 +578,9 @@ the record)</summary>
     today's redirect.
   - **deferred during the build (Task 16)**: the digest mints action tokens for EVERY pending draft,
     not only the ten rendered (a bounded fetch when backlogs grow), and the email pass scans every
-    workspace on each 5-minute tick.
+    workspace on each 5-minute tick. *(The first half was fixed in the fix wave — the digest now
+    slices to `DIGEST_MAX_ITEMS` before minting and passes the remainder as a `moreDrafts` count so
+    the "…and N more" line still speaks for the whole backlog. The 5-minute scan carries.)*
   - **pre-final fixes (`883ecac`)**: Task 23's mock-tier E2E surfaced two real defects, both fixed
     before the whole-branch review — `llm_calls.latency_ms` is an `integer` column while both
     producers handed it a `performance.now()` float, so EVERY insert failed inside
@@ -568,6 +593,110 @@ the record)</summary>
     WALL-CLOCK claim stamp was never re-drafted and never escalated (the stuck branch cannot rescue a
     run that finished) — it now clears the stamp too, the same way `send.execute`'s hand-backs do.
     Four regression tests came with them.
+  - **whole-branch fix wave (2026-09-10)**: six rulings, one of them a reversal.
+    1. **REVERSED — ledger ruling 28 (the approve gate screens fails only, `trustedTexts: []`).**
+       The approve gate now screens against the SAME policy as the draft and send gates — the four
+       trusted texts in the same order (platform hard rules, persona block, workspace operating
+       guidance, agent guidance extra) plus `expectedLanguage: ticket.language` — built by the one
+       `buildReplyPolicy` in the new pure sub-path `@aesa/agent/policy`. The original ruling's
+       recorded cost ("an owner-edited reply could quote internal guidance") was wrong in the other
+       direction: `send.execute` screened the same body against the full policy moments later, so a
+       `trusted_text_leak` in an owner edit passed approve and then destroyed the reply at send with
+       no way back. The gates now differ in exactly one deliberate way: no `groundedNumbers` at
+       approve (the owner is the grounding for their own edit; `unbacked_number` is a `warn` that
+       flips no outcome). The api depends on `@aesa/agent` only through `@aesa/agent/policy`, and
+       two module-graph tests hold the line that the SDK never enters the api's graph.
+    2. **A dead-lettered (`failed`) draft has a way back to review.** `draftTransitions.failed`
+       gains `pending` and `ticketTransitions.needs_owner` gains `awaiting_review` (the first
+       production caller of `ticketTransitions.assert`); `resumeDraft` accepts `held|failed`, and a
+       `failed` draft on a `needs_owner/send_failed` ticket walks the ticket back to
+       `awaiting_review` in the same transaction. The send row is left alone, so the next approve
+       revives that SAME `outbound_sends` row (`attempts` 0, `last_error` cleared). A resume is
+       REFUSED (`not_resumable`) while any other live draft exists on the ticket — `failed` is
+       outside `drafts_live_per_ticket_uidx` and `pending` is inside it, so without the guard a
+       resume beside a landed re-draft raised a bare 23505. `inbox.ticket` falls back to the
+       ticket's newest `failed` draft when no live draft exists, which is what makes the button
+       reachable at all; `inbox.list` is unchanged.
+    3. **`resolveTicket` retires EVERY live draft and holds a claimed send.** `pending|approved →
+       superseded`, `held → expired` (the legal edge — `held → superseded` is not in the matrix),
+       one audit row per retired draft named for where it landed; the send pre-lock widens to the
+       live draft's send in any status and holds `queued|claimed` sends with
+       `last_error = 'held:ticket_resolved'`. `sending` is deliberately left alone: a reply is in
+       flight and only the send job may say what happened to it. The other half is in the worker —
+       the pre-send flip now requires the draft `IN ('approved','sending')` with `RETURNING`, and 0
+       rows releases the send row and lands `draft not approved` without paging.
+    4. **The backstop sweep reads the global killswitch once and skips arm (a), and only (a).** The
+       recovery arms — stuck runs, orphans, due sends and the new (a2) — keep running: the lever
+       pauses the agent, not the owner's visibility into what is stuck. (a2) is the rescue for a
+       ticket stranded at the agent failure ceiling (`triaged` with
+       `agent_failure_count >= AGENT_FAILURE_ESCALATE_AT`, which nothing could draft and nothing
+       escalated); it escalates to `needs_owner/agent_failed` per-row in its own SAVEPOINT, deduped
+       per ticket per UTC day, under its OWN `ESCALATIONS_CAP_PER_CYCLE` budget rather than one
+       shared with (c) — the two arms select disjoint sets, so a shared budget would let one starve
+       the other. The org-cap half of the same busy loop is NOT fixed and carries.
+    5. **`policy: 'short'` on the four Phase 3 queues.** Verified against a real boss first:
+       pg-boss 10 gates its singleton indexes on the queue's policy, `defineJob` defaulted to
+       `standard`, and on `standard` no index applies — so `enqueue()`'s `singletonKey` was inert
+       and every place reasoning from a `null` return described an event that could not occur.
+       `ticket.draft`, `send.execute`, `agent.sandbox` and `notify.dispatch` now declare
+       `policy: 'short'`, which collapses a duplicate only while the first job is still `created`
+       (a job that has gone `active` — or that is sitting in `retry` — never swallows a newer
+       event). `ticket.triage` and `mailbox.sync` stay `standard` and keep debouncing through
+       `singletonSeconds`, which is policy-independent.
+    6. **A resume of a stale-`failed` draft onto a `triaged` ticket is allowed while a re-draft may
+       still be in flight** — it self-corrects (approving it hits `send.execute`'s staleness check
+       and lands `landStale` again) at the cost of one wasted run. Narrowing `resumeDraft` to refuse
+       every `triaged` ticket would close it but would also make a `landStale` failed draft
+       permanently un-resumable, which may be the wrong trade. **A carry**, not a fix.
+- **Whole-branch review and fix wave** (`176f717`, `b776159`, `2aebfde`, `0e444c6`, `0cf7c1c`, on
+  top of the pre-wave `883ecac`). The branch was reviewed six ways at `3c76a8a` — A1 (drafting and
+  the sweeps), A2 (`send.execute` and the digest), B (`packages/{core,llm,agent,db,mail}` and the
+  migrations), C (the api and the review pages), D (`apps/app`), E (the seams between them, the
+  rulings and the documents) — for a verdict of **approve with fixes: 0 Critical, 13 Important**,
+  plus the per-area minors and a consolidated triage of the ledger's 24 deferred minors. The wave
+  landed in five commits, one per area, each with the full gate green: `176f717` packages,
+  `b776159` api, `2aebfde` worker, `0e444c6` app, `0cf7c1c` a second api round from the re-review.
+  The thirteen Important findings — two pairs of which are one mechanism seen from two areas — one
+  sentence each:
+  - **B-I1** every 5-minute cache write was priced at the 1-hour rate — `ChatUsage` now carries the
+    `cache_creation.{ephemeral_5m,ephemeral_1h}_input_tokens` split, `computeCostMicros` prices 5m
+    at 1.25× and 1h at 2×, and the configured TTL is the fallback rate for an unattributed
+    remainder (no migration: `cache_write_tokens` stays the total).
+  - **B-I2** the guardrail strip removed only `\p{Cf}`, so a U+FE0F or U+034F inside a promised
+    action, a phone number, a URL host, an `sk-` secret or an HTML tag defeated six of the eight
+    fail screens — it now strips `\p{Default_Ignorable_Code_Point}` on both sides of NFKC.
+  - **B-I3** `JSON.stringify` leaves U+2028/U+2029 raw, so a customer body could render a second
+    line inside the thread's one-JSON-line-per-message containment — `thread.ts` re-escapes every
+    line terminator (U+0085 included) on both the thread line and the prior-draft line.
+  - **E-I1 / C-I2** the two guardrail policies — ruling 1 above.
+  - **C-I1 / E-I4** `resolveTicket` — ruling 3 above (`resolveTicket` left a `held` draft live,
+    which permanently broke the next draft cycle on that ticket, and could not stop an
+    already-claimed send).
+  - **E-I2** the runbook's dead-letter recovery told the operator to do something the code made
+    impossible — ruling 2 above made it real, and §6 now names the actual flow.
+  - **E-I3** the backstop sweep under the killswitch — ruling 4 above.
+  - **A1-I1** a `triaged` ticket at the failure ceiling was stranded silently forever — both
+    `send.execute` hand-backs now reset `agent_failure_count`, and sweep arm (a2) rescues anything
+    already stranded.
+  - **A2-I1** `RELEASE_RETRY_SECONDS` (60 s) outran pg-boss's first retry (30 s), so the two
+    release-and-throw paths never reached `lastAttempt` and never dead-lettered or paged — the
+    delay is now `INVARIANTS.SEND_RELEASE_RETRY_SECONDS` (15) with a boot-asserted invariant that
+    it stays below `SEND_RETRY_DELAY_SECONDS` (30).
+  - **D-I1** after a reject→redraft the ticket screen never refetched, so the promised draft never
+    appeared — the poll now also covers a `triaged` ticket that has no live draft (or only a
+    `failed` one, once `inbox.ticket` started serving those).
+  - **D-I2** a failed `drafts.markViewed` disabled Approve for the whole visit, silently — it now
+    retries itself once per draft id and otherwise shows "Could not open the draft — tap to retry"
+    with a Retry button.
+  Two more Important-adjacent fixes came from the section-A re-review (`0cf7c1c`): `resumeDraft`
+  refusing while a live draft exists, and `inbox.ticket`'s failed-draft fallback (both in ruling 2).
+  Also landed: five of the ledger's deferred minors (69, 70, 71, 79, 129) plus 39, 112, 136 and
+  89b, and the per-area minors each section carried — the token-minting slice, the `orgId` brace on
+  `sandboxStart`, `@fastify/formbody` scoped to the review routes, a fresh clock per deadlock
+  retry, the claim-time email firing only on a first claim, `errorMessage(err)` instead of `{ err }`
+  on the sandbox recovery logs, the `completeSend` NULL-watermark flip, the three landings gating on
+  their guarded UPDATE's `RETURNING`, the draft insert retiring every live draft except `sending`,
+  and the app's five copy/state minors.
 
 ## Next: Phase 4 — knowledge
 
@@ -575,7 +704,7 @@ the record)</summary>
 a merge commit on Robert's go-ahead (the standing flow from his 2026-09-09 instruction). Once it is
 merged, check out `main`, pull, and branch `phase-4` off it. Start with
 `superpowers:writing-plans` against the spec's *Build phases → Phase 4* section. Run the local setup
-from `CLAUDE.md` and confirm the 1,572-test baseline above before writing the plan.
+from `CLAUDE.md` and confirm the 1,637-test baseline above before writing the plan.
 
 **The hand-off.** Phase 4 is knowledge: the document parsers, the site crawler, Voyage embeddings,
 retrieval, and the `minio`/R2 upload path. Two seams are already in place and waiting for it:
@@ -607,7 +736,9 @@ again):
   drizzle snapshots may shift.
 - `packages/db/test/keys.test.ts` is still order-dependent (file untouched this phase).
 - The remaining `apps/app` accessibility/UX minors from Phase 1's residuals list, on screens this
-  phase didn't touch, are still open.
+  phase didn't touch, are still open — and Phase 3 adds one on a screen it did: the draft panel's
+  "Blocked: …" guardrail lines render as plain `Text` rather than a `Banner`, so a screen reader
+  hears the generic sentence below them but not the specific reason.
 - The DMARC first-match re-examination moves to **Phase 5**, with `decide()`'s auto branch: this
   phase's `decide()` consumes a single boolean, and the multi-`Authentication-Results` reasoning only
   becomes load-bearing once that branch is reachable.
@@ -625,8 +756,129 @@ again):
 - `agent_runs.kind = 'triage'` rows move to **Phase 6** (plan deviation 8). The enum admits the
   value for Phase 6's dashboards, but only draft and sandbox runs create rows today; triage calls DO
   get `llm_calls` rows, since the agent role wraps its one provider with the metering sink.
-- Deferred from Task 16: the digest mints action tokens for every pending draft rather than only the
-  ten rendered, and its email pass scans every workspace on each 5-minute tick.
+- Deferred from Task 16: `notify.digest`'s email pass still scans every workspace on each 5-minute
+  tick (two `withPlatform` audit rows per tick plus a full `workspaces` scan). The token-minting
+  half of this carry was fixed in the fix wave. A due-orgs pre-filter needs a local-hour index that
+  does not exist yet.
+
+**Carried out of the whole-branch review** — one line each; none is believed to block the live
+verification walk:
+
+- **The org-cap arm of the backstop-sweep busy loop.** The fix wave closed the killswitch arm only.
+  An org that has hit its daily draft or spend cap keeps satisfying sub-sweep (a)'s predicate, so
+  the sweep enqueues up to `SELECT_CAP_PER_CYCLE` (50) `ticket.draft` jobs every minute until UTC
+  midnight, each of which does one read transaction and exits at rule 3's org-cap gate. Nothing is
+  written and the owner is paged once per day, so this is wasted work, not a defect; the fix needs a
+  `usage_counters` join plus per-org settings in the sweep's own predicate.
+- **`structuredOutput: 'none'` moves to Phase 6** (ruling ledger 74): a provider declaring `'none'`
+  makes zero calls today. It is unreachable — Anthropic models are native, unknown models take
+  `json_mode` — and Phase 6's OpenAI-compatible adapter has to give it a real rung (a plain call
+  with a JSON instruction, then repair/extract).
+- **Emoji presentation flattens.** The wider default-ignorable strip (B-I2) removes U+FE0F, so a
+  heart-with-VS16 is stored and sent as its bare text-presentation glyph. Consistent with what
+  already happened to ZWJ sequences (U+200D is `\p{Cf}`) and the price of closing the bypass, but it
+  is a visible change to a sent reply.
+- **`blocks.ts` still tells the model bidi controls are "rejected"** when the validator silently
+  strips them (same for `GUARDRAIL_CODE_TEXT`). It is prompt text inside the cached static prefix,
+  so correcting it belongs with a deliberate prompt change, not a docs pass.
+- **A re-approve inside the undo window can be up to ~2 minutes late.** On the now-`short`
+  `send.execute` queue, a re-approve whose previous job is still `created` gets a `null` back
+  instead of a second job; the already-scheduled job runs, finds `send_after` still in the future
+  and returns, and the backstop sweep's arm (d) re-picks the row on its next pass. No send is lost.
+- **Two KEYLESS `boss.send` calls on a `short` queue collapse into one.** `short`'s index is over
+  `COALESCE(singleton_key,'')`. Production never does that — everything goes through `enqueue()`,
+  which always sets `${orgId}:${entityId}` — and the E2E's raw triggers now mint a throwaway key
+  each, but a future bare `boss.send` on one of the four queues would dedupe silently. A lint rule
+  making `enqueue` the only send path is the Phase 4 option.
+- **The four queues' pre-creation does not carry the policy.** `apps/worker/src/index.ts` and
+  `apps/api/src/boss.ts` pre-create them with no options, so a queue first created by an api-only
+  boot stays `standard` until a worker replica that registers the job runs `updateQueue`.
+  Correctness never depends on the dedupe, so this is a cold-start inefficiency only.
+- **A resume of a stale-`failed` draft onto a `triaged` ticket is wasteful when a re-draft is
+  already in flight** — see fix-wave ruling 6: it self-corrects at the send gate, at the cost of one
+  run.
+- **`sweeps.daily` holds write locks on every expiring draft across every org for the whole pass**,
+  including its per-row escalation loop and both retention deletes. A locked draft blocks a
+  concurrent approve/hold/reject for the duration; the api's 30 s statement timeout would surface it
+  as a failed button, not a hang. Fix when it bites: move the escalation loop and the deletes out of
+  the bulk transaction. (Same file: the two retention `DELETE`s materialize every deleted id via
+  `.returning({ id })` purely to produce a count.)
+- **The push's Hold action cannot succeed until Phase 5.** A `draft_review` notification is only
+  ever created for a freshly created `pending` draft, and `holdDraft` refuses anything that is not
+  `approved` with a `queued` send — so every Hold tap is a guaranteed `not_holdable`, swallowed,
+  with the ticket simply opening. Plan deviation 12 accepts the refusal; it did not observe that it
+  is unconditional. Either drop the action from the category until auto-send exists, or surface the
+  refusal.
+- **The inbox keyset cursor can silently drop rows** (inherited from Phase 2, untouched here): the
+  predicate is `sortKey < cursor` with no `id` tiebreaker while the `ORDER BY` carries one, and the
+  cursor is a millisecond ISO string cut from a microsecond `timestamptz`. Fix as a row-comparison
+  keyset `(sortKey, id) < (cursorTs, cursorId)` carrying the raw value.
+- **The review pages set no `Content-Security-Policy` / `X-Frame-Options` / `X-Content-Type-Options`.**
+  Defense in depth only — every interpolation is escaped and the pages have no script and no
+  external resource — but `default-src 'none'; form-action 'self'`, `DENY` and `nosniff` on
+  `reviewReply` cost one line each and keep the four failure pages header-identical.
+- **The cache-hit fixture is still hand-authored.** `packages/llm/test/fixtures/anthropic/draft-cache-hit.json`
+  pins the field mapping and the pricing, not that Anthropic really returned those numbers. The
+  runbook's `LLM_RECORD=1` recorder step is the only thing that proves caching end to end, and
+  re-running it will need the two `anthropic.test.ts` cache assertions' expected numbers updated.
+- **`sendFailureLabel` maps worker-owned literals.** The app's "Not sent — …" copy keys off four
+  fixed `landTerminal` reason strings plus the `guardrail:`/`stale:` prefixes; if `send-execute.ts`
+  ever rewords one, the label degrades to the generic sentence rather than leaking raw text — safe,
+  but a coupling with no test spanning the two packages.
+- **Smaller review minors, still open**, by area: the "the page that rendered the body IS the read"
+  comments claim more than the code enforces (nothing binds the review POST to a prior GET); the
+  approve gate's edit-distance ratio compares a normalized string against a raw one; `rejectDraft`
+  leaves an inert orphan `held` `outbound_sends` row; Activity's approved counts drop `failed` and
+  `pending` drafts so the summary rows do not reconcile; `LIVE_DRAFT_STATUSES` has three copies
+  (`workspace.ts` still re-declares it); the token-race throw logs as "review page failed" at `warn`
+  with a stack for an expected race; `claim.ts:229`'s `detail` comment invites a body into a run
+  event that must never hold one; the agent-cache rate count includes the run doing the counting;
+  `createFakeProvider` ignores `opts.kind` in the result it returns; `PLAUSIBLE_TLDS` is an 18-entry
+  allowlist so a bare domain on any other TLD is not screened; the phone screens are ASCII-digit
+  only; the subject and triage questions are interpolated raw into the user message; ladder rung 4
+  extracts only from the repair reply, never from the original; the digest subject drops the
+  business name when there are no drafts; `(a2)` escalates under the global killswitch by design, so
+  the lever does not silence owner pages for stuck tickets; and the E2E never drives the digest
+  through `runNotifyDigest`'s own cron branch.
+
+**The ledger's deferred minors still carried** — the whole-branch review triaged 24, the fix wave
+cleared nine of them (69, 70, 71, 79, 129 from that triage, plus 39, 112, 136 and 89b picked up by
+the sections that were already in those files), and these 19 carry:
+
+- 40 — `use-gate.test.tsx` near-duplicates the `setActive`-rejection scaffold (the two tests assert
+  different things; the review's own triage says drop rather than merge).
+- 41 — the Task 1 report's rationale is imprecise about the `provider as MailProvider` cast
+  precedent; the code is safe by the DB CHECK. Report text only.
+- 47 — `ticket-row.test.tsx`'s `it.each` title says "one-word chip"; the review confirmed the block
+  it titles carries only genuinely one-word chips, so the recorded minor no longer applies. Drop.
+- 48 — the Task 2 report miscounts `DECISION_REASONS` as 20 (it is 21). Report text only.
+- 53 — the Task 3 report mischaracterises migration 0010's per-table index split (the total, 12, is
+  right). Report text only.
+- 58 — `autonomy.test.ts` asserts the absence of `quiet` implicitly through `toEqual` rather than an
+  explicit per-row check.
+- 76 — the Task 7 report claims a fake-provider test edit that is not in its diff. Report accuracy.
+- 77 — `ZERO_USAGE` is duplicated in `structured.ts` and `with-metering.ts`.
+- 78 — ladder rungs 1–2 repeat the `isRefusal`/parsed shape; a small shared helper would do.
+- 84 — the lockfile regen added unrelated transitive churn under `@react-native/metro-config`, and
+  the default meter `onError` wraps `console.error` with a prefix (the worker overrides it).
+- 89a — the workspace profile block's `contactUrls` are not cross-checked against
+  `allowedUrlHosts`; the assertion belongs where the two are assembled.
+- 89c — an empty `categoryKeys` renders `"from: ."` in the prompt.
+- 89d — the prior-draft body is sliced (a benign extra beyond what the brief asked for).
+- 89e — one `as GuardrailCode` cast in `thread.ts`, type-safe by construction.
+- 92 — a prompt bullet's either/or packs two clauses with a comma; a semicolon would read cleaner.
+- 126 — the job-level `MessageGone` catch in `send.execute`'s recovery scan is unreachable today
+  (both adapters and the mock swallow it inside `findSentByMarker`); kept deliberately, since
+  removing it would make a future adapter that does surface it send blind.
+- 127 — the crash-recovered path reconstructs the outbound `messages` row from this run's
+  body/subject with `sent_at = now` rather than the provider's record. Activity reads
+  `outbound_sends.sent_at`, so the skew is bounded by the retry window; re-check when Phase 4 adds
+  a thread view.
+- 130 — on `send.execute`'s fresh path the kill-lever check sits below the draft-status/null-body
+  refusals, so a rejected draft plus a lever lands `draft not approved` instead of a hold. The
+  owner's own disposition winning is the better outcome; it wants a sentence in the file header.
+- 183 — no test renders a NEW undo window after an expired one (correct by inspection: the latch is
+  keyed to the `undoAt` value, and both ends are pinned by the two existing tests).
 
 ## Later phases (see the spec for scope and verification)
 
