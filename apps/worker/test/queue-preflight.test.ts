@@ -15,7 +15,7 @@ import { createQueueRetrying, defineJob, enqueue, JOB_NAMES } from '@aesa/queue'
 import { deleteJobsForOrgs, startTestBoss } from './helpers/boss.ts'
 
 describe('worker boot: pre-created queues accept sends with no registrations', () => {
-  it.each([JOB_NAMES.notifyDispatch, JOB_NAMES.ticketTriage, JOB_NAMES.ticketDraft, JOB_NAMES.mailboxSync])('enqueue(%s) returns a non-null id once the queue is pre-created, before any registerJob call', async (name) => {
+  it.each([JOB_NAMES.notifyDispatch, JOB_NAMES.ticketTriage, JOB_NAMES.ticketDraft, JOB_NAMES.mailboxSync, JOB_NAMES.sendExecute])('enqueue(%s) returns a non-null id once the queue is pre-created, before any registerJob call', async (name) => {
     const boss: PgBoss = await startTestBoss()
     const orgId = crypto.randomUUID()
     try {

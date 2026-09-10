@@ -15,6 +15,7 @@ import { registerPlatformHeartbeat } from './jobs/platform-heartbeat.ts'
 import { enqueueTicketDraft } from './jobs/ticket-draft.ts'
 import { createWorkerLogger } from './logging.ts'
 import { createExpoPush } from './push.ts'
+import { maybeRegisterSendRole } from './send-role.ts'
 
 loadDotEnv(import.meta.url)
 const config = loadConfig(process.env)
@@ -26,18 +27,20 @@ logger.info({ roles: [...config.roles], kekActive: config.kekRing?.active ?? nul
 
 // pg-boss 10's insertJob SQL INNER JOINs the new job row against the queue table and returns zero
 // rows (no error, `boss.send` resolves `null`) when the named queue does not exist yet. notify.dispatch
-// is now registered unconditionally right below, but ticket.triage's, ticket.draft's and mailbox.sync's OWN queues
-// are still created only by their config/role-gated `registerJob` calls further down — a
-// `WORKER_ROLES=sync` replica with no ANTHROPIC_API_KEY never runs `registerTicketTriage` on this
+// is now registered unconditionally right below, but ticket.triage's, ticket.draft's, mailbox.sync's and
+// send.execute's OWN queues are still created only by their config/role-gated `registerJob` calls further
+// down — a `WORKER_ROLES=sync` replica with no ANTHROPIC_API_KEY never runs `registerTicketTriage` on this
 // process, and mailbox.poll-sweep's (d)/(e) enqueue `ticket.triage` regardless; the same gap hits
 // mailbox.sync on a `sync`-role replica missing the KEK ring or MAIL_FROM, which mailbox.poll-sweep's
-// (a) enqueues into unconditionally too. Create all four unconditionally at boot, before any
-// role-gated registration, so a send never silently no-ops on a role-partitioned or under-configured
-// replica.
+// (a) enqueues into unconditionally too, and send.execute (whose producer is the API's approve
+// mutation, on a process that runs no worker roles at all). Create all five unconditionally at boot,
+// before any role-gated registration, so a send never silently no-ops on a role-partitioned or
+// under-configured replica.
 await createQueueRetrying(boss, JOB_NAMES.notifyDispatch)
 await createQueueRetrying(boss, JOB_NAMES.ticketTriage)
 await createQueueRetrying(boss, JOB_NAMES.ticketDraft)
 await createQueueRetrying(boss, JOB_NAMES.mailboxSync)
+await createQueueRetrying(boss, JOB_NAMES.sendExecute)
 
 // notify.dispatch's producers span every role (ticket.triage's escalations under `agent`,
 // mailbox.sync/renew-watch's reauth notices and mailbox.poll-sweep's stuck-pending retry under
@@ -56,6 +59,18 @@ await maybeRegisterAgentRole({
   boss, db, logger, config,
   enqueueNotify: (orgId, notificationId) => enqueueNotifyDispatch(boss, orgId, notificationId),
   enqueueDraft: (orgId, ticketId, opts) => enqueueTicketDraft(boss, orgId, ticketId, opts),
+})
+
+// ONE limiter for the whole process, created ABOVE the role branches and shared by `mailbox.sync`
+// and `send.execute`. Its per-connection gate (concurrency 1) is what serializes a send against a
+// poll of the SAME mailbox; two instances would each think they held the only slot and let a send
+// and a sync hit the provider — and the same thread — at once.
+const limiter = createMailLimiter()
+
+await maybeRegisterSendRole({
+  boss, db, config, limiter, logger,
+  enqueueNotify: (orgId, notificationId) => enqueueNotifyDispatch(boss, orgId, notificationId),
+  enqueueDraft: (orgId, ticketId) => enqueueTicketDraft(boss, orgId, ticketId),
 })
 
 if (config.roles.has('sync')) {
@@ -77,7 +92,6 @@ if (config.roles.has('sync')) {
       // without MAIL_FROM when `sync` is active.
       logger.warn('MAIL_FROM missing; skipping mailbox.sync registration (sync role otherwise inactive)')
     } else {
-      const limiter = createMailLimiter()
       await registerMailboxSync(boss, { db, ring: config.kekRing, config, limiter, logger })
     }
   }

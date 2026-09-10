@@ -28,6 +28,7 @@ export async function createSendOnlyBoss(connectionString: string): Promise<PgBo
   await createQueueRetrying(boss, JOB_NAMES.revokeMailbox)
   await createQueueRetrying(boss, JOB_NAMES.mailboxSync)
   await createQueueRetrying(boss, JOB_NAMES.ticketDraft)
+  await createQueueRetrying(boss, JOB_NAMES.sendExecute)
 
   return boss
 }

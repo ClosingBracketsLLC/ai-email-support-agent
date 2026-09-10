@@ -25,9 +25,9 @@ import {
   type DraftCallResult, type DraftDecision, type DraftPromptInput, type EscalateReason,
   type RetrievedAnswer, type RetrievedChunk, type Retriever, type ThreadMessage, type WorkspaceProfile,
 } from '@aesa/agent'
-import type { PersonaPreset, Tone } from '@aesa/contracts'
+import type { Tone } from '@aesa/contracts'
 import {
-  buildWorkspacePolicy, COLD_START_DECISIONS, collectGroundedNumbers, decide, INVARIANTS,
+  COLD_START_DECISIONS, collectGroundedNumbers, decide, INVARIANTS,
   resolveSetting, validateReplyBody, type GuardrailResult, type SettingKey,
 } from '@aesa/core'
 import {
@@ -44,6 +44,7 @@ import {
   applyDraftOutcome, applyEscalateOutcome, applyNoReplyOutcome, DRAFT_ACTOR, LostRaceError, recordLostRace,
   type DraftLanding, type OutcomeContext,
 } from '../drafting/outcomes.ts'
+import { buildReplyPolicy, personaFor } from '../drafting/policy.ts'
 import { appendRunEvent, finishRun } from '../drafting/runs.ts'
 
 /**
@@ -378,15 +379,6 @@ async function loadContext(
 
     return ctx
   })
-}
-
-function personaFor(agent: AgentRow): { preset: PersonaPreset; personaText: string; displayName: string; address: string } {
-  return {
-    preset: agent.personaPreset as PersonaPreset,
-    personaText: agent.personaText,
-    displayName: agent.displayName,
-    address: agent.replyFromAddress ?? agent.address,
-  }
 }
 
 /** The org's category matching the model's claimed key, falling back to `other` for anything it invents. */
@@ -778,8 +770,9 @@ async function screen(
   ticketLanguage: string | null,
   knowledge: { chunks: RetrievedChunk[]; answers: RetrievedAnswer[] },
 ): Promise<GuardrailResult> {
-  const personaText = personaBlock(personaFor(agent)).text
-  const policy = buildWorkspacePolicy({
+  // The SAME construction `send.execute`'s third pass uses — see `drafting/policy.ts` for why the
+  // two gates must never screen against different policies.
+  const policy = buildReplyPolicy({
     workspace: {
       allowedUrlHosts: ctx.profile.allowedUrlHosts,
       allowedEmailDomains: ctx.profile.allowedEmailDomains,
@@ -787,8 +780,9 @@ async function screen(
       contactUrls: ctx.profile.contactUrls,
       locale: ctx.profile.locale,
     },
-    agentDomain: agent.domain,
-    trustedTexts: [platformRulesBlock().text, personaText, ctx.workspaceGuidance, ctx.agentGuidance],
+    agent,
+    workspaceGuidance: ctx.workspaceGuidance,
+    agentGuidance: ctx.agentGuidance,
     expectedLanguage: ticketLanguage,
   })
   const groundedNumbers = collectGroundedNumbers([

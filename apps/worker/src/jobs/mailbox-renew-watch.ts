@@ -17,6 +17,7 @@ import type { WorkerConfig } from '../config.ts'
 import { errorMessage } from '../err-message.ts'
 import { resolveMailProvider } from '../mail-provider.ts'
 import { notifyReauthRequired } from '../reauth-notify.ts'
+import { enqueueNotifyDispatch } from './notify-dispatch.ts'
 
 const RENEW_WINDOW_MS = 36 * 60 * 60 * 1000
 
@@ -111,7 +112,10 @@ export async function runMailboxRenewWatch(boss: PgBoss, deps: MailboxRenewWatch
         // bumping consecutive_failures (which nothing would ever act on for a reauth_required row).
         deps.logger.warn({ connectionId: c.id, provider }, 'mailbox.renew_watch_reauth_required')
         try {
-          await notifyReauthRequired(boss, deps.db, c.orgId, c.id, now)
+          await notifyReauthRequired(
+            { db: deps.db, enqueueNotify: (orgId, notificationId) => enqueueNotifyDispatch(boss, orgId, notificationId) },
+            c.orgId, c.id, now,
+          )
         } catch (notifyErr) {
           deps.logger.warn({ connectionId: c.id, error: errorMessage(notifyErr) }, 'mailbox.renew_watch_reauth_notify_failed')
         }

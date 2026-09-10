@@ -269,7 +269,10 @@ export async function runMailboxSync(boss: PgBoss, deps: MailboxSyncDeps, payloa
   }
 
   if (outcome === 'reauth') {
-    await notifyReauthRequired(boss, deps.db, payload.orgId, payload.connectionId, now)
+    await notifyReauthRequired(
+      { db: deps.db, enqueueNotify: (orgId, notificationId) => enqueueNotifyDispatch(boss, orgId, notificationId) },
+      payload.orgId, payload.connectionId, now,
+    )
     return
   }
 
