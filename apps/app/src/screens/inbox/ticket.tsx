@@ -1,42 +1,20 @@
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useLocalSearchParams, useRouter } from 'expo-router'
-import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native'
+import { useEffect, useRef, useState } from 'react'
+import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native'
 import { SafeAreaView } from 'react-native-safe-area-context'
-import type { NeedsOwnerReason } from '@aesa/contracts'
+import type { RejectAction } from '@aesa/contracts'
 import { Banner } from '@/components/banner'
+import { Button } from '@/components/button'
 import { Loading } from '@/components/loading'
 import { Heading, Muted } from '@/components/typography'
 import { useTRPC } from '@/lib/trpc'
 import { radius, spacing, typeScale, useColors } from '@/theme'
+import { DraftPanel, type DraftPanelHandle } from './draft-panel'
+import { reasonSentence } from './reason-labels'
 
-/** One sentence per `NeedsOwnerReason` (task brief: "needs_owner banner with the reason sentence"),
- * plus Phase 3's twelve drafting/review reasons (Task 2 controller ruling). */
-const REASON_SENTENCE: Record<NeedsOwnerReason, string> = {
-  tripwire: 'A tripwire term was found in this thread — it needs your review before anything is sent.',
-  triage_flags: 'Triage flagged this message — it needs your review.',
-  sentiment_angry: 'This customer sounds angry — it needs your review.',
-  triage_failed: 'Triage could not read this message, so it needs your review.',
-  triage_cap: "This category has hit today's review cap, so it needs your review.",
-  agent_escalated: 'The agent asked for a human on this one — it needs your reply.',
-  agent_failed: 'Drafting failed twice, so this ticket needs your reply.',
-  agent_run_cap: "This ticket hit today's drafting limit — it needs your reply.",
-  guardrail_failed: 'The guardrails blocked this draft. Edit it — the edited version has to pass before it can send.',
-  redraft_limit_reached: 'Re-drafted twice already — please reply yourself.',
-  redraft_unfulfilled: 'The agent could not act on your feedback — it needs your reply.',
-  owner_handling: 'You chose to handle this one yourself.',
-  orphaned: 'This ticket lost its draft — it needs your review.',
-  draft_expired: 'A draft expired unreviewed — it needs your review.',
-  send_failed: 'An approved reply could not be sent — check the mailbox and try again.',
-  category_off: 'This category is switched off, so replies wait for you.',
-  no_agent: 'No agent is set up for this address yet.',
-}
-
-/** `needsOwnerReason` is a plain `text` column, so the tRPC-inferred type is a bare `string | null`
- * — same defensive lookup as `ticket-row.tsx`'s `reasonChip`. */
-function reasonSentence(reason: string | null): string | null {
-  if (!reason) return null
-  return (REASON_SENTENCE as Record<string, string>)[reason] ?? null
-}
+/** How often the ticket re-reads itself while a reply is on its way out (spec §Send). */
+const TICKET_POLL_MS = 10_000
 
 interface AttachmentMeta { filename?: string; mime?: string; size?: number }
 /** `messages.attachments` is a jsonb column typed `unknown` at the schema level (comment: "[{filename,
@@ -52,12 +30,144 @@ function formatBytes(size: number | undefined): string {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`
 }
 
-export function TicketScreen() {
+/** The keyboard event this cares about — structural so a test can pass a plain object. */
+interface ShortcutEvent { key: string; target?: unknown; ctrlKey?: boolean; metaKey?: boolean; altKey?: boolean }
+
+/**
+ * The web-only review shortcuts (deviation 13: the draft must be on screen). Pure, so the guard —
+ * never steal a key the owner is typing into a field — is testable without a DOM.
+ */
+export function shortcutFor(event: ShortcutEvent): 'approve' | 'edit' | 'reject' | null {
+  if (event.ctrlKey || event.metaKey || event.altKey) return null
+  const target = event.target as { tagName?: unknown; isContentEditable?: unknown } | null | undefined
+  if (target?.isContentEditable === true) return null
+  const tag = typeof target?.tagName === 'string' ? target.tagName.toUpperCase() : ''
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return null
+  switch (event.key.toLowerCase()) {
+    case 'a': return 'approve'
+    case 'e': return 'edit'
+    case 'r': return 'reject'
+    default: return null
+  }
+}
+
+/** The api's error shape for a refused approve: `message` is the service's own code and, for the
+ * guardrail refusal, `data.findings` carries `{ code, severity, detail }` objects (init.ts's
+ * errorFormatter copies them there for any non-500). */
+function approveErrorFrom(error: unknown): { code: string; findings?: string[] } {
+  const e = error as { message?: unknown; data?: { findings?: unknown } } | null | undefined
+  const code = typeof e?.message === 'string' && e.message.length > 0 ? e.message : 'unknown'
+  const raw = e?.data?.findings
+  if (!Array.isArray(raw)) return { code }
+  return { code, findings: raw.map(findingText) }
+}
+function findingText(raw: unknown): string {
+  const f = raw as { code?: unknown; detail?: unknown } | null | undefined
+  const code = typeof f?.code === 'string' ? f.code : 'guardrail'
+  const detail = typeof f?.detail === 'string' ? f.detail.trim() : ''
+  return detail ? `${code}: ${detail}` : code
+}
+
+export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?: number; undoTickMs?: number } = {}) {
   const { id } = useLocalSearchParams<{ id: string }>()
   const router = useRouter()
   const c = useColors()
   const trpc = useTRPC()
-  const query = useQuery(trpc.inbox.ticket.queryOptions({ ticketId: id }))
+  const queryClient = useQueryClient()
+
+  const query = useQuery(trpc.inbox.ticket.queryOptions({ ticketId: id }, {
+    // Only while a reply is actually on its way out; an idle ticket costs nothing (spec §Send).
+    refetchInterval: (q) => {
+      const status = q.state.data?.draft?.status
+      return status === 'approved' || status === 'sending' ? pollMs : false
+    },
+  }))
+  const draft = query.data?.draft ?? null
+
+  const [markedViewed, setMarkedViewed] = useState(false)
+  const [undoUntil, setUndoUntil] = useState<Date | null>(null)
+  const [approveError, setApproveError] = useState<{ code: string; findings?: string[] } | null>(null)
+  const [note, setNote] = useState<{ tone: 'info' | 'error'; text: string } | null>(null)
+  const [confirmingResolve, setConfirmingResolve] = useState(false)
+  const panel = useRef<DraftPanelHandle | null>(null)
+
+  const ticketKey = trpc.inbox.ticket.queryKey({ ticketId: id })
+  const listKey = trpc.inbox.list.queryKey()
+  const invalidateTicket = () => queryClient.invalidateQueries({ queryKey: ticketKey })
+  const invalidateAll = () => Promise.all([
+    queryClient.invalidateQueries({ queryKey: ticketKey }),
+    queryClient.invalidateQueries({ queryKey: listKey }),
+  ])
+
+  const markViewed = useMutation(trpc.drafts.markViewed.mutationOptions({
+    onSuccess: () => { setMarkedViewed(true); void invalidateTicket() },
+  }))
+  const approve = useMutation(trpc.drafts.approve.mutationOptions({
+    onSuccess: (data) => {
+      setApproveError(null)
+      setNote(null)
+      setUndoUntil(new Date(data.undoUntil))
+      void invalidateAll()
+    },
+    onError: (error) => setApproveError(approveErrorFrom(error)),
+  }))
+  const hold = useMutation(trpc.drafts.hold.mutationOptions({
+    onSuccess: (data) => {
+      // The undo bar was racing a 15-second clock; losing that race is an ordinary result.
+      setUndoUntil(null)
+      setNote(data.held ? null : {
+        tone: 'error',
+        text: data.code === 'too_late' ? 'Too late — it already sent.' : 'This reply could not be pulled back.',
+      })
+      void invalidateAll()
+    },
+    onError: () => setNote({ tone: 'error', text: 'Could not undo. Try again.' }),
+  }))
+  const reject = useMutation(trpc.drafts.reject.mutationOptions({
+    onSuccess: (data) => {
+      setApproveError(null)
+      setNote({
+        tone: 'info',
+        text: data.resolution === 'redraft'
+          ? 'The agent is re-drafting — a new draft will appear here.'
+          : 'Marked for you to handle.',
+      })
+      void invalidateAll()
+    },
+    onError: () => setNote({ tone: 'error', text: 'Could not reject this draft. Try again.' }),
+  }))
+  const resume = useMutation(trpc.drafts.resume.mutationOptions({
+    onSuccess: () => { setApproveError(null); setNote(null); void invalidateAll() },
+    onError: () => setNote({ tone: 'error', text: 'Could not bring this draft back. Try again.' }),
+  }))
+  const resolve = useMutation(trpc.inbox.resolve.mutationOptions({
+    onSuccess: () => { setConfirmingResolve(false); void invalidateAll() },
+    onError: () => setNote({ tone: 'error', text: 'Could not mark this resolved. Try again.' }),
+  }))
+
+  // Exactly once per draft: the approve gate refuses a draft no human has opened (`not_viewed`), and
+  // the ref survives the refetch this very mutation's invalidation triggers.
+  const marked = useRef<string | null>(null)
+  useEffect(() => {
+    if (!draft || draft.status !== 'pending' || draft.viewedAt !== null) return
+    if (marked.current === draft.id) return
+    marked.current = draft.id
+    markViewed.mutate({ draftId: draft.id })
+  }, [draft?.id, draft?.status, draft?.viewedAt])
+
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof window === 'undefined') return
+    const onKeyDown = (event: KeyboardEvent) => {
+      const action = shortcutFor(event)
+      // No panel on screen means no shortcut — and no swallowed keystroke either (deviation 13).
+      if (!action || !panel.current) return
+      // Every other guard (viewed, still pending, not already editing) lives in the panel's own handle.
+      event.preventDefault()
+      panel.current[action]()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [])
 
   if (query.isPending) return <Loading testID="ticket-loading" />
 
@@ -72,6 +182,7 @@ export function TicketScreen() {
 
   const { ticket, messages } = query.data
   const sentence = reasonSentence(ticket.needsOwnerReason)
+  const busy = approve.isPending || hold.isPending || reject.isPending || resume.isPending
 
   return (
     <SafeAreaView style={[styles.safe, { backgroundColor: c.bg }]} testID="ticket">
@@ -88,6 +199,43 @@ export function TicketScreen() {
       </View>
 
       {sentence ? <View style={styles.padded}><Banner tone="error" testID="ticket-needs-owner">{sentence}</Banner></View> : null}
+
+      {draft ? (
+        <View style={styles.padded}>
+          <DraftPanel
+            draft={draft}
+            ticket={{ id: ticket.id, redraftCount: ticket.redraftCount, status: ticket.status }}
+            viewed={draft.viewedAt !== null || markedViewed}
+            onApprove={(body) => approve.mutate(body === undefined ? { draftId: draft.id } : { draftId: draft.id, body })}
+            onHold={() => hold.mutate({ draftId: draft.id })}
+            onReject={(action: RejectAction, reason: string) => reject.mutate({ draftId: draft.id, action, reason })}
+            onResume={() => resume.mutate({ draftId: draft.id })}
+            busy={busy}
+            approveError={approveError}
+            undoUntil={undoUntil}
+            undoTickMs={undoTickMs}
+            panelRef={panel}
+          />
+        </View>
+      ) : null}
+
+      {note ? <View style={styles.padded}><Banner tone={note.tone} testID="ticket-note">{note.text}</Banner></View> : null}
+
+      {ticket.status === 'needs_owner' ? (
+        <View style={styles.padded}>
+          <Button
+            label={confirmingResolve ? 'Confirm resolve' : 'Mark resolved'}
+            variant={confirmingResolve ? 'danger' : 'secondary'}
+            onPress={() => {
+              if (resolve.isPending) return
+              if (!confirmingResolve) { setConfirmingResolve(true); return }
+              resolve.mutate({ ticketId: ticket.id })
+            }}
+            loading={resolve.isPending}
+            testID="resolve"
+          />
+        </View>
+      ) : null}
 
       <ScrollView contentContainerStyle={styles.messages} testID="ticket-messages">
         {messages.map((m) => {
@@ -123,7 +271,7 @@ function BackRow({ onBack }: { onBack: () => void }) {
 
 const styles = StyleSheet.create({
   safe: { flex: 1 },
-  padded: { paddingHorizontal: spacing.md },
+  padded: { paddingHorizontal: spacing.md, paddingBottom: spacing.sm },
   header: { padding: spacing.md, gap: spacing.xs, borderBottomWidth: StyleSheet.hairlineWidth },
   backRow: { paddingVertical: spacing.xs },
   headerMeta: { flexDirection: 'row', gap: spacing.sm, flexWrap: 'wrap', alignItems: 'center' },

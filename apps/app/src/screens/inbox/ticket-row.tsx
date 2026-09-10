@@ -1,6 +1,17 @@
 import { Pressable, StyleSheet, Text, View } from 'react-native'
-import type { NeedsOwnerReason } from '@aesa/contracts'
+import type { DraftStatus, NeedsOwnerReason } from '@aesa/contracts'
 import { radius, spacing, typeScale, useColors } from '@/theme'
+
+/** The ticket's ONE live draft, as `inbox.list` joins it (apps/api/src/trpc/routers/inbox.ts) —
+ * just enough for a row's chip; the review panel loads the full `DraftView`. */
+export interface TicketDraftSummary {
+  id: string
+  status: DraftStatus
+  confidence: number | null
+  decisionReason: string
+  expiresAt: Date
+  version: number
+}
 
 /** The client-side view of `inbox.list`'s `TicketSummary` (apps/api/src/trpc/routers/inbox.ts).
  * Declared explicitly rather than inferred off `AppRouter` so `TicketRow` (and its test) don't need
@@ -21,6 +32,7 @@ export interface TicketSummary {
   agentAddress: string | null
   spamFlagged: boolean
   hasAttachments: boolean
+  draft: TicketDraftSummary | null
 }
 
 /** Spec's four reason words plus 'Capped' for the cap reason (task brief), plus Phase 3's twelve
@@ -52,6 +64,16 @@ function reasonChip(reason: string | null): string | null {
   return (REASON_CHIP as Record<string, string>)[reason] ?? null
 }
 
+/** The draft's own word on the row: what the agent has ready, or where its reply has got to. */
+function draftChip(draft: TicketDraftSummary | null, categoryLabel: string | null): string | null {
+  if (!draft) return null
+  if (draft.status === 'approved' || draft.status === 'sending') return 'Sending…'
+  if (draft.status === 'held') return 'On hold'
+  if (draft.status !== 'pending') return null
+  const pct = draft.confidence === null ? null : `${Math.round(draft.confidence * 100)}%`
+  return ['Reply ready', categoryLabel ?? 'Uncategorized', ...(pct ? [pct] : [])].join(' · ')
+}
+
 function relativeTime(date: Date | null): string {
   if (!date) return 'no messages yet'
   const minutes = Math.max(0, Math.round((Date.now() - date.getTime()) / 60_000))
@@ -65,6 +87,7 @@ function relativeTime(date: Date | null): string {
 export function TicketRow({ ticket, onPress }: { ticket: TicketSummary; onPress: () => void }) {
   const c = useColors()
   const chip = reasonChip(ticket.needsOwnerReason)
+  const draft = draftChip(ticket.draft, ticket.categoryLabel)
   const subject = ticket.subject || '(no subject)'
   const customer = ticket.customerName || ticket.customerEmail || 'Unknown sender'
 
@@ -85,9 +108,18 @@ export function TicketRow({ ticket, onPress }: { ticket: TicketSummary; onPress:
           {ticket.categoryLabel ? <Text style={[typeScale.caption, { color: c.muted }]}> · {ticket.categoryLabel}</Text> : null}
         </View>
       </View>
-      {chip ? (
-        <View style={[styles.chip, { borderColor: c.border, backgroundColor: c.info }]} testID={`ticket-reason-${ticket.id}`}>
-          <Text style={[typeScale.caption, { color: c.text }]}>{chip}</Text>
+      {draft || chip ? (
+        <View style={styles.chips}>
+          {draft ? (
+            <View style={[styles.chip, { borderColor: c.primary, backgroundColor: c.info }]} testID={`ticket-draft-${ticket.id}`}>
+              <Text style={[typeScale.caption, { color: c.text }]}>{draft}</Text>
+            </View>
+          ) : null}
+          {chip ? (
+            <View style={[styles.chip, { borderColor: c.border, backgroundColor: c.info }]} testID={`ticket-reason-${ticket.id}`}>
+              <Text style={[typeScale.caption, { color: c.text }]}>{chip}</Text>
+            </View>
+          ) : null}
         </View>
       ) : null}
     </Pressable>
@@ -100,5 +132,6 @@ const styles = StyleSheet.create({
   titleLine: { flexDirection: 'row', alignItems: 'center', gap: spacing.xs },
   subject: { flex: 1, fontWeight: '600' },
   metaLine: { flexDirection: 'row' },
+  chips: { alignItems: 'flex-end', gap: spacing.xs },
   chip: { borderWidth: 1, borderRadius: radius.lg, paddingHorizontal: spacing.sm, paddingVertical: 2 },
 })

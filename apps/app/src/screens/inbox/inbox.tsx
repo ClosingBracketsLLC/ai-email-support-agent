@@ -37,6 +37,9 @@ export function InboxScreen() {
   )
 
   const tickets: TicketSummary[] = list.data?.pages.flatMap((p) => p.tickets) ?? []
+  // A page served without its cursor (an unparsable one — `parseCursor`): say so rather than let the
+  // owner believe a short list is the whole list.
+  const degraded = list.data?.pages.some((p) => p.degraded) ?? false
 
   return (
     <SafeAreaView style={[styles.safe, { backgroundColor: c.bg }]} testID="inbox">
@@ -63,6 +66,7 @@ export function InboxScreen() {
               keyExtractor={(t) => t.id}
               renderItem={({ item }) => <TicketRow ticket={item} onPress={() => router.push(`/ticket/${item.id}`)} />}
               refreshControl={<RefreshControl refreshing={list.isRefetching && !list.isFetchingNextPage} onRefresh={() => list.refetch()} />}
+              ListHeaderComponent={degraded ? <Banner testID="inbox-degraded">Some tickets may be missing — pull down to refresh.</Banner> : null}
               ListEmptyComponent={<Muted testID="inbox-empty">{SECTION_EMPTY[section]}</Muted>}
               ListFooterComponent={
                 list.hasNextPage ? (
