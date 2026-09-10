@@ -17,10 +17,16 @@ function esc(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;')
 }
 
-/** `noindex` because these URLs ARE the capability: nothing that reaches one should end up in an index. */
+/**
+ * These URLs ARE the capability, which is what the two head metas are about: `noindex` so nothing that
+ * reaches one ends up in a search index, and `no-referrer` so clicking "Open in the app" cannot hand the
+ * web origin a `Referer` carrying `?t=<live token>`. (The caching half of the same concern is a
+ * `Cache-Control: no-store` header, set on every response in routes.ts.)
+ */
 function page(body: string): string {
   return '<!doctype html><html><head><meta charset="utf-8">'
-    + '<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">'
+    + '<meta name="viewport" content="width=device-width, initial-scale=1">'
+    + '<meta name="robots" content="noindex"><meta name="referrer" content="no-referrer">'
     + `<title>aesa</title></head><body>${body}</body></html>`
 }
 
@@ -112,10 +118,11 @@ function ago(from: Date, now: Date): string {
  * A VALID token on a draft nobody can act on any more. Naming the real status is safe here and only
  * here: the caller already proved they hold the unconsumed, unexpired token for THIS draft, so there
  * is no oracle left to protect — and "already handled" beats the friendly page's misleading "expired".
+ * `now` is passed in rather than read here so every function in this module stays a pure fold of its props.
  */
-export function statusPage(p: { status: DraftStatus; sentAt: Date | null; appUrl: string }): string {
+export function statusPage(p: { status: DraftStatus; sentAt: Date | null; now: Date; appUrl: string }): string {
   const heading = p.status === 'pending' ? 'Still waiting' : 'Already handled'
-  const detail = p.status === 'sent' && p.sentAt ? `It was sent ${ago(p.sentAt, new Date())}.` : STATUS_DETAIL[p.status]
+  const detail = p.status === 'sent' && p.sentAt ? `It was sent ${ago(p.sentAt, p.now)}.` : STATUS_DETAIL[p.status]
   return page(`<h1>${heading}</h1><p>${esc(detail)}</p>` + appLink(p.appUrl, 'see the whole thread there.'))
 }
 

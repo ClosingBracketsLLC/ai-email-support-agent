@@ -57,7 +57,7 @@ describe('review pages (/a/:draftId)', () => {
   afterAll(async () => { await t.close() })
   beforeEach(() => { sent.length = 0 })
 
-  async function seedOrg(opts: { agentEnabled?: boolean } = {}) {
+  async function seedOrg(opts: { agentEnabled?: boolean; killSwitch?: boolean } = {}) {
     const n = ++seq
     const signed = await signInWithOtp(t.app, t.mail, `review-${n}@example.com`, 'Owner')
     const { orgId } = await client(base, signed.cookie).workspace.create.mutate({ businessName: 'Acme', timezone: 'UTC' })
@@ -65,7 +65,8 @@ describe('review pages (/a/:draftId)', () => {
     const connectionId = await insertConnectedMailbox(t.api, orgId, signed.user.id, address)
     const agentId = await insertAgent(t.api, orgId, connectionId, address)
     await t.api.withOrg(orgId, (tx) => tx.update(workspaces)
-      .set({ agentEnabled: opts.agentEnabled ?? true }).where(eq(workspaces.orgId, orgId)))
+      .set({ agentEnabled: opts.agentEnabled ?? true, killSwitch: opts.killSwitch ?? false })
+      .where(eq(workspaces.orgId, orgId)))
     return { orgId, userId: signed.user.id, connectionId, agentId }
   }
 
@@ -86,6 +87,8 @@ describe('review pages (/a/:draftId)', () => {
     t.api.withOrg(orgId, async (tx) => (await tx.select().from(outboundSends).where(eq(outboundSends.draftId, draftId)))[0])
   const readToken = (orgId: string, draftId: string) =>
     t.api.withOrg(orgId, (tx) => tx.select().from(draftActionTokens).where(eq(draftActionTokens.draftId, draftId)))
+  const countAudit = async (orgId: string) =>
+    (await t.api.withOrg(orgId, (tx) => tx.select({ id: auditLog.id }).from(auditLog))).length
   const readAudit = (orgId: string, action: string, entityId: string) =>
     t.api.withOrg(orgId, (tx) => tx.select().from(auditLog).where(and(eq(auditLog.action, action), eq(auditLog.entityId, entityId))!))
 
@@ -104,10 +107,16 @@ describe('review pages (/a/:draftId)', () => {
     const { draft } = await seedReviewable(org, { body: RISKY_BODY })
     const token = await mintToken(t.api, org.orgId, draft.id, org.userId)
     const before = await readDraft(org.orgId, draft.id)
+    const auditBefore = await countAudit(org.orgId)
+    expect(auditBefore).toBeGreaterThan(0)   // the org's own setup wrote rows: the check below is not vacuous
 
     const res = await get(draft.id, token)
     expect(res.statusCode).toBe(200)
     expect(res.headers['content-type']).toBe('text/html; charset=utf-8')
+    // A capability url whose body carries the customer's message and a live token: never cached, and
+    // never a Referer when the reader clicks through to the app.
+    expect(res.headers['cache-control']).toBe('no-store')
+    expect(res.body).toContain('<meta name="referrer" content="no-referrer">')
     expect(res.body).toContain('Reply ready')
     expect(res.body).toContain('Where is my order?')
     expect(res.body).toContain('Casey &lt;Q&amp;A&gt;')
@@ -124,6 +133,8 @@ describe('review pages (/a/:draftId)', () => {
     expect(after!.status).toBe('pending')
     const [tok] = await readToken(org.orgId, draft.id)
     expect(tok!.consumedAt).toBeNull()
+    // Not one row anywhere in the org's audit log either — rendering is not an event.
+    expect(await countAudit(org.orgId)).toBe(auditBefore)
   })
 
   it('an unknown draft, a wrong token, a consumed token and an expired token all render ONE byte-identical page', async () => {
@@ -141,6 +152,10 @@ describe('review pages (/a/:draftId)', () => {
     for (const res of [unknown, wrong, used, stale]) {
       expect(res.statusCode).toBe(200)
       expect(res.headers['content-type']).toBe('text/html; charset=utf-8')
+      // Identical HEADERS as well as identical bytes: a no-store on some of them and not others would
+      // be exactly the oracle this page exists to deny.
+      expect(res.headers['cache-control']).toBe('no-store')
+      expect(res.body).toContain('<meta name="referrer" content="no-referrer">')
       expect(res.body).toContain(FRIENDLY_COPY)
     }
     expect(new Set([unknown.body, wrong.body, used.body, stale.body]).size).toBe(1)
@@ -174,6 +189,7 @@ describe('review pages (/a/:draftId)', () => {
     const res = await post(draft.id, 'approve', token)
     expect(res.statusCode).toBe(200)
     expect(res.headers['content-type']).toBe('text/html; charset=utf-8')
+    expect(res.headers['cache-control']).toBe('no-store')
     expect(res.body).toContain('Approved')
 
     const after = await readDraft(org.orgId, draft.id)
@@ -237,6 +253,23 @@ describe('review pages (/a/:draftId)', () => {
     expect((await post(draft.id, 'approve', token)).body).toContain('Approved')
   })
 
+  it('the other lever (workspace kill switch) refuses the same way and leaves the token unspent', async () => {
+    const org = await seedOrg({ killSwitch: true })
+    const { draft } = await seedReviewable(org)
+    const token = await mintToken(t.api, org.orgId, draft.id, org.userId)
+
+    const res = await post(draft.id, 'approve', token)
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toContain('Could not approve')
+    expect(res.body).toContain('Sending is paused')
+    expect(res.body).not.toContain('Turn the agent on')
+
+    expect((await readDraft(org.orgId, draft.id))!.status).toBe('pending')
+    expect((await readToken(org.orgId, draft.id))[0]!.consumedAt).toBeNull()
+    expect(await readSend(org.orgId, draft.id)).toBeUndefined()
+    expect(sent).toHaveLength(0)
+  })
+
   it('a guardrail refusal lists the codes and leaves the token unspent', async () => {
     const org = await seedOrg()
     const { draft } = await seedReviewable(org, { body: GUARDRAIL_BODY })
@@ -286,6 +319,16 @@ describe('review pages (/a/:draftId)', () => {
   })
 
   // -- the hostile edges --
+
+  it('an upper-cased :draftId still resolves (link rewriters normalize case)', async () => {
+    const org = await seedOrg()
+    const { draft } = await seedReviewable(org)
+    const token = await mintToken(t.api, org.orgId, draft.id, org.userId)
+
+    const res = await get(draft.id.toUpperCase(), token)
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toContain('Reply ready')
+  })
 
   it('a malformed :draftId never reaches Postgres: friendly page at 200, on GET and on POST', async () => {
     const org = await seedOrg()

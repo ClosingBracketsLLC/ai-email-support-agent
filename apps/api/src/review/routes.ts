@@ -20,7 +20,7 @@
  * leaves the link usable once the owner fixes the cause).
  */
 import { and, eq } from 'drizzle-orm'
-import type { FastifyInstance, FastifyRequest } from 'fastify'
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import { hashToken, hashesEqual } from '@aesa/crypto'
 import { categories, tickets } from '@aesa/db'
 import type { ServerDeps } from '../deps.ts'
@@ -49,6 +49,9 @@ interface ResolvedToken {
  * The five checks, in cost order: shape, then the (SECURITY DEFINER, cross-org) hash lookup, then the
  * three properties of the row itself. The draft id is compared in constant time against the path
  * parameter — a token is bound to one draft, and a mismatch is exactly as unremarkable as a bad token.
+ * The parameter is lower-cased first: Postgres renders a uuid lower-case, but link rewriters (and users
+ * retyping a link) normalize case, and a real token on its own draft must not fail over that. Case is
+ * the only thing folded — `hashesEqual` still guards length and compares in constant time.
  */
 async function resolveActionToken(deps: ServerDeps, draftId: string, raw: unknown): Promise<ResolvedToken | null> {
   // `unknown`, not `string | undefined`: a duplicated `?t=`/`t=` arrives as an ARRAY, and the typeof
@@ -56,7 +59,7 @@ async function resolveActionToken(deps: ServerDeps, draftId: string, raw: unknow
   if (typeof raw !== 'string' || !RAW_TOKEN.test(raw)) return null
   const row = await deps.api.resolveDraftActionToken(hashToken('action', raw))
   if (!row) return null
-  if (!hashesEqual(row.draftId, draftId)) return null
+  if (!hashesEqual(row.draftId, draftId.toLowerCase())) return null
   if (row.consumedAt !== null) return null
   if (row.expiresAt.getTime() <= Date.now()) return null
   return { tokenId: row.tokenId, orgId: row.orgId, userId: row.userId, draftId: row.draftId, raw }
@@ -118,7 +121,9 @@ function holdable(draft: DraftView): boolean {
 }
 
 function statusPageFor(data: ReviewData): string {
-  return statusPage({ status: data.draft.status, sentAt: data.draft.send?.sentAt ?? null, appUrl: data.appUrl })
+  return statusPage({
+    status: data.draft.status, sentAt: data.draft.send?.sentAt ?? null, now: new Date(), appUrl: data.appUrl,
+  })
 }
 
 /** What the GET renders: the review page while there is still something to decide (a `pending` draft, or
@@ -219,21 +224,27 @@ async function safeRender(req: FastifyRequest, work: () => Promise<string>): Pro
   }
 }
 
+/**
+ * The ONE reply shape every route here uses. `no-store` is not decoration: the GET's url carries a live
+ * single-use token in its query string and its body carries the customer's message context and that same
+ * token in a form field, so no shared cache, browser back-forward store or corporate proxy may keep a
+ * copy. Applying it unconditionally is also what keeps the four failure modes identical in their HEADERS
+ * as well as their bytes — a `no-store` present on some review responses and absent on others would be
+ * exactly the oracle `friendlyPage()` exists to deny.
+ */
+function reviewReply(reply: FastifyReply, body: string): FastifyReply {
+  return reply.code(200).header('cache-control', 'no-store').type('text/html; charset=utf-8').send(body)
+}
+
 export function registerReviewRoutes(routes: FastifyInstance, deps: ServerDeps): void {
-  routes.get<{ Params: { draftId: string }; Querystring: { t?: string } }>('/a/:draftId', async (req, reply) => {
-    const body = await safeRender(req, () => handleGet(deps, req.params.draftId, req.query.t))
-    return reply.code(200).type('text/html; charset=utf-8').send(body)
-  })
+  routes.get<{ Params: { draftId: string }; Querystring: { t?: string } }>('/a/:draftId', async (req, reply) =>
+    reviewReply(reply, await safeRender(req, () => handleGet(deps, req.params.draftId, req.query.t))))
 
   // The token comes off the FORM, not the query string: a POST's url is what lands in the access log.
   // `@fastify/formbody` (registered in server.ts) is what turns the body into this object at all.
-  routes.post<{ Params: { draftId: string }; Body: { t?: string } }>('/a/:draftId/approve', async (req, reply) => {
-    const body = await safeRender(req, () => handleApprove(deps, req, req.params.draftId, req.body?.t))
-    return reply.code(200).type('text/html; charset=utf-8').send(body)
-  })
+  routes.post<{ Params: { draftId: string }; Body: { t?: string } }>('/a/:draftId/approve', async (req, reply) =>
+    reviewReply(reply, await safeRender(req, () => handleApprove(deps, req, req.params.draftId, req.body?.t))))
 
-  routes.post<{ Params: { draftId: string }; Body: { t?: string } }>('/a/:draftId/hold', async (req, reply) => {
-    const body = await safeRender(req, () => handleHold(deps, req, req.params.draftId, req.body?.t))
-    return reply.code(200).type('text/html; charset=utf-8').send(body)
-  })
+  routes.post<{ Params: { draftId: string }; Body: { t?: string } }>('/a/:draftId/hold', async (req, reply) =>
+    reviewReply(reply, await safeRender(req, () => handleHold(deps, req, req.params.draftId, req.body?.t))))
 }
