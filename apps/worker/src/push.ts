@@ -16,6 +16,11 @@ export interface PushMessage {
   title: string
   body: string
   data?: Record<string, unknown>
+  /**
+   * Expo's `categoryId`: the notification category whose ACTIONS the OS renders on the push itself
+   * (Approve / Open, for `draft_review`). The app registers the category; this only names it.
+   */
+  categoryId?: string
 }
 
 export type SendPush = (msg: PushMessage) => Promise<{ ok: boolean; invalidTokens: string[] }>
@@ -43,7 +48,10 @@ export function createExpoPush(logger: pino.Logger, client: ExpoLikeClient = new
   return async (msg) => {
     if (msg.to.length === 0) return { ok: true, invalidTokens: [] }
     try {
-      const message: ExpoPushMessage = { to: msg.to, title: msg.title, body: msg.body, data: msg.data }
+      const message: ExpoPushMessage = {
+        to: msg.to, title: msg.title, body: msg.body, data: msg.data,
+        ...(msg.categoryId ? { categoryId: msg.categoryId } : {}),
+      }
       const chunks = client.chunkPushNotifications([message])
       const invalidTokens: string[] = []
       for (const chunk of chunks) {

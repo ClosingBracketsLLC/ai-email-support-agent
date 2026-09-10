@@ -130,6 +130,9 @@ export async function runNotifyDispatch(deps: NotifyDispatchDeps, payload: Notif
     title: ready.title,
     body: ready.body,
     data: { kind: ready.kind, ...((ready.payload as Record<string, unknown> | null) ?? {}) },
+    // Only the review push is actionable from the notification shade (Approve / Open); every other
+    // kind is informational, so it carries no category and the OS renders no action buttons.
+    ...(ready.kind === 'draft_review' ? { categoryId: 'draft_review' } : {}),
   })
 
   if (!result.ok) {

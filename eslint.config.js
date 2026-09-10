@@ -21,7 +21,7 @@ const appImports = {
     ...rawDbImports.paths,
     ...[
       '@aesa/db', '@aesa/core', '@aesa/crypto', '@aesa/queue', '@aesa/api',
-      '@aesa/mail', '@aesa/llm', '@aesa/agent', '@aesa/test-kit',
+      '@aesa/mail', '@aesa/platform-mail', '@aesa/llm', '@aesa/agent', '@aesa/test-kit',
       'drizzle-orm', 'fastify', 'better-auth/node',
     ].map((name) => ({ name, message: APP_MESSAGE, allowTypeImports: true })),
   ],

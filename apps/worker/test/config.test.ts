@@ -100,4 +100,40 @@ describe('worker config', () => {
       expect(config.platformSender).toBe('no-reply@mail.example.com')
     })
   })
+
+  describe('mail / app URLs (Task 16)', () => {
+    it('defaults to the devsink transport outside production', () => {
+      expect(loadConfig({ DATABASE_URL }).mail).toEqual({ transport: 'devsink', from: 'aesa <onboarding@resend.dev>' })
+    })
+
+    it('throws in production when the cron role is active and RESEND_API_KEY is missing (the digest email needs it)', () => {
+      expect(() => loadConfig({ DATABASE_URL, NODE_ENV: 'production', WORKER_ROLES: 'cron' }))
+        .toThrow(/RESEND_API_KEY is required when EMAIL_TRANSPORT=resend/)
+    })
+
+    it('does NOT throw in production without the cron role — that replica never sends platform mail', () => {
+      expect(loadConfig({ DATABASE_URL, NODE_ENV: 'production', WORKER_ROLES: 'agent', ANTHROPIC_API_KEY: 'sk-ant-x' }).mail.transport).toBe('devsink')
+    })
+
+    it('builds the resend transport config in production when the cron role is fully configured', () => {
+      const config = loadConfig({ DATABASE_URL, NODE_ENV: 'production', WORKER_ROLES: 'cron', RESEND_API_KEY: 're_k', MAIL_FROM: 'aesa <no-reply@x.test>' })
+      expect(config.mail.transport).toBe('resend')
+      expect(config.mail.transport === 'resend' && config.mail.apiKey.expose()).toBe('re_k')
+      expect(JSON.stringify(config.mail)).not.toContain('re_k')
+    })
+
+    it('reports null app URLs when unset, and strips trailing slashes when set', () => {
+      const bare = loadConfig({ DATABASE_URL })
+      expect(bare.appBaseUrl).toBeNull()
+      expect(bare.appWebOrigin).toBeNull()
+      const set = loadConfig({ DATABASE_URL, APP_BASE_URL: 'https://api.example.com/', APP_WEB_ORIGIN: 'https://app.example.com//' })
+      expect(set.appBaseUrl).toBe('https://api.example.com')
+      expect(set.appWebOrigin).toBe('https://app.example.com')
+    })
+
+    it('rejects a non-http(s) APP_BASE_URL / APP_WEB_ORIGIN', () => {
+      expect(() => loadConfig({ DATABASE_URL, APP_BASE_URL: 'nope' })).toThrow(/APP_BASE_URL must be an http\(s\) URL/)
+      expect(() => loadConfig({ DATABASE_URL, APP_WEB_ORIGIN: 'aesa://app' })).toThrow(/APP_WEB_ORIGIN must be an http\(s\) URL/)
+    })
+  })
 })

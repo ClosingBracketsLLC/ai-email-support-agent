@@ -21,8 +21,7 @@ import {
 import { hashToken } from '@aesa/crypto'
 import { JOB_NAMES } from '@aesa/queue'
 import { createFlow } from '../../connect/flows.ts'
-import { mailboxClaimedMail } from '../../mail/templates.ts'
-import type { OutgoingMail } from '../../mail/transport.ts'
+import { mailboxClaimedMail, verificationMail } from '../../mail/templates.ts'
 import { isUniqueViolation } from '../../pg-error.ts'
 import { managerProcedure, orgProcedure, router } from '../init.ts'
 
@@ -35,27 +34,6 @@ const VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000
 function issueVerificationCode(): { code: string; hash: string; expiresAt: Date } {
   const code = String(randomInt(0, 1_000_000)).padStart(6, '0')
   return { code, hash: hashToken('action', code), expiresAt: new Date(Date.now() + VERIFICATION_TTL_MS) }
-}
-
-/**
- * The code rides in the subject (so it survives even if the body is stripped) AND the body (belt and
- * braces, since the worker's regex scans `subject + '\n' + bodyText`). This mail's `from` is whatever
- * `deps.mail` sends as (`ApiConfig.mail.from`, i.e. this api's own `MAIL_FROM`) — the worker's sync
- * walk only intercepts a code from `ctx.platformSender`, its OWN `MAIL_FROM` parsed the same way
- * (`apps/worker/src/config.ts`). The two must be the SAME address in every real deployment, or a
- * verification mail lands as an ordinary, unauthenticated customer message instead of being caught
- * before ticketing (`packages/mail/src/sync.ts`'s `interceptVerification`).
- */
-function verificationMail(address: string, code: string): OutgoingMail {
-  return {
-    to: address,
-    subject: `aesa address verification ${code}`,
-    text: `Someone added ${address} as a support address on your aesa workspace.\n\n` +
-      `Verification code: ${code}\n\n` +
-      `You don't need to reply or do anything with this code yourself — as soon as this address ` +
-      `receives any email carrying it, aesa's mailbox sync notices it automatically and activates the ` +
-      `address. This code expires in 24 hours.`,
-  }
 }
 
 type ClaimOutcome =

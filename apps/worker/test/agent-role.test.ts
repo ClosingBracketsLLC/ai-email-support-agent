@@ -24,6 +24,9 @@ function baseConfig(overrides: Partial<WorkerConfig> = {}): WorkerConfig {
     msOauth: null,
     gmailPubsubTopic: null,
     webhookPublicUrl: null,
+    mail: { transport: 'devsink', from: 'aesa <onboarding@resend.dev>' },
+    appBaseUrl: null,
+    appWebOrigin: null,
     platformSender: null,
     ...overrides,
   }

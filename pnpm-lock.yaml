@@ -38,6 +38,9 @@ importers:
       '@aesa/mail':
         specifier: workspace:*
         version: link:../../packages/mail
+      '@aesa/platform-mail':
+        specifier: workspace:*
+        version: link:../../packages/platform-mail
       '@aesa/queue':
         specifier: workspace:*
         version: link:../../packages/queue
@@ -74,9 +77,6 @@ importers:
       pino:
         specifier: ^10.3.0
         version: 10.3.1
-      resend:
-        specifier: ^6.26.0
-        version: 6.26.0
       superjson:
         specifier: ^2.2.0
         version: 2.2.6
@@ -256,6 +256,9 @@ importers:
       '@aesa/mail':
         specifier: workspace:*
         version: link:../../packages/mail
+      '@aesa/platform-mail':
+        specifier: workspace:*
+        version: link:../../packages/platform-mail
       '@aesa/queue':
         specifier: workspace:*
         version: link:../../packages/queue
@@ -477,6 +480,31 @@ importers:
       '@types/html-to-text':
         specifier: ^9.0.4
         version: 9.0.4
+      '@types/node':
+        specifier: ^22
+        version: 22.20.1
+      tsx:
+        specifier: ^4.20.0
+        version: 4.23.13
+      typescript:
+        specifier: ^5.9.2
+        version: 5.9.3
+      vitest:
+        specifier: ^3.2.0
+        version: 3.2.7(@types/node@22.20.1)(jsdom@20.0.3)(lightningcss@1.33.0)(terser@5.51.2)(tsx@4.23.13)(yaml@2.9.0)
+
+  packages/platform-mail:
+    dependencies:
+      '@aesa/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+      '@aesa/crypto':
+        specifier: workspace:*
+        version: link:../crypto
+      resend:
+        specifier: ^6.26.0
+        version: 6.26.0
+    devDependencies:
       '@types/node':
         specifier: ^22
         version: 22.20.1

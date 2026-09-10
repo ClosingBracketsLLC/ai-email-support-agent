@@ -20,6 +20,9 @@ function baseConfig(overrides: Partial<WorkerConfig> = {}): WorkerConfig {
   return {
     env: 'test', databaseUrl: 'unused', roles: new Set(['sync']), kekRing: null, logLevel: 'silent', anthropicApiKey: null,
     gmailOauth: { clientId: 'gmail-client', clientSecret: { expose: () => 'gmail-secret' } as never },
+    mail: { transport: 'devsink', from: 'aesa <onboarding@resend.dev>' },
+    appBaseUrl: null,
+    appWebOrigin: null,
     msOauth: null, gmailPubsubTopic: null, webhookPublicUrl: null, platformSender: 'no-reply@aesa.test',
     ...overrides,
   }

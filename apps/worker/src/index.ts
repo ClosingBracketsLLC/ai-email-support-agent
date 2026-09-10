@@ -1,6 +1,7 @@
 import { assertInvariants, loadDotEnv } from '@aesa/core'
 import { createDb } from '@aesa/db/raw'
 import { createMailLimiter } from '@aesa/mail'
+import { createMailTransport } from '@aesa/platform-mail'
 import { createQueueRetrying, JOB_NAMES, startBoss } from '@aesa/queue'
 import { maybeRegisterAgentRole } from './agent-role.ts'
 import { loadConfig } from './config.ts'
@@ -56,7 +57,10 @@ await registerNotifyDispatch(boss, { db, push, logger })
 
 if (config.roles.has('cron')) {
   await registerPlatformHeartbeat(boss, db)
-  await registerNotifyDigest(boss, { db, push, logger })
+  // The ONLY process that sends platform mail besides the api: notify.digest's daily digest email.
+  // Its links need both origins, so an unconfigured deployment logs once and runs push-only.
+  const mail = createMailTransport(config.mail)
+  await registerNotifyDigest(boss, { db, push, logger, mail, appBaseUrl: config.appBaseUrl, appWebOrigin: config.appWebOrigin })
   await registerTicketBackstopSweep(boss, { db, logger })
   await registerSweepsDaily(boss, { db, logger })
 }

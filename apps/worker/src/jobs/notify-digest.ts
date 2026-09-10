@@ -20,8 +20,10 @@ import { and, asc, eq, inArray, isNull, lt } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import { resolveSetting } from '@aesa/core'
-import { notificationDevices, notifications, orgSettings, tickets, withOrg, withPlatform, type Db } from '@aesa/db'
+import { notificationDevices, notifications, orgSettings, tickets, withOrg, withPlatform, workspaces, type Db } from '@aesa/db'
+import type { MailTransport } from '@aesa/platform-mail'
 import { registerCron } from '@aesa/queue'
+import { runDigestEmailForOrg } from '../digest-email.ts'
 import type { SendPush } from '../push.ts'
 
 /** Ported cap: bounds only what's RENDERED into the push body, never what's stamped `sent` below. */
@@ -32,6 +34,10 @@ export interface NotifyDigestDeps {
   push: SendPush
   logger: pino.Logger
   now?: () => Date
+  /** Task 16's daily digest EMAIL pass. All three absent (unconfigured deployment) turns it off. */
+  mail?: MailTransport
+  appBaseUrl?: string | null
+  appWebOrigin?: string | null
 }
 
 function buildDigestBody(titles: string[]): string {
@@ -146,6 +152,41 @@ async function runOneOrgDigest(deps: NotifyDigestDeps, orgId: string, now: Date)
   await disableInvalidDevices(deps.db, orgId, result.invalidTokens, now)
 }
 
+/** Once per process, not once per 5-minute tick: an unconfigured deployment must not spam the log. */
+let emailPassWarned = false
+
+/**
+ * The daily digest EMAIL pass (Task 16), run after the push pass on every tick. Unlike the push
+ * pass — which only visits orgs that have collapsed rows — this visits every org that has a
+ * workspace at all, because whether it is that org's send hour is a per-org, local-time question
+ * only `runDigestEmailForOrg` can answer (and it is what holds the once-per-local-day lock).
+ */
+async function runDigestEmailPass(deps: NotifyDigestDeps, now: Date): Promise<void> {
+  const { mail, appBaseUrl, appWebOrigin } = deps
+  if (!mail || !appBaseUrl || !appWebOrigin) {
+    if (!emailPassWarned) {
+      emailPassWarned = true
+      deps.logger.warn('digest email pass disabled: a mail transport, APP_BASE_URL and APP_WEB_ORIGIN are all required')
+    }
+    return
+  }
+
+  const orgIds = await withPlatform(deps.db, 'cron:notify.digest-email', async (tx) => {
+    const rows = await tx.select({ orgId: workspaces.orgId }).from(workspaces)
+    return rows.map((r) => r.orgId)
+  })
+
+  for (const orgId of orgIds) {
+    // One org's failure (a bad timezone row, a transient DB error) must not strand every org after
+    // it in the scan — the lock row means a failed org simply waits for tomorrow.
+    try {
+      await runDigestEmailForOrg({ db: deps.db, mail, appBaseUrl, appWebOrigin, logger: deps.logger, now: deps.now }, orgId, now)
+    } catch (err) {
+      deps.logger.warn({ orgId, error: err instanceof Error ? err.message : String(err) }, 'digest_email_org_failed')
+    }
+  }
+}
+
 export async function runNotifyDigest(deps: NotifyDigestDeps): Promise<void> {
   const now = deps.now?.() ?? new Date()
 
@@ -157,6 +198,8 @@ export async function runNotifyDigest(deps: NotifyDigestDeps): Promise<void> {
   for (const orgId of orgIds) {
     await runOneOrgDigest(deps, orgId, now)
   }
+
+  await runDigestEmailPass(deps, now)
 }
 
 export async function registerNotifyDigest(boss: PgBoss, deps: NotifyDigestDeps): Promise<void> {

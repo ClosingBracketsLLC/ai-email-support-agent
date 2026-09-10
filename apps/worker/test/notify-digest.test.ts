@@ -10,7 +10,8 @@ import { randomBytes } from 'node:crypto'
 import { eq, inArray } from 'drizzle-orm'
 import pino from 'pino'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { mailboxConnections, notificationDevices, notifications, orgSettings, tickets, user, withOrg } from '@aesa/db'
+import { createDevSink } from '@aesa/platform-mail'
+import { drafts, mailboxConnections, member, notificationDevices, notifications, orgSettings, tickets, user, withOrg, workspaces } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
 import { runNotifyDigest, type NotifyDigestDeps } from '../src/jobs/notify-digest.ts'
@@ -244,5 +245,50 @@ describe('notify.digest', () => {
 
     expect((await readNotification(orgId, id))?.status).toBe('sent')
     expect((await readTicket(orgId, ticketId))?.escalationNotifiedAt?.getTime()).toBe(stampedAt.getTime())
+  })
+})
+
+describe('notify.digest: the email pass', () => {
+  /** One workspace per org, in a timezone where NOW is the catalog default digest hour (08:00). */
+  async function newOrgReadyForDigest(): Promise<{ orgId: string; ownerEmail: string; ticketId: string }> {
+    const orgId = await newOrg()
+    await withOrg(app.db, orgId, (tx) => tx.insert(workspaces).values({ orgId, businessName: `Biz ${rand()}`, timezone: 'America/New_York' }))
+    const ownerEmail = `digest-owner-${rand()}@example.com`
+    const [u] = await app.db.insert(user).values({ name: 'Owner', email: ownerEmail }).returning({ id: user.id })
+    await app.db.insert(member).values({ organizationId: orgId, userId: u!.id, role: 'owner' })
+    const ticketId = await seedTicket(orgId, { status: 'awaiting_review', subject: 'Where is my order?', customerEmail: 'buyer@x.test' })
+    await withOrg(app.db, orgId, (tx) =>
+      tx.insert(drafts).values({
+        orgId, ticketId, body: 'It shipped yesterday.', decision: 'review', decisionReason: 'confidence',
+        confidence: 0.9, status: 'pending', threadSnapshotAt: NOW, expiresAt: new Date(NOW.getTime() + 7 * 86_400_000),
+      }))
+    return { orgId, ownerEmail, ticketId }
+  }
+
+  it('runs once per org with a workspace, and is a no-op on a second tick the same local day', async () => {
+    const a = await newOrgReadyForDigest()
+    const b = await newOrgReadyForDigest()
+    const mail = createDevSink()
+    const { send } = createRecordingPush()
+    const deps: NotifyDigestDeps = { ...makeDeps(send), mail, appBaseUrl: 'https://api.test', appWebOrigin: 'https://app.test' }
+
+    await runNotifyDigest(deps)
+    await runNotifyDigest(deps)
+
+    expect(mail.all().filter((m) => m.to === a.ownerEmail)).toHaveLength(1)
+    expect(mail.all().filter((m) => m.to === b.ownerEmail)).toHaveLength(1)
+    expect(mail.latestTo(a.ownerEmail)?.text).toContain(`https://app.test/ticket/${a.ticketId}`)
+  })
+
+  it('without a mail transport the push pass still runs and nothing is emailed', async () => {
+    const orgId = await newOrg()
+    await seedDevice(orgId)
+    const id = await seedCollapsed(orgId, 'Push still works', OLD_ENOUGH)
+    const { send, calls } = createRecordingPush()
+
+    await runNotifyDigest(makeDeps(send)) // no `mail`/`appBaseUrl`/`appWebOrigin` in deps
+
+    expect(calls.some((c) => c.body.includes('Push still works'))).toBe(true)
+    expect((await readNotification(orgId, id))?.status).toBe('sent')
   })
 })

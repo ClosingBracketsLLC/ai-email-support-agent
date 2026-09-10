@@ -54,6 +54,9 @@ function baseConfig(overrides: Partial<WorkerConfig> = {}): WorkerConfig {
     env: 'test', databaseUrl: 'unused', roles: new Set(['send']), kekRing: null, logLevel: 'silent', anthropicApiKey: null,
     gmailOauth: { clientId: 'gmail-client', clientSecret: { expose: () => 'gmail-secret' } as never },
     msOauth: { clientId: 'ms-client', clientSecret: { expose: () => 'ms-secret' } as never },
+    mail: { transport: 'devsink', from: 'aesa <onboarding@resend.dev>' },
+    appBaseUrl: null,
+    appWebOrigin: null,
     gmailPubsubTopic: null, webhookPublicUrl: null, platformSender: 'no-reply@aesa.test',
     ...overrides,
   }

@@ -74,6 +74,9 @@ function baseConfig(): WorkerConfig {
     msOauth: { clientId: 'ms-client', clientSecret: { expose: () => 'ms-secret' } as never },
     gmailPubsubTopic: null,
     webhookPublicUrl: null,
+    mail: { transport: 'devsink', from: 'aesa <onboarding@resend.dev>' },
+    appBaseUrl: null,
+    appWebOrigin: null,
     platformSender: 'no-reply@aesa.test',
   }
 }
