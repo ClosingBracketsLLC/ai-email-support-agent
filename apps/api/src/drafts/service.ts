@@ -84,6 +84,47 @@ const REQUEUEABLE_SEND_STATUSES = OUTBOUND_SEND_STATUSES.filter((s) => outboundS
 const clock = (deps: DraftServiceDeps): Date => deps.now?.() ?? new Date()
 const utcDay = (now: Date): string => now.toISOString().slice(0, 10)
 
+/** Postgres `deadlock_detected`. */
+const DEADLOCK_SQLSTATE = '40P01'
+
+/** The SQLSTATE arrives on the pg error, which drizzle wraps — `DrizzleQueryError.cause` is the
+ * original, and Postgres errors can nest one further, so walk a bounded chain. */
+function isDeadlock(error: unknown): boolean {
+  let current: unknown = error
+  for (let depth = 0; depth < 5 && typeof current === 'object' && current !== null; depth++) {
+    if ((current as { code?: unknown }).code === DEADLOCK_SQLSTATE) return true
+    current = (current as { cause?: unknown }).cause
+  }
+  return false
+}
+
+/**
+ * Re-runs a whole transaction once when Postgres picks it as a deadlock victim.
+ *
+ * The three functions that touch two of the three row kinds all take them in the global order
+ * (`outbound_sends` → `drafts` → `tickets`), which removes every ordinary inversion — but one narrow
+ * three-way window survives it: a send row created by an approve that commits WHILE `resolveTicket`
+ * waits on the draft lock cannot have been locked by resolve's first statement, so a `holdDraft` or a
+ * second `approveDraft` that grabbed that send row and is now waiting on the draft can deadlock with
+ * it. Postgres detects that in milliseconds and aborts one side with `40P01`; the aborted transaction
+ * has rolled back WHOLE, and every body here is a fresh set of reads plus status-guarded writes, so
+ * re-running it is safe and idempotent — the retry sees the world the winner left and returns the
+ * ordinary soft outcome (`not_pending`, `too_late`, `false`) instead of a masked 500 on a button.
+ *
+ * Deliberately narrow: only `40P01`, only one extra attempt, and never around anything but a single
+ * `withOrg` call (no enqueue, no I/O, is inside).
+ */
+export async function withDeadlockRetry<T>(fn: () => Promise<T>, opts: { attempts?: number } = {}): Promise<T> {
+  const attempts = Math.max(1, opts.attempts ?? 2)
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn()
+    } catch (error) {
+      if (attempt >= attempts || !isDeadlock(error)) throw error
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // The draft view (the app's review panel, and `inbox.ticket`)
 // ---------------------------------------------------------------------------
@@ -201,7 +242,7 @@ export async function approveDraft(
   opts?: { consumeTokenId?: string },
 ): Promise<ApproveResult> {
   const now = clock(deps)
-  const outcome = await deps.api.withOrg(orgId, async (tx): Promise<ApproveResult> => {
+  const outcome = await withDeadlockRetry(() => deps.api.withOrg(orgId, async (tx): Promise<ApproveResult> => {
     // Lock order `outbound_sends` → `drafts` → `tickets` (see this file's header): a no-op when this
     // draft has never been approved, and the lock the upsert below would otherwise take second.
     await tx.select({ id: outboundSends.id })
@@ -299,7 +340,7 @@ export async function approveDraft(
       ip: actor.ip, userAgent: actor.userAgent,
     })
     return { ok: true, sendId: send.id, sendAfter, edited }
-  })
+  }))
 
   if (outcome.ok) {
     const jobId = await deps.enqueue(
@@ -342,7 +383,7 @@ export async function holdDraft(
   deps: DraftServiceDeps, orgId: string, draftId: string, actor: DraftActor, opts?: { consumeTokenId?: string },
 ): Promise<{ ok: true } | { ok: false; code: 'not_found' | 'not_holdable' | 'too_late' }> {
   const now = clock(deps)
-  return deps.api.withOrg(orgId, async (tx) => {
+  return withDeadlockRetry(() => deps.api.withOrg(orgId, async (tx) => {
     // Send row first: `send.execute` claims it before it touches the draft, and the undo races
     // exactly that claim — locking in the other order is how the two would deadlock.
     const [send] = await tx.select({ id: outboundSends.id, status: outboundSends.status })
@@ -376,7 +417,7 @@ export async function holdDraft(
       ip: actor.ip, userAgent: actor.userAgent,
     })
     return { ok: true }
-  })
+  }))
 }
 
 /**
@@ -496,7 +537,10 @@ export async function rejectDraft(
         detail: { draftId: draft.id, rejectAction: input.action },
       })
       : { escalated: false, notificationId: undefined }
-    const resolutionName: RejectResolution = atLimit ? 'escalate_limit' : 'escalate_terminal'
+    // `escalate_limit` is the caller's cue that the ticket was paged for hitting the re-draft cap —
+    // so it is only that when the escalation actually happened. A ticket a concurrent writer moved
+    // out of `awaiting_review` (the guard above) is reported as the terminal resolution it got.
+    const resolutionName: RejectResolution = atLimit && escalated.escalated ? 'escalate_limit' : 'escalate_terminal'
     await audit(tx, {
       actor: actor.actor, action: 'draft.rejected', entityType: 'draft', entityId: draft.id,
       detail: { draftId: draft.id, ticketId: ticket.id, resolution: resolutionName, reasonLen: input.reason.length, escalated: escalated.escalated },
@@ -556,7 +600,7 @@ export async function markViewed(deps: DraftServiceDeps, orgId: string, draftId:
  * every other exit from it is.
  */
 export async function resolveTicket(deps: DraftServiceDeps, orgId: string, ticketId: string, actor: DraftActor): Promise<boolean> {
-  return deps.api.withOrg(orgId, async (tx) => {
+  return withDeadlockRetry(() => deps.api.withOrg(orgId, async (tx) => {
     // Lock order `outbound_sends` → `drafts` → `tickets` (see this file's header). The send rows go
     // first, found through a subquery so no draft row has to be read (let alone locked) before them.
     await tx.select({ id: outboundSends.id })
@@ -607,7 +651,7 @@ export async function resolveTicket(deps: DraftServiceDeps, orgId: string, ticke
       detail: { ticketId, supersededDraftId }, ip: actor.ip, userAgent: actor.userAgent,
     })
     return true
-  })
+  }))
 }
 
 // ---------------------------------------------------------------------------

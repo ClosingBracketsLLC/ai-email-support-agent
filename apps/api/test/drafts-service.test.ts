@@ -12,7 +12,7 @@ import { APPROVE_UNDO_SECONDS } from '@aesa/contracts'
 import { auditLog, draftActionTokens, drafts, notifications, outboundSends, tickets, workspaces } from '@aesa/db'
 import { JOB_NAMES } from '@aesa/queue'
 import {
-  approveDraft, holdDraft, levenshteinRatio, markViewed, rejectDraft, resolveTicket, resumeDraft,
+  approveDraft, holdDraft, levenshteinRatio, markViewed, rejectDraft, resolveTicket, resumeDraft, withDeadlockRetry,
   type DraftActor, type DraftServiceDeps,
 } from '../src/drafts/service.ts'
 import type { ApiFacade, EnqueueFn } from '../src/deps.ts'
@@ -404,7 +404,11 @@ describe('draft service', () => {
     // for another reason, and overwriting that with `owner_handling` would erase why it is waiting.
     expect(await readTicket(org.orgId, ticket.id)).toMatchObject({ status: 'needs_owner', needsOwnerReason: 'tripwire' })
     expect(await readAudit(org.orgId, 'ticket.escalated')).toHaveLength(0)
-    expect((await readAudit(org.orgId, 'draft.rejected'))[0]!.detail).toMatchObject({ resolution: 'escalate_terminal', escalated: false })
+    // The resolution the caller is told and the one on the audit row are the same, and both say what
+    // actually happened: nothing was escalated, so it is never reported as `escalate_limit`.
+    const audited = (await readAudit(org.orgId, 'draft.rejected'))[0]!.detail as { resolution: string; escalated: boolean }
+    expect(audited).toMatchObject({ resolution: 'escalate_terminal', escalated: false })
+    expect(res).toEqual({ ok: true, resolution: audited.resolution })
     expect(sent).toEqual([])
   })
 
@@ -497,6 +501,53 @@ describe('draft service', () => {
   })
 
   // -- the ratio --
+
+  it('withDeadlockRetry retries a deadlock victim exactly once, and nothing else', async () => {
+    const deadlock = (): Error => Object.assign(new Error('deadlock detected'), { code: '40P01' })
+    // How drizzle actually surfaces it: the SQLSTATE sits on the wrapped pg error, not the wrapper.
+    const wrappedDeadlock = (): Error => Object.assign(new Error('Failed query: update "drafts" …'), { cause: deadlock() })
+
+    let calls = 0
+    const retried = await withDeadlockRetry(async () => {
+      calls += 1
+      if (calls === 1) throw deadlock()
+      return 'committed'
+    })
+    expect(retried).toBe('committed')
+    expect(calls).toBe(1 + 1)
+
+    calls = 0
+    expect(await withDeadlockRetry(async () => {
+      calls += 1
+      if (calls === 1) throw wrappedDeadlock()
+      return 'committed'
+    })).toBe('committed')
+    expect(calls).toBe(2)
+
+    // A different SQLSTATE is someone else's problem: rethrown untouched, no second attempt.
+    calls = 0
+    await expect(withDeadlockRetry(async () => {
+      calls += 1
+      throw Object.assign(new Error('duplicate key'), { code: '23505' })
+    })).rejects.toMatchObject({ code: '23505' })
+    expect(calls).toBe(1)
+
+    // Two deadlocks in a row: the caller sees the error rather than a third attempt.
+    calls = 0
+    await expect(withDeadlockRetry(async () => {
+      calls += 1
+      throw deadlock()
+    })).rejects.toMatchObject({ code: '40P01' })
+    expect(calls).toBe(2)
+
+    // The service's own throw (an already-consumed action token) is never retried.
+    calls = 0
+    await expect(withDeadlockRetry(async () => {
+      calls += 1
+      throw new Error('draft action token was already consumed')
+    })).rejects.toThrow('already consumed')
+    expect(calls).toBe(1)
+  })
 
   it('levenshteinRatio: 0 for identical (and empty) strings, 1 for a full rewrite, in between for an edit', () => {
     expect(levenshteinRatio('same text', 'same text')).toBe(0)
