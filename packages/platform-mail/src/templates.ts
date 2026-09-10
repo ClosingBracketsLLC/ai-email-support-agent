@@ -67,7 +67,6 @@ export interface DigestDraftItem {
 /** One open `needs_owner` ticket in the daily digest — no draft to approve, only a reason to look. */
 export interface DigestEscalationItem {
   subject: string
-  /** Carried for parity with DigestDraftItem; the text digest's escalation line renders subject · reason only. */
   customer: string
   reason: string
   openUrl: string
@@ -100,8 +99,9 @@ export function digestMail(p: {
   const n = p.drafts.length
   const m = p.escalations.length
   const draftHeadline = `${n} draft${n === 1 ? '' : 's'} waiting for review`
+  const escalationHeadline = `${m} ticket${m === 1 ? '' : 's'} need${m === 1 ? 's' : ''} you`
   // With no drafts at all the escalations ARE the news, so the subject leads with them instead.
-  const subject = n > 0 ? `${draftHeadline} · ${p.businessName}` : `${m} tickets need you`
+  const subject = n > 0 ? `${draftHeadline} · ${p.businessName}` : escalationHeadline
 
   const lines: string[] = []
   if (n > 0) {
@@ -114,9 +114,9 @@ export function digestMail(p: {
     }))
   }
   if (m > 0) {
-    lines.push(`${m} ticket${m === 1 ? '' : 's'} need${m === 1 ? 's' : ''} you:`, '')
+    lines.push(`${escalationHeadline}:`, '')
     lines.push(...renderSection(p.escalations, (e) => [
-      [e.subject || NO_SUBJECT, e.reason].filter(Boolean).join(' · '),
+      [e.subject || NO_SUBJECT, e.customer, e.reason].filter(Boolean).join(' · '),
       `Open: ${e.openUrl}`,
     ]))
   }

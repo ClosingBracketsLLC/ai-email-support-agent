@@ -81,15 +81,22 @@ describe('digestMail', () => {
     const mail = digestMail({ to: 'owner@acme.test', businessName: 'Acme', drafts: [], escalations, inboxUrl: 'https://app.test/inbox' })
 
     expect(mail.subject).toBe('12 tickets need you')
-    expect(mail.text).toContain('Angry about 0 · tripwire')
+    // Mirrors the draft line's shape: subject · customer · … (reason, where a draft has category/confidence).
+    expect(mail.text).toContain('Angry about 0 · angry0@x.test · tripwire')
     expect(mail.text).toContain(`Open: ${escalations[0]!.openUrl}`)
     expect(mail.text).toContain(`…and ${12 - DIGEST_MAX_ITEMS} more`)
     for (const e of escalations.slice(DIGEST_MAX_ITEMS)) expect(mail.text).not.toContain(e.openUrl)
   })
 
+  it('singularises the no-drafts subject and its section heading for one escalation', () => {
+    const mail = digestMail({ to: 'owner@acme.test', businessName: 'Acme', drafts: [], escalations: [escalation(1)], inboxUrl: 'https://app.test/inbox' })
+    expect(mail.subject).toBe('1 ticket needs you')
+    expect(mail.text).toContain('1 ticket needs you:')
+  })
+
   it('keeps the draft subject form when drafts and escalations are both present', () => {
     const mail = digestMail({ to: 'owner@acme.test', businessName: 'Acme', drafts: [draft(1)], escalations: [escalation(1)], inboxUrl: 'https://app.test/inbox' })
     expect(mail.subject).toBe('1 draft waiting for review · Acme')
-    expect(mail.text).toContain('Angry about 1 · tripwire')
+    expect(mail.text).toContain('Angry about 1 · angry1@x.test · tripwire')
   })
 })

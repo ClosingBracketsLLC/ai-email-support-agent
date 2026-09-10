@@ -168,12 +168,37 @@ describe('runDigestEmailForOrg', () => {
     expect(ownerMail.text).toContain(`${APP_WEB_ORIGIN}/ticket/${ticketA}`)
     expect(ownerMail.text).toContain('Shipping · 86% confidence')
     // The needs_owner ticket rides along as an escalation item.
-    expect(ownerMail.text).toContain('Legal threat · tripwire')
+    expect(ownerMail.text).toContain('Legal threat · Bea Buyer · tripwire')
     expect(ownerMail.text).toContain(`${APP_WEB_ORIGIN}/ticket/${escalated}`)
 
     const lock = await readLock(orgId)
     expect(lock).toMatchObject({ kind: 'digest', title: 'Daily digest email', body: '', status: 'sent', payload: { channel: 'email' } })
     expect(lock!.sentAt?.getTime()).toBe(NOW.getTime())
+  })
+
+  it("renders the DRAFT's own category label, falling back to the ticket's when the draft has none", async () => {
+    const orgId = await newOrgWithWorkspace()
+    const owner = await addMember(orgId, 'owner')
+    const connectionId = await seedConnection(orgId, owner.userId)
+    const [ticketCat, draftCat] = await withOrg(app.db, orgId, async (tx) => {
+      const rows = await tx
+        .insert(categories)
+        .values([{ orgId, key: `tkt-${rand()}`, label: 'Ticket Category' }, { orgId, key: `drf-${rand()}`, label: 'Draft Category' }])
+        .returning({ id: categories.id })
+      return [rows[0]!.id, rows[1]!.id]
+    })
+    // Same ticket category on both tickets; only the first draft carries its own, differing category.
+    const withOwn = await seedTicket(orgId, connectionId, { categoryId: ticketCat, subject: 'Model decided' })
+    const withoutOwn = await seedTicket(orgId, connectionId, { categoryId: ticketCat, subject: 'Model undecided' })
+    await seedPendingDraft(orgId, withOwn, { categoryId: draftCat })
+    await seedPendingDraft(orgId, withoutOwn)
+    const mail = createDevSink()
+
+    expect(await runDigestEmailForOrg(makeDeps(mail), orgId, NOW)).toBe('sent')
+
+    const text = mail.latestTo(owner.email)!.text
+    expect(text).toContain('Model decided · Bea Buyer · Draft Category ·')
+    expect(text).toContain('Model undecided · Bea Buyer · Ticket Category ·')
   })
 
   it('runs once per local day: a second run the same day sends nothing and mints no new tokens', async () => {
@@ -257,7 +282,7 @@ describe('runDigestEmailForOrg', () => {
     expect(await runDigestEmailForOrg(makeDeps(mail), orgId, NOW)).toBe('sent')
 
     const sent = mail.latestTo(owner.email)
-    expect(sent?.subject).toBe('1 tickets need you')
+    expect(sent?.subject).toBe('1 ticket needs you')
     expect(sent?.text).toContain(`${APP_WEB_ORIGIN}/ticket/${escalated}`)
     expect(await readTokens(orgId)).toHaveLength(0)
   })

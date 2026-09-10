@@ -14,6 +14,7 @@
  * than a tenant transaction.
  */
 import { and, asc, eq, inArray } from 'drizzle-orm'
+import { alias } from 'drizzle-orm/pg-core'
 import type pino from 'pino'
 import { resolveSetting, type SettingKey } from '@aesa/core'
 import { generateToken } from '@aesa/crypto'
@@ -128,15 +129,20 @@ interface PendingEscalation {
 /** Everything still waiting on the owner: pending drafts to approve, and open `needs_owner` tickets. */
 async function loadPending(db: Db, orgId: string): Promise<{ drafts: PendingDraft[]; escalations: PendingEscalation[] }> {
   return withOrg(db, orgId, async (tx) => {
+    // Two joins to `categories`: the draft's OWN category (the model's decided one, which the
+    // draft_review push already shows) wins, with the ticket's as the fallback when it is NULL.
+    const draftCategories = alias(categories, 'draft_categories')
+    const ticketCategories = alias(categories, 'ticket_categories')
     const draftRows = await tx
       .select({
         draftId: drafts.id, ticketId: drafts.ticketId, body: drafts.body, confidence: drafts.confidence,
         subject: tickets.subject, customerName: tickets.customerName, customerEmail: tickets.customerEmail,
-        categoryLabel: categories.label,
+        draftCategoryLabel: draftCategories.label, ticketCategoryLabel: ticketCategories.label,
       })
       .from(drafts)
       .innerJoin(tickets, eq(tickets.id, drafts.ticketId))
-      .leftJoin(categories, eq(categories.id, tickets.categoryId))
+      .leftJoin(draftCategories, eq(draftCategories.id, drafts.categoryId))
+      .leftJoin(ticketCategories, eq(ticketCategories.id, tickets.categoryId))
       .where(and(eq(drafts.orgId, orgId), eq(drafts.status, 'pending')))
       .orderBy(asc(drafts.createdAt))
 
@@ -152,7 +158,7 @@ async function loadPending(db: Db, orgId: string): Promise<{ drafts: PendingDraf
         ticketId: r.ticketId,
         subject: r.subject ?? '',
         customer: r.customerName || r.customerEmail || 'unknown sender',
-        categoryLabel: r.categoryLabel,
+        categoryLabel: r.draftCategoryLabel ?? r.ticketCategoryLabel,
         confidencePct: r.confidence === null ? null : Math.round(r.confidence * 100),
         excerpt: r.body.slice(0, EXCERPT_CHARS),
       })),
