@@ -12,6 +12,8 @@ import { registerMailboxSync } from './jobs/mailbox-sync.ts'
 import { registerNotifyDigest } from './jobs/notify-digest.ts'
 import { enqueueNotifyDispatch, registerNotifyDispatch } from './jobs/notify-dispatch.ts'
 import { registerPlatformHeartbeat } from './jobs/platform-heartbeat.ts'
+import { registerSweepsDaily } from './jobs/sweeps-daily.ts'
+import { registerTicketBackstopSweep } from './jobs/ticket-backstop-sweep.ts'
 import { enqueueTicketDraft } from './jobs/ticket-draft.ts'
 import { createWorkerLogger } from './logging.ts'
 import { createExpoPush } from './push.ts'
@@ -53,6 +55,8 @@ await registerNotifyDispatch(boss, { db, push, logger })
 if (config.roles.has('cron')) {
   await registerPlatformHeartbeat(boss, db)
   await registerNotifyDigest(boss, { db, push, logger })
+  await registerTicketBackstopSweep(boss, { db, logger })
+  await registerSweepsDaily(boss, { db, logger })
 }
 
 await maybeRegisterAgentRole({

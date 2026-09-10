@@ -1,6 +1,6 @@
 export * from './schema/index.ts'
 export type { Db } from './client.ts'
-export { withOrg, withPlatform, isUuid, type OrgTx, type PlatformTx } from './tenant.ts'
+export { withOrg, withOrgIdentity, withPlatform, isUuid, type OrgTx, type PlatformTx } from './tenant.ts'
 export { provisionOrgKeys, loadOrgDek, getOrgBoxPublicKey, getOrgBoxPublicKeyOrNull, openSealedForOrg } from './keys.ts'
 export { audit, type AuditActor, type AuditEntry } from './audit.ts'
 export { escalateTicket, escalationCopy, escalationDedupeKey, insertEscalationNotification, type EscalateTicketParams } from './escalations.ts'
