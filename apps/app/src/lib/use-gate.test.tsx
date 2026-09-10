@@ -4,9 +4,13 @@ import type { ReactNode } from 'react'
 import type { GateTarget } from './session-gate'
 import { classifyWorkspaceError, useGate } from './use-gate'
 
+let mockPathname = '/inbox'
 const mockSetActive = jest.fn()
 const mockUseSession = jest.fn()
 const mockUseListOrganizations = jest.fn()
+
+// Read lazily (inside the returned function), so this factory is safe to hoist above the declaration.
+jest.mock('expo-router', () => ({ usePathname: () => mockPathname }))
 
 jest.mock('@/lib/auth-client', () => ({
   authClient: {
@@ -61,6 +65,7 @@ beforeEach(() => {
   mockUseSession.mockReset()
   mockUseListOrganizations.mockReset()
   mockWorkspaceQueryFn = () => Promise.resolve({ onboardingStep: 'done' })
+  mockPathname = '/inbox'
 })
 
 afterEach(async () => {
@@ -253,5 +258,24 @@ describe('classifyWorkspaceError', () => {
     expect(classifyWorkspaceError({ data: null })).toBe('error')
     expect(classifyWorkspaceError(null)).toBe('error')
     expect(classifyWorkspaceError(undefined)).toBe('error')
+  })
+})
+
+describe('useGate — the go-live ticket exception', () => {
+  // `(app)/_layout.tsx` renders its children (the Shell, and so the ticket route) exactly when this
+  // hook reports `app`, and redirects to `hrefFor(gate)` otherwise — so this IS the layout's decision
+  // for the go-live "Review it" tap.
+  it('feeds the current pathname to resolveGate: a go_live workspace reaches the app on a ticket route only', async () => {
+    mockUseSession.mockReturnValue({ data: { session: { activeOrganizationId: 'o1' } }, isPending: false, error: null, refetch: jest.fn() })
+    mockUseListOrganizations.mockReturnValue({ data: [], isPending: false })
+    mockWorkspaceQueryFn = () => Promise.resolve({ onboardingStep: 'go_live' })
+    mockPathname = '/ticket/t1'
+
+    const { result, rerender } = await setupGate()
+    await waitFor(() => expect(result.current.kind).toBe('app'))
+
+    mockPathname = '/inbox'
+    await rerender(undefined)
+    expect(result.current).toEqual({ kind: 'onboarding', step: 'go_live' })
   })
 })

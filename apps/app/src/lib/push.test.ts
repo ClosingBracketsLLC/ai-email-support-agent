@@ -15,7 +15,7 @@ jest.mock('expo-notifications', () => ({
 // except in the one test below that deliberately switches it to 'web'.
 
 import * as Notifications from 'expo-notifications'
-import { DRAFT_REVIEW_CATEGORY, registerForPush } from './push'
+import { DRAFT_REVIEW_CATEGORY, __resetPushCategoriesForTests, registerForPush } from './push'
 
 const getPermissionsAsync = jest.mocked(Notifications.getPermissionsAsync)
 const requestPermissionsAsync = jest.mocked(Notifications.requestPermissionsAsync)
@@ -26,11 +26,13 @@ function permissions(status: 'granted' | 'undetermined' | 'denied') {
   return { status, granted: status === 'granted', expires: 'never', canAskAgain: true } as Awaited<ReturnType<typeof Notifications.getPermissionsAsync>>
 }
 
-beforeEach(() => jest.clearAllMocks())
+beforeEach(() => {
+  jest.clearAllMocks()
+  // The category registration is memoized per process (one native call per app launch, not one per
+  // `registerForPush`); dropping the memo here keeps every test below independent of the order.
+  __resetPushCategoriesForTests()
+})
 
-// This test MUST stay first in the file: the category registration is memoized per process (one
-// native call per app launch, not one per `registerForPush`), so whichever test reaches it first is
-// the only one that can observe the call itself.
 test('registers the draft_review actions before asking for a token, and only once per process', async () => {
   getPermissionsAsync.mockResolvedValue(permissions('granted'))
   getExpoPushTokenAsync.mockResolvedValue({ type: 'expo', data: 'ExponentPushToken[abc]' })

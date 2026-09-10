@@ -8,7 +8,12 @@ export interface GateInput {
   organizations: { id: string }[] | undefined
   /** Only consulted when there is an active organization. 'missing' = the org has no workspaces row. */
   workspace: { onboardingStep: OnboardingStep } | 'missing' | undefined
+  /** The pathname being rendered. Only consulted for the one go-live exception below. */
+  route?: string
 }
+
+/** The go-live step's "Review it" opens the agent's first draft — see `resolveGate`. */
+const TICKET_ROUTE_PREFIX = '/ticket/'
 
 export type GateTarget =
   | { kind: 'loading' }
@@ -31,7 +36,15 @@ export function resolveGate(i: GateInput): GateTarget {
   }
   if (i.workspace === undefined) return { kind: 'loading' }
   if (i.workspace === 'missing') return { kind: 'create-workspace' }
-  if (i.workspace.onboardingStep !== 'done') return { kind: 'onboarding', step: i.workspace.onboardingStep }
+  if (i.workspace.onboardingStep !== 'done') {
+    // The one hole in the onboarding wall: the go-live step's test-email box offers "Review it" on the
+    // agent's first draft, and that ticket lives under `(app)`. Only that step, and only a ticket
+    // route — every other step, and every other route during go_live, still goes back to onboarding.
+    // Nothing can be sent from there: `drafts.approve` refuses with `agent_disabled` until the master
+    // switch is on, which is the very thing this step exists to flip.
+    const peekingAtTheFirstDraft = i.workspace.onboardingStep === 'go_live' && (i.route?.startsWith(TICKET_ROUTE_PREFIX) ?? false)
+    if (!peekingAtTheFirstDraft) return { kind: 'onboarding', step: i.workspace.onboardingStep }
+  }
   return { kind: 'app' }
 }
 

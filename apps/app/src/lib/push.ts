@@ -31,6 +31,11 @@ export function registerNotificationCategories(): Promise<void> {
   return categoryRegistration
 }
 
+/** Test-only: drops the per-process memo above so a suite can observe the native call more than once. */
+export function __resetPushCategoriesForTests(): void {
+  categoryRegistration = null
+}
+
 export type PushResult =
   | { kind: 'unsupported' }   // web, simulators, Expo Go
   | { kind: 'denied' }
