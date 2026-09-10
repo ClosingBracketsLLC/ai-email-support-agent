@@ -182,6 +182,15 @@ test('a held draft explains why and offers "Back to review" instead of the actio
   expect(mockResume).toHaveBeenCalledTimes(1)
 })
 
+test('a send a re-draft superseded says so', async () => {
+  // `ticket.draft`'s own retirement (`outcomes.ts`): the owner approved, a newer customer message
+  // bought a re-draft, and the queued send was pulled back under the new draft.
+  const send = { id: 'send-1', status: 'held', sendAfter: new Date(), sentAt: null, lastError: 'held:superseded_by_redraft' }
+  await render(<DraftPanel {...props({ draft: { ...BASE, status: 'held', send } })} />)
+
+  expect(screen.getByText('On hold — a newer draft replaced it.')).toBeTruthy()
+})
+
 test('a held draft with an unknown hold reason falls back to the generic sentence', async () => {
   const send = { id: 'send-1', status: 'held', sendAfter: new Date(), sentAt: null, lastError: 'held:something_new' }
   await render(<DraftPanel {...props({ draft: { ...BASE, status: 'held', send } })} />)

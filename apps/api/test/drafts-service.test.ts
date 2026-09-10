@@ -458,6 +458,11 @@ describe('draft service', () => {
     expect(await readAudit(org.orgId, 'draft.resumed')).toEqual([])
   })
 
+  // Round 3: a `failed` draft is the owner's to bring back only while the TICKET is still theirs —
+  // `needs_owner/send_failed` (the send job's own escalation) or `triaged` (the stale hand-back).
+  // `resolveTicket` leaves `failed` drafts alone (terminal, by design) and `reopenIfEligible` never
+  // touches drafts, so a resolved/new/waiting ticket can carry one from a prior cycle; resuming it
+  // would strand a `pending` draft that 23505s the next `ticket.draft` insert after re-triage.
   it('refuses a resume on a ticket escalated for some OTHER reason — only the send job\'s own escalation is walked back', async () => {
     const org = await seedOrg()
     const ticket = await insertTicket(t.api, org.orgId, {
@@ -465,9 +470,33 @@ describe('draft service', () => {
     })
     const draft = await seedPendingDraft(t.api, org.orgId, ticket.id, { agentId: org.agentId, viewedAt: new Date(), status: 'failed' })
 
+    expect(await resumeDraft(deps, org.orgId, draft.id, org.actor)).toEqual({ ok: false, code: 'not_resumable' })
+    expect(await readDraft(org.orgId, draft.id)).toMatchObject({ status: 'failed' })
+    expect(await readTicket(org.orgId, ticket.id)).toMatchObject({ status: 'needs_owner', needsOwnerReason: 'owner_handling' })
+    expect(await readAudit(org.orgId, 'draft.resumed')).toEqual([])
+  })
+
+  it('refuses a resume on a RESOLVED ticket carrying a stale failed draft, writing nothing', async () => {
+    const org = await seedOrg()
+    const ticket = await insertTicket(t.api, org.orgId, { connectionId: org.connectionId, agentId: org.agentId, status: 'resolved' })
+    const draft = await seedPendingDraft(t.api, org.orgId, ticket.id, { agentId: org.agentId, viewedAt: new Date(), status: 'failed' })
+
+    expect(await resumeDraft(deps, org.orgId, draft.id, org.actor)).toEqual({ ok: false, code: 'not_resumable' })
+    expect(await readDraft(org.orgId, draft.id)).toMatchObject({ status: 'failed' })
+    expect(await readTicket(org.orgId, ticket.id)).toMatchObject({ status: 'resolved' })
+    expect(await readAudit(org.orgId, 'draft.resumed')).toEqual([])
+  })
+
+  it('a HELD draft is resumable whatever the ticket says — the precondition is the failed path\'s alone', async () => {
+    const org = await seedOrg()
+    // `landHeld` never moves the ticket, so a held draft always sits on `awaiting_review` in
+    // practice; this pins that the round-3 precondition did not narrow the hold path by accident.
+    const ticket = await insertTicket(t.api, org.orgId, { connectionId: org.connectionId, agentId: org.agentId, status: 'needs_owner', needsOwnerReason: 'tripwire' })
+    const draft = await seedPendingDraft(t.api, org.orgId, ticket.id, { agentId: org.agentId, viewedAt: new Date(), status: 'held' })
+
     expect(await resumeDraft(deps, org.orgId, draft.id, org.actor)).toEqual({ ok: true })
     expect(await readDraft(org.orgId, draft.id)).toMatchObject({ status: 'pending' })
-    expect(await readTicket(org.orgId, ticket.id)).toMatchObject({ status: 'needs_owner', needsOwnerReason: 'owner_handling' })
+    expect(await readTicket(org.orgId, ticket.id)).toMatchObject({ status: 'needs_owner', needsOwnerReason: 'tripwire' })
   })
 
   // -- reject --

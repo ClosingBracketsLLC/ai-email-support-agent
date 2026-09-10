@@ -209,6 +209,37 @@ describe('inbox router (read-only)', () => {
     expect(afterResume.ticket).toMatchObject({ status: 'awaiting_review' })
   })
 
+  // Round 3: the fallback is bounded by the TICKET's status. `resolveTicket` leaves `failed` drafts
+  // alone (terminal, by design) and `reopenIfEligible` never touches drafts, so a resolved (or
+  // reopened) ticket can carry one from a prior cycle — and nothing polls a resolved ticket, so the
+  // "Not sent — … Back to review" banner would sit there forever with a button that must not work.
+  it('serves a failed draft only while the ticket is still the owner\'s: needs_owner and triaged, never resolved/new/waiting', async () => {
+    const signed = await signInWithOtp(t.app, t.mail, 'owner-failed-scope@example.com', 'Owner')
+    const c = client(base, signed.cookie)
+    const { orgId } = await c.workspace.create.mutate({ businessName: 'Acme', timezone: 'UTC' })
+    const connectionId = await insertConnectedMailbox(t.api, orgId, signed.user.id, 'support@scope.test')
+    const agentId = await insertAgent(t.api, orgId, connectionId, 'support@scope.test')
+
+    // The `landStale` shape: draft failed, ticket handed back to `triaged` for a re-draft.
+    const stale = await insertTicket(orgId, connectionId, { status: 'triaged', agentId, lastInboundAt: new Date() })
+    const staleDraft = await seedPendingDraft(t.api, orgId, stale.id, { agentId, status: 'failed' })
+    expect((await c.inbox.ticket.query({ ticketId: stale.id })).draft).toMatchObject({ id: staleDraft.id, status: 'failed' })
+
+    // The same rows, on a ticket the owner has since resolved.
+    const done = await insertTicket(orgId, connectionId, { status: 'resolved', agentId, lastInboundAt: new Date() })
+    await seedPendingDraft(t.api, orgId, done.id, { agentId, status: 'failed' })
+    expect((await c.inbox.ticket.query({ ticketId: done.id })).draft).toBeNull()
+
+    // ...and on one a customer reply reopened (`reopenIfEligible` does not touch drafts).
+    const reopened = await insertTicket(orgId, connectionId, { status: 'new', agentId, lastInboundAt: new Date() })
+    await seedPendingDraft(t.api, orgId, reopened.id, { agentId, status: 'failed' })
+    expect((await c.inbox.ticket.query({ ticketId: reopened.id })).draft).toBeNull()
+
+    const waiting = await insertTicket(orgId, connectionId, { status: 'waiting_on_customer', agentId, lastInboundAt: new Date() })
+    await seedPendingDraft(t.api, orgId, waiting.id, { agentId, status: 'failed' })
+    expect((await c.inbox.ticket.query({ ticketId: waiting.id })).draft).toBeNull()
+  })
+
   it('a cursor that passes zod but is not a real instant is served WITHOUT the cursor and flagged degraded', async () => {
     // zod 4's own `.datetime()` rejects everything a Date cannot represent (an impossible calendar day
     // included — and V8 would silently ROLL '2026-02-31' over to March rather than refusing it), so

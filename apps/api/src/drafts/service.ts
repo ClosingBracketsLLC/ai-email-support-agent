@@ -243,21 +243,39 @@ export async function loadDraftView(tx: OrgTx, orgId: string, draftId: string): 
 }
 
 /**
+ * The ticket statuses on which a `failed` draft is still the OWNER'S to see and to bring back:
+ * `needs_owner` (where `landTerminal`/`landDeadLetter` escalate to, reason `send_failed`) and
+ * `triaged` (where `landStale` hands the ticket back for a re-draft).
+ *
+ * Anything else means the failed draft is a leftover, not a decision waiting to be made. Nothing
+ * retires a `failed` draft — `resolveTicket` leaves it alone on purpose (it is terminal) and
+ * `reopenIfEligible` never touches drafts at all — so a `resolved`, `new` or `waiting_on_customer`
+ * ticket can carry one from a prior cycle indefinitely (round 3). `resumeDraft` keeps the same list.
+ */
+const FAILED_DRAFT_TICKET_STATUSES = ['needs_owner', 'triaged'] as const
+
+/**
  * The draft the ticket screen opens on: the one LIVE draft (at most one, by the partial unique) —
- * or, when there is none, the ticket's most recent `failed` one.
+ * or, when there is none AND the ticket is still one of `FAILED_DRAFT_TICKET_STATUSES`, its most
+ * recent `failed` one.
  *
  * The fallback exists because A3's return path is otherwise unreachable from the app (round 2,
  * re-review 2): a terminal send failure leaves the draft `failed`, which is outside
  * `drafts_live_per_ticket_uidx`, so "Not sent — … Back to review" had nothing to render against and
  * `drafts.resume` had no button. `failed` is the ONLY non-live status served this way — a `rejected`,
- * `superseded`, `expired` or `sent` draft is finished business and stays out of the panel.
+ * `superseded`, `expired` or `sent` draft is finished business and stays out of the panel — and the
+ * ticket-status bound is what stops the banner from becoming permanent furniture on a resolved
+ * ticket, where nothing polls it away and its button would be refused anyway (round 3).
  *
  * `inbox.list`'s join is deliberately NOT widened: a `needs_owner/send_failed` row shows no draft
  * chip, which keeps the list's "a draft is waiting for you" chip honest.
  */
-export async function loadLiveDraftView(tx: OrgTx, orgId: string, ticketId: string): Promise<DraftView | null> {
+export async function loadLiveDraftView(
+  tx: OrgTx, orgId: string, ticketId: string, ticketStatus: string,
+): Promise<DraftView | null> {
   const [live] = await draftViewQuery(tx, orgId, and(eq(drafts.ticketId, ticketId), inArray(drafts.status, [...LIVE_DRAFT_STATUSES]))!)
   if (live) return toDraftView(live)
+  if (!(FAILED_DRAFT_TICKET_STATUSES as readonly string[]).includes(ticketStatus)) return null
 
   // `decided_at` is always set on a `failed` draft (both edges into it, `approved → failed` and
   // `sending → failed`, run downstream of an approve), but NULLS LAST keeps the order total if that
@@ -511,6 +529,14 @@ type ResumableDraftStatus = (typeof RESUMABLE_DRAFT_STATUSES)[number]
  * (`REQUEUEABLE_SEND_STATUSES` covers both), so the delivery keeps its history (attempts, provider
  * ids, `last_error`) instead of starting a second one.
  *
+ * A `failed` draft is resumable only while the TICKET is still one of
+ * `FAILED_DRAFT_TICKET_STATUSES` — `needs_owner/send_failed` or `triaged` (round 3). Nothing retires
+ * a `failed` draft, so a `resolved`, `new` or `waiting_on_customer` ticket can be carrying one from
+ * a prior cycle; bringing that back would strand a `pending` draft on a ticket nobody is reviewing,
+ * which then collides with the next `ticket.draft` INSERT after a re-triage. The `held` path is
+ * untouched by this: `landHeld` never moves the ticket, and a held draft's own liveness is what the
+ * one-live-draft rule below already governs.
+ *
  * ONE-LIVE-DRAFT: `held` is inside `drafts_live_per_ticket_uidx` and `failed` is OUTSIDE it, so a
  * resume from `failed` MOVES A ROW INTO the partial unique. If a re-draft has already landed on that
  * ticket the insert-side of that index is occupied and the UPDATE raises a raw 23505 — a masked 500
@@ -540,6 +566,19 @@ export async function resumeDraft(
       ))
       .for('update')
     if (rivals.length > 0) return { ok: false, code: 'not_resumable' }
+
+    // The failed path's ticket precondition (see the header) — read AFTER the draft locks, so the
+    // file's `drafts → tickets` order holds. A plain SELECT: the guarded UPDATE below re-checks
+    // under its own snapshot, and a ticket that moves in between simply wins there.
+    if (from === 'failed') {
+      const [ticket] = await tx.select({ status: tickets.status, needsOwnerReason: tickets.needsOwnerReason })
+        .from(tickets).where(and(eq(tickets.orgId, orgId), eq(tickets.id, draft.ticketId))).limit(1)
+      const ownersToBringBack = ticket !== undefined && (
+        ticket.status === 'triaged'
+        || (ticket.status === 'needs_owner' && ticket.needsOwnerReason === 'send_failed')
+      )
+      if (!ownersToBringBack) return { ok: false, code: 'not_resumable' }
+    }
 
     draftTransitions.assert(from, 'pending')
     const resumed = await tx.update(drafts)

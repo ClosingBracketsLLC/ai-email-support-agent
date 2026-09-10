@@ -53,9 +53,12 @@ export const REASON_SENTENCE: Record<NeedsOwnerReason, string> = {
 }
 
 /**
- * Why an approved send is parked. The keys are the exact strings `send.execute` writes into
- * `outbound_sends.last_error` (`held:${lever}`, one per `firstKillLever` arm) plus the api's own
- * `held:ticket_resolved`; anything starting with `reauth` is the mailbox asking to be reconnected.
+ * Why an approved send is parked. Unlike the failed vocabulary below this one IS closed, and these
+ * are every `held:*` string the product writes into `outbound_sends.last_error`: the six
+ * `held:${lever}` arms of `send.execute`'s `firstKillLever`, `ticket.draft`'s
+ * `held:superseded_by_redraft` (`outcomes.ts`, when a re-draft retires the draft a send was queued
+ * for) and the api's own `held:ticket_resolved` (`resolveTicket`). Anything starting with `reauth`
+ * is the mailbox asking to be reconnected — `send.execute` writes that one without a `held:` prefix.
  * These read as the tail of "On hold — …".
  */
 const HOLD_REASON_LABEL: Record<string, string> = {
@@ -65,6 +68,7 @@ const HOLD_REASON_LABEL: Record<string, string> = {
   'held:agent_inactive': 'this agent is not active',
   'held:connection_unavailable': 'the mailbox needs reconnecting',
   'held:category_off': 'this category is off',
+  'held:superseded_by_redraft': 'a newer draft replaced it',
   'held:ticket_resolved': 'the ticket was resolved',
 }
 const HOLD_REASON_FALLBACK = 'sending was paused'

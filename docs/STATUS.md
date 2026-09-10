@@ -614,9 +614,13 @@ the record)</summary>
        revives that SAME `outbound_sends` row (`attempts` 0, `last_error` cleared). A resume is
        REFUSED (`not_resumable`) while any other live draft exists on the ticket — `failed` is
        outside `drafts_live_per_ticket_uidx` and `pending` is inside it, so without the guard a
-       resume beside a landed re-draft raised a bare 23505. `inbox.ticket` falls back to the
-       ticket's newest `failed` draft when no live draft exists, which is what makes the button
-       reachable at all; `inbox.list` is unchanged.
+       resume beside a landed re-draft raised a bare 23505 — and refused unless the ticket is still
+       the owner's to act on: `needs_owner/send_failed` or `triaged`. `inbox.ticket` falls back to
+       the ticket's newest `failed` draft when no live draft exists **and the ticket is in one of
+       those two statuses**, which is what makes the button reachable at all; anything else
+       (`resolved`, a reopened `new`, `waiting_on_customer`) serves `draft: null`, because nothing
+       ever retires a `failed` draft and a leftover one would otherwise render a permanent
+       "Not sent — …" banner on a ticket nobody is reviewing. `inbox.list` is unchanged.
     3. **`resolveTicket` retires EVERY live draft and holds a claimed send.** `pending|approved →
        superseded`, `held → expired` (the legal edge — `held → superseded` is not in the matrix),
        one audit row per retired draft named for where it landed; the send pre-lock widens to the
@@ -689,7 +693,9 @@ the record)</summary>
     retries itself once per draft id and otherwise shows "Could not open the draft — tap to retry"
     with a Retry button.
   Two more Important-adjacent fixes came from the section-A re-review (`0cf7c1c`): `resumeDraft`
-  refusing while a live draft exists, and `inbox.ticket`'s failed-draft fallback (both in ruling 2).
+  refusing while a live draft exists, and `inbox.ticket`'s failed-draft fallback (both in ruling 2);
+  a third round bounded both of those by the ticket's own status and completed the app's hold-reason
+  label map with `held:superseded_by_redraft`.
   Also landed: five of the ledger's deferred minors (69, 70, 71, 79, 129) plus 39, 112, 136 and
   89b, and the per-area minors each section carried — the token-minting slice, the `orgId` brace on
   `sandboxStart`, `@fastify/formbody` scoped to the review routes, a fresh clock per deadlock

@@ -171,7 +171,10 @@ Then, on **both** iOS and Android, with the app backgrounded:
   same row (`attempts` back to 0, `last_error` cleared) instead of starting a second one.
   Refusals to know about: a resume is refused (`resumed: false`, an in-app note) while another live
   draft already exists on that ticket — a re-draft that landed in the meantime is the reply to work
-  with instead.
+  with instead — and it is refused unless the ticket is still `needs_owner/send_failed` or `triaged`
+  (the stale hand-back). A ticket the owner has since resolved, or that a customer reply reopened,
+  keeps its `failed` draft as history: the ticket screen shows no banner and no button there, and the
+  recovery is an ordinary fresh reply on the reopened thread.
 - **Nothing sends twice.** Every reply carries `X-Aesa-Draft: <draftId>`, and any re-entered run
   scans the thread for its own marker BEFORE anything else. If you ever have to reason about
   "did it actually go out?", search the connected mailbox for that header value — that, not our
