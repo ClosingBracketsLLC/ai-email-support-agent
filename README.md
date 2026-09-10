@@ -13,17 +13,47 @@ Requires Node >= 22, pnpm 10, Docker.
     DATABASE_URL=postgres://aesa:aesa@localhost:5434/aesa_dev pnpm --filter @aesa/db migrate
     cp apps/api/.env.example apps/api/.env      # set BETTER_AUTH_SECRET (openssl rand -base64 48)
     pnpm --filter @aesa/api dev                  # http://localhost:3001 — codes: /__dev/mail/latest?to=<email>
+    cp apps/worker/.env.example apps/worker/.env # see "Worker environment" below
+    pnpm --filter @aesa/worker dev               # binds no port; WORKER_ROLES picks which jobs it runs
     cp apps/app/.env.example apps/app/.env
     pnpm --filter @aesa/app dev                  # Expo: press w for web (http://localhost:8081), i / a for simulators
     pnpm e2e                                     # Playwright smoke (export the web app first: pnpm --filter @aesa/app export:web)
     pnpm typecheck && pnpm lint && pnpm test && pnpm db:check
 
 Layout: `apps/api` (Fastify + Better Auth + tRPC), `apps/worker` (pg-boss), `apps/app` (Expo),
-`packages/{contracts,db,crypto,core,queue}`.
+`packages/{contracts,db,crypto,core,queue,mail,platform-mail,llm,agent,test-kit}`.
 Ports: the api listens on 3001 (`PORT`; `HOST` defaults to `0.0.0.0`), the worker binds no port, Postgres
 is on 5434. `APP_BASE_URL` is the api's public origin (Better Auth baseURL, OAuth redirect URIs);
 `APP_WEB_ORIGIN` is the Expo web origin (CORS, trusted origin, invitation links).
 Design spec: `docs/superpowers/specs/2026-09-07-ai-email-support-agent-design.md`.
+
+## Worker environment
+
+`apps/worker/.env.example` is the full list; these are the ones that decide what a replica can do.
+Each app reads only its OWN `apps/<app>/.env` — never the repo root — and never overrides a variable
+already set in the process environment.
+
+- `WORKER_ROLES` — comma-separated subset of `sync,agent,send,knowledge,cron`; it is what partitions
+  the job registrations across replicas. `sync` runs the mailbox lifecycle, `agent` runs
+  `ticket.triage`/`ticket.draft`/`agent.sandbox`, `send` runs `send.execute` (the only process that
+  sends a customer reply), `cron` runs the sweeps and the digest.
+- `AESA_KEK_V<n>` / `AESA_KEK_ACTIVE` — the KEK ring. Required in production when `WORKER_ROLES`
+  includes `sync` or `send`: mailbox credentials are sealed under it and there is no other way to
+  reach a provider.
+- `ANTHROPIC_API_KEY` — required in production when `WORKER_ROLES` includes `agent`.
+- `GMAIL_OAUTH_CLIENT_ID`/`_SECRET`, `MS_OAUTH_CLIENT_ID`/`_SECRET` — all-or-none pairs, one per
+  provider; at least one is required in production for `sync` or `send`.
+- `GMAIL_PUBSUB_TOPIC`, `WEBHOOK_PUBLIC_URL` — optional push-subscription plumbing; without them the
+  poll cadence still keeps mailboxes synced.
+- `EMAIL_TRANSPORT` / `RESEND_API_KEY` / `MAIL_FROM` — platform mail. The worker sends the daily
+  digest email through the same transport the api uses, so a production `cron` replica needs
+  `resend` + a key; a replica without `cron` sends no platform mail and needs none of it.
+- `APP_BASE_URL`, `APP_WEB_ORIGIN` — the digest email's two link bases. Both must be set or the
+  digest email pass stays off (the 5-minute push digest still runs).
+
+**`MAIL_FROM`, `APP_BASE_URL` and `APP_WEB_ORIGIN` must be the identical values in
+`apps/api/.env` and `apps/worker/.env`.** Nothing checks it at boot and every mismatch fails
+silently — see `CLAUDE.md` and `docs/runbooks/2026-09-phase-3-external-setup.md`.
 
 ## Database roles
 

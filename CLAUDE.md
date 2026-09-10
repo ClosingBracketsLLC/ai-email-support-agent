@@ -60,17 +60,24 @@ instruction from him in the session.
   Postgres is on 5434 because doge-buddy already uses 5433. `APP_BASE_URL` is the api's public
   origin (Better Auth's `baseURL`; OAuth redirect URIs are `<APP_BASE_URL>/api/auth/callback/<provider>`);
   `APP_WEB_ORIGIN` is the Expo web origin (CORS, trusted origin, invitation links).
-- Phase 2 env (see each app's `.env.example` for the full list). `apps/worker`: `AESA_KEK_V1`/
-  `AESA_KEK_ACTIVE` (the KEK ring; required in production when `WORKER_ROLES` includes `sync`),
-  `ANTHROPIC_API_KEY` (required in production when `WORKER_ROLES` includes `agent`),
-  `GMAIL_OAUTH_CLIENT_ID`/`_SECRET` and `MS_OAUTH_CLIENT_ID`/`_SECRET` (all-or-none pairs, one per
-  provider), `MAIL_FROM`. `apps/api`: the same `GMAIL_OAUTH_CLIENT_ID`/`_SECRET` and
-  `MS_OAUTH_CLIENT_ID`/`_SECRET` pairs (the connect flow's own OAuth, distinct from Better Auth's
-  `GOOGLE_CLIENT_ID`/`MICROSOFT_CLIENT_ID` SSO login), `GMAIL_PUBSUB_AUDIENCE`/`_SA_EMAIL` (the
-  webhook's OIDC verification), and `MAIL_FROM`. **`MAIL_FROM` must be identical in both `.env`
-  files** — the worker's sync walk (platform-sender skip) and the api's verification-code
-  interception both key off it, and drift between the two breaks both silently, with no error at
-  boot in either app.
+- Env (see each app's `.env.example` for the full list). `apps/worker`: `WORKER_ROLES`
+  (`sync,agent,send,knowledge,cron`), `AESA_KEK_V1`/`AESA_KEK_ACTIVE` (the KEK ring; required in
+  production when `WORKER_ROLES` includes `sync` or `send`), `ANTHROPIC_API_KEY` (required in
+  production when `WORKER_ROLES` includes `agent` — `ticket.triage`, `ticket.draft`,
+  `agent.sandbox`), `GMAIL_OAUTH_CLIENT_ID`/`_SECRET` and `MS_OAUTH_CLIENT_ID`/`_SECRET`
+  (all-or-none pairs, one per provider; at least one required in production when `WORKER_ROLES`
+  includes `sync` or `send`), `MAIL_FROM`, and — because the worker now sends the daily digest email
+  through the same `@aesa/platform-mail` transport the api uses — `EMAIL_TRANSPORT` +
+  `RESEND_API_KEY` (required in production on a `cron` replica) plus `APP_BASE_URL` and
+  `APP_WEB_ORIGIN` (the digest links' two bases; **both unset disables the digest email pass
+  entirely**, the push digest still runs). `apps/api`: the same `GMAIL_OAUTH_CLIENT_ID`/`_SECRET`
+  and `MS_OAUTH_CLIENT_ID`/`_SECRET` pairs (the connect flow's own OAuth, distinct from Better
+  Auth's `GOOGLE_CLIENT_ID`/`MICROSOFT_CLIENT_ID` SSO login), `GMAIL_PUBSUB_AUDIENCE`/`_SA_EMAIL`
+  (the webhook's OIDC verification), and `MAIL_FROM`. **`MAIL_FROM`, `APP_BASE_URL` and
+  `APP_WEB_ORIGIN` must be identical in both `.env` files** — the worker's sync walk
+  (platform-sender skip), the api's verification-code interception and the digest email's
+  `/a/:draftId` + `/ticket/:id` links all key off them, and drift breaks each silently, with no
+  error at boot in either app.
 
 ## Layout
 
@@ -86,22 +93,39 @@ instruction from him in the session.
 - `packages/mail` — the provider-agnostic mailbox port: Gmail + Microsoft Graph adapters, credential
   lease/refresh, rfc2822/address/body/threading helpers, the sync walk (`sync.ts`), `MockMailbox`,
   the send limiter. No database dependency beyond what `sync.ts` itself needs via `@aesa/db`.
-- `packages/llm` — the provider-agnostic chat port (`LlmProvider`), the Anthropic adapter, and
-  `createFakeProvider` for tests. No database dependency.
-- `packages/agent` — the triage prompt and one-model-call (`runTriageCall`); no database dependency
-  — `apps/worker`'s `ticket.triage` job owns every read and write around it.
+- `packages/llm` — the provider-agnostic chat port (`LlmProvider`), the Anthropic adapter, the
+  structured-output ladder, the per-model limiter, the metering wrapper, the code-seeded price
+  table, `createManagedProvider`, and `createFakeProvider` for tests. No database dependency (the
+  `MeterSink` it consumes is implemented in `packages/db`).
+- `packages/agent` — the triage prompt and one-model-call (`runTriageCall`), the six-layer draft
+  prompt with its stability hints and `runDraftCall`, the `Retriever` seam (empty until Phase 4),
+  the usage accumulator and the run watchdog; no database dependency — `apps/worker`'s
+  `ticket.triage` / `ticket.draft` jobs own every read and write around it.
+- `packages/platform-mail` — the platform's own outbound mail (sign-in codes, invitations,
+  address-verification codes, the daily digest): the `MailTransport` port with a Resend transport
+  and a devsink, plus the templates. Shared by `apps/api` and `apps/worker`; no database dependency.
 - `packages/test-kit` — `MockMailbox` re-export, the scrubbed fixture recorder (`MAIL_RECORD=1`),
   and the provider conformance suite run against both the mock and recorded fixtures.
-- `apps/api` — Fastify skeleton: `/healthz`, config, scrubbed error handler, log redaction. The api
-  never holds the KEK, never calls a model, never touches customer mail (it sends platform email —
-  sign-in codes, invitations, address-verification codes — through the `MailTransport`; Resend in
-  production, the devsink elsewhere). It never touches `mailbox_credentials` either (platform-role
-  only) — a connect flow's sealed OAuth tokens ride a job payload to the worker, which is the only
-  process that ever opens them.
+- `apps/api` — Fastify + Better Auth + tRPC: `/healthz`, config, scrubbed error handler, log
+  redaction; the mailbox connect flow and provider webhooks; the `inbox`/`agents`/`workspace`/`team`
+  routers, and Phase 3's `drafts` router (approve with the 15-second undo, hold, resume, reject with
+  redraft, mark viewed) and `activity` router (counts, cost, recent sends), both sharing ONE service
+  module (`src/drafts/service.ts`, exported as `@aesa/api/drafts`) with the session-less
+  `/a/:draftId?t=` one-click review pages. The api never holds the KEK, never calls a model, never
+  touches customer mail (it sends platform email — sign-in codes, invitations, address-verification
+  codes — through `@aesa/platform-mail`'s `MailTransport`; Resend in production, the devsink
+  elsewhere). It never touches `mailbox_credentials` either (platform-role only) — a connect flow's
+  sealed OAuth tokens ride a job payload to the worker, which is the only process that ever opens
+  them.
 - `apps/worker` — `WORKER_ROLES` partition, KEK ring, `jobs/`: `platform.heartbeat` (cron),
   `mailbox.sync` / `mailbox.poll-sweep` / `mailbox.renew-watch` / `mailbox.store-credentials` /
-  `mailbox.revoke` (mailbox lifecycle, `sync` role), `ticket.triage` (`agent` role), `notify.dispatch`
-  / `notify.digest` (escalation and collapsed-overflow push).
+  `mailbox.revoke` (mailbox lifecycle, `sync` role), `ticket.triage` / `ticket.draft` /
+  `agent.sandbox` (`agent` role; `drafting/` holds the claim protocol, the caps gate, the run
+  context, the outcome table and the reply policy), `send.execute` (`send` role — the only process
+  that ever sends a customer reply), `notify.dispatch` / `notify.digest` (escalation and
+  collapsed-overflow push, plus the daily digest EMAIL via `digest-email.ts`), and the crons
+  `ticket.backstop-sweep` (every minute: missed/stuck draft runs, stuck run rows, orphaned tickets,
+  due sends) and `sweeps.daily` (draft expiry and run-event/action-token retention).
 - `apps/app` — the Expo universal app (`@aesa/app`, SDK 57, Expo Router, `web.output` server):
   `src/app` routes only, `src/screens` bodies, `src/lib` clients and the session gate, `src/components`
   primitives; jest-expo + RNTL for units, Playwright for the signup smoke.
@@ -127,7 +151,27 @@ instruction from him in the session.
   asserted by a test), so a violation fails loudly at runtime.
 - **Jobs.** Payload schemas include `orgId`; `enqueue` sets `singletonKey` to `${orgId}:${entityId}`;
   `registerJob` hands the handler an `AbortSignal` that fires at `expireInSeconds` minus
-  `JOB_SIGNAL_MARGIN_SECONDS` (owned by `@aesa/core`).
+  `JOB_SIGNAL_MARGIN_SECONDS` (owned by `@aesa/core`). **A new queue is added in FOUR places** —
+  `JOB_NAMES` (`packages/queue/src/names.ts`), the worker's `apps/worker/src/index.ts` pre-create
+  list (any queue another role or a cron enqueues), the api's `apps/api/src/boss.ts` pre-create list
+  (any queue the api sends), and `apps/worker/test/queue-preflight.test.ts`'s `it.each`. pg-boss 10
+  silently returns `null` from `send` on a queue that does not exist yet, so a missed pre-create is
+  a job that never runs and never errors; the preflight test is what catches it.
+- **Escalation.** Every entry into `needs_owner` from the drafting, send and api paths goes through
+  `escalateTicket` (`@aesa/db`) — it owns the guarded transition, the `escalation_notified_at` reset,
+  the audit row and the deduped notification, and its `dedupeKey` is reason-scoped where a second
+  same-day escalation for a DIFFERENT reason must still page. Never write
+  `tickets.status = 'needs_owner'` by hand.
+- **Guarded writes and the staleness anchor.** Every status write is guarded on the status it was
+  read at (`WHERE ... AND status = <read value>`), and zero rows is a soft outcome the caller
+  reports, never an error — that is what makes a concurrent owner, sweep or job simply win.
+  `drafts.thread_snapshot_at` (the claiming run's `tickets.last_inbound_at`, never a wall-clock read)
+  is the ONE staleness anchor: `send.execute` refuses any send whose thread has an inbound strictly
+  newer than it, and nothing else is allowed to stand in for that comparison.
+- **Lock order.** Any transaction touching more than one of the three row kinds takes them in ONE
+  global order, in the api AND the worker: **`outbound_sends` → `drafts` → `tickets`**. That is the
+  order every `send.execute` path already takes; `approveDraft`, `holdDraft` and `resolveTicket`
+  follow it, and the worker's draft landings lock the ticket's live drafts before the ticket flip.
 - **Secrets.** Never logged, never returned by an API. `Secret` serializes as `[redacted]`; the api
   error handler strips SQL parameters and redacts URLs before anything reaches a log or a client.
 - **App bundle.** `apps/app` never imports `@aesa/db`, `@aesa/core`, `@aesa/crypto`, `@aesa/queue`,
@@ -149,5 +193,5 @@ instruction from him in the session.
   packages and `apps/api` / `apps/worker`; `apps/app` extends `expo/tsconfig.base` instead
   (bundler resolution, JSX, extensionless imports) with `allowImportingTsExtensions`, `noEmit` and
   `types: ["node", "jest"]`, and is built by EAS; the root ESLint TypeScript block covers `**/*.tsx`.
-- **Commits** end with the trailer `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`
+- **Commits** end with the trailer `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`
   (a convention, not a check).

@@ -1,6 +1,6 @@
 # Project status
 
-Updated 2026-09-09. The spec (`docs/superpowers/specs/2026-09-07-ai-email-support-agent-design.md`)
+Updated 2026-09-10. The spec (`docs/superpowers/specs/2026-09-07-ai-email-support-agent-design.md`)
 defines seven build phases; this file records where the build stands against them.
 
 ## Done
@@ -270,60 +270,10 @@ defines seven build phases; this file records where the build stands against the
   the fix-wave commits themselves (`0015a74`, `e00a339`) and the review record (the ephemeral
   fix-wave report was deleted with the SDD workspace). The review's own remaining findings — not
   must-fix for this wave — are
-  carried into Phase 3 below (DMARC first-match re-exam, claim-time notification email,
+  carried into Phase 3 (DMARC first-match re-exam, claim-time notification email,
   `push_subscription_id` index, `use-gate` `setActive` regression test, malformed-cursor degraded
-  marking).
+  marking) — all but the DMARC re-exam resolved there; see the Phase 3 record below.
 
-## Next: Phase 3 — draft, review, send
-
-**Where to start.** Phases 1 and 2 are merged; `main` is the base. Check out `main`, pull, and
-branch `phase-3` off it. Start with `superpowers:writing-plans` against the spec's *Build phases →
-Phase 3* section. Run the local setup from `CLAUDE.md` and confirm the 816-test baseline above
-before writing the plan. When the phase is done, it lands on `main` through a GitHub PR with a
-merge commit (the standing flow from Robert's 2026-09-09 instruction) — opening and merging the PR
-still happens on his go-ahead per phase, or per any standing instruction he gives in that session.
-
-Rulings the Phase 3 planner needs, carried from this phase's execution:
-
-- The send path must consume `SendReplyInput.replyToProviderMessageId`/`existingDraftId` (Graph's
-  two-phase send needs the first to create a reply and the second to resume a crashed one) and
-  persist `outbound_sends.provider_draft_id` — both fields already exist on the Phase 2 port/types
-  (`packages/mail/src/types.ts`) with no consumer yet; Phase 3's send executor is that consumer.
-- `notify.digest` gains the email channel (Phase 2 deviation 6) — worker → Resend (or the api's
-  `MailTransport`, if that boundary is worth crossing) once the review pages exist for a digest
-  email to link to.
-- The inbox's `awaiting_review` section joins `to_review` (Phase 2's inbox only has `to_review` =
-  `needs_owner`, per the plan's own note that Phase 3 extends this) once drafts exist to review.
-- The `llm` ladder (limiter, registry, probe, pricing) and the metering wrapper (`withMetering`,
-  `llm_calls`) land here — Phase 2's triage runtime uses only a fail-closed `usage_counters` spend
-  guard, deliberately omitting all of this per deviation 5.
-- Carry-overs still open (deferred again at Phase 2's close; fix in the first Phase 3 task that
-  touches the file, or record why it moves again):
-  - The api's rate limiters (Better Auth's in-memory limiter, `@fastify/rate-limit`, `team.invite`'s
-    per-org throttle) are all in-memory and therefore per-replica — move to shared/database storage
-    before the api scales past one instance (carried since Phase 1).
-  - `platform.access` audit rows have no retention rule; Phase 2's per-sync credential-read audit
-    trail (`getAccessToken`'s `withPlatform` call on every mailbox poll) meaningfully raises the row
-    volume beyond Phase 1's heartbeat-only baseline — the retention rule is Phase 7's sweep, but
-    note the volume now, before it's a production surprise.
-  - `pnpm-lock.yaml` still carries a duplicate TypeScript variant (Task 1's `pnpm dedupe` pass was
-    peer-driven and could not fully collapse it) — worth a second look once Phase 3's dependencies
-    settle rather than chasing it now.
-  - Better Auth 1.7.3 still declares a peer of `drizzle-orm ^0.45.2` against the workspace's pinned
-    `^0.44.0` (pnpm warns only, carried since Phase 1) — bump both together in a dedicated task,
-    since drizzle snapshots may shift.
-  - `packages/db/test/keys.test.ts` is still order-dependent (file untouched this phase).
-  - The remaining `apps/app` accessibility/UX minors from Phase 1's residuals list, on screens this
-    phase didn't touch, are still open.
-  - Promoted from the final review, not must-fix for the fix wave above: re-examine the DMARC
-    first-match semantics `autonomy.ts` will need once Phase 5 lands (this phase's own DMARC parser
-    is clause-anchored per the Task 6 ruling above, but autonomy's own first-match reasoning over
-    multiple `Authentication-Results` instances hasn't been checked against it yet); send a
-    claim-time notification email (today a claimed connection has no email trail, only the app's own
-    poll); add an index on `mailbox_connections.push_subscription_id` (poll-sweep's sub-sweep (a)
-    filters on it with no supporting index); a regression test for `use-gate`'s `setActive` path
-    (Phase 1's carry-over gate logic, never covered by a dedicated test); mark a ticket's inbox
-    listing as degraded (not merely silent) when a malformed keyset cursor is presented.
 
 ### Carry-overs resolved during Phase 2
 
@@ -333,7 +283,7 @@ now folded into Phase 2's own tasks: `pnpm dedupe` + re-export + smoke, `pinned-
 fail-fast all landed in Task 1; the duplicate `organization.slug` unique index and the non-superuser
 LOGIN role exercising the privilege boundary landed in Task 3; the Better Auth `APIError` → tRPC
 code mapping (the `organizationLimit` masked-500) landed in Task 17; `session.cookieCache` landed
-in Task 19. What did NOT fully resolve is carried forward above, under Phase 3's carry-overs.
+in Task 19. What did NOT fully resolve is carried forward below, under Phase 4's carry-overs.
 
 <details>
 <summary>Original Phase 1 carry-over text (superseded by the resolution note above; kept for
@@ -423,9 +373,248 @@ the record)</summary>
 
 </details>
 
+
+### Phase 3 — draft, review, send (complete on branch `phase-3`; PR not yet opened)
+
+- Plan: `docs/superpowers/plans/2026-09-09-phase-3-draft-review-send.md` (23 tasks, executed with
+  subagent-driven development). 36 commits `acf1f4f..f2d66be` on `phase-3`, branched from `main` at
+  `a613a22` — the plan, the Phase 2 carry-over task, and the 23 tasks' implementation and fix-round
+  commits — plus this close-out commit (the mock-tier E2E, the cache-hit recorder, the
+  external-setup runbook and the docs). The per-task execution ledger was an ephemeral SDD workspace
+  artifact; everything load-bearing from it is distilled below, and the git history plus the
+  forthcoming review record are the durable account. Gate on the branch at close: typecheck and lint
+  clean across all 13 packages/apps; `pnpm test` green with **1,569 tests** (`@aesa/contracts` 21,
+  `@aesa/crypto` 42, `@aesa/platform-mail` 17, `@aesa/core` 189, `@aesa/llm` 88, `@aesa/agent` 58,
+  `@aesa/db` 69, `@aesa/queue` 15, `@aesa/mail` 237, `@aesa/test-kit` 43 [39 run + 4 conditional
+  skips], `apps/api` 195, `apps/worker` 347 [including the 8-scenario `e2e-phase2.test.ts` and the
+  21-case `e2e-phase3.test.ts`], `apps/app` 248 jest across 33 suites — no database); `db:check`
+  reports no drift; the Expo web export produces **21 static routes** (unchanged — Phase 3 added no
+  route file; `activity.tsx` already existed); the Playwright signup smoke passes (still ending at
+  the gated mailbox step — providerless CI cannot reach go-live, per Phase 2's Task 20 ruling).
+- Review: the whole-branch review record lands at
+  `docs/superpowers/reviews/2026-09-XX-phase-3-final-review.md` after this commit, per
+  `superpowers:subagent-driven-development`.
+- What exists now:
+  - `packages/contracts` — the draft/decision/reject/sandbox/activity contracts, twelve new
+    `needs_owner` reasons, the `draft_review` notification kind, `APPROVE_UNDO_SECONDS` and
+    `DRAFT_EXPIRE_DAYS`.
+  - `packages/db` — six new tables (`drafts`, `draft_action_tokens`, `outbound_sends`, `agent_runs`,
+    `agent_run_events`, `llm_calls`), the one-live-draft partial unique, the
+    `resolve_draft_action_token(text)` SECURITY DEFINER resolver, `escalateTicket` (the single entry
+    into `needs_owner`), `withOrgIdentity`, and the meter home (`LLM_METERS`, `SEND_METERS`,
+    `SANDBOX_METERS`, `bumpMeter`, `createMeterSink`).
+  - `packages/core` — the guardrails validator (eight screens over a per-tenant `WorkspacePolicy`,
+    one implementation run at three gates), `decide()` (the spec's autonomy order, with the `auto`
+    branch written, table-tested and unreachable), the reject resolver, `clearRedraftCycle`,
+    `appendSignature`, and the outbound-send/draft/agent-run transition matrices.
+  - `packages/llm` — the structured-output fallback ladder, the per-model limiter, the metering
+    wrapper, the code-seeded price table, `createManagedProvider`, and the Anthropic adapter's
+    native structured output, `effort` and stability-driven `cache_control` placement.
+  - `packages/agent` — the six prompt layers (platform hard rules → workspace profile → persona →
+    knowledge → guidance → the thread as untrusted JSON lines), `DraftDecision`, `runDraftCall`, the
+    usage accumulator, the run watchdog, and the `Retriever` seam (`emptyRetriever` until Phase 4).
+  - `packages/mail` — `SendReplyInput.onDraftCreated` on the port, the Graph two-phase send's
+    `existingDraftId` re-entry, the mock's draft ledger and crash hooks, and `draft_id` on ingested
+    sent copies.
+  - `packages/platform-mail` — NEW: the `MailTransport` port (Resend + devsink) and the templates,
+    lifted out of the api so the worker can send the digest email.
+  - `apps/worker` — `ticket.draft` (the ported claim protocol: row-locked CAS on
+    `last_agent_run_at`, three watermarks, stuck-run recovery, a failure ceiling, advisory-locked
+    caps, the one automatic redraft, `decide()` and the outcome table), `send.execute` (marker
+    recovery scan first, kill levers re-read in the claim, staleness on `thread_snapshot_at`, the
+    atomic pre-send flip, the `Message-ID` read-back, one outbound row, the dead-letter),
+    `agent.sandbox`, the crons `ticket.backstop-sweep` and `sweeps.daily`, and the daily digest
+    email with per-recipient single-use action tokens.
+  - `apps/api` — the `drafts` router and the session-less `/a/:draftId?t=` review pages over ONE
+    service module, the `activity` router, the master switch and go-live completion, and the
+    sandbox start/get procedures.
+  - `apps/app` — the review panel on the ticket screen (viewed-before-approve, inline Edit, the
+    reject sheet with redraft-with-reason and "I'll handle it", the 15-second undo, `A`/`E`/`R` on
+    web), draft rows in To review, Review/Hold notification actions, the go-live test-email box and
+    master switch, Activity v1 and the "Try it" sandbox card.
+  - Verification: `apps/worker/test/e2e-phase3.test.ts` — the spec's twenty Phase-3 scenarios driven
+    through real pg-boss jobs and the real api draft service; `packages/llm/scripts/record-cache-hit.ts`
+    — the live, hand-run recorder for the one fixture CI cannot fake; and
+    `docs/runbooks/2026-09-phase-3-external-setup.md`.
+- Deviations from the spec's Phase 3 list, all recorded in the plan header:
+  1. **The `llm.probe` job and the capability registry's probe path move to Phase 6.** STATUS.md's carry lists "limiter, registry, probe, pricing"; the spec's own phase list puts `llm.probe` with BYOK in Phase 6. Phase 3 lands the limiter, the structured ladder, the metering wrapper, the pricing seed and `createManagedProvider` (the registry for the one managed provider); `capabilities(model)` is a preset table with no probe override until Phase 6.
+  2. **No `model_pricing` table yet.** The spec lists it under Phase 6's tables. `llm_calls.cost_micros` is computed from the code seed in `packages/llm/src/pricing/seed.ts` (Anthropic list prices verified 2026-09-09: opus-5 $5/$25 per MTok, sonnet-5 $2/$10, haiku-4-5 $1/$5; cache reads 0.1×, cache writes 1.25× for 5-minute and 2× for 1-hour TTL); `llm_calls` has no `pricing_id` column until the table exists.
+  3. **The `MeterSink` lives in `packages/db/src/metering.ts`** exactly as the spec says, importing only the `MeterSink` type from `@aesa/llm` (a new `@aesa/db → @aesa/llm` type-only edge; no cycle — `@aesa/llm` depends on `@aesa/crypto` alone).
+  4. **Platform admission control is per-process, not an advisory-lock slot pool.** `ticket.draft` runs one job at a time per worker process (`batchSize: 1`, one `work` registration); the per-org gate (concurrency 2, the daily caps) is serialized under a transaction-scoped `pg_advisory_xact_lock(hashtext('draft-gate:' || org_id))`. The `pg_try_advisory_lock` slot pool sized to our Anthropic tier is Phase 7's caps hardening.
+  5. **`memory.capture` is not enqueued** (Phase 5 owns `resolved_answers`). `send.execute` exposes an `onSent(orgId, ticketId, draftId)` seam that Phase 5 wires; Phase 3 passes a no-op.
+  6. **`ai_handled_conversations` is metered at send, once per ticket per UTC month** via `tickets.ai_handled_month` (spec §Send); `review_sends` and `draft_runs` meters join it. Escalated-without-draft mail is never counted.
+  7. **Confidence in Phase 3 is the model's self-assessment alone.** `drafts.confidence = model_confidence`; `confidence_breakdown` records the blocker booleans plus `{ model, memory: null, grounding: null, evidence: null }`. `decide()`'s auto branch is written and table-tested but unreachable: with `evidence === null` every `auto` category resolves to `review/below_threshold`. The chip shows the percent only; "would auto-send at N%" arrives with Phase 5's evidence score.
+  8. **Triage keeps its `usage_counters` spend guard and writes no `agent_runs` row.** `agent_runs.kind` admits `'triage'` for Phase 6's dashboards, but only draft and sandbox runs create rows. Triage calls DO get `llm_calls` rows: the agent role wraps its one provider with the metering sink, so every model call the worker makes is metered.
+  9. **`MailboxClient.getDraftState` is not added.** The Graph adapter's `sendReply({ existingDraftId })` re-entry already reads `isDraft` and returns without sending when the draft was sent; the port instead gains `SendReplyInput.onDraftCreated(providerDraftId)` — the Graph adapter calls it between `createReply` and the PATCH so the send job can persist `outbound_sends.provider_draft_id` BEFORE the send (the spec's "persist draft id" step is impossible with today's one-call adapter). Gmail ignores it.
+  10. **`messages.draft_id` stays an FK-less uuid** (a real FK creates a `support.ts ↔ drafts.ts` module cycle). The sync walk now writes it from `X-Aesa-Draft` on outbound rows and the send job's outbound upsert sets it too.
+  11. **The digest email is daily, not every five minutes.** `notify.digest` keeps its 5-minute push collapse; the email channel sends at most one email per org per local day (08:00 in the workspace's timezone, `notifications.digest_email` setting, default on) to every owner/admin, listing pending drafts and open escalations with per-recipient single-use `/a/:draftId?t=` links (Approve / Hold / Open in app). The spec's "email digest" wording never states a cadence; a 5-minute email would be spam.
+  12. **The `draft_review` push carries Review and Hold, and Hold acts only on an approved-not-yet-sent draft** (the undo window now; auto-sends from Phase 5). A pending draft has nothing to hold — the matrix has no `pending → held` edge — so Hold on one just opens the ticket. The app registers the category at startup; the worker stamps `categoryId` on the push.
+  13. **Web-only extras deferred:** the three-pane review layout, J/K queue navigation and multi-select. Phase 3 ships the phone composition on every platform plus `A`/`E`/`R` keyboard shortcuts on web (the draft must be on screen). The Playwright smoke keeps stopping at the mailbox gate (providerless CI cannot reach go-live); the mock-tier vitest E2E proves the flow end to end, and a stubbed-provider Playwright walk is a Phase 7 hardening item.
+  14. **Guardrail hard failure stores the draft as `pending` with `decision: 'escalate'`** and routes the ticket to `needs_owner/guardrail_failed` — visible, editable, never sendable until the edited body passes the validator at the approve gate (spec §Decision). The agent's own `escalate` outcome and `no_reply` store no draft row; their rationale lives on `agent_runs.output` and the audit row.
+  15. **"I'll handle it" lands the ticket in `needs_owner/owner_handling`, pre-stamped silent**, and a new `inbox.resolve` mutation lets the owner close it after replying by hand (doge-buddy's terminal reject is `escalated/owner_rejected_draft`; the SaaS's `needs_owner` is that state).
+  16. **`kill_switch` is read, not exposed.** `decide()` and `send.execute` honour `workspaces.kill_switch`; the Settings toggle for it is Phase 7 (spec: Settings → Billing/hardening). The master switch (`agent_enabled`) IS exposed (`workspace.setAgentEnabled`) and gates sends: a human approve while the agent is off is refused with a clear message, and the send job holds as defense in depth.
+  17. **Live verification is Robert's runbook step** (`docs/runbooks/2026-09-phase-3-external-setup.md`): approve from the phone → reply in Gmail and outlook.com in the same conversation, follow-up threads, redeploy mid-thread. CI proves the mock tier; the `cacheReadTokens > 0` assertion runs against a recorded response fixture.
+- **Carry-overs resolved during Phase 3.** The five Phase 2 residuals folded into this phase's
+  own tasks all landed: the claim-time mailbox notification email and the `use-gate` `setActive`
+  regression test (Task 1, `1ee18c5`, with the `pnpm dedupe` pass alongside), the
+  `mailbox_connections.push_subscription_id` partial index (Task 3's hardening migration 0011),
+  and the malformed-cursor degraded marking on `inbox.list` (Task 17, `parseCursor` → the
+  response's `degraded` flag). The sixth, the DMARC first-match re-examination, moves to Phase 5
+  with `decide()`'s auto branch — see below.
+- Execution-time rulings recorded during the build, by area:
+  - **process**: no git worktree — the repo's documented flow is a phase branch in the main working
+    tree, and the branch is the isolation.
+  - **contracts (Task 2)**: the sandbox inputs live in `contracts/src/drafts.ts` (the brief's code
+    block), not `agents.ts` (its file list) — both re-exported from the index; Task 2 also carried
+    Task 20's chip words and reason sentences for the twelve new `needs_owner` reasons forward into
+    the app's two typed `Record<NeedsOwnerReason, …>` maps, so typecheck could not break between the
+    two tasks; the `guardrail_failed` reason sentence stays TWO sentences, which is the copy the
+    plan's Task 20 mandates.
+  - **core/guardrails (Task 5)**: the brief's "24 phrases" was a miscount — the reference has 22 and
+    all 22 were ported; the warning screens live in `validator.ts` rather than `screens.ts` to avoid
+    an import cycle.
+  - **llm (Tasks 6-8)**: native structured output uses `messages.create` + `output_config.format`
+    plus the adapter's own envelope `safeParse`, never `messages.parse` — that helper throws an
+    `AnthropicError` on a schema-violating response, which would break this package's never-throw
+    parse contract (same wire request either way); a `structuredOutput: 'none'` provider making zero
+    calls is accepted for Phase 3 as unreachable (Anthropic models are native, unknown models
+    `json_mode`) with Phase 6's OpenAI-compatible adapter to revisit it; a pg-boss retry cannot reuse
+    an idempotency key, because a failure clears `last_agent_run_at`, the retry re-claims, and
+    `gateAndRecordRun` mints a NEW run id — so `draft:${runId}:${attempt}` differs per attempt and
+    the rungs suffix `:native`/`:json_mode`/`:repair`; the send meters got named constants
+    (`SEND_METERS`) in `packages/db/src/metering.ts` beside `LLM_METERS`, and
+    `SANDBOX_METERS = { runs: 'sandbox_runs' }` joined them — one home for meter names.
+  - **agent (Task 9)**: prompt-text contradictions cost a redraft cycle per affected reply, so three
+    of them were fixed rather than parked — the sales persona mandating an offer to have someone
+    reach out (a callback the hard rules forbid), a bullet reading "say X and escalate" (unsatisfiable:
+    an `escalate` decision has no body), and the concierge persona's "name the policy" nudge toward a
+    `trusted_text_leak`.
+  - **db (Task 10)**: `escalateTicket` gained an optional `dedupeKey?` (default
+    `escalationDedupeKey(ticketId, day)`) so a same-day second escalation for a DIFFERENT reason is
+    not deduped away — the draft job, the sweeps and the send job all pass reason-prefixed keys;
+    `ClaimResult`'s `claimed: false` variant gained `notificationId?` (set on `stuck_escalated`) so
+    the job dispatches that page immediately instead of waiting on the poll sweep's 10-minute
+    re-enqueue; the tripwire notification body stands as deliberate copy.
+  - **worker drafting (Task 11)**: all six disclosed deviations were accepted — the `outcomes.ts`
+    split, the `escalateReason` detail key (a plain `reason` key would clobber `escalateTicket`'s
+    own), ONE watchdog spanning retrieval and both model attempts, the prompt trace event storing
+    block sizes plus a thread count and never bodies, a retrieval throw counting as a run failure
+    (else the run row stays `running` until the sweep), and a failed automatic redraft counting as
+    skipped rather than charging the ticket a failure (the same end state a second guardrail failure
+    produces); `finishRun` is guarded on `status = 'running'` and returns false when the backstop
+    sweep already aborted the run, so the job logs and continues instead of throwing.
+  - **mail (Task 12)**: the sync walk writes `messages.draft_id` only when the `X-Aesa-Draft` value
+    is a syntactically valid uuid (else null) — the column is `uuid`, and a malformed header on an
+    owner-sent message would otherwise make every sync of that mailbox throw.
+  - **worker send (Task 13)**: the kill levers run at step 1 only for an `approved` draft; for a
+    `sending` draft (a crash re-entry) they are deferred past the recovery scan — a scan HIT
+    completes regardless (the customer already has the mail) and a MISS applies them before
+    staleness — with `draftTransitions.sending` gaining `held` so a send and its draft always move
+    together, and a reauth on a `sending` draft releasing the claim and throwing instead of holding
+    (delivery is unverified). Dead-lettering a send whose delivery could not be verified marks it
+    failed and pages the owner with the real reason. The brief's "no enqueueDraft" line for the
+    recovery-before-staleness case contradicted its own step 11, so step 11 wins: a recovered send
+    that lands the ticket on `triaged` enqueues `ticket.draft`. The task review then added three
+    more: a null agent holds at step 1 for ANY draft status, `landStale` must accept a `sending`
+    draft (`sending → failed` is legal), and every landing must be test-driven with a `sending`
+    draft as well as an `approved` one.
+  - **worker sweeps (Task 14)**: `OrgTx` is the drizzle tx plus an `orgId` property, so a platform
+    sweep lends a ticket's identity to its per-row SAVEPOINT tx — never the outer platform tx —
+    through a new exported `withOrgIdentity(tx, orgId): OrgTx`; the platform role bypasses RLS, so
+    the identity feeds only `audit()`/`escalateTicket`, whose writes are keyed by ticket id.
+  - **api (Tasks 16-19)**: ONE lock order for every transaction touching more than one of the three
+    row kinds, in the api AND the worker — **`outbound_sends → drafts → tickets`** — chosen over the
+    reviewer's `send → ticket → draft` because it leaves `send.execute` untouched; the approve gate
+    screens FAILS only (`trustedTexts: []`, no `groundedNumbers`), since an owner may legitimately
+    paste the workspace's own guidance wording into a reply and the draft gate already screened the
+    model's body against the full policy; tRPC's default error shape carries no `cause`, so
+    `drafts.approve`'s BAD_REQUEST `guardrail` surfaces its findings through an `errorFormatter`
+    branch that copies them to `data.findings` for a non-500 error (the 500 masking untouched, with
+    an error-surface test pinning it); the digest email pluralises its subject, renders the
+    escalation's customer (`subject · customer · reason`), and takes its category label from the
+    draft's own `category_id` with the ticket's as fallback (matching the `draft_review` push);
+    `agents.sandboxGet` returns the stored output parsed through a zod `SandboxOutputView` in
+    contracts (an unparsable stored output is null, never a 500) so the app consumes a contract type
+    rather than a worker type, and the api never value-imports `@aesa/agent`, so the sandbox run's
+    model id comes from contracts too.
+  - **api/app (Tasks 17, 20)**: a draft the send job parked on `held` had no way back in the plan, so
+    Task 17 added `resumeDraft` (`held → pending`; the send row stays `held` and the next approve
+    revives that same ledger row through the existing ON CONFLICT path, keeping its attempts and
+    provider ids) exposed as `drafts.resume`, with `DraftView.send.lastError` and a "Back to review"
+    button; `HOLD_REASON_LABEL` maps the send row's machine `last_error` strings
+    (`held:<lever>`, `reauth_required`, `held:ticket_resolved`) to banner copy with a generic
+    fallback; and the review screen seeds its undo window from `draft.undoUntil` (a server value)
+    with the approve mutation's result overriding it, so a reload inside the 15 s keeps the Undo
+    button.
+  - **app (Task 21)**: `resolveGate` admits the `/ticket/[id]` route while
+    `onboardingStep === 'go_live'` — that step exists to look at the first draft, and approve on it
+    refuses with `agent_disabled` until the master switch is on; every other step and route keep
+    today's redirect.
+  - **deferred during the build (Task 16)**: the digest mints action tokens for EVERY pending draft,
+    not only the ten rendered (a bounded fetch when backlogs grow), and the email pass scans every
+    workspace on each 5-minute tick.
+
+## Next: Phase 4 — knowledge
+
+**Where to start.** `phase-3` is complete on its branch and lands on `main` through a GitHub PR with
+a merge commit on Robert's go-ahead (the standing flow from his 2026-09-09 instruction). Once it is
+merged, check out `main`, pull, and branch `phase-4` off it. Start with
+`superpowers:writing-plans` against the spec's *Build phases → Phase 4* section. Run the local setup
+from `CLAUDE.md` and confirm the 1,569-test baseline above before writing the plan.
+
+**The hand-off.** Phase 4 is knowledge: the document parsers, the site crawler, Voyage embeddings,
+retrieval, and the `minio`/R2 upload path. Two seams are already in place and waiting for it:
+
+- **`Retriever` in `@aesa/agent`.** `ticket.draft` and `agent.sandbox` both call
+  `deps.retriever.retrieve({ orgId, questions, text, signal })` OUTSIDE every transaction, before the
+  prompt is built, and both already thread the result through the knowledge block, the
+  `retrieved_chunk_ids`/`cited_chunk_ids`/`retrieved_answer_ids`/`used_answer_ids` columns on
+  `drafts`, and `collectGroundedNumbers`' sources. Phase 3 wires `emptyRetriever`; Phase 4 replaces
+  it and nothing above it changes shape. Two Phase 3 behaviours become load-bearing the moment it
+  returns anything: the draft job re-filters every id the model cites against what retrieval
+  actually returned (a model must not be able to make a draft look grounded by inventing an id), and
+  `confidence_breakdown.grounding` is the `null` slot Phase 4 fills.
+- **`knowledge_version`.** The prompt's knowledge block is the cacheable per-org layer, so a
+  knowledge change has to bust that cache; Phase 4 owns the version column and threading it into the
+  block's stability hint.
+
+**Carries still open** (fix in the first Phase 4 task that touches the file, or record why it moves
+again):
+
+- The api's rate limiters (Better Auth's in-memory limiter, `@fastify/rate-limit`, `team.invite`'s
+  per-org throttle) are all in-memory and therefore per-replica — move to shared/database storage
+  before the api scales past one instance (carried since Phase 1).
+- `platform.access` audit rows still have no retention rule, and Phase 3 raises the volume again:
+  `send.execute` adds ONE credential-read audit row per send on top of Phase 2's per-sync row. The
+  retention rule is Phase 7's sweep; note the volume now, before it is a production surprise.
+- Better Auth 1.7.3 still declares a peer of `drizzle-orm ^0.45.2` against the workspace's pinned
+  `^0.44.0` (pnpm warns only, carried since Phase 1) — bump both together in a dedicated task, since
+  drizzle snapshots may shift.
+- `packages/db/test/keys.test.ts` is still order-dependent (file untouched this phase).
+- The remaining `apps/app` accessibility/UX minors from Phase 1's residuals list, on screens this
+  phase didn't touch, are still open.
+- The DMARC first-match re-examination moves to **Phase 5**, with `decide()`'s auto branch: this
+  phase's `decide()` consumes a single boolean, and the multi-`Authentication-Results` reasoning only
+  becomes load-bearing once that branch is reachable.
+- The three-pane review layout, J/K queue navigation, multi-select and the stubbed-provider
+  Playwright walk move to **Phase 7** (plan deviation 13). Phase 3 ships the phone composition on
+  every platform plus `A`/`E`/`R` on web, and the Playwright smoke still stops at the mailbox gate.
+- The `pg_try_advisory_lock` slot pool sized to our Anthropic tier moves to **Phase 7** (plan
+  deviation 4). Phase 3's admission control is per-process (`batchSize: 1`) plus a
+  transaction-scoped `pg_advisory_xact_lock` per org.
+- The `workspaces.kill_switch` Settings toggle moves to **Phase 7** (plan deviation 16). The lever is
+  read by `decide()` and by `send.execute`; only the master switch (`agent_enabled`) is exposed.
+- `memory.capture` moves to **Phase 5** (plan deviation 5). `send.execute` already exposes the
+  `onSent({ orgId, ticketId, draftId })` seam, called post-commit and never allowed to fail a
+  delivered send; Phase 3 passes a no-op.
+- `agent_runs.kind = 'triage'` rows move to **Phase 6** (plan deviation 8). The enum admits the
+  value for Phase 6's dashboards, but only draft and sandbox runs create rows today; triage calls DO
+  get `llm_calls` rows, since the agent role wraps its one provider with the metering sink.
+- Deferred from Task 16: the digest mints action tokens for every pending draft rather than only the
+  ten rendered, and its email pass scans every workspace on each 5-minute tick.
+
 ## Later phases (see the spec for scope and verification)
 
-- Phase 3 — draft → review → send, the first shippable slice (`agent.orphan-sweep` lands here).
 - Phase 4 — knowledge (parsers, crawler, Voyage embeddings, retrieval, `minio`/R2 uploads).
 - Phase 5 — autonomy and learning (resolved-answer memory, evidence score, graduation).
 - Phase 6 — provider choice (BYOK adapters, probes, per-agent model config).
@@ -448,3 +637,12 @@ this phase needs the same way: the Gmail OAuth client + Pub/Sub topic/push subsc
 the CASA Tier 2 submission now (independent of code — a 4–12 week clock), the Microsoft Entra app
 registration, the live verification walk against a real Gmail test user and an M365 sandbox, and
 recording real fixtures from that walk.
+
+The Phase 3 external-setup runbook (`docs/runbooks/2026-09-phase-3-external-setup.md`) is what
+Phase 3 needs before a real reply leaves the building: the `send`-role environment (and the
+`MAIL_FROM` / `APP_BASE_URL` / `APP_WEB_ORIGIN` values that must be identical in both apps), an
+Anthropic Console workspace spend limit as the backstop to the in-product caps, the live
+send/reply/follow-up walk against both providers from both a Gmail and an outlook.com sender,
+recording the cache-hit fixture (`LLM_RECORD=1 … tsx packages/llm/scripts/record-cache-hit.ts`) and
+committing it, an EAS dev build to verify the Review/Hold push actions on iOS and Android, and
+confirming the 08:00-local digest email with working one-click links.

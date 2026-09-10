@@ -8,5 +8,5 @@
     "@aesa/db": "workspace:*", "@aesa/llm": "workspace:*", "@aesa/mail": "workspace:*", "@aesa/platform-mail": "workspace:*", "@aesa/queue": "workspace:*",
     "expo-server-sdk": "^7.2.0", "pg-boss": "^10.4.2", "pg": "^8.16.0", "pino": "^10.3.1", "tsx": "^4.20.0", "zod": "^4.0.0"
   },
-  "devDependencies": { "@types/node": "^22", "@types/pg": "^8.15.0", "drizzle-orm": "^0.44.0", "typescript": "^5.9.2", "vitest": "^3.2.0" }
+  "devDependencies": { "@aesa/api": "workspace:*", "@types/node": "^22", "@types/pg": "^8.15.0", "drizzle-orm": "^0.44.0", "typescript": "^5.9.2", "vitest": "^3.2.0" }
 }
