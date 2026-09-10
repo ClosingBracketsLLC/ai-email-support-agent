@@ -9,6 +9,7 @@ export const JOB_NAMES = {
   revokeMailbox: 'mailbox.revoke',
   mailboxSync: 'mailbox.sync',
   ticketTriage: 'ticket.triage',
+  ticketDraft: 'ticket.draft',
   notifyDispatch: 'notify.dispatch',
 } as const
 

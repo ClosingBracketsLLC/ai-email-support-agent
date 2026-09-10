@@ -126,8 +126,13 @@ async function notificationsFor(dedupeKey: string) {
   return withOrg(app.db, orgId, (tx) => tx.select().from(notifications).where(eq(notifications.dedupeKey, dedupeKey)))
 }
 
-function makeDeps(provider: LlmProvider): { deps: TicketTriageDeps; notified: { orgId: string; notificationId: string }[] } {
+function makeDeps(provider: LlmProvider): {
+  deps: TicketTriageDeps
+  notified: { orgId: string; notificationId: string }[]
+  drafted: { orgId: string; ticketId: string }[]
+} {
   const notified: { orgId: string; notificationId: string }[] = []
+  const drafted: { orgId: string; ticketId: string }[] = []
   const deps: TicketTriageDeps = {
     db: app.db,
     provider,
@@ -135,9 +140,12 @@ function makeDeps(provider: LlmProvider): { deps: TicketTriageDeps; notified: { 
     enqueueNotify: async (org, notificationId) => {
       notified.push({ orgId: org, notificationId })
     },
+    enqueueDraft: async (org, ticketId) => {
+      drafted.push({ orgId: org, ticketId })
+    },
     now: () => NOW,
   }
-  return { deps, notified }
+  return { deps, notified, drafted }
 }
 
 function verdictProvider(verdict: TriageVerdict): ReturnType<typeof createFakeProvider> {
@@ -366,6 +374,22 @@ describe('runTicketTriage', () => {
     expect(audits).toHaveLength(1)
     expect(audits[0]!.actor).toBe('system:ticket.triage')
     expect(audits[0]!.detail).toMatchObject({ categoryKey: 'order_status', sentiment: 'neutral', outcome: 'triaged' })
+  })
+
+  it('6h. the triaged outcome hands the ticket to ticket.draft exactly once; no other outcome does', async () => {
+    const ticketId = await seedTicket()
+    await seedInboundMessage(ticketId, 'Where is my order?', new Date('2026-09-08T00:00:00Z'))
+    const { deps, drafted } = makeDeps(verdictProvider(BASE_VERDICT))
+
+    await runTicketTriage(deps, { orgId, ticketId }, new AbortController().signal)
+
+    expect(drafted).toEqual([{ orgId, ticketId }])
+
+    // An escalating verdict is the owner's, not the agent's: no draft run is enqueued for it.
+    const angryId = await seedTicket()
+    const { deps: angryDeps, drafted: angryDrafted } = makeDeps(verdictProvider({ ...BASE_VERDICT, sentiment: 'angry' }))
+    await runTicketTriage(angryDeps, { orgId, ticketId: angryId }, new AbortController().signal)
+    expect(angryDrafted).toEqual([])
   })
 
   it('6b. isSpam or isAutomated in the verdict resolves the ticket', async () => {

@@ -12,6 +12,7 @@ import { registerMailboxSync } from './jobs/mailbox-sync.ts'
 import { registerNotifyDigest } from './jobs/notify-digest.ts'
 import { enqueueNotifyDispatch, registerNotifyDispatch } from './jobs/notify-dispatch.ts'
 import { registerPlatformHeartbeat } from './jobs/platform-heartbeat.ts'
+import { enqueueTicketDraft } from './jobs/ticket-draft.ts'
 import { createWorkerLogger } from './logging.ts'
 import { createExpoPush } from './push.ts'
 
@@ -25,16 +26,17 @@ logger.info({ roles: [...config.roles], kekActive: config.kekRing?.active ?? nul
 
 // pg-boss 10's insertJob SQL INNER JOINs the new job row against the queue table and returns zero
 // rows (no error, `boss.send` resolves `null`) when the named queue does not exist yet. notify.dispatch
-// is now registered unconditionally right below, but ticket.triage's and mailbox.sync's OWN queues
+// is now registered unconditionally right below, but ticket.triage's, ticket.draft's and mailbox.sync's OWN queues
 // are still created only by their config/role-gated `registerJob` calls further down — a
 // `WORKER_ROLES=sync` replica with no ANTHROPIC_API_KEY never runs `registerTicketTriage` on this
 // process, and mailbox.poll-sweep's (d)/(e) enqueue `ticket.triage` regardless; the same gap hits
 // mailbox.sync on a `sync`-role replica missing the KEK ring or MAIL_FROM, which mailbox.poll-sweep's
-// (a) enqueues into unconditionally too. Create all three unconditionally at boot, before any
+// (a) enqueues into unconditionally too. Create all four unconditionally at boot, before any
 // role-gated registration, so a send never silently no-ops on a role-partitioned or under-configured
 // replica.
 await createQueueRetrying(boss, JOB_NAMES.notifyDispatch)
 await createQueueRetrying(boss, JOB_NAMES.ticketTriage)
+await createQueueRetrying(boss, JOB_NAMES.ticketDraft)
 await createQueueRetrying(boss, JOB_NAMES.mailboxSync)
 
 // notify.dispatch's producers span every role (ticket.triage's escalations under `agent`,
@@ -53,6 +55,7 @@ if (config.roles.has('cron')) {
 await maybeRegisterAgentRole({
   boss, db, logger, config,
   enqueueNotify: (orgId, notificationId) => enqueueNotifyDispatch(boss, orgId, notificationId),
+  enqueueDraft: (orgId, ticketId, opts) => enqueueTicketDraft(boss, orgId, ticketId, opts),
 })
 
 if (config.roles.has('sync')) {

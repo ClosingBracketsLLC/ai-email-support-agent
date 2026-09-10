@@ -60,6 +60,13 @@ export interface TicketTriageDeps {
   logger: pino.Logger
   /** index.ts wires this to `enqueueNotifyDispatch` (`notify-dispatch.ts`, Task 16). */
   enqueueNotify: (orgId: string, notificationId: string) => Promise<void>
+  /**
+   * Phase 3 hand-off: a ticket that lands on `triaged` is drafting work. Called AFTER the verdict
+   * transaction commits (and only when the guarded write actually landed), so the draft job can
+   * never read a ticket the verdict has not been written for yet. Optional so Phase 2's own tests
+   * and any caller that only wants triage keep working.
+   */
+  enqueueDraft?: (orgId: string, ticketId: string) => Promise<void>
   now?: () => Date
 }
 
@@ -318,7 +325,7 @@ export async function runTicketTriage(deps: TicketTriageDeps, payload: TicketTri
   const outcome = computeOutcome(verdict)
   const categoryId = resolveCategoryId(cats, verdict.categoryKey)
 
-  const notificationId = await withOrg(deps.db, orgId, async (tx) => {
+  const applied = await withOrg(deps.db, orgId, async (tx) => {
     const patch: TicketPatch = {
       status: outcome.status,
       categoryId,
@@ -338,7 +345,7 @@ export async function runTicketTriage(deps: TicketTriageDeps, payload: TicketTri
     if (outcome.status === 'needs_owner') patch.escalationNotifiedAt = null
 
     const written = await guardedWrite(tx, ticketId, ticket.status, patch)
-    if (!written) return undefined
+    if (!written) return { written: false as const }
 
     let notifId: string | undefined
     if (outcome.status === 'needs_owner') {
@@ -348,7 +355,10 @@ export async function runTicketTriage(deps: TicketTriageDeps, payload: TicketTri
       actor: 'system:ticket.triage', action: 'ticket.triaged', entityType: 'ticket', entityId: ticketId,
       detail: { categoryKey: verdict.categoryKey, sentiment: verdict.sentiment, outcome: outcome.status },
     })
-    return notifId
+    return notifId === undefined ? { written: true as const } : { written: true as const, notificationId: notifId }
   })
-  if (notificationId) await deps.enqueueNotify(orgId, notificationId)
+  if (applied.notificationId) await deps.enqueueNotify(orgId, applied.notificationId)
+  // Post-commit hand-off to `ticket.draft` (Phase 3). Only on a verdict that actually landed on
+  // `triaged`: a lost race wrote nothing, and every other outcome is either resolved or an owner's.
+  if (applied.written && outcome.status === 'triaged') await deps.enqueueDraft?.(orgId, ticketId)
 }
