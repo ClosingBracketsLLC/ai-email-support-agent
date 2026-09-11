@@ -16,6 +16,7 @@ import { registerNotifyDigest } from './jobs/notify-digest.ts'
 import { enqueueNotifyDispatch, registerNotifyDispatch } from './jobs/notify-dispatch.ts'
 import { registerPlatformHeartbeat } from './jobs/platform-heartbeat.ts'
 import { enqueueSendExecute } from './jobs/send-execute.ts'
+import { registerStatsRollup } from './jobs/stats-rollup.ts'
 import { registerSweepsDaily } from './jobs/sweeps-daily.ts'
 import { registerTicketBackstopSweep } from './jobs/ticket-backstop-sweep.ts'
 import { enqueueTicketDraft } from './jobs/ticket-draft.ts'
@@ -84,6 +85,7 @@ if (config.roles.has('cron')) {
   await registerNotifyDigest(boss, { db, push, logger, mail, appBaseUrl: config.appBaseUrl, appWebOrigin: config.appWebOrigin })
   await registerTicketBackstopSweep(boss, { db, logger })
   await registerSweepsDaily(boss, { db, logger })
+  await registerStatsRollup(boss, { db, logger })
 }
 
 await maybeRegisterAgentRole({
