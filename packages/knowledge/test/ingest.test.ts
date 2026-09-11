@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { ParseError, parseHtml, prepareDocument } from '../src/index.ts'
+import { contentHashOf, ParseError, parseHtml, prepareDocument, type Block } from '../src/index.ts'
 
 // The Task 4 HTML fixture (test/parsers.test.ts's `describe('parseHtml', ...)` block), reused here
 // so `prepareDocument` runs against blocks a real parser produced, not hand-built `Block`s.
@@ -48,5 +48,16 @@ describe('prepareDocument', () => {
   it('throws ParseError(no_text) for empty blocks', () => {
     expect(() => prepareDocument({ blocks: [], uri: 'https://acme.example/empty', title: null })).toThrow(ParseError)
     expect(() => prepareDocument({ blocks: [], uri: 'https://acme.example/empty', title: null })).toThrow(/no_text/)
+  })
+
+  it('throws ParseError(no_text) for whitespace-only blocks too (review finding 10)', () => {
+    const whitespaceOnly: Block[] = [{ kind: 'paragraph', headingPath: [], text: '   \n\t  ' }]
+    expect(() => prepareDocument({ blocks: whitespaceOnly, uri: 'https://acme.example/empty', title: null })).toThrow(ParseError)
+    expect(() => prepareDocument({ blocks: whitespaceOnly, uri: 'https://acme.example/empty', title: null })).toThrow(/no_text/)
+  })
+
+  it('uses the SAME hash as the shared contentHashOf helper (review finding 7)', () => {
+    const doc = prepareDocument({ blocks, uri: 'https://acme.example/returns', title })
+    expect(doc.contentHash).toBe(contentHashOf(blocks))
   })
 })

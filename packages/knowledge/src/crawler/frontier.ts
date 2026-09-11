@@ -18,7 +18,11 @@ export class Frontier {
     const queue = source === 'sitemap' ? this.sitemapQueue : this.linkQueue
     for (const url of urls) {
       if (this.seen.has(url)) continue
-      if (this.seen.size >= this.maxSeen) return
+      // `continue`, not `return` (review finding 5): an over-cap entry is skipped, not a reason to
+      // abandon the rest of THIS array — a caller that adds several urls in one call (or relies on
+      // add() never bailing out early) must not have entries after the cap silently vanish for a
+      // reason unrelated to them individually.
+      if (this.seen.size >= this.maxSeen) continue
       this.seen.add(url)
       queue.push(url)
     }

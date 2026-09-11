@@ -1,22 +1,25 @@
 export { DEFAULT_PARSE_LIMITS, ParseError, type ParseLimits } from './bounds.ts'
 export { chunkBlocks, type Chunk } from './chunker.ts'
 export {
+  collectSitemapSeeds,
   CRAWL_USER_AGENT,
   CrawlError,
   createPinnedCrawlFetch,
   crawlSite,
   translatePinnedFetchError,
+  validateHop,
   type CrawledPage,
   type CrawlFetch,
   type CrawlOptions,
   type CrawlProgress,
   type CrawlSummary,
+  type RefusalReason,
 } from './crawler/engine.ts'
 export { Frontier } from './crawler/frontier.ts'
 export { CRAWLER_USER_AGENT, parseRobots } from './crawler/robots.ts'
 export { parseSitemap } from './crawler/sitemap.ts'
 export { normalizeUrl, sameSite } from './crawler/url.ts'
-export { prepareDocument, type PreparedDocument } from './ingest.ts'
+export { contentHashOf, prepareDocument, type PreparedDocument } from './ingest.ts'
 export { screenChunk } from './injection.ts'
 export { type Block } from './parsers/blocks.ts'
 export { runParserInChild } from './parsers/child-runner.ts'

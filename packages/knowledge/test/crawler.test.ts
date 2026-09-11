@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { CrawlError, crawlSite, Frontier, type CrawlFetch } from '../src/index.ts'
+import { collectSitemapSeeds, CrawlError, crawlSite, Frontier, normalizeUrl, validateHop, type CrawlFetch } from '../src/index.ts'
 import { fakeSite, type FakePage } from './fake-site.ts'
 
 const SITE = 'https://acme.example'
@@ -282,5 +282,214 @@ describe('crawlSite', () => {
     for (let i = 1; i < timestamps.length; i++) {
       expect(timestamps[i]! - timestamps[i - 1]!).toBeGreaterThanOrEqual(25)
     }
+  })
+
+  it('15. the politeness delay is enforced across concurrent workers too, not just within one worker (review finding 1)', async () => {
+    const extra = [0, 1, 2, 3, 4, 5]
+    const pages: Record<string, FakePage> = { '/': { body: `<h1>Home</h1><p>Welcome.</p>${extra.map((i) => `<a href="/p${i}">p${i}</a>`).join('')}` } }
+    for (const i of extra) pages[`/p${i}`] = page(`P${i}`, `Content ${i}.`)
+    const site = fakeSite(pages)
+    const timestamps: number[] = []
+    const trackedFetch: CrawlFetch = async (url, init) => {
+      timestamps.push(Date.now())
+      return site.fetch(url, init)
+    }
+    const summary = await crawlSite({
+      startUrl: `${SITE}/`, maxPages: 7, concurrency: 2, delayMs: 20, fetch: trackedFetch, resolver: site.resolver, signal: signal(),
+      onBatch: async () => {},
+    })
+    expect(summary.ingested).toBe(7)
+    expect(timestamps.length).toBeGreaterThanOrEqual(7)
+    // Every same-host fetch is spaced by at least delayMs, INCLUDING the two members of a
+    // concurrent wave — the old bug let a wave's pair fire together (a ~0ms gap here) since the
+    // slot was claimed only after the delay was awaited, not before.
+    for (let i = 1; i < timestamps.length; i++) {
+      expect(timestamps[i]! - timestamps[i - 1]!).toBeGreaterThanOrEqual(15)
+    }
+  })
+
+  it('16. a sitemapindex with more children than the fetch cap only fetches the cap\'s worth (review finding 2)', async () => {
+    const children = [1, 2, 3, 4, 5, 6, 7]
+    const site = fakeSite({
+      '/robots.txt': { body: `Sitemap: ${SITE}/sitemapindex.xml` },
+      '/sitemapindex.xml': { body: `<sitemapindex>${children.map((i) => `<sitemap><loc>${SITE}/child${i}.xml</loc></sitemap>`).join('')}</sitemapindex>` },
+      ...Object.fromEntries(children.map((i) => [`/child${i}.xml`, { body: sitemapXml([`${SITE}/page${i}`]) }])),
+      '/': { body: '<nav></nav>' },
+    })
+    await crawlSite({ startUrl: `${SITE}/`, maxPages: 10, delayMs: 0, fetch: site.fetch, resolver: site.resolver, signal: signal(), onBatch: async () => {} })
+    const sitemapHits = site.hits.filter((h) => h.includes('sitemapindex.xml') || h.includes('/child'))
+    expect(sitemapHits).toHaveLength(5) // the index itself + 4 of the 7 children (5 sitemap-file fetches total)
+  })
+
+  it('17. an onBatch failure aborts the crawl as crawl_failed, without silently losing pages (review finding 4)', async () => {
+    const site = fakeSite({
+      '/robots.txt': { body: `Sitemap: ${SITE}/sitemap.xml` },
+      '/sitemap.xml': { body: sitemapXml([`${SITE}/b`, `${SITE}/a`]) },
+      '/': { body: '<nav><a href="/c">Next</a></nav>' },
+      '/b': page('B', 'Page b content.'),
+      '/a': page('A', 'Page a content.'),
+      '/c': page('C', 'Page c content.'),
+    })
+    const delivered: string[][] = []
+    let batchCount = 0
+    await expect(
+      crawlSite({
+        startUrl: `${SITE}/`, maxPages: 3, firstBatch: 2, delayMs: 0, fetch: site.fetch, resolver: site.resolver, signal: signal(),
+        onBatch: async (pages) => {
+          batchCount++
+          if (batchCount === 2) throw new Error('persistence boom')
+          delivered.push(pages.map((p) => p.url))
+        },
+      }),
+    ).rejects.toMatchObject({ name: 'CrawlError', code: 'crawl_failed' })
+    // The first batch (b, a) was delivered exactly once, before the second batch's failure aborted
+    // the crawl — it is not retried, re-delivered, or rolled back.
+    expect(delivered).toEqual([[`${SITE}/b`, `${SITE}/a`]])
+  })
+
+  it('18. the start URL is queued before sitemap seeds, so a full frontier cap never silently drops the homepage (review finding 5)', async () => {
+    const bogusUrls = Array.from({ length: 15 }, (_, i) => `${SITE}/bogus${i}`)
+    const site = fakeSite({
+      '/robots.txt': { body: `Sitemap: ${SITE}/sitemap.xml` },
+      // None of these paths have a real page defined — every one 404s. With maxPages: 1 the
+      // frontier's maxSeen cap is 10, so at most 9 of these 15 can be admitted once the start URL
+      // claims its own slot first — and since none of them are real pages, the crawl must fall
+      // through all of them before it ever reaches (and ingests) the start URL itself.
+      '/sitemap.xml': { body: sitemapXml(bogusUrls) },
+      '/': page('Home', 'The homepage.'),
+    })
+    const ingestedUrls: string[] = []
+    const summary = await crawlSite({
+      startUrl: `${SITE}/`, maxPages: 1, delayMs: 0, fetch: site.fetch, resolver: site.resolver, signal: signal(),
+      onBatch: async (pages) => { ingestedUrls.push(...pages.map((p) => p.url)) },
+    })
+    expect(summary.ingested).toBe(1)
+    expect(ingestedUrls).toEqual([`${SITE}/`])
+  })
+
+  it('19. an abort mid-discovery (right after the robots.txt fetch) stops before any sitemap or page fetch (review finding 6)', async () => {
+    const controller = new AbortController()
+    const site = fakeSite({
+      '/robots.txt': { body: `Sitemap: ${SITE}/sitemap.xml` },
+      '/sitemap.xml': { body: sitemapXml([`${SITE}/a`]) },
+      '/': page('Home', 'Welcome.'),
+      '/a': page('A', 'Page a.'),
+    })
+    const abortingFetch: CrawlFetch = async (url, init) => {
+      const result = await site.fetch(url, init)
+      if (url.endsWith('/robots.txt')) controller.abort()
+      return result
+    }
+    const summary = await crawlSite({
+      startUrl: `${SITE}/`, maxPages: 5, delayMs: 0, fetch: abortingFetch, resolver: site.resolver, signal: controller.signal, onBatch: async () => {},
+    })
+    expect(summary).toEqual({ fetched: 0, ingested: 0, skipped: 0, refused: [] })
+    expect(site.hits).toEqual([`${SITE}/robots.txt`])
+  })
+
+  it('20. a redirect with a missing or unparsable Location is refused invalid_location, not too_many_redirects (review finding 8)', async () => {
+    const site = fakeSite({
+      '/': { body: '<h1>Home</h1><p>Welcome.</p><a href="/no-location">NoLoc</a><a href="/bad-location">BadLoc</a>' },
+      '/no-location': { status: 302, headers: {} },
+      '/bad-location': { status: 302, headers: { location: 'javascript:void(0)' } },
+    })
+    const summary = await crawlSite({ startUrl: `${SITE}/`, maxPages: 5, delayMs: 0, fetch: site.fetch, resolver: site.resolver, signal: signal(), onBatch: async () => {} })
+    expect(summary.refused).toContainEqual({ url: `${SITE}/no-location`, reason: 'invalid_location' })
+    expect(summary.refused).toContainEqual({ url: `${SITE}/bad-location`, reason: 'invalid_location' })
+    expect(summary.refused.some((r) => r.reason === 'too_many_redirects')).toBe(false)
+  })
+
+  it('21. robots.txt is re-checked on every redirect hop: a same-site redirect into a disallowed path is skipped, not fetched (review finding 9)', async () => {
+    const site = fakeSite({
+      '/robots.txt': { body: 'User-agent: *\nDisallow: /private' },
+      '/': { body: '<h1>Home</h1><p>Welcome.</p><a href="/redirect-in">RedirectIn</a>' },
+      '/redirect-in': { status: 302, headers: { location: `${SITE}/private` } },
+      '/private': page('Private', 'Secret.'),
+    })
+    const summary = await crawlSite({ startUrl: `${SITE}/`, maxPages: 5, delayMs: 0, fetch: site.fetch, resolver: site.resolver, signal: signal(), onBatch: async () => {} })
+    expect(site.hits).toContain(`${SITE}/redirect-in`)
+    expect(site.hits).not.toContain(`${SITE}/private`)
+    expect(summary.skipped).toBeGreaterThanOrEqual(1)
+  })
+
+  it('22. subsequent batches after the first are always the fixed 20, regardless of firstBatch: 45 pages flush as 20, 20, 5 (review finding 12)', async () => {
+    const n = 45
+    const urls = Array.from({ length: n }, (_, i) => `${SITE}/p${i}`)
+    const pages: Record<string, FakePage> = { '/sitemap.xml': { body: sitemapXml(urls) }, '/': { body: '<nav></nav>' } }
+    for (let i = 0; i < n; i++) pages[`/p${i}`] = page(`P${i}`, `Content ${i}.`)
+    const site = fakeSite(pages)
+    const batchSizes: number[] = []
+    const summary = await crawlSite({
+      startUrl: `${SITE}/`, maxPages: n, delayMs: 0, fetch: site.fetch, resolver: site.resolver, signal: signal(),
+      onBatch: async (batchPages) => { batchSizes.push(batchPages.length) },
+    })
+    expect(summary.ingested).toBe(n)
+    expect(batchSizes).toEqual([20, 20, 5])
+  })
+
+  it('23. an https:// link on a nonstandard port is refused invalid_url and never fetched (review finding 3)', async () => {
+    const site = fakeSite({
+      '/': { body: `<h1>Home</h1><p>Welcome.</p><a href="https://acme.example:8080/x">Odd port</a>` },
+    })
+    const summary = await crawlSite({ startUrl: `${SITE}/`, maxPages: 5, delayMs: 0, fetch: site.fetch, resolver: site.resolver, signal: signal(), onBatch: async () => {} })
+    expect(site.hits).not.toContain('https://acme.example:8080/x')
+    expect(summary.refused).toContainEqual({ url: 'https://acme.example:8080/x', reason: 'invalid_url' })
+  })
+})
+
+describe('normalizeUrl (review finding 3: https only)', () => {
+  it('rejects http: outright — a plain http link is silently dropped at discovery, same as mailto:/javascript:', () => {
+    expect(normalizeUrl('http://acme.example/x')).toBeNull()
+    expect(normalizeUrl('http://acme.example/x', `${SITE}/`)).toBeNull()
+  })
+  it('still accepts https:', () => {
+    expect(normalizeUrl('https://acme.example/x')).toBe('https://acme.example/x')
+  })
+})
+
+describe('validateHop (review finding 3: invalid_url via validateOutboundUrl, checked before resolvePublic)', () => {
+  const siteUrl = new URL(`${SITE}/`)
+  it('refuses http: as invalid_url (unreachable through the normal discovery path — normalizeUrl already drops it first — but validateHop independently enforces the same https-only rule)', async () => {
+    const result = await validateHop('http://acme.example/x', siteUrl, undefined)
+    expect(result).toEqual({ ok: false, reason: 'invalid_url' })
+  })
+  it('refuses a nonstandard port as invalid_url', async () => {
+    const result = await validateHop('https://acme.example:8080/x', siteUrl, undefined)
+    expect(result).toEqual({ ok: false, reason: 'invalid_url' })
+  })
+  it('still accepts a plain https same-site URL', async () => {
+    const resolver = async () => [{ address: '93.184.216.34', family: 4 as const }]
+    const result = await validateHop('https://acme.example/x', siteUrl, resolver)
+    expect(result.ok).toBe(true)
+  })
+})
+
+describe('collectSitemapSeeds (review findings 2, 6, 12 — tested directly: a full crawl through thousands of dummy seeded pages would be far too slow)', () => {
+  const siteUrl = new URL(`${SITE}/`)
+  const rawPageFetch = (site: ReturnType<typeof fakeSite>) => (url: URL) => site.fetch(url.toString(), { timeoutMs: 10_000, maxBodyBytes: 2 * 1024 * 1024, headers: {} })
+  const neverAborted = new AbortController().signal
+
+  it('caps the TOTAL seeded URLs at 5,000 across files, not 5,000 per file: two files of 3,000 seed exactly 5,000', async () => {
+    const urlsA = Array.from({ length: 3000 }, (_, i) => `${SITE}/a${i}`)
+    const urlsB = Array.from({ length: 3000 }, (_, i) => `${SITE}/b${i}`)
+    const site = fakeSite({ '/sitemapA.xml': { body: sitemapXml(urlsA) }, '/sitemapB.xml': { body: sitemapXml(urlsB) } })
+    const seeds = await collectSitemapSeeds([`${SITE}/sitemapA.xml`, `${SITE}/sitemapB.xml`], siteUrl, rawPageFetch(site), site.resolver, neverAborted)
+    expect(seeds).toHaveLength(5000)
+  })
+
+  it('a sitemap file at a private address is silently skipped, contributing no seeds', async () => {
+    const site = fakeSite({ '/sitemap.xml': { body: sitemapXml([`${SITE}/x`]) } })
+    const seeds = await collectSitemapSeeds(['https://sitemap-host.internal/sitemap.xml'], siteUrl, rawPageFetch(site), site.resolver, neverAborted)
+    expect(seeds).toEqual([])
+    expect(site.hits).toEqual([])
+  })
+
+  it('stops fetching more sitemap files once the signal is already aborted', async () => {
+    const site = fakeSite({ '/sitemapA.xml': { body: sitemapXml([`${SITE}/a`]) }, '/sitemapB.xml': { body: sitemapXml([`${SITE}/b`]) } })
+    const controller = new AbortController()
+    controller.abort()
+    const seeds = await collectSitemapSeeds([`${SITE}/sitemapA.xml`, `${SITE}/sitemapB.xml`], siteUrl, rawPageFetch(site), site.resolver, controller.signal)
+    expect(seeds).toEqual([])
+    expect(site.hits).toEqual([])
   })
 })

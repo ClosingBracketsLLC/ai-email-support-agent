@@ -1,6 +1,6 @@
-import { createHash } from 'node:crypto'
 import type { KnowledgeFailureReason } from '@aesa/contracts'
 import { PinnedFetchError, pinnedFetch, resolvePublic, validateOutboundUrl, type Resolver } from '@aesa/crypto'
+import { contentHashOf } from '../ingest.ts'
 import type { Block } from '../parsers/blocks.ts'
 import { parseHtml } from '../parsers/html.ts'
 import { Frontier } from './frontier.ts'
@@ -18,10 +18,13 @@ const DEFAULT_FIRST_BATCH = 20
 const SUBSEQUENT_BATCH_SIZE = 20
 const FRONTIER_CAP_MULTIPLIER = 10
 
-/** A safety bound on the sitemap-index recursion (rule 3's "else /sitemap.xml" fallback can chain
- * through nested `<sitemapindex>` children) — not itself a rule the engine is scored against, just
- * a guard against a pathological or hostile sitemap graph. */
-const MAX_SITEMAP_FETCHES = 20
+/** The sitemap discovery bounds (review finding 2, replacing an earlier ad hoc 20-files-no-total
+ * cap): at most 5 sitemap FILES are fetched — index and leaf combined, breadth-first through any
+ * nested `<sitemapindex>` — and at most 5,000 page URLs are seeded IN TOTAL across every file
+ * fetched, not 5,000 per file (`parseSitemap`'s own per-file cap in `sitemap.ts` stays underneath
+ * this as a defensive floor). */
+const MAX_SITEMAP_FETCHES = 5
+const MAX_SITEMAP_SEED_URLS = 5_000
 
 /** The exact User-Agent every request carries (rule 12) — also usable by robots.txt reporting/runbooks. */
 export const CRAWL_USER_AGENT = 'aesa-crawler/1.0 (+https://aesa.app)'
@@ -38,9 +41,22 @@ export class CrawlError extends Error {
   }
 }
 
+/** Marks an `onBatch` failure as it unwinds out of `processUrl` — distinguishes "the caller's own
+ * persistence failed, abort the whole crawl" from "this one page failed, skip it and move on"
+ * (review finding 4): both used to surface as a thrown error inside the very same `try`, so the
+ * first kind was being silently swallowed as if it were the second. */
+class BatchFlushError extends Error {
+  readonly cause: unknown
+  constructor(cause: unknown) {
+    super('onBatch failed')
+    this.name = 'BatchFlushError'
+    this.cause = cause
+  }
+}
+
 export type CrawlFetch = (
   url: string,
-  init: { timeoutMs: number; maxBodyBytes: number; headers: Record<string, string> },
+  init: { timeoutMs: number; maxBodyBytes: number; headers: Record<string, string>; signal?: AbortSignal },
 ) => Promise<{ status: number; headers: Record<string, string>; body: string }>
 
 export interface CrawledPage {
@@ -57,11 +73,16 @@ export interface CrawlProgress {
   frontier: number
 }
 
+/** Every reason a hop, a sitemap URL, or a redirect target can be refused — shared by
+ * `CrawlSummary` and the internal gates (`validateHop`, `fetchResolved`) so the two can never
+ * silently drift into different vocabularies (review finding 8). */
+export type RefusalReason = 'private_address' | 'off_site' | 'too_many_redirects' | 'invalid_url' | 'invalid_location'
+
 export interface CrawlSummary {
   fetched: number
   ingested: number
   skipped: number
-  refused: { url: string; reason: string }[]
+  refused: { url: string; reason: RefusalReason }[]
 }
 
 export interface CrawlOptions {
@@ -104,7 +125,13 @@ export function translatePinnedFetchError(err: unknown): { status: number; heade
  * (`fetchResolved`: normalize → same-site → `resolvePublic` → fetch) is what actually follows it,
  * exactly as it already does against the fake `CrawlFetch` in tests. `translatePinnedFetchError`
  * still catches an oversized body (`body_too_large`, still thrown regardless of redirect mode) so
- * that ends the ONE fetch attempt, not the whole crawl. */
+ * that ends the ONE fetch attempt, not the whole crawl.
+ *
+ * `init.signal` (review finding 6) is NOT forwarded to `pinnedFetch` here: `@aesa/crypto`'s
+ * `pinnedFetch`/`PinnedFetchInit` has no `signal` option — it builds its own internal
+ * `AbortSignal.timeout(...)` and has no way to accept an external one layered on top. Cancellation
+ * through this adapter is therefore between-fetch only, via `crawlSite`'s own signal checks; an
+ * in-flight `pinnedFetch` call always runs to completion (or hits its own `timeoutMs`). */
 export function createPinnedCrawlFetch(): CrawlFetch {
   return async (url, init) => {
     try {
@@ -121,19 +148,24 @@ export function createPinnedCrawlFetch(): CrawlFetch {
   }
 }
 
-type HopRefusal = 'off_site' | 'private_address'
+type HopRefusal = 'off_site' | 'private_address' | 'invalid_url'
 
-/** The resolved-address check runs BEFORE the same-site check on purpose: a link to a private or
- * blocked address is always reported as `private_address`, even when its hostname also happens to
+/** Runs `validateOutboundUrl` (https only, port 443, no userinfo, no IP-literal host — review
+ * finding 3) BEFORE the resolved-address check, which itself runs BEFORE the same-site check: a
+ * malformed/non-https/nonstandard-port hop is `invalid_url` regardless of where it points; a link
+ * to a private or blocked address is `private_address` even when its hostname also happens to
  * differ from the site (the common case — `api.internal`, an SSRF bait host, is never "this
- * site"). `off_site` is reserved for a hostname that resolves PUBLICLY but still isn't the site
- * being crawled. */
-async function validateHop(rawUrl: string, siteUrl: URL, resolver: Resolver | undefined): Promise<{ ok: true; url: URL } | { ok: false; reason: HopRefusal }> {
+ * site"); `off_site` is reserved for a hostname that passes both those checks but still isn't the
+ * site being crawled. Exported for direct testing of the `invalid_url` arm, which — since
+ * `normalizeUrl` now also rejects a non-https scheme before a URL would ever reach this function
+ * through the crawl's normal discovery path — is otherwise only reachable end-to-end via the
+ * nonstandard-port case (`normalizeUrl` does not check ports at all). */
+export async function validateHop(rawUrl: string, siteUrl: URL, resolver: Resolver | undefined): Promise<{ ok: true; url: URL } | { ok: false; reason: HopRefusal }> {
   let url: URL
   try {
-    url = new URL(rawUrl)
+    url = validateOutboundUrl(rawUrl)
   } catch {
-    return { ok: false, reason: 'off_site' }
+    return { ok: false, reason: 'invalid_url' }
   }
   try {
     await resolvePublic(url.hostname, { resolver })
@@ -146,21 +178,27 @@ async function validateHop(rawUrl: string, siteUrl: URL, resolver: Resolver | un
 
 type FetchOutcome =
   | { kind: 'ok'; url: string; status: number; headers: Record<string, string>; body: string }
-  | { kind: 'refused'; url: string; reason: HopRefusal | 'too_many_redirects' }
+  | { kind: 'refused'; url: string; reason: RefusalReason }
+  | { kind: 'disallowed'; url: string }
 
 /** Fetches `initialUrl`, following at most `MAX_REDIRECTS` redirects (rule 4): each hop's target
  * is normalized, same-site-checked and re-resolved through `resolvePublic` BEFORE it is fetched —
- * `pageFetch` never sees a redirect target the caller hasn't re-validated. */
+ * `pageFetch` never sees a redirect target the caller hasn't re-validated. `isAllowed` (robots) is
+ * re-checked on EVERY hop, not just the first (review finding 9) — a same-site redirect into a
+ * disallowed path must never be fetched either. */
 async function fetchResolved(
   pageFetch: (url: URL) => Promise<{ status: number; headers: Record<string, string>; body: string }>,
   initialUrl: string,
   siteUrl: URL,
   resolver: Resolver | undefined,
+  isAllowed: (url: string) => boolean,
 ): Promise<FetchOutcome> {
   let currentUrl = initialUrl
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     const gate = await validateHop(currentUrl, siteUrl, resolver)
     if (!gate.ok) return { kind: 'refused', url: currentUrl, reason: gate.reason }
+
+    if (!isAllowed(gate.url.toString())) return { kind: 'disallowed', url: currentUrl }
 
     const res = await pageFetch(gate.url)
     if (!REDIRECT_STATUSES.has(res.status)) {
@@ -168,13 +206,62 @@ async function fetchResolved(
     }
     if (hop === MAX_REDIRECTS) return { kind: 'refused', url: currentUrl, reason: 'too_many_redirects' }
 
+    // A missing or unparsable Location is its own reason (review finding 8) — never one more hop
+    // toward the redirect-chain limit, so it must not be reported as too_many_redirects.
     const location = res.headers['location'] ?? res.headers['Location']
-    const normalized = location ? normalizeUrl(location, gate.url.toString()) : null
-    if (!normalized) return { kind: 'refused', url: currentUrl, reason: 'too_many_redirects' }
+    if (!location) return { kind: 'refused', url: currentUrl, reason: 'invalid_location' }
+    const normalized = normalizeUrl(location, gate.url.toString())
+    if (!normalized) return { kind: 'refused', url: currentUrl, reason: 'invalid_location' }
     currentUrl = normalized
   }
   /* c8 ignore next */
   return { kind: 'refused', url: currentUrl, reason: 'too_many_redirects' }
+}
+
+/** Fetches robots-declared (or the `/sitemap.xml`-fallback) sitemap files, breadth-first through
+ * any nested `<sitemapindex>`, bounded by `MAX_SITEMAP_FETCHES` files AND `MAX_SITEMAP_SEED_URLS`
+ * page URLs in TOTAL across every file (review finding 2 — the total cap can bind well before any
+ * single file's own 5,000-URL cap would). Checks `signal` before each file fetch (review finding
+ * 6) and stops early — returning whatever was collected so far — once aborted. A sitemap file
+ * itself refused by `validateHop` (off-site, private, or an invalid URL) contributes no seeds and
+ * is silently skipped, same as a non-2xx or unparsable one; none of that is reported anywhere
+ * (`collectSitemapSeeds` returns only the seed list) — reporting IS done for pages and redirect
+ * hops dequeued from the frontier (`crawlSite`'s `refused`), which sitemap-file-level problems are
+ * deliberately not conflated with. Exported so this can be tested directly: proving either cap by
+ * running a full crawl through thousands of dummy seeded pages would be far too slow. */
+export async function collectSitemapSeeds(
+  initialSitemapUrls: string[],
+  siteUrl: URL,
+  pageFetch: (url: URL) => Promise<{ status: number; headers: Record<string, string>; body: string }>,
+  resolver: Resolver | undefined,
+  signal: AbortSignal,
+): Promise<string[]> {
+  const toFetch = [...initialSitemapUrls]
+  const fetchedSitemaps = new Set<string>()
+  const seeds: string[] = []
+  while (toFetch.length > 0 && fetchedSitemaps.size < MAX_SITEMAP_FETCHES && seeds.length < MAX_SITEMAP_SEED_URLS) {
+    if (signal.aborted) break
+    const nextSitemapUrl = toFetch.shift()!
+    const normalizedSitemapUrl = normalizeUrl(nextSitemapUrl, siteUrl.toString())
+    if (!normalizedSitemapUrl || fetchedSitemaps.has(normalizedSitemapUrl)) continue
+    fetchedSitemaps.add(normalizedSitemapUrl)
+    try {
+      const gate = await validateHop(normalizedSitemapUrl, siteUrl, resolver)
+      if (!gate.ok) continue
+      const res = await pageFetch(gate.url)
+      if (res.status < 200 || res.status >= 300) continue
+      const parsed = parseSitemap(res.body)
+      for (const u of parsed.urls) {
+        if (seeds.length >= MAX_SITEMAP_SEED_URLS) break
+        const n = normalizeUrl(u, gate.url.toString())
+        if (n) seeds.push(n)
+      }
+      toFetch.push(...parsed.sitemaps)
+    } catch {
+      // One bad sitemap fetch doesn't fail the crawl — just contributes no urls.
+    }
+  }
+  return seeds
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
@@ -203,33 +290,48 @@ export async function crawlSite(opts: CrawlOptions): Promise<CrawlSummary> {
 
   const lastRequestAtByHost = new Map<string, number>()
   /** Rule 10 (politeness half): serializes requests to the SAME host by `delayMs`; requests to
-   * different hosts are never held up by this. Rule 10's concurrency half lives in the wave loop
-   * below, which never has more than `concurrency` of these in flight at once. */
+   * different hosts are never held up by this. The slot is claimed SYNCHRONOUSLY — `last` is read,
+   * the wake time computed, and the map written back all before any `await` (review finding 1):
+   * the old code read `last`, awaited a sleep, and only then wrote the map, so two workers racing
+   * for the same host in one concurrent wave could both read the same stale `last` and fire
+   * together. Rule 10's concurrency half lives in the wave loop below, which never has more than
+   * `concurrency` of these in flight at once. */
   const pageFetch = async (url: URL): Promise<{ status: number; headers: Record<string, string>; body: string }> => {
     const host = url.hostname
+    const now = Date.now()
     const last = lastRequestAtByHost.get(host)
-    if (last !== undefined) {
-      const wait = delayMs - (Date.now() - last)
-      if (wait > 0) await sleep(wait)
-    }
-    lastRequestAtByHost.set(host, Date.now())
-    return opts.fetch(url.toString(), { timeoutMs: TIMEOUT_MS, maxBodyBytes: MAX_BODY_BYTES, headers: FETCH_HEADERS })
+    const wake = last !== undefined ? Math.max(now, last + delayMs) : now
+    lastRequestAtByHost.set(host, wake)
+    const wait = wake - now
+    if (wait > 0) await sleep(wait)
+    return opts.fetch(url.toString(), { timeoutMs: TIMEOUT_MS, maxBodyBytes: MAX_BODY_BYTES, headers: FETCH_HEADERS, signal: opts.signal })
   }
 
   const frontier = new Frontier({ maxSeen: opts.maxPages * FRONTIER_CAP_MULTIPLIER })
   let fetchedCount = 0
   let ingestedCount = 0
   let skippedCount = 0
-  const refused: { url: string; reason: string }[] = []
+  const refused: { url: string; reason: RefusalReason }[] = []
   const seenHashes = new Set<string>()
   let buffer: CrawledPage[] = []
   let firstBatchDone = false
 
+  // Rule 8 + review finding 4: `onBatch` must fully succeed before its pages are considered
+  // delivered — `buffer` keeps holding them until then, so a rejection never silently drops up to
+  // 20 pages while still counting them ingested. A failure is re-thrown as `BatchFlushError`,
+  // which `processUrl` (below) is careful NOT to swallow like every other page-level failure, and
+  // which `crawlSite`'s own try/catch (further below) turns into a `CrawlError('crawl_failed')`
+  // that aborts the whole crawl — including from this function's LAST call, after the main loop,
+  // which used to propagate raw and uncaught while a mid-crawl failure was silently swallowed.
   const flush = async (): Promise<void> => {
     if (buffer.length === 0) return
     const pages = buffer
+    try {
+      await opts.onBatch(pages)
+    } catch (err) {
+      throw new BatchFlushError(err)
+    }
     buffer = []
-    await opts.onBatch(pages)
   }
   // Rule 8: the first `firstBatch` (20) ingested pages flush immediately; every flush after that
   // carries up to the fixed 20, not `firstBatch` again. Whatever's left flushes once at the end
@@ -247,6 +349,10 @@ export async function crawlSite(opts: CrawlOptions): Promise<CrawlSummary> {
     }
   }
 
+  // Review finding 6: checked before the robots fetch too, not just between crawl waves — an
+  // abort that lands during discovery must stop discovery, not just the page-fetching loop after it.
+  if (opts.signal.aborted) return { fetched: fetchedCount, ingested: ingestedCount, skipped: skippedCount, refused }
+
   // Rule 2: GET /robots.txt first; a 4xx/5xx, a non-text response, or a transport failure all mean
   // "no rules" — every URL is allowed and there are no robots-declared sitemaps.
   let robots: { isAllowed(url: string): boolean; sitemaps: string[] } = { isAllowed: () => true, sitemaps: [] }
@@ -261,40 +367,22 @@ export async function crawlSite(opts: CrawlOptions): Promise<CrawlSummary> {
     // Transport failure: fall back to the permissive default above.
   }
 
-  // Rule 3: sitemap-first. Robots' own `Sitemap:` lines win; otherwise fall back to `/sitemap.xml`
-  // at the site root. A `<sitemapindex>` child sitemap is followed too, breadth-first, bounded by
-  // MAX_SITEMAP_FETCHES. Every discovered page URL is normalized and queued as a 'sitemap' seed —
-  // same-site filtering happens later, at the single per-URL gate every frontier entry passes
-  // through (`validateHop`, inside `fetchResolved`), not here.
-  const sitemapUrlsToFetch = robots.sitemaps.length > 0 ? [...robots.sitemaps] : [new URL('/sitemap.xml', siteUrl).toString()]
-  const fetchedSitemaps = new Set<string>()
-  const sitemapSeeds: string[] = []
-  while (sitemapUrlsToFetch.length > 0 && fetchedSitemaps.size < MAX_SITEMAP_FETCHES) {
-    const nextSitemapUrl = sitemapUrlsToFetch.shift()!
-    const normalizedSitemapUrl = normalizeUrl(nextSitemapUrl, siteUrl.toString())
-    if (!normalizedSitemapUrl || fetchedSitemaps.has(normalizedSitemapUrl)) continue
-    fetchedSitemaps.add(normalizedSitemapUrl)
-    try {
-      const gate = await validateHop(normalizedSitemapUrl, siteUrl, resolver)
-      if (!gate.ok) continue
-      const res = await pageFetch(gate.url)
-      if (res.status < 200 || res.status >= 300) continue
-      const parsed = parseSitemap(res.body)
-      for (const u of parsed.urls) {
-        const n = normalizeUrl(u, gate.url.toString())
-        if (n) sitemapSeeds.push(n)
-      }
-      sitemapUrlsToFetch.push(...parsed.sitemaps)
-    } catch {
-      // One bad sitemap fetch doesn't fail the crawl — just contributes no urls.
-    }
-  }
-  frontier.add(sitemapSeeds, 'sitemap')
+  if (opts.signal.aborted) return { fetched: fetchedCount, ingested: ingestedCount, skipped: skippedCount, refused }
 
-  // The start URL is queued exactly like any other discovered link — placed in the LINK queue, so
-  // every sitemap-seeded URL is dequeued before it (rule 3's "before the start URL's links").
+  // Rule 3: sitemap-first. Robots' own `Sitemap:` lines win; otherwise fall back to `/sitemap.xml`
+  // at the site root.
+  const sitemapUrlsToFetch = robots.sitemaps.length > 0 ? [...robots.sitemaps] : [new URL('/sitemap.xml', siteUrl).toString()]
+  const sitemapSeeds = await collectSitemapSeeds(sitemapUrlsToFetch, siteUrl, pageFetch, resolver, opts.signal)
+
+  // The start URL is queued FIRST (review finding 5): a large sitemap can otherwise fill the
+  // frontier's `maxSeen` cap entirely before the start URL ever gets a slot, silently dropping the
+  // one URL the crawl absolutely must visit. It still goes into the LINK queue, though, so every
+  // sitemap-seeded URL is still dequeued before it regardless of `add()` order — `Frontier.next()`
+  // always drains the sitemap queue first (rule 3's "sitemap seeds before the start URL's links").
   const normalizedStart = normalizeUrl(opts.startUrl)
   if (normalizedStart) frontier.add([normalizedStart], 'link')
+
+  frontier.add(sitemapSeeds, 'sitemap')
 
   const addDiscoveredLinks = (hrefs: string[], baseUrl: string): void => {
     const normalized: string[] = []
@@ -307,17 +395,11 @@ export async function crawlSite(opts: CrawlOptions): Promise<CrawlSummary> {
 
   const processUrl = async (url: string): Promise<void> => {
     try {
-      // Rule 2 (disallow half): never fetched, just counted.
-      if (!robots.isAllowed(url)) {
-        skippedCount++
-        return
-      }
-
-      const result = await fetchResolved(pageFetch, url, siteUrl, resolver)
-      if (result.kind === 'refused') {
-        refused.push({ url: result.url, reason: result.reason })
-        return
-      }
+      const result = await fetchResolved(pageFetch, url, siteUrl, resolver, robots.isAllowed)
+      // Rule 2 (disallow half): never fetched, just counted — checked on every hop inside
+      // fetchResolved now (review finding 9), including this URL itself (hop 0).
+      if (result.kind === 'disallowed') { skippedCount++; return }
+      if (result.kind === 'refused') { refused.push({ url: result.url, reason: result.reason }); return }
       fetchedCount++
 
       const { url: finalUrl, status, headers: resHeaders, body } = result
@@ -353,39 +435,47 @@ export async function crawlSite(opts: CrawlOptions): Promise<CrawlSummary> {
       if (parsed.blocks.length === 0) { skippedCount++; return }
 
       // Rule 7: a page whose content was already ingested this crawl (same blocks, any URL) is a duplicate.
-      const contentHash = createHash('sha256').update(parsed.blocks.map((b) => b.text).join('\n')).digest('hex')
+      const contentHash = contentHashOf(parsed.blocks)
       if (seenHashes.has(contentHash)) { skippedCount++; return }
       seenHashes.add(contentHash)
 
       ingestedCount++
       buffer.push({ url: finalUrl, title: parsed.title, blocks: parsed.blocks, contentHash })
       await maybeFlush()
-    } catch {
-      // A single page's failure (a malformed response, a transport error not shaped as
-      // PinnedFetchError, ...) must not take the whole crawl down with it.
+    } catch (err) {
+      // A persistence failure (BatchFlushError, from maybeFlush() above) must abort the whole
+      // crawl (review finding 4) — it is NOT "this one page failed", and must not be swallowed
+      // like every other page-level failure (a malformed response, a transport error, ...) below.
+      if (err instanceof BatchFlushError) throw err
       skippedCount++
     } finally {
       await reportProgress()
     }
   }
 
-  // Rule 10 (concurrency half) + rule 9 (maxPages counts INGESTED pages): each wave pulls at most
-  // `concurrency` URLs, capped further by how many more pages could possibly be ingested, so a
-  // wave can never push `ingestedCount` past `maxPages` even when every member of the wave lands.
-  while (!opts.signal.aborted && ingestedCount < opts.maxPages) {
-    const remaining = opts.maxPages - ingestedCount
-    const waveSize = Math.min(concurrency, remaining)
-    const batch: string[] = []
-    for (let i = 0; i < waveSize; i++) {
-      const next = frontier.next()
-      if (next === null) break
-      batch.push(next)
+  try {
+    // Rule 10 (concurrency half) + rule 9 (maxPages counts INGESTED pages): each wave pulls at
+    // most `concurrency` URLs, capped further by how many more pages could possibly be ingested,
+    // so a wave can never push `ingestedCount` past `maxPages` even when every member of the wave lands.
+    while (!opts.signal.aborted && ingestedCount < opts.maxPages) {
+      const remaining = opts.maxPages - ingestedCount
+      const waveSize = Math.min(concurrency, remaining)
+      const batch: string[] = []
+      for (let i = 0; i < waveSize; i++) {
+        const next = frontier.next()
+        if (next === null) break
+        batch.push(next)
+      }
+      if (batch.length === 0) break
+      await Promise.all(batch.map((url) => processUrl(url)))
     }
-    if (batch.length === 0) break
-    await Promise.all(batch.map((url) => processUrl(url)))
+    await flush()
+  } catch (err) {
+    if (err instanceof BatchFlushError) {
+      throw new CrawlError('crawl_failed', err.cause instanceof Error ? err.cause.message : String(err.cause))
+    }
+    throw err
   }
-
-  await flush()
 
   return { fetched: fetchedCount, ingested: ingestedCount, skipped: skippedCount, refused }
 }

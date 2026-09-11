@@ -34,6 +34,10 @@ describe('parseHtml', () => {
     const two = parseHtml('<html><head><title>First</title><title>Second</title></head><body></body></html>')
     expect(two.title).toBe('Second')
   })
+  it('collapses the title and returns null for one that collapses to empty (review finding 11)', () => {
+    expect(parseHtml('<html><head><title>  </title></head><body></body></html>').title).toBeNull()
+    expect(parseHtml('<html><head><title>\n Acme \n</title></head><body></body></html>').title).toBe('Acme')
+  })
 })
 
 describe('parseHtml: anchor text is TEXT everywhere (phase-4 controller ruling, dropping the anchorDepth exception)', () => {

@@ -202,7 +202,10 @@ export function parseHtml(html: string): { title: string | null; canonical: stri
   flushList()
   flushLoose()
 
-  if (title !== null) title = collapse(title)
+  if (title !== null) {
+    const collapsedTitle = collapse(title)
+    title = collapsedTitle.length > 0 ? collapsedTitle : null
+  }
 
   return { title, canonical, noindex, links, blocks }
 }

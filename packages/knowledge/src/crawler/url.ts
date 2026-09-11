@@ -5,11 +5,14 @@ function isIpLiteralHost(hostname: string): boolean {
 }
 
 /** Normalize a discovered URL for frontier dedup: resolves `raw` against `base` (if given), keeps
- * only http/https, strips the fragment and a default port (already dropped by `URL` itself) and a
- * trailing `index.html`, lowercases the host (already lowercased by `URL`'s own host parsing —
- * done again here to document the contract), and sorts nothing (query order is never touched).
- * Returns `null` for anything that isn't a plain http(s) URL with a hostname: `mailto:`, `tel:`,
- * `javascript:`, an IP-literal host, or unparsable input. */
+ * only https (the crawler never fetches plain http — review finding 3), strips the fragment and a
+ * default port (already dropped by `URL` itself) and a trailing `index.html`, lowercases the host
+ * (already lowercased by `URL`'s own host parsing — done again here to document the contract), and
+ * sorts nothing (query order is never touched). Returns `null` for anything that isn't a plain
+ * https URL with a hostname: `http:`, `mailto:`, `tel:`, `javascript:`, an IP-literal host, or
+ * unparsable input. This is a cheap SYNTACTIC filter only — a nonstandard port or other
+ * `validateOutboundUrl`-only concern still passes through here and is caught later, at fetch time,
+ * by `validateHop` (`engine.ts`). */
 export function normalizeUrl(raw: string, base?: string): string | null {
   let url: URL
   try {
@@ -18,7 +21,7 @@ export function normalizeUrl(raw: string, base?: string): string | null {
     return null
   }
 
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null
+  if (url.protocol !== 'https:') return null
   if (isIpLiteralHost(url.hostname)) return null
 
   url.hash = ''
