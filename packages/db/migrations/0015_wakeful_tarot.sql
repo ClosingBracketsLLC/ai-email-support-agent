@@ -1,0 +1,1 @@
+ALTER TABLE "knowledge_sources" ADD COLUMN "claim_token" uuid;

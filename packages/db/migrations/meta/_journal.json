@@ -85,6 +85,34 @@
       "when": 1789000369233,
       "tag": "0011_draft_hardening",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1789099341970,
+      "tag": "0012_pgvector",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1789099636092,
+      "tag": "0013_tan_epoch",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1789099651312,
+      "tag": "0014_knowledge_hardening",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1789120254006,
+      "tag": "0015_wakeful_tarot",
+      "breakpoints": true
     }
   ]
 }

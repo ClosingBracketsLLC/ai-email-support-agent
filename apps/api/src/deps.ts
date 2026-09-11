@@ -4,6 +4,7 @@ import type pino from 'pino'
 import { z } from 'zod'
 import type { MailProvider } from '@aesa/contracts'
 import { webhookEvents, withOrg, type Db, type OrgTx } from '@aesa/db'
+import type { ObjectStore } from '@aesa/knowledge/storage'
 import { enqueue as enqueueJob, type JobDefinition } from '@aesa/queue'
 import type { MailboxProvider } from '@aesa/mail'
 import type { Auth } from './auth.ts'
@@ -144,6 +145,9 @@ export interface ServerDeps {
   logger: pino.Logger
   /** The api's only path to pg-boss: it enqueues jobs by name, never works one (src/boss.ts). */
   enqueue: EnqueueFn
+  /** The knowledge router's presigned uploads and object deletes: S3 (minio locally) when
+   * `config.s3` is set, an in-memory store otherwise (src/index.ts). */
+  store: ObjectStore
   /** Test seam: overrides the real Gmail/Graph adapters per provider (connect/routes.ts); production
    * code leaves this unset and resolves the real adapter every time. */
   mailProviders?: Partial<Record<MailProvider, MailboxProvider>>

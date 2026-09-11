@@ -199,6 +199,10 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
       mail: { transport: 'devsink', from: 'aesa <onboarding@resend.dev>' },
       appBaseUrl: 'https://api.test',
       appWebOrigin: 'https://app.test',
+      voyageApiKey: null,
+      knowledgeEmbedModel: 'voyage-4',
+      knowledgeRerank: false,
+      s3: null,
       platformSender: 'no-reply@aesa.test',
     }
   }

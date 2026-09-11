@@ -19,6 +19,15 @@ export async function createTestDatabase(): Promise<{ url: string; drop: () => P
   await admin.query(`CREATE DATABASE ${name} OWNER aesa_owner`)
   await admin.end()
   const url = testDatabaseUrl(ADMIN_URL, name)
+  // pgvector's control file is not `trusted`, so only a superuser can install it (0012_pgvector.sql
+  // runs as the non-superuser aesa_owner and depends on it already being present). ADMIN_URL is the
+  // cluster superuser: install it here, directly in the fresh database, so every throwaway test
+  // database is self-sufficient and does not depend on `template1` having been seeded by
+  // scripts/db-init/001-roles.sql (which still seeds `template1` for `aesa_dev` itself).
+  const superuser = new pg.Client({ connectionString: url })
+  await superuser.connect()
+  await superuser.query('CREATE EXTENSION IF NOT EXISTS vector')
+  await superuser.end()
   await runMigrations(url)
   return {
     url,

@@ -1,4 +1,5 @@
 import { loadKekRing, Secret, type KekRing } from '@aesa/crypto'
+import { parseS3Env, type S3Config } from '@aesa/knowledge'
 import { parseFirstAddrSpec } from '@aesa/mail'
 import { parseMailConfig, type MailConfig } from '@aesa/platform-mail'
 import { z } from 'zod'
@@ -41,6 +42,25 @@ const EnvSchema = z.object({
   // The Expo web origin — the base of the digest email's "open the ticket" links
   // (`<APP_WEB_ORIGIN>/ticket/<ticketId>`). Optional, same as APP_BASE_URL.
   APP_WEB_ORIGIN: z.string().optional(),
+  // Voyage embeddings (and the optional reranker). Optional here, like ANTHROPIC_API_KEY: the
+  // production gates below are what refuse a `knowledge` or `agent` replica without it, so a dev
+  // box falls back to the deterministic hash embedder instead of failing to boot.
+  VOYAGE_API_KEY: z.string().optional(),
+  // Which Voyage model writes (and therefore which model's rows retrieval scores — `embedding_model`
+  // is part of the vector leg's WHERE). Changing it on a live workspace makes every existing chunk
+  // invisible to the vector leg until Phase 6's re-embed job runs.
+  KNOWLEDGE_EMBED_MODEL: z.enum(['voyage-4', 'voyage-4-lite']).default('voyage-4'),
+  // The cross-encoder rerank pass over the fused candidates: off by default (it costs one more
+  // Voyage call per retrieval) and inert without VOYAGE_API_KEY.
+  KNOWLEDGE_RERANK: z.enum(['on', 'off']).default('off'),
+  // Object storage for uploads — all six or none (parseS3Env). Required in production when
+  // WORKER_ROLES includes `knowledge`: knowledge.ingest reads every uploaded file's bytes from it.
+  S3_ENDPOINT: z.string().optional(),
+  S3_REGION: z.string().optional(),
+  S3_BUCKET: z.string().optional(),
+  S3_ACCESS_KEY_ID: z.string().optional(),
+  S3_SECRET_ACCESS_KEY: z.string().optional(),
+  S3_FORCE_PATH_STYLE: z.string().optional(),
 })
 
 export interface OAuthClient {
@@ -67,7 +87,19 @@ export interface WorkerConfig {
   appBaseUrl: string | null
   /** The Expo web origin, trailing slash stripped; null disables the digest email pass. */
   appWebOrigin: string | null
+  /** Voyage's key; null falls back to the deterministic hash embedder (dev/test only). */
+  voyageApiKey: Secret | null
+  /** Which Voyage model `knowledge.embed-batch` writes with (and retrieval therefore scores). */
+  knowledgeEmbedModel: 'voyage-4' | 'voyage-4-lite'
+  /** KNOWLEDGE_RERANK=on: the optional cross-encoder pass over the fused retrieval candidates. */
+  knowledgeRerank: boolean
+  /** The six `S3_*` as one config, or null when object storage is not configured at all. */
+  s3: WorkerS3Config | null
 }
+
+/** `parseS3Env`'s shape with the secret wrapped: the same rule every other credential here follows
+ * (`Secret` serializes as `[redacted]`, so a config dump can never spill the bucket's keys). */
+export type WorkerS3Config = Omit<S3Config, 'secretAccessKey'> & { secretAccessKey: Secret }
 
 const isHttpUrl = (v: string) => { try { return ['http:', 'https:'].includes(new URL(v).protocol) } catch { return false } }
 
@@ -100,6 +132,25 @@ export function loadConfig(env: NodeJS.ProcessEnv): WorkerConfig {
     throw new Error('AESA_KEK_V<n> and AESA_KEK_ACTIVE are required in production when WORKER_ROLES includes `sync` (mailbox credentials)')
   }
 
+  // All-or-none, and it throws on a half-configured deploy — read from the ALREADY-PARSED values so
+  // the six names are documented in EnvSchema above rather than only inside `parseS3Env`.
+  const rawS3 = parseS3Env({
+    S3_ENDPOINT: d.S3_ENDPOINT, S3_REGION: d.S3_REGION, S3_BUCKET: d.S3_BUCKET,
+    S3_ACCESS_KEY_ID: d.S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY: d.S3_SECRET_ACCESS_KEY,
+    S3_FORCE_PATH_STYLE: d.S3_FORCE_PATH_STYLE,
+  })
+  const s3: WorkerS3Config | null = rawS3 ? { ...rawS3, secretAccessKey: new Secret(rawS3.secretAccessKey) } : null
+  // The `knowledge` role reads every upload's bytes out of the bucket and the `agent` role's
+  // retriever embeds every query — neither has a production fallback (the hash embedder is a dev
+  // convenience whose vectors are not comparable with Voyage's), so refuse at boot rather than
+  // running a replica that looks healthy while every ingest fails or every draft loses its grounding.
+  if (production && (roles.has('knowledge') || roles.has('agent')) && !d.VOYAGE_API_KEY) {
+    throw new Error('VOYAGE_API_KEY is required in production when WORKER_ROLES includes `agent` or `knowledge` (embeddings)')
+  }
+  if (production && roles.has('knowledge') && !s3) {
+    throw new Error('S3_* (endpoint, region, bucket, access key id, secret access key, force path style) are required in production when WORKER_ROLES includes `knowledge` (upload storage)')
+  }
+
   const platformSender = d.MAIL_FROM ? parseFirstAddrSpec(d.MAIL_FROM) : null
   if (production && roles.has('sync') && !platformSender) {
     throw new Error('MAIL_FROM is required in production when WORKER_ROLES includes `sync` (mailbox.sync platform-mail detection)')
@@ -125,5 +176,9 @@ export function loadConfig(env: NodeJS.ProcessEnv): WorkerConfig {
     ),
     appBaseUrl: optionalOrigin('APP_BASE_URL', d.APP_BASE_URL),
     appWebOrigin: optionalOrigin('APP_WEB_ORIGIN', d.APP_WEB_ORIGIN),
+    voyageApiKey: d.VOYAGE_API_KEY ? new Secret(d.VOYAGE_API_KEY) : null,
+    knowledgeEmbedModel: d.KNOWLEDGE_EMBED_MODEL,
+    knowledgeRerank: d.KNOWLEDGE_RERANK === 'on',
+    s3,
   }
 }

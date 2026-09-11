@@ -9,7 +9,8 @@ Requires Node >= 22, pnpm 10, Docker.
 
     corepack enable
     pnpm install
-    pnpm db:up                                   # Postgres 17 + pgvector on :5434
+    pnpm db:up                                   # Postgres 17 + pgvector on :5434, minio on :9000/:9001 (minio's CORS is server-wide via MINIO_API_CORS_ALLOW_ORIGIN in compose.yaml, not per-bucket)
+    pnpm s3:init                                 # creates the dev bucket in minio (idempotent)
     DATABASE_URL=postgres://aesa:aesa@localhost:5434/aesa_dev pnpm --filter @aesa/db migrate
     cp apps/api/.env.example apps/api/.env      # set BETTER_AUTH_SECRET (openssl rand -base64 48)
     pnpm --filter @aesa/api dev                  # http://localhost:3001 — codes: /__dev/mail/latest?to=<email>
@@ -22,7 +23,7 @@ Requires Node >= 22, pnpm 10, Docker.
     pnpm brand:build                             # rebuild the brand assets after changing a brand/ source; see brand/README.md
 
 Layout: `apps/api` (Fastify + Better Auth + tRPC), `apps/worker` (pg-boss), `apps/app` (Expo),
-`packages/{contracts,db,crypto,core,queue,mail,platform-mail,llm,agent,test-kit}`, `brand`
+`packages/{contracts,db,crypto,core,queue,mail,platform-mail,llm,agent,knowledge,test-kit}`, `brand`
 (the `@aesa/brand` workspace package — see `brand/README.md`).
 Ports: the api listens on 3001 (`PORT`; `HOST` defaults to `0.0.0.0`), the worker binds no port, Postgres
 is on 5434. `APP_BASE_URL` is the api's public origin (Better Auth baseURL, OAuth redirect URIs);
@@ -38,11 +39,29 @@ already set in the process environment.
 - `WORKER_ROLES` — comma-separated subset of `sync,agent,send,knowledge,cron`; it is what partitions
   the job registrations across replicas. `sync` runs the mailbox lifecycle, `agent` runs
   `ticket.triage`/`ticket.draft`/`agent.sandbox`, `send` runs `send.execute` (the only process that
-  sends a customer reply), `cron` runs the sweeps and the digest.
+  sends a customer reply), `knowledge` runs
+  `knowledge.ingest`/`knowledge.crawl`/`knowledge.embed-batch` (the only process that reads an
+  uploaded file's bytes), `cron` runs the sweeps and the digest.
 - `AESA_KEK_V<n>` / `AESA_KEK_ACTIVE` — the KEK ring. Required in production when `WORKER_ROLES`
   includes `sync` or `send`: mailbox credentials are sealed under it and there is no other way to
   reach a provider.
 - `ANTHROPIC_API_KEY` — required in production when `WORKER_ROLES` includes `agent`.
+- `VOYAGE_API_KEY` — embeddings. Required in production when `WORKER_ROLES` includes `knowledge`
+  (every chunk's vector) or `agent` (every retrieval query); outside production a missing key falls
+  back to a deterministic hash embedder whose vectors are NOT comparable with Voyage's.
+  `KNOWLEDGE_EMBED_MODEL` (default `voyage-4`) is stored on every chunk and is part of the vector
+  leg's filter, so it **must be identical on every `knowledge` and `agent` replica** — a drifted
+  one retrieves nothing from the vector leg and silently degrades to lexical grounding, with no
+  boot-time refusal; `KNOWLEDGE_RERANK` (default `off`) adds Voyage's cross-encoder pass.
+- `S3_ENDPOINT` / `S3_REGION` / `S3_BUCKET` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` /
+  `S3_FORCE_PATH_STYLE` — object storage for knowledge uploads: minio locally (`pnpm db:up` starts
+  it, `pnpm s3:init` creates the bucket), S3/R2 in production. All six or none. Required in
+  production when `WORKER_ROLES` includes `knowledge`; **the api reads the same six names for its
+  presigned PUT, so point both apps at one bucket.** Without them the api hands the browser a
+  `memory://` URL, the PUT fails client-side and the source row just sits `queued`.
+  `S3_CORS_ORIGIN` is a seventh name neither app reads: `pnpm s3:init` alone reads it and writes it
+  into the bucket's CORS rule, so it must equal `APP_WEB_ORIGIN` whenever `s3:init` is run against
+  a real bucket (it defaults to `http://localhost:8081`).
 - `GMAIL_OAUTH_CLIENT_ID`/`_SECRET`, `MS_OAUTH_CLIENT_ID`/`_SECRET` — all-or-none pairs, one per
   provider. At least one is required in production for **`send`** — `maybeRegisterSendRole`
   (`apps/worker/src/send-role.ts`) refuses to boot without one. `sync` is not gated on a pair at

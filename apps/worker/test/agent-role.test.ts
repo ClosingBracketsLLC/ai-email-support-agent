@@ -1,5 +1,6 @@
 import type PgBoss from 'pg-boss'
 import { describe, expect, it } from 'vitest'
+import { emptyRetriever } from '@aesa/agent'
 import { Secret } from '@aesa/crypto'
 import type { Db } from '@aesa/db'
 import { maybeRegisterAgentRole, type AgentRoleRegistrars } from '../src/agent-role.ts'
@@ -27,6 +28,10 @@ function baseConfig(overrides: Partial<WorkerConfig> = {}): WorkerConfig {
     mail: { transport: 'devsink', from: 'aesa <onboarding@resend.dev>' },
     appBaseUrl: null,
     appWebOrigin: null,
+    voyageApiKey: null,
+    knowledgeEmbedModel: 'voyage-4',
+    knowledgeRerank: false,
+    s3: null,
     platformSender: null,
     ...overrides,
   }
@@ -96,7 +101,9 @@ describe('maybeRegisterAgentRole', () => {
     await maybeRegisterAgentRole(
       {
         boss: fakeBoss, db: fakeDb, logger,
-        config: baseConfig({ env: 'production', anthropicApiKey: new Secret('sk-ant-test') }),
+        // VOYAGE_API_KEY too: the role now builds the retriever's embedder, which refuses to fall
+        // back to the hash embedder in production (knowledge-deps.ts).
+        config: baseConfig({ env: 'production', anthropicApiKey: new Secret('sk-ant-test'), voyageApiKey: new Secret('pa-voyage') }),
         enqueueNotify: async () => {},
         enqueueDraft: async () => {},
       },
@@ -117,5 +124,46 @@ describe('maybeRegisterAgentRole', () => {
     expect(draftDeps?.retriever).toBeDefined()
     expect(sandboxDeps?.retriever).toBeDefined()
     expect(triageDeps?.enqueueDraft).toBeDefined()
+  })
+
+  it('hands draft AND sandbox the REAL retriever — one instance, with retrieveDetailed (not emptyRetriever)', async () => {
+    const { logger, lines } = testLogger()
+    let draftDeps: TicketDraftDeps | undefined
+    let sandboxDeps: AgentSandboxDeps | undefined
+    await maybeRegisterAgentRole(
+      {
+        boss: fakeBoss, db: fakeDb, logger,
+        config: baseConfig({ anthropicApiKey: new Secret('sk-ant-test') }),
+        enqueueNotify: async () => {},
+        enqueueDraft: async () => {},
+      },
+      {
+        registerTriage: async () => {},
+        registerDraft: async (_boss, jobDeps) => { draftDeps = jobDeps },
+        registerSandbox: async (_boss, jobDeps) => { sandboxDeps = jobDeps },
+      },
+    )
+    expect(draftDeps?.retriever).not.toBe(emptyRetriever)
+    expect(draftDeps?.retriever).toHaveProperty('retrieveDetailed')
+    // ONE retriever (one embedder, one rate budget) for both jobs.
+    expect(sandboxDeps?.retriever).toBe(draftDeps?.retriever)
+    // An `agent`-only replica is the one that announces the dev fallback here.
+    expect(lines.map((l) => JSON.parse(l).msg as string).filter((m) => m.includes('VOYAGE_API_KEY'))).toHaveLength(1)
+  })
+
+  it('says the VOYAGE_API_KEY fallback ONCE on a combined `knowledge,agent` replica — the knowledge role owns that warning', async () => {
+    const { logger, lines } = testLogger()
+    await maybeRegisterAgentRole(
+      {
+        boss: fakeBoss, db: fakeDb, logger,
+        config: baseConfig({ roles: new Set(['agent', 'knowledge']), anthropicApiKey: new Secret('sk-ant-test') }),
+        enqueueNotify: async () => {},
+        enqueueDraft: async () => {},
+      },
+      spyRegistrars(() => {}),
+    )
+    // `maybeRegisterKnowledgeRole` builds its own embedder from the same helper and warns there; the
+    // owner of a one-process dev worker should read the sentence once, not twice.
+    expect(lines.map((l) => JSON.parse(l).msg as string).filter((m) => m.includes('VOYAGE_API_KEY'))).toHaveLength(0)
   })
 })

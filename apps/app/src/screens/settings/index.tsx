@@ -49,6 +49,7 @@ export function SettingsIndexScreen() {
       <ListRow title="Notifications" subtitle="Push on this device" onPress={() => router.push('/settings/notifications')} testID="settings-notifications" />
       <ListRow title="Mailboxes" subtitle="Connect Gmail or Microsoft 365" onPress={() => router.push('/settings/mailboxes')} testID="settings-mailboxes" />
       <ListRow title="Agents" subtitle="Personas, signatures, per-agent guidance" onPress={() => router.push('/settings/agents')} testID="settings-agents" />
+      <ListRow title="Knowledge" subtitle="Website crawl, documents, pasted FAQs, guidance" onPress={() => router.push('/settings/knowledge')} testID="settings-knowledge" />
       <ListRow title="Autopilot" subtitle="Off / Review / Auto per category" badge="Phase 5" />
       <ListRow title="AI" subtitle="Managed AI or your own provider" badge="Phase 6" />
       <ListRow title="Billing" subtitle="Plan, domains, usage" badge="Phase 7" />

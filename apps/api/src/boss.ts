@@ -23,14 +23,21 @@ export async function createSendOnlyBoss(connectionString: string): Promise<PgBo
   // 15's finding). Create every queue this api will ever send to right after start, so a send from a
   // cold-booted api replica — one that raced ahead of the worker's own queue creation, or is running
   // against a brand-new database in a test — never silently no-ops.
+  // The policy must match `defineJob`'s `queue.policy`; pg-boss `createQueue` ignores a second call, so
+  // the FIRST process to boot decides. `options.name` below is redundant with the positional `name`
+  // arg — pg-boss's own `PgBoss.Queue` type requires it, but `manager.js`'s `createQueue` ignores it
+  // at runtime (`name = name || options.name`) — it's here only to satisfy the type.
   await createQueueRetrying(boss, JOB_NAMES.keysProvision)
   await createQueueRetrying(boss, JOB_NAMES.storeCredentials)
   await createQueueRetrying(boss, JOB_NAMES.revokeMailbox)
   await createQueueRetrying(boss, JOB_NAMES.mailboxSync)
-  await createQueueRetrying(boss, JOB_NAMES.ticketDraft)
-  await createQueueRetrying(boss, JOB_NAMES.agentSandbox)
-  await createQueueRetrying(boss, JOB_NAMES.sendExecute)
-  await createQueueRetrying(boss, JOB_NAMES.notifyDispatch)
+  await createQueueRetrying(boss, JOB_NAMES.ticketDraft, { name: JOB_NAMES.ticketDraft, policy: 'short' })
+  await createQueueRetrying(boss, JOB_NAMES.agentSandbox, { name: JOB_NAMES.agentSandbox, policy: 'short' })
+  await createQueueRetrying(boss, JOB_NAMES.sendExecute, { name: JOB_NAMES.sendExecute, policy: 'short' })
+  await createQueueRetrying(boss, JOB_NAMES.notifyDispatch, { name: JOB_NAMES.notifyDispatch, policy: 'short' })
+  await createQueueRetrying(boss, JOB_NAMES.knowledgeIngest, { name: JOB_NAMES.knowledgeIngest, policy: 'short' })
+  await createQueueRetrying(boss, JOB_NAMES.knowledgeCrawl, { name: JOB_NAMES.knowledgeCrawl, policy: 'short' })
+  await createQueueRetrying(boss, JOB_NAMES.knowledgeEmbedBatch, { name: JOB_NAMES.knowledgeEmbedBatch, policy: 'short' })
 
   return boss
 }

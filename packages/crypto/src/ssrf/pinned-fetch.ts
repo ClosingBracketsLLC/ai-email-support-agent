@@ -46,6 +46,12 @@ export interface PinnedTransportInit {
   timeoutMs?: number
   /** Hard cap on the response body; the read aborts and the connection is destroyed past it. */
   maxBodyBytes?: number
+  /** How a 3xx response is handled. `'error'` (the default — every existing caller's behavior,
+   * unchanged): throws `PinnedFetchError('redirect_not_followed')`. `'manual'`: the 3xx `Response`
+   * itself is RETURNED (status + headers, notably `location`; the body is drained, per this
+   * function's own dispatcher-close ordering, but never exposed) instead of thrown, so the caller
+   * re-validates the hop — this transport never follows a redirect itself, in either mode. */
+  redirect?: 'error' | 'manual'
 }
 
 export interface PinnedFetchInit extends PinnedTransportInit {
@@ -57,10 +63,12 @@ const DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024
 
 /**
  * The transport half of pinnedFetch: no URL validation and no DNS of its own — it fetches `url` through
- * `dispatcher`, refuses redirects, and buffers the body under `maxBodyBytes` BEFORE the dispatcher is
- * closed (closing an Agent waits for the in-flight request, which cannot finish while its body is
- * unread — that deadlocked every response larger than the socket buffer). Owns the dispatcher: closed
- * after a complete read, destroyed on every rejection path. Exported so tests can drive it over a real socket.
+ * `dispatcher`, NEVER follows a redirect itself (`init.redirect` only chooses whether a 3xx throws or
+ * is returned to the caller — see `PinnedTransportInit`), and buffers the body under `maxBodyBytes`
+ * BEFORE the dispatcher is closed (closing an Agent waits for the in-flight request, which cannot
+ * finish while its body is unread — that deadlocked every response larger than the socket buffer).
+ * Owns the dispatcher: closed after a complete read, destroyed on every rejection path. Exported so
+ * tests can drive it over a real socket.
  */
 export async function fetchThroughPinnedDispatcher(url: URL, dispatcher: Dispatcher, init: PinnedTransportInit = {}): Promise<Response> {
   const maxBodyBytes = init.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES
@@ -74,7 +82,22 @@ export async function fetchThroughPinnedDispatcher(url: URL, dispatcher: Dispatc
       signal: AbortSignal.timeout(init.timeoutMs ?? 30_000),
     })
     if (res.status >= 300 && res.status < 400) {
-      throw new PinnedFetchError(`redirects are not followed for outbound URLs (${res.status})`, 'redirect_not_followed')
+      if ((init.redirect ?? 'error') === 'error') {
+        throw new PinnedFetchError(`redirects are not followed for outbound URLs (${res.status})`, 'redirect_not_followed')
+      }
+      // 'manual': drain the body (same reasoning as the success path below — closing the
+      // dispatcher before the body is fully read can hang) but discard it, still honoring
+      // maxBodyBytes against a misbehaving origin; only status and headers reach the caller.
+      let size = 0
+      for await (const chunk of (res.body ?? []) as AsyncIterable<Uint8Array>) {
+        size += chunk.byteLength
+        if (size > maxBodyBytes) throw new PinnedFetchError(`response body exceeds ${maxBodyBytes} bytes`, 'body_too_large')
+      }
+      await dispatcher.close()
+      const redirectHeaders = new Headers([...res.headers])
+      redirectHeaders.delete('content-encoding')
+      redirectHeaders.set('content-length', '0')
+      return new Response(null, { status: res.status, statusText: res.statusText, headers: redirectHeaders })
     }
     const chunks: Buffer[] = []
     let size = 0

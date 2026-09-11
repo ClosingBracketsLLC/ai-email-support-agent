@@ -1,7 +1,12 @@
+import { Secret } from '@aesa/crypto'
 import { describe, expect, it } from 'vitest'
 import { loadConfig } from '../src/config.ts'
 
 const BASE = { DATABASE_URL: 'postgres://x', APP_BASE_URL: 'http://localhost:3001', APP_WEB_ORIGIN: 'http://localhost:8081', BETTER_AUTH_SECRET: 's'.repeat(32) }
+const S3_ENV = {
+  S3_ENDPOINT: 'http://localhost:9000', S3_REGION: 'us-east-1', S3_BUCKET: 'aesa-dev',
+  S3_ACCESS_KEY_ID: 'aesa', S3_SECRET_ACCESS_KEY: 'aesaaesa', S3_FORCE_PATH_STYLE: 'true',
+}
 
 describe('api config', () => {
   it('parses defaults: devsink mail outside production, aesa:// and exp:// trusted', () => {
@@ -32,10 +37,35 @@ describe('api config', () => {
     expect(() => loadConfig({ ...BASE, NODE_ENV: 'production' })).toThrow(/RESEND_API_KEY/)
     expect(() => loadConfig({ ...BASE, NODE_ENV: 'production', RESEND_API_KEY: 're_x' })).toThrow(/MAIL_FROM/)
     expect(() => loadConfig({ ...BASE, NODE_ENV: 'production', EMAIL_TRANSPORT: 'devsink' })).toThrow(/devsink/)
-    const c = loadConfig({ ...BASE, NODE_ENV: 'production', RESEND_API_KEY: 're_x', MAIL_FROM: 'aesa <no-reply@mail.example.com>', AUTH_TRUSTED_ORIGINS: 'https://app.example.com, https://staging.example.com', TRUST_PROXY: 'true' })
+    const c = loadConfig({
+      ...BASE, ...S3_ENV, NODE_ENV: 'production', RESEND_API_KEY: 're_x', MAIL_FROM: 'aesa <no-reply@mail.example.com>',
+      AUTH_TRUSTED_ORIGINS: 'https://app.example.com, https://staging.example.com', TRUST_PROXY: 'true',
+    })
     expect(c.mail.transport).toBe('resend')
     expect(c.trustedOrigins).toEqual(['http://localhost:8081', 'aesa://', 'https://app.example.com', 'https://staging.example.com'])
     expect(c.webOrigins).toEqual(['http://localhost:8081', 'https://app.example.com', 'https://staging.example.com'])
+  })
+  describe('knowledge object storage (Task 9)', () => {
+    it('is null in development when S3_* is unset', () => {
+      expect(loadConfig(BASE).s3).toBeNull()
+    })
+    it('parses the six S3_* into one config with the secret wrapped, and never prints it', () => {
+      const c = loadConfig({ ...BASE, ...S3_ENV })
+      expect(c.s3).toMatchObject({ endpoint: 'http://localhost:9000', region: 'us-east-1', bucket: 'aesa-dev', accessKeyId: 'aesa', forcePathStyle: true })
+      // Same rule as every other credential in this file: the bucket's secret never survives a config dump.
+      expect(c.s3?.secretAccessKey).toBeInstanceOf(Secret)
+      expect(c.s3?.secretAccessKey.expose()).toBe('aesaaesa')
+      expect(JSON.stringify(c)).not.toContain('aesaaesa')
+    })
+    it('refuses a half-configured S3_* set', () => {
+      expect(() => loadConfig({ ...BASE, S3_BUCKET: 'aesa-dev' })).toThrow(/S3_\* variables are all-or-none/)
+    })
+    it('is required in production; boots once every S3_* is set', () => {
+      expect(() => loadConfig({ ...BASE, NODE_ENV: 'production', RESEND_API_KEY: 're_x', MAIL_FROM: 'a <a@example.com>', TRUST_PROXY: 'true' }))
+        .toThrow(/S3_\*.*required in production/)
+      const c = loadConfig({ ...BASE, ...S3_ENV, NODE_ENV: 'production', RESEND_API_KEY: 're_x', MAIL_FROM: 'a <a@example.com>', TRUST_PROXY: 'true' })
+      expect(c.s3?.bucket).toBe('aesa-dev')
+    })
   })
   it('strips trailing slashes from the origins before trusting them', () => {
     const c = loadConfig({ DATABASE_URL: 'postgres://x', APP_BASE_URL: 'http://localhost:3001/', APP_WEB_ORIGIN: 'http://localhost:8081/', BETTER_AUTH_SECRET: 's'.repeat(32), AUTH_TRUSTED_ORIGINS: 'https://app.example.com/' })

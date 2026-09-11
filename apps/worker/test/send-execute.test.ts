@@ -57,6 +57,10 @@ function baseConfig(overrides: Partial<WorkerConfig> = {}): WorkerConfig {
     mail: { transport: 'devsink', from: 'aesa <onboarding@resend.dev>' },
     appBaseUrl: null,
     appWebOrigin: null,
+    voyageApiKey: null,
+    knowledgeEmbedModel: 'voyage-4',
+    knowledgeRerank: false,
+    s3: null,
     gmailPubsubTopic: null, webhookPublicUrl: null, platformSender: 'no-reply@aesa.test',
     ...overrides,
   }

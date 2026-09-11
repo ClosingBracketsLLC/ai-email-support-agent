@@ -1,5 +1,6 @@
 import { hkdfSync } from 'node:crypto'
 import { Secret } from '@aesa/crypto'
+import { parseS3Env, type S3Config } from '@aesa/knowledge/storage'
 import { parseMailConfig, type MailConfig } from '@aesa/platform-mail'
 import { z } from 'zod'
 
@@ -54,6 +55,17 @@ const EnvSchema = z.object({
   /** Task 18 (Gmail Pub/Sub push webhook verification); parsed now, optional until that task lands. */
   GMAIL_PUBSUB_AUDIENCE: z.string().optional(),
   GMAIL_PUBSUB_SA_EMAIL: z.string().optional(),
+  /** Object storage for knowledge uploads — minio locally (`pnpm db:up` starts it, `pnpm s3:init`
+   * creates the bucket), S3/R2 in production. All six or none (`parseS3Env`): a half-configured
+   * set throws at boot. REQUIRED IN PRODUCTION — the presigned PUT `knowledge.startUpload` issues
+   * has nowhere else to point. The worker reads the SAME six names for its own upload reads; point
+   * both apps at one bucket. */
+  S3_ENDPOINT: z.string().optional(),
+  S3_REGION: z.string().optional(),
+  S3_BUCKET: z.string().optional(),
+  S3_ACCESS_KEY_ID: z.string().optional(),
+  S3_SECRET_ACCESS_KEY: z.string().optional(),
+  S3_FORCE_PATH_STYLE: z.string().optional(),
 })
 
 export interface OAuthClient { clientId: string; clientSecret: Secret }
@@ -93,7 +105,14 @@ export interface ApiConfig {
    * connect flow's PKCE verifier ciphertext (packages/crypto's encrypt/decrypt). Never derived from a
    * secret this api doesn't already hold, and never persisted anywhere itself. */
   flowKey: Buffer
+  /** The six `S3_*` as one config, or null when object storage is not configured at all. */
+  s3: ApiS3Config | null
 }
+
+/** `parseS3Env`'s shape with the secret wrapped — the same rule every other credential in this file
+ * follows (`Secret` serializes as `[redacted]`), and the same shape the worker's own `WorkerS3Config`
+ * (`apps/worker/src/config.ts`) uses. */
+export type ApiS3Config = Omit<S3Config, 'secretAccessKey'> & { secretAccessKey: Secret }
 
 function oauthPair(name: string, id: string | undefined, secret: string | undefined): OAuthClient | null {
   if (!id && !secret) return null
@@ -145,6 +164,20 @@ export function loadConfig(env: NodeJS.ProcessEnv): ApiConfig {
 
   const gmailPubsub = gmailPubsubPair(d.GMAIL_PUBSUB_AUDIENCE, d.GMAIL_PUBSUB_SA_EMAIL)
 
+  // All-or-none, and it throws on a half-configured deploy — read from the ALREADY-PARSED values so
+  // the six names are documented in EnvSchema above rather than only inside `parseS3Env`.
+  const rawS3 = parseS3Env({
+    S3_ENDPOINT: d.S3_ENDPOINT, S3_REGION: d.S3_REGION, S3_BUCKET: d.S3_BUCKET,
+    S3_ACCESS_KEY_ID: d.S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY: d.S3_SECRET_ACCESS_KEY, S3_FORCE_PATH_STYLE: d.S3_FORCE_PATH_STYLE,
+  })
+  const s3: ApiS3Config | null = rawS3 ? { ...rawS3, secretAccessKey: new Secret(rawS3.secretAccessKey) } : null
+  // Unconditional (unlike the worker's role-gated check): the api always serves the presigned-upload
+  // flow, so a production api with no bucket to point browsers at would look healthy while every
+  // upload silently failed.
+  if (production && !s3) {
+    throw new Error('S3_* (endpoint, region, bucket, access key id, secret access key, force path style) are required in production (the presigned upload flow has nowhere to point)')
+  }
+
   return {
     env: d.NODE_ENV, databaseUrl: d.DATABASE_URL, port: d.PORT, host: d.HOST, logLevel: d.LOG_LEVEL,
     appBaseUrl, appWebOrigin, webOrigins, trustedOrigins, trustProxy,
@@ -157,5 +190,6 @@ export function loadConfig(env: NodeJS.ProcessEnv): ApiConfig {
     gmailPubsubAudience: gmailPubsub?.audience ?? null,
     gmailPubsubServiceAccount: gmailPubsub?.serviceAccount ?? null,
     flowKey: deriveFlowKey(d.BETTER_AUTH_SECRET),
+    s3,
   }
 }

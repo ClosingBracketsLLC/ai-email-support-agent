@@ -8,15 +8,18 @@
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
     "lint": "eslint .",
-    "db:up": "docker compose up -d db --wait",
+    "db:up": "docker compose up -d db minio --wait",
     "db:down": "docker compose down -v",
     "db:check": "bash scripts/check-migration-drift.sh",
+    "s3:init": "tsx scripts/s3-init.ts",
     "e2e": "pnpm --filter @aesa/app e2e",
     "brand:build": "pnpm --filter @aesa/brand build"
   },
   "devDependencies": {
+    "@aws-sdk/client-s3": "^3.1130.0",
     "@eslint/js": "^9.30.0",
     "eslint": "^9.30.0",
+    "tsx": "^4.20.0",
     "typescript": "^5.9.2",
     "typescript-eslint": "^8.35.0"
   }

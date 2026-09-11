@@ -35,6 +35,8 @@ import {
   type Db, type OrgTx,
 } from '@aesa/db'
 import { computeCostMicros, findPricing, LlmError, type ChatMeta, type LlmProvider } from '@aesa/llm'
+// type-only: the base `Retriever` is what this job depends on; this is the shape of the richer one.
+import type { DetailedRetriever } from '@aesa/knowledge'
 import { defineJob, enqueue, JOB_NAMES, registerJob, type JobDefinition } from '@aesa/queue'
 import { utcDayString } from '../date-utils.ts'
 import { gateAndRecordRun, readCapsUnlocked } from '../drafting/caps.ts'
@@ -264,6 +266,8 @@ interface DraftContext {
   humanDecisionCount: number
   cacheAgentBlocks: boolean
   mailboxHealthy: boolean
+  /** The `prompt` trace event's context-derived half; the knowledge half is added after retrieval. */
+  promptEvent: { blocks: { id: string; chars: number }[]; effort: 'medium' | 'high'; cacheAgentBlocks: boolean; threadMessages: number }
 }
 
 async function loadContext(
@@ -335,6 +339,15 @@ async function loadContext(
       .from(mailboxConnections)
       .where(eq(mailboxConnections.id, ticket.connectionId))
 
+    // The prompt event's four CONTEXT-derived blocks; the fifth (knowledge) is built from retrieval,
+    // which by the pinned order has not run yet — so the EVENT is written by the caller, after it.
+    const blocks = [
+      platformRulesBlock(),
+      workspaceProfileBlock(shared.profile),
+      personaBlock(personaFor(agent)),
+      guidanceBlock({ workspaceGuidance: shared.workspaceGuidance, agentGuidance: agent.guidanceExtra }),
+    ].filter((b) => b !== null)
+
     const ctx: DraftContext = {
       profile: shared.profile,
       workspaceGuidance: shared.workspaceGuidance,
@@ -350,22 +363,13 @@ async function loadContext(
       humanDecisionCount,
       cacheAgentBlocks,
       mailboxHealthy: connection?.status === 'connected',
+      promptEvent: {
+        blocks: blocks.map((b) => ({ id: b.id, chars: b.text.length })),
+        effort,
+        cacheAgentBlocks,
+        threadMessages: thread.length,
+      },
     }
-
-    // The prompt event records the four CONTEXT-derived blocks; the fifth (knowledge) is built from
-    // retrieval, which by the pinned order has not run yet — and in Phase 3 is always empty.
-    const blocks = [
-      platformRulesBlock(),
-      workspaceProfileBlock(shared.profile),
-      personaBlock(personaFor(agent)),
-      guidanceBlock({ workspaceGuidance: ctx.workspaceGuidance, agentGuidance: ctx.agentGuidance }),
-    ].filter((b) => b !== null)
-    await appendRunEvent(tx, runId, 'prompt', {
-      blocks: blocks.map((b) => ({ id: b.id, chars: b.text.length })),
-      effort,
-      cacheAgentBlocks,
-      threadMessages: thread.length,
-    })
 
     return ctx
   })
@@ -501,15 +505,41 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
   // this deadline, so a slow first attempt cannot buy a second full budget.
   const watchdog = withWatchdog(signal, deps.watchdogMs)
 
-  // --- Rule 7: retrieval, OUTSIDE every transaction. Empty in Phase 3.
+  // --- Rule 7: retrieval, OUTSIDE every transaction.
+  // `retrieveDetailed` is duck-typed on purpose: the job's contract is `@aesa/agent`'s base
+  // `Retriever`, and the `emptyRetriever` every pre-Phase-4 caller passes has no such method. When
+  // it IS there (`@aesa/knowledge`'s real retriever), its extra provenance — which leg answered and
+  // the knowledge version the chunks came from — is what `confidenceBreakdown.grounding` records.
   let knowledge: { chunks: RetrievedChunk[]; answers: RetrievedAnswer[] }
+  let knowledgeMode: 'hybrid' | 'lexical' | null = null
+  let knowledgeVersion: number | null = null
+
+  /** The `prompt` trace event, once all FIVE blocks are known. It stays the run's FIRST event on
+   *  every path — including the retrieval failure below, whose trace would otherwise open with an
+   *  `error` event and no record of what the run was even built from. */
+  const writePromptEvent = async (retrieved: number): Promise<void> => {
+    await withOrg(deps.db, orgId, (tx) =>
+      appendRunEvent(tx, runId, 'prompt', { ...ctx.promptEvent, knowledge: { retrieved, mode: knowledgeMode } }))
+  }
+
   try {
-    knowledge = await deps.retriever.retrieve({ orgId, questions: ticket.triageQuestions, text: ctx.latestInboundBody, signal: watchdog })
+    const input = { orgId, questions: ticket.triageQuestions, text: ctx.latestInboundBody, signal: watchdog }
+    if ('retrieveDetailed' in deps.retriever) {
+      const detailed = await (deps.retriever as DetailedRetriever).retrieveDetailed(input)
+      knowledge = { chunks: detailed.chunks, answers: detailed.answers }
+      knowledgeMode = detailed.mode
+      knowledgeVersion = detailed.knowledgeVersion
+    } else {
+      knowledge = await deps.retriever.retrieve(input)
+    }
   } catch (err) {
+    await writePromptEvent(0)
     const aborted = watchdog.aborted
     if (await fail(aborted ? 'watchdog' : 'retrieval', errorToDetail(err), aborted ? 'aborted' : 'failed')) return
     throw err
   }
+
+  await writePromptEvent(knowledge.chunks.length)
 
   const promptInput = (guardrailRetry: { codes: string[] } | null, effort: 'medium' | 'high'): DraftPromptInput => ({
     ticket: {
@@ -678,6 +708,8 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
   const citedChunkIds = decision.citedChunkIds.filter((id) => retrievedChunkIds.includes(id))
   const usedAnswerIds = decision.usedAnswerIds.filter((id) => retrievedAnswerIds.includes(id))
   const memoryConflictIds = decision.memoryConflictIds.filter((id) => retrievedChunkIds.includes(id) || retrievedAnswerIds.includes(id))
+  const citedScores = knowledge.chunks.filter((c) => citedChunkIds.includes(c.id)).map((c) => c.score)
+  const groundingScore = citedScores.length > 0 ? Math.max(...citedScores) : null
 
   // `escalate` is `guardrail_failed` or `category_off`; everything else lands in the review queue.
   // `send` is unreachable in Phase 3 (`evidence: null` forces `below_threshold` first) and would
@@ -712,7 +744,15 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
         },
         model: decision.confidence,
         memory: null,
-        grounding: null, // Phase 4 fills this once retrieval returns anything
+        grounding: {
+          // The best VALIDATED citation's retrieval score — an id the model invented was already
+          // filtered out above, so it can never raise this. Null when nothing was cited at all.
+          score: groundingScore,
+          mode: knowledgeMode,
+          knowledgeVersion,
+          retrieved: retrievedChunkIds.length,
+          cited: citedChunkIds.length,
+        },
         evidence: null, // Phase 5
         warnings,
       },

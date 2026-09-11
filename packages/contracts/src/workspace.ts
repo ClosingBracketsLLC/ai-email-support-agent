@@ -6,6 +6,12 @@ export type Tone = (typeof TONES)[number]
 const isHttpUrl = (v: string) => { try { return ['http:', 'https:'].includes(new URL(v).protocol) } catch { return false } }
 export const HttpUrl = z.string().trim().max(2048).refine(isHttpUrl, { message: 'must be an http(s) URL' })
 
+/** `HttpUrl` narrowed to `https:` — for the inputs where plain http is never acceptable (the
+ * crawler only ever fetches https, `normalizeUrl` drops an http URL outright). Kept next to
+ * `HttpUrl` so the two messages stay a matched pair. */
+const isHttpsUrl = (v: string) => { try { return new URL(v).protocol === 'https:' } catch { return false } }
+export const HttpsUrl = z.string().trim().max(2048).refine(isHttpsUrl, { message: 'must be an https:// URL' })
+
 export const CreateWorkspaceInput = z.object({
   businessName: z.string().trim().min(1).max(120),
   /** IANA zone from the device; the api validates it against Intl.supportedValuesOf('timeZone'). */
@@ -34,6 +40,9 @@ export function deriveAllowedHosts(websiteUrl: string | null, contactUrls: reado
   }
   return [...hosts]
 }
+
+export const UpdateGuidanceInput = z.object({ operatingGuidance: z.string().trim().max(8000) })
+export type UpdateGuidanceInput = z.infer<typeof UpdateGuidanceInput>
 
 /** Base for the Better Auth organization slug; the api appends a random suffix and retries on collision. */
 export function slugify(name: string): string {

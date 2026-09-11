@@ -14,3 +14,20 @@ services:
       interval: 2s
       timeout: 3s
       retries: 15
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: aesa
+      MINIO_ROOT_PASSWORD: aesaaesa
+      # MinIO has no per-bucket CORS API (PutBucketCors always 501s — see scripts/s3-init.ts); CORS
+      # is server-wide instead, via this variable.
+      MINIO_API_CORS_ALLOW_ORIGIN: http://localhost:8081
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 3s
+      retries: 15

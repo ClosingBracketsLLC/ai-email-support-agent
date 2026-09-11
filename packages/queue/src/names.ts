@@ -13,6 +13,9 @@ export const JOB_NAMES = {
   agentSandbox: 'agent.sandbox',
   sendExecute: 'send.execute',
   notifyDispatch: 'notify.dispatch',
+  knowledgeIngest: 'knowledge.ingest',
+  knowledgeCrawl: 'knowledge.crawl',
+  knowledgeEmbedBatch: 'knowledge.embed-batch',
 } as const
 
 export type JobName = (typeof JOB_NAMES)[keyof typeof JOB_NAMES]

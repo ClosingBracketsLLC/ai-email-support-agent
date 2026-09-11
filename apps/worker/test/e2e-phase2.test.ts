@@ -77,6 +77,10 @@ function baseConfig(): WorkerConfig {
     mail: { transport: 'devsink', from: 'aesa <onboarding@resend.dev>' },
     appBaseUrl: null,
     appWebOrigin: null,
+    voyageApiKey: null,
+    knowledgeEmbedModel: 'voyage-4',
+    knowledgeRerank: false,
+    s3: null,
     platformSender: 'no-reply@aesa.test',
   }
 }

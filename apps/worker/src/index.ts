@@ -6,6 +6,7 @@ import { createQueueRetrying, JOB_NAMES, startBoss } from '@aesa/queue'
 import { maybeRegisterAgentRole } from './agent-role.ts'
 import { loadConfig } from './config.ts'
 import { registerKeysProvision } from './jobs/keys-provision.ts'
+import { enqueueKnowledgeEmbedBatch } from './jobs/knowledge-embed-batch.ts'
 import { registerRevokeMailbox, registerStoreCredentials } from './jobs/mailbox-credentials.ts'
 import { registerMailboxPollSweep } from './jobs/mailbox-poll-sweep.ts'
 import { registerMailboxRenewWatch } from './jobs/mailbox-renew-watch.ts'
@@ -16,6 +17,7 @@ import { registerPlatformHeartbeat } from './jobs/platform-heartbeat.ts'
 import { registerSweepsDaily } from './jobs/sweeps-daily.ts'
 import { registerTicketBackstopSweep } from './jobs/ticket-backstop-sweep.ts'
 import { enqueueTicketDraft } from './jobs/ticket-draft.ts'
+import { maybeRegisterKnowledgeRole } from './knowledge-role.ts'
 import { createWorkerLogger } from './logging.ts'
 import { createExpoPush } from './push.ts'
 import { maybeRegisterSendRole } from './send-role.ts'
@@ -37,15 +39,27 @@ logger.info({ roles: [...config.roles], kekActive: config.kekRing?.active ?? nul
 // `ticket.triage` regardless; the same gap hits mailbox.sync on a `sync`-role replica missing the KEK
 // ring or MAIL_FROM, which mailbox.poll-sweep's (a) enqueues into unconditionally too, agent.sandbox
 // (whose producer is the API's sandbox-start mutation, on a process that runs no worker roles at all),
-// and send.execute (whose producer is the API's approve mutation, same story). Create all six
+// and send.execute (whose producer is the API's approve mutation, same story). Create all nine
 // unconditionally at boot, before any role-gated registration, so a send never silently no-ops on a
 // role-partitioned or under-configured replica.
-await createQueueRetrying(boss, JOB_NAMES.notifyDispatch)
+// The policy must match `defineJob`'s `queue.policy`; pg-boss `createQueue` ignores a second call, so
+// the FIRST process to boot decides. ticket.triage and mailbox.sync stay optionless — they are
+// `standard` on purpose (CLAUDE.md Jobs: their burst source is a push webhook, deduped instead through
+// `enqueue`'s `debounceSeconds`). `options.name` below is redundant with the positional `name` arg —
+// pg-boss's own `PgBoss.Queue` type requires it, but `manager.js`'s `createQueue` ignores it at
+// runtime (`name = name || options.name`) — it's here only to satisfy the type.
+await createQueueRetrying(boss, JOB_NAMES.notifyDispatch, { name: JOB_NAMES.notifyDispatch, policy: 'short' })
 await createQueueRetrying(boss, JOB_NAMES.ticketTriage)
-await createQueueRetrying(boss, JOB_NAMES.ticketDraft)
-await createQueueRetrying(boss, JOB_NAMES.agentSandbox)
+await createQueueRetrying(boss, JOB_NAMES.ticketDraft, { name: JOB_NAMES.ticketDraft, policy: 'short' })
+await createQueueRetrying(boss, JOB_NAMES.agentSandbox, { name: JOB_NAMES.agentSandbox, policy: 'short' })
 await createQueueRetrying(boss, JOB_NAMES.mailboxSync)
-await createQueueRetrying(boss, JOB_NAMES.sendExecute)
+await createQueueRetrying(boss, JOB_NAMES.sendExecute, { name: JOB_NAMES.sendExecute, policy: 'short' })
+// Phase 4's three: the api's knowledge router sends all three (completeUpload/paste → ingest,
+// startCrawl → crawl, unflagChunk → embed-batch) and the crawl/ingest jobs send embed-batch
+// themselves — none of which may depend on a `knowledge`-role replica having booted first.
+await createQueueRetrying(boss, JOB_NAMES.knowledgeIngest, { name: JOB_NAMES.knowledgeIngest, policy: 'short' })
+await createQueueRetrying(boss, JOB_NAMES.knowledgeCrawl, { name: JOB_NAMES.knowledgeCrawl, policy: 'short' })
+await createQueueRetrying(boss, JOB_NAMES.knowledgeEmbedBatch, { name: JOB_NAMES.knowledgeEmbedBatch, policy: 'short' })
 
 // notify.dispatch's producers span every role (ticket.triage's escalations under `agent`,
 // mailbox.sync/renew-watch's reauth notices and mailbox.poll-sweep's stuck-pending retry under
@@ -69,6 +83,11 @@ await maybeRegisterAgentRole({
   boss, db, logger, config,
   enqueueNotify: (orgId, notificationId) => enqueueNotifyDispatch(boss, orgId, notificationId),
   enqueueDraft: (orgId, ticketId, opts) => enqueueTicketDraft(boss, orgId, ticketId, opts),
+})
+
+await maybeRegisterKnowledgeRole({
+  boss, db, logger, config,
+  enqueueEmbedBatch: (orgId, documentId) => enqueueKnowledgeEmbedBatch(boss, orgId, documentId),
 })
 
 // ONE limiter for the whole process, created ABOVE the role branches and shared by `mailbox.sync`

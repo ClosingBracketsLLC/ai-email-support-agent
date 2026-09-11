@@ -1,0 +1,50 @@
+import { readFileSync, statSync } from 'node:fs'
+import type { ParseLimits } from '../bounds.ts'
+import { ParseError } from '../bounds.ts'
+import { capBlockText, type Block } from './blocks.ts'
+import { parseDocx } from './docx.ts'
+import { parsePdf } from './pdf.ts'
+
+/** The parser child's forked entry point: reads exactly one IPC message, parses the file it
+ * names, and replies with either `{ blocks }` or `{ error, message }` before exiting. Never logs —
+ * the child's stdout and stderr are both `'ignore'` (see `child-runner.ts`'s `fork` call), so
+ * nothing written to either would ever reach the parent anyway, but a bounded, single-purpose
+ * process that talks only over IPC should stay silent regardless. */
+type ChildInput = { kind: 'pdf' | 'docx'; path: string; limits: ParseLimits }
+type ChildReply = { blocks: Block[]; truncated: boolean } | { error: string; message?: string }
+
+function toReply(err: unknown): ChildReply {
+  if (err instanceof ParseError) return { error: err.code, message: err.message }
+  return { error: 'parse_failed', message: err instanceof Error ? err.message : String(err) }
+}
+
+process.once('message', (input: ChildInput) => {
+  void run(input)
+})
+
+async function run(input: ChildInput): Promise<void> {
+  let reply: ChildReply
+  try {
+    const size = statSync(input.path).size
+    if (size > input.limits.maxBytes) {
+      reply = { error: 'too_large', message: `file is ${size} bytes, over the ${input.limits.maxBytes}-byte limit` }
+    } else {
+      const bytes = new Uint8Array(readFileSync(input.path))
+      const parsed = input.kind === 'pdf' ? await parsePdf(bytes, input.limits) : await parseDocx(bytes, input.limits)
+      // The reply is bounded BEFORE `process.send` (final review A3): past `maxTextChars` the
+      // parent would have to buffer and JSON.parse a string the child's heap alone allowed — a
+      // 20 MiB PDF of dense text can inflate well past it. Blocks past the ceiling can never
+      // become chunks anyway (the chunker stops at `maxChunks`), so dropping them here costs
+      // nothing a later stage would have kept.
+      reply = capBlockText(parsed, input.limits.maxTextChars)
+    }
+  } catch (err) {
+    reply = toReply(err)
+  }
+  // `process.send` is asynchronous — a reply that doesn't fit the IPC socket's buffer in one write
+  // is still draining when a bare `process.exit(0)` on the next line tears the process down, and
+  // the parent sees an `exit` with no `message` ever having arrived. Exit only once the callback
+  // confirms the write landed.
+  if (process.send) process.send(reply, () => process.exit(0))
+  else process.exit(0)
+}

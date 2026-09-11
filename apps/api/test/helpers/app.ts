@@ -5,6 +5,7 @@ import type { MailProvider } from '@aesa/contracts'
 import { agents, audit, drafts, mailboxConnections, tickets } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase } from '@aesa/db/testing'
+import { createMemoryStore } from '@aesa/knowledge/storage'
 import type pino from 'pino'
 import { expect } from 'vitest'
 import { createAuth } from '../../src/auth.ts'
@@ -32,7 +33,7 @@ const noopEnqueue: EnqueueFn = async () => null
  * what the `req` serializer's redactUrl() actually emitted (review-pages.test.ts). */
 export async function createTestApi(
   overrides: Partial<NodeJS.ProcessEnv> = {},
-  depsOverrides: Partial<Pick<ServerDeps, 'enqueue' | 'mailProviders' | 'verifyGoogleJwt'>> = {},
+  depsOverrides: Partial<Pick<ServerDeps, 'enqueue' | 'mailProviders' | 'verifyGoogleJwt' | 'store'>> = {},
   opts: { logLevel?: string } = {},
 ) {
   const t = await createTestDatabase()
@@ -44,12 +45,13 @@ export async function createTestApi(
   const logger = createAppLogger({ level: opts.logLevel ?? 'warn', stream: { write: (line: string) => void lines.push(line) } })
   const auth = createAuth({ db: handle.db, config, mail, logger, audit: (orgId, entry) => api.withOrg(orgId, (tx) => audit(tx, entry)) })
   const enqueue = depsOverrides.enqueue ?? noopEnqueue
+  const store = depsOverrides.store ?? createMemoryStore()
   const app = buildServer({
-    config, auth, api, mail, logger, enqueue,
+    config, auth, api, mail, logger, enqueue, store,
     mailProviders: depsOverrides.mailProviders,
     verifyGoogleJwt: depsOverrides.verifyGoogleJwt,
   })
-  return { app, config, mail, api, handle, lines, close: async () => { await app.close(); await handle.pool.end(); await t.drop() } }
+  return { app, config, mail, api, handle, lines, store, close: async () => { await app.close(); await handle.pool.end(); await t.drop() } }
 }
 
 /** Deps for suites that never touch the database (error handler, redaction, /meta). Silent by default. */
@@ -66,7 +68,7 @@ export function stubDeps(env: Partial<NodeJS.ProcessEnv> = {}, opts: { level?: s
     health: async () => ({ db: 'error', migrations: { count: 0, latest: null } }),
   }
   const logger = createAppLogger({ level: opts.level ?? 'silent', stream: opts.stream })
-  return { config, auth, api, mail: createDevSink(), logger, enqueue: noopEnqueue }
+  return { config, auth, api, mail: createDevSink(), logger, enqueue: noopEnqueue, store: createMemoryStore() }
 }
 
 /** Email OTP sign-in through the real routes. Returns the session cookie (name=value) and the user. */
