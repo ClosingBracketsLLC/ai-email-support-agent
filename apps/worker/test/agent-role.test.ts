@@ -127,7 +127,7 @@ describe('maybeRegisterAgentRole', () => {
   })
 
   it('hands draft AND sandbox the REAL retriever — one instance, with retrieveDetailed (not emptyRetriever)', async () => {
-    const { logger } = testLogger()
+    const { logger, lines } = testLogger()
     let draftDeps: TicketDraftDeps | undefined
     let sandboxDeps: AgentSandboxDeps | undefined
     await maybeRegisterAgentRole(
@@ -147,5 +147,23 @@ describe('maybeRegisterAgentRole', () => {
     expect(draftDeps?.retriever).toHaveProperty('retrieveDetailed')
     // ONE retriever (one embedder, one rate budget) for both jobs.
     expect(sandboxDeps?.retriever).toBe(draftDeps?.retriever)
+    // An `agent`-only replica is the one that announces the dev fallback here.
+    expect(lines.map((l) => JSON.parse(l).msg as string).filter((m) => m.includes('VOYAGE_API_KEY'))).toHaveLength(1)
+  })
+
+  it('says the VOYAGE_API_KEY fallback ONCE on a combined `knowledge,agent` replica — the knowledge role owns that warning', async () => {
+    const { logger, lines } = testLogger()
+    await maybeRegisterAgentRole(
+      {
+        boss: fakeBoss, db: fakeDb, logger,
+        config: baseConfig({ roles: new Set(['agent', 'knowledge']), anthropicApiKey: new Secret('sk-ant-test') }),
+        enqueueNotify: async () => {},
+        enqueueDraft: async () => {},
+      },
+      spyRegistrars(() => {}),
+    )
+    // `maybeRegisterKnowledgeRole` builds its own embedder from the same helper and warns there; the
+    // owner of a one-process dev worker should read the sentence once, not twice.
+    expect(lines.map((l) => JSON.parse(l).msg as string).filter((m) => m.includes('VOYAGE_API_KEY'))).toHaveLength(0)
   })
 })

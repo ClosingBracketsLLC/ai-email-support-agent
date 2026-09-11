@@ -4,11 +4,14 @@
  * `ANTHROPIC_API_KEY` is unit-testable without a real pg-boss instance — `register` is an
  * injectable seam (defaulting to the three real registrars) that tests replace with spies.
  *
- * ONE retriever, too (Phase 4): `createRetriever` over the SAME embedder `createKnowledgeDeps`
- * builds for the `knowledge` role (`createKnowledgeEmbedder` — Voyage when a key is configured, the
- * hash embedder in dev/test), so the model that WROTE a workspace's vectors is always the model that
- * queries them; `embedding_model` is part of the vector leg's WHERE, and a mismatch would silently
- * return nothing from it. The optional reranker rides along under `KNOWLEDGE_RERANK=on`.
+ * ONE retriever, too (Phase 4): `createRetriever` over an embedder from the SAME helper
+ * `createKnowledgeDeps` uses for the `knowledge` role (`createKnowledgeEmbedder` — Voyage when a key
+ * is configured, the hash embedder in dev/test), so the model that WROTE a workspace's vectors is
+ * always the model that queries them; `embedding_model` is part of the vector leg's WHERE, and a
+ * mismatch would silently return nothing from it. It is a second INSTANCE, not the knowledge role's
+ * one — the two roles are usually separate replicas — so on a combined `knowledge,agent` replica
+ * this call passes `warnOnFallback: false` and the dev fallback is announced once, by the
+ * `knowledge` role. The optional reranker rides along under `KNOWLEDGE_RERANK=on`.
  *
  * ONE provider is built for the whole role and handed to ALL THREE jobs: `createManagedProvider`
  * wraps the raw Anthropic adapter in metering (every rung of the structured-output ladder becomes
@@ -77,7 +80,7 @@ export async function maybeRegisterAgentRole(deps: AgentRoleDeps, register: Agen
   // budgets and two chances to disagree about the model.
   const retriever = createRetriever({
     db: deps.db,
-    embedder: createKnowledgeEmbedder(deps.config, deps.logger),
+    embedder: createKnowledgeEmbedder(deps.config, deps.logger, { warnOnFallback: !deps.config.roles.has('knowledge') }),
     reranker: createKnowledgeReranker(deps.config),
     logger: deps.logger,
   })

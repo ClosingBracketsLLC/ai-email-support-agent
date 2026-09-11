@@ -19,6 +19,7 @@ import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
 import { createHashEmbedder, createMemoryStore } from '@aesa/knowledge'
 import { fakeSite } from '@aesa/knowledge/testing'
 import { CRAWL_LEASE_SECONDS, knowledgeCrawlJob, runKnowledgeCrawl } from '../src/jobs/knowledge-crawl.ts'
+import { createWorkerLogger } from '../src/logging.ts'
 import { guardedSourceWrite } from '../src/knowledge/sources.ts'
 import type { KnowledgeDeps } from '../src/knowledge-deps.ts'
 
@@ -171,6 +172,16 @@ describe('knowledge.crawl', () => {
     // Only the changed document is re-embedded.
     expect(embedded).toEqual([docs[2]!.id])
     expect((await getSource(sourceId)).status).toBe('ready')
+
+    // A THIRD walk with nothing changed persists nothing, so it does not bump the version either:
+    // every draft's `knowledge_version` stamp stays valid (final-B minor).
+    const version = await knowledgeVersion()
+    await withOrg(app.db, orgId, (tx) => tx.update(knowledgeSources).set({ status: 'queued' }).where(eq(knowledgeSources.id, sourceId)))
+    await run(deps, sourceId)
+
+    expect(await knowledgeVersion()).toBe(version)
+    expect(embedded).toEqual([docs[2]!.id])       // nothing new to embed
+    expect((await getSource(sourceId)).status).toBe('ready')
   })
 
   it("clamps crawl_config.maxPages to the org's knowledge.max_crawl_pages setting", async () => {
@@ -265,7 +276,8 @@ describe('knowledge.crawl', () => {
 
   it("OUR persistence failing (a consumer-origin CrawlError) re-queues and rethrows — the owner's site is never blamed", async () => {
     const sourceId = await seedCrawlSource()
-    const { deps } = makeDeps(site())
+    const lines: string[] = []
+    const { deps } = makeDeps(site(), { logger: createWorkerLogger('info', { write: (line: string) => void lines.push(line) }) })
     // The batch transaction — and only it — fails: the chunk insert loses its privilege. The
     // document insert and every `knowledge_sources` write still work, so this is precisely the
     // "onBatch threw" path, not a progress-write failure.
@@ -282,6 +294,15 @@ describe('knowledge.crawl', () => {
     expect(thrown).toBeInstanceOf(Error)
     expect((thrown as Error).message).toMatch(/insert into "knowledge_chunks"/)
     expect(String(((thrown as { cause?: { message?: string } }).cause)?.message)).toMatch(/permission denied/)
+
+    // Nor does the page text reach the LOG: a `DrizzleQueryError`'s message is
+    // `Failed query: … params: <the page's own text>`, and pino's `err` serializer would copy its
+    // enumerable `query`/`params` too (final-B5). The driver's own message and code stand in.
+    const warn = lines.map((l) => JSON.parse(l) as Record<string, unknown>).find((l) => l.level === 40)!
+    expect(warn.msg).toMatch(/batch persistence failed/)
+    expect(warn.error).toBe('batch persistence failed')
+    expect(warn.driver).toMatchObject({ name: 'DrizzleQueryError', code: '42501', message: expect.stringMatching(/permission denied/) })
+    expect(JSON.stringify(warn)).not.toContain('Acme Dog Supplies sells beds')
 
     const source = await getSource(sourceId)
     expect(source.status).toBe('queued')          // re-queued for pg-boss's retry, NOT failed

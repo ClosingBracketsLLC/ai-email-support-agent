@@ -45,15 +45,29 @@ export function createKnowledgeStore(config: WorkerConfig, logger: pino.Logger):
   return createMemoryStore()
 }
 
-/** Voyage when a key is configured; in dev/test the deterministic hash embedder. */
-export function createKnowledgeEmbedder(config: WorkerConfig, logger: pino.Logger): Embedder {
+/**
+ * Voyage when a key is configured; in dev/test the deterministic hash embedder.
+ *
+ * `warnOnFallback: false` silences only the dev/test warning, never the production refusal: a
+ * combined `knowledge,agent` replica calls this twice (once per role) and the owner does not need
+ * to read the same sentence twice. `agent-role.ts` is the caller that passes it — the `knowledge`
+ * role's own call is the one that keeps the warning, because it is the role whose writes the
+ * fallback embedder makes unusable.
+ */
+export function createKnowledgeEmbedder(
+  config: WorkerConfig,
+  logger: pino.Logger,
+  opts: { warnOnFallback?: boolean } = {},
+): Embedder {
   if (config.voyageApiKey) {
     return createVoyageEmbedder({ apiKey: config.voyageApiKey, model: config.knowledgeEmbedModel })
   }
   if (config.env === 'production') {
     throw new Error('VOYAGE_API_KEY is required in production when WORKER_ROLES includes `agent` or `knowledge` (embeddings)')
   }
-  logger.warn('VOYAGE_API_KEY missing; using the deterministic hash embedder (its vectors are NOT comparable with Voyage\'s)')
+  if (opts.warnOnFallback !== false) {
+    logger.warn('VOYAGE_API_KEY missing; using the deterministic hash embedder (its vectors are NOT comparable with Voyage\'s)')
+  }
   return createHashEmbedder()
 }
 

@@ -6,7 +6,7 @@
  * (`beforeEach`): `workspaces.knowledge_version` and the source/document/chunk rows are all
  * per-org, and two cases assert the version's exact value.
  */
-import { randomBytes } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { eq } from 'drizzle-orm'
 import pino from 'pino'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
@@ -16,7 +16,7 @@ import {
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
 import { createHashEmbedder, createMemoryStore, ParseError, uploadKey, type Block } from '@aesa/knowledge'
-import { runKnowledgeIngest, type KnowledgeIngestPayload } from '../src/jobs/knowledge-ingest.ts'
+import { INGEST_LEASE_SECONDS, runKnowledgeIngest, type KnowledgeIngestPayload } from '../src/jobs/knowledge-ingest.ts'
 import type { KnowledgeDeps } from '../src/knowledge-deps.ts'
 
 const rand = () => randomBytes(4).toString('hex')
@@ -30,17 +30,22 @@ const FAQ = [
 
 let t: Awaited<ReturnType<typeof createTestDatabase>>
 let app: ReturnType<typeof createDb>
+/** The table owner: one test revokes a privilege from `aesa_app` to make the persist transaction —
+ *  and only that transaction — fail the way a dropped connection would. */
+let owner: ReturnType<typeof createDb>
 let userId: string
 let orgId: string
 
 beforeAll(async () => {
   t = await createTestDatabase()
   app = createDb(t.url, { role: 'app' })
+  owner = createDb(t.url, { role: 'owner' })
   const [u] = await app.db.insert(user).values({ name: 'Owner', email: `owner-${rand()}@example.com` }).returning()
   userId = u!.id
 })
 afterAll(async () => {
   await app.pool.end()
+  await owner.pool.end()
   await t.drop()
 })
 beforeEach(async () => {
@@ -271,16 +276,74 @@ describe('knowledge.ingest', () => {
     expect(embedded).toHaveLength(2)
   })
 
-  it('leaves a source that is not `queued` completely alone (another run already claimed it)', async () => {
+  it('leaves a `processing` source whose lease is still LIVE completely alone (another run holds it)', async () => {
     const sourceId = await seedSource({ kind: 'paste', pastedText: FAQ, status: 'processing' })
+    const held = (await getSource(sourceId)).claimToken
     const { deps, embedded } = makeDeps()
 
     await run(deps, sourceId)
 
-    expect((await getSource(sourceId)).status).toBe('processing')
+    const source = await getSource(sourceId)
+    expect(source.status).toBe('processing')
+    expect(source.claimToken).toBe(held)
     expect(await documentsFor(sourceId)).toHaveLength(0)
     expect(embedded).toHaveLength(0)
     expect(await knowledgeVersion()).toBe(0)
+  })
+
+  it('re-claims a `processing` source whose lease has EXPIRED (the died-mid-parse retry), with a fresh token', async () => {
+    // The lease is measured against the database clock, so the stale stamp is a REAL-clock one.
+    const staleToken = randomUUID()
+    const sourceId = await seedSource({
+      kind: 'paste', pastedText: FAQ, status: 'processing', claimToken: staleToken,
+      updatedAt: new Date(Date.now() - 2 * INGEST_LEASE_SECONDS * 1000),
+    })
+    const { deps, embedded } = makeDeps()
+
+    await run(deps, sourceId)
+
+    const source = await getSource(sourceId)
+    expect(source.status).toBe('processing')          // this run's own claim, held until embed-batch
+    expect(source.claimToken).not.toBe(staleToken)    // the abandoned attempt's late writes no-op
+    expect(source.claimToken).not.toBeNull()
+    expect(await documentsFor(sourceId)).toHaveLength(1)
+    expect(embedded).toHaveLength(1)
+  })
+
+  it('a persist failure hands the source back as `queued` and throws a message carrying no document text', async () => {
+    const secret = 'The warranty code is HOUND-4417 and the refund window is 45 days.'
+    const sourceId = await seedSource({ kind: 'paste', pastedText: secret })
+    const { deps, embedded } = makeDeps()
+    // The persist transaction — and only it — fails: the chunk insert loses its privilege. The
+    // source writes and the document insert still work, so this is exactly "tx2 threw".
+    await owner.pool.query('REVOKE INSERT ON knowledge_chunks FROM aesa_app')
+    let thrown: unknown
+    try {
+      thrown = await run(deps, sourceId).then(() => null, (err: unknown) => err)
+    } finally {
+      await owner.pool.query('GRANT INSERT ON knowledge_chunks TO aesa_app')
+    }
+
+    // Whatever is thrown here is what pg-boss serialises into `pgboss.job.output`. drizzle's own
+    // `DrizzleQueryError` would carry `Failed query: … params: <the pasted text>` in its MESSAGE and
+    // in its enumerable `params`; the wrapper's cause is non-enumerable, so it travels nowhere.
+    expect(thrown).toBeInstanceOf(Error)
+    expect((thrown as Error).message).toBe('knowledge.ingest: persist failed')
+    // pg-boss stores `serializeError(thrown)`, and serialize-error 8 walks OWN ENUMERABLE properties
+    // plus name/message/stack. So these two assertions are exactly what reaches `pgboss.job.output`:
+    // nothing enumerable (drizzle's error carries `query` and `params` as enumerable own properties,
+    // and `cause` from the options bag is non-enumerable), and no page text in the message or stack.
+    expect(Object.keys(thrown as object)).toEqual([])
+    expect(`${(thrown as Error).message}\n${(thrown as Error).stack}`).not.toContain('HOUND-4417')
+    // The driver error is still THERE for a local log, one `cause` down from drizzle's wrapper.
+    expect(String(((thrown as { cause?: { cause?: { message?: string } } }).cause)?.cause?.message)).toMatch(/permission denied/)
+
+    const source = await getSource(sourceId)
+    expect(source.status).toBe('queued')      // re-queued for pg-boss's retry, NOT failed
+    expect(source.claimToken).toBeNull()      // released, so the retry's own claim can take it
+    expect(source.failureReason).toBeNull()
+    expect(await documentsFor(sourceId)).toHaveLength(0)
+    expect(embedded).toHaveLength(0)
   })
 
   it('stores a flagged chunk (never drops it) and counts it in the audit detail', async () => {

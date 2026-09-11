@@ -38,7 +38,10 @@ import {
 } from '@aesa/knowledge'
 import { defineJob, enqueue, JOB_NAMES, registerJob, type JobDefinition } from '@aesa/queue'
 import { utcDayString } from '../date-utils.ts'
-import { failSource, guardedSourceWrite, loadOrgSettings } from '../knowledge/sources.ts'
+import { errorMessage } from '../err-message.ts'
+import {
+  failSource, guardedSourceWrite, guardedSourceWriteReturning, loadOrgSettings,
+} from '../knowledge/sources.ts'
 import type { KnowledgeDeps } from '../knowledge-deps.ts'
 
 export const KnowledgeCrawlPayload = z.object({ orgId: z.string(), sourceId: z.string() })
@@ -49,8 +52,9 @@ const ACTOR = 'system:knowledge.crawl' as const
 /** How long a claim holds the source. Deliberately SHORTER than the queue's `expireInSeconds` and
  * equal to its `retryDelay`, so the single retry always fires after the lease has lapsed and can
  * actually re-claim; a lease as long as the expiry would make every retry a silent no-op. Measured
- * against the DATABASE's clock (`now()`), never an injected one — `updated_at` is written by whoever
- * last touched the row, so a caller's idea of "now" says nothing about how old the claim is. */
+ * against the DATABASE's clock (`now()`), never an injected one: `updated_at` is written from the
+ * WORKER's clock (drizzle's `$onUpdate`), so only the comparison side can be trusted, and a caller's
+ * idea of "now" says nothing about how old the claim is. */
 export const CRAWL_LEASE_SECONDS = 300
 
 /** How many ingested pages the FIRST persistence batch carries ("first 20 pages fast", spec §Knowledge). */
@@ -74,6 +78,27 @@ interface ClaimedCrawl {
   maxPages: number
   /** This attempt's claim token: every later write of this run is guarded on it. */
   token: string
+}
+
+/**
+ * What may be logged about a driver failure. NOT `errorMessage(cause)`: a `DrizzleQueryError`'s own
+ * message is `Failed query: <sql>\nparams: <every bound parameter>`, and for the batch transaction
+ * those parameters are the CRAWLED PAGE's text — the same reason `{ err }` (pino copies every
+ * enumerable property, and drizzle assigns `query` and `params` as own properties) is wrong here.
+ * Its `cause` is pg's own error, whose `message` ("permission denied for table knowledge_chunks")
+ * and `code` name the failure without a byte of row data (final-B5).
+ */
+function driverSummary(cause: unknown): { name?: string; code?: string; message?: string } | null {
+  if (!(cause instanceof Error)) return cause === undefined ? null : { name: typeof cause }
+  // The nested error is the driver's; only ITS message is logged, never the wrapper's.
+  const pg = cause.cause instanceof Error ? cause.cause : null
+  const { code } = (pg ?? cause) as unknown as { code?: unknown }
+  return {
+    // The CLASS, not `err.name`: drizzle never sets `name`, so every wrapper would log as "Error".
+    name: cause.constructor?.name ?? cause.name,
+    ...(typeof code === 'string' ? { code } : {}),
+    ...(pg ? { message: pg.message } : {}),
+  }
 }
 
 /** `{ maxPages, progress }` — jsonb, so it is read defensively rather than trusted. */
@@ -161,8 +186,10 @@ async function upsertPage(
 
 export async function runKnowledgeCrawl(deps: KnowledgeDeps, payload: KnowledgeCrawlPayload, signal: AbortSignal): Promise<void> {
   const { orgId, sourceId } = payload
-  const now = deps.now?.() ?? new Date()
-  const day = utcDayString(now)
+  // Read at each landing, never once up front: a crawl can run for half an hour, and a walk that
+  // starts at 23:58 UTC must meter its later pages against the day they actually happened and stamp
+  // `completed_at` with the time it actually finished.
+  const nowAt = (): Date => deps.now?.() ?? new Date()
 
   const claimed = await claim(deps, orgId, sourceId)
   if (!claimed) return
@@ -184,6 +211,7 @@ export async function runKnowledgeCrawl(deps: KnowledgeDeps, payload: KnowledgeC
     // happens, nothing was persisted, so there is no version to bump and no page to meter.
     if (prepared.length === 0) return
 
+    const day = utcDayString(nowAt())
     const changedDocumentIds = await withOrg(deps.db, orgId, async (tx) => {
       const changed: string[] = []
       let chunkDelta = 0
@@ -198,8 +226,10 @@ export async function runKnowledgeCrawl(deps: KnowledgeDeps, payload: KnowledgeC
         documentCount: sql`${knowledgeSources.documentCount} + ${documentDelta}`,
         chunkCount: sql`${knowledgeSources.chunkCount} + ${chunkDelta}`,
       }, claimed.token)
-      // Same transaction as the chunk set it describes.
-      await bumpKnowledgeVersion(tx, orgId)
+      // Same transaction as the chunk set it describes — and only when that set actually moved. A
+      // re-walk of an unchanged site persists nothing, and a version bump with no content change
+      // would invalidate every draft's grounding stamp for nothing (final-B minor).
+      if (changed.length > 0 || documentDelta !== 0) await bumpKnowledgeVersion(tx, orgId)
       await bumpMeter(tx, orgId, day, KNOWLEDGE_METERS.crawlPages, pages.length)
       return changed
     })
@@ -238,12 +268,15 @@ export async function runKnowledgeCrawl(deps: KnowledgeDeps, payload: KnowledgeC
       // broken, and the detail (a driver message) must never reach `failure_detail`. Re-queue and
       // rethrow the underlying error so pg-boss retries after the lease lapses.
       if (err.origin === 'consumer') {
-        deps.logger.warn({ sourceId, err: err.cause }, 'knowledge.crawl: batch persistence failed; re-queueing the source')
+        deps.logger.warn(
+          { sourceId, error: errorMessage(err), driver: driverSummary(err.cause) },
+          'knowledge.crawl: batch persistence failed; re-queueing the source',
+        )
         await handBack()
         throw err.cause ?? err
       }
       // Terminal: the crawl itself could not run (a refused start URL, a dead site).
-      await failSource(deps.db, { orgId, sourceId, actor: ACTOR, reason: err.code, detail: err.message, now, claimToken: claimed.token })
+      await failSource(deps.db, { orgId, sourceId, actor: ACTOR, reason: err.code, detail: err.message, now: nowAt(), claimToken: claimed.token })
       return
     }
     await handBack()
@@ -268,13 +301,14 @@ export async function runKnowledgeCrawl(deps: KnowledgeDeps, payload: KnowledgeC
   if (summary.ingested === 0) {
     await failSource(deps.db, {
       orgId, sourceId, actor: ACTOR, reason: 'crawl_no_pages',
-      detail: `fetched ${summary.fetched}, skipped ${summary.skipped}, refused ${summary.refused.length}`, now,
+      detail: `fetched ${summary.fetched}, skipped ${summary.skipped}, refused ${summary.refused.length}`, now: nowAt(),
       claimToken: claimed.token,
     })
     return
   }
 
   // The end: recount rather than trust the per-batch deltas (a concurrent delete, a re-walk).
+  const completedAt = nowAt()
   await withOrg(deps.db, orgId, async (tx) => {
     const [counts] = await tx
       .select({
@@ -283,26 +317,25 @@ export async function runKnowledgeCrawl(deps: KnowledgeDeps, payload: KnowledgeC
       })
       .from(knowledgeDocuments)
       .where(eq(knowledgeDocuments.sourceId, sourceId))
-    // `knowledge.embed-batch` never flips a crawl source's status — it records its verdict as a
-    // failure reason and leaves the transition here, because only this job knows the walk is over.
-    const [source] = await tx
-      .select({ failureReason: knowledgeSources.failureReason })
-      .from(knowledgeSources)
-      .where(eq(knowledgeSources.id, sourceId))
-    const failed = source?.failureReason != null
-    const written = await guardedSourceWrite(tx, sourceId, ['processing'], {
-      status: failed ? 'failed' : 'ready',
-      completedAt: now,
+    // `knowledge.embed-batch` never flips a crawl source's status while it is `processing` — it
+    // records its verdict as a failure reason and leaves the transition here, because only this job
+    // knows the walk is over. The status is decided IN the update (final-B4): a separate SELECT
+    // could read a reason an embed job wrote a moment before the UPDATE it is meant to describe —
+    // or miss one written a moment after — and the landed status is what the audit row reports.
+    const landed = await guardedSourceWriteReturning(tx, sourceId, ['processing'], {
+      status: sql`case when ${knowledgeSources.failureReason} is not null then 'failed' else 'ready' end`,
+      completedAt,
       claimToken: null,
       documentCount: counts?.documents ?? 0,
       chunkCount: counts?.chunks ?? 0,
     }, claimed.token)
-    if (!written) return
+    if (!landed) return
     await audit(tx, {
       actor: ACTOR, action: 'knowledge.crawl.finished', entityType: 'knowledge_source', entityId: sourceId,
       detail: {
         fetched: summary.fetched, ingested: summary.ingested, skipped: summary.skipped,
-        refused: summary.refused.length, ...(failed ? { failureReason: source?.failureReason } : {}),
+        refused: summary.refused.length,
+        ...(landed.status === 'failed' ? { failureReason: landed.failureReason } : {}),
       },
     })
   })

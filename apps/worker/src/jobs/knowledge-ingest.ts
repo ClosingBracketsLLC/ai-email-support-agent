@@ -11,17 +11,23 @@
  *    lands `failed` with an owner-facing reason and the job returns cleanly. Retrying a file that
  *    cannot be parsed just burns the retry budget and re-fails identically.
  *  - anything else (a store outage, a dropped connection) rethrows for pg-boss's retry, and hands
- *    the source back as `queued` first so the retry's own claim can take it — the claim below only
- *    accepts `queued`, so without that hand-back the retry would be a silent no-op.
+ *    the source back as `queued` first so the retry's own claim can take it — a `processing` source
+ *    is only re-claimable once its lease has lapsed, so without that hand-back the retry would wait
+ *    `INGEST_LEASE_SECONDS` for nothing.
+ *
+ * A rethrow out of this job is never a raw `DrizzleQueryError`: its message is
+ * `Failed query: <sql>\nparams: <every bound parameter>`, and the parameters of the chunk insert ARE
+ * the uploaded file's text. pg-boss stores whatever is thrown in `pgboss.job.output`, so the persist
+ * path rethrows a plain `Error` with the driver error on its (non-enumerable) `cause` instead.
  */
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { eq } from 'drizzle-orm'
+import { eq, sql } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import { z } from 'zod'
-import { KNOWLEDGE_MAX_UPLOAD_BYTES } from '@aesa/contracts'
+import { KNOWLEDGE_MAX_UPLOAD_BYTES, type KnowledgeSourceStatus } from '@aesa/contracts'
 import {
   audit, bumpKnowledgeVersion, knowledgeChunks, knowledgeDocuments, knowledgeSources, withOrg,
 } from '@aesa/db'
@@ -54,6 +60,22 @@ export const knowledgeIngestJob: JobDefinition<KnowledgeIngestPayload> = defineJ
   },
 })
 
+/**
+ * How long a claim holds the source — `knowledge.crawl`'s `CRAWL_LEASE_SECONDS`, same mechanism.
+ * The two bounds that make 300 s the right number:
+ *  - an ingest CANNOT still be running at 300 s: the object is capped at 20 MiB
+ *    (`KNOWLEDGE_MAX_UPLOAD_BYTES`), the forked parser is killed at 60 s (`DEFAULT_PARSE_LIMITS`),
+ *    and the rest is a download plus two short transactions — call it ~90 s in the worst case. So a
+ *    lapsed lease really does mean the attempt that held it is gone (a deploy, an OOM kill).
+ *  - a retry CANNOT arrive before 300 s either, except after a hand-back that already released the
+ *    claim: pg-boss only re-queues an abandoned ACTIVE job once its `expireInSeconds` (600) has
+ *    passed, so the stranded-`processing` case is always ≥ 600 s old by the time the retry runs.
+ * Measured against the DATABASE's clock (`now()`), never an injected one: `updated_at` is written
+ * from the WORKER's clock (drizzle's `$onUpdate`), so only the comparison side can be trusted, and
+ * a caller's idea of "now" says nothing about how old the claim is.
+ */
+export const INGEST_LEASE_SECONDS = 300
+
 interface ClaimedSource {
   kind: string
   title: string
@@ -79,7 +101,7 @@ class ObjectRefused extends ParseError {
 }
 
 /** Reads the source's bytes and turns them into blocks. Never inside a transaction. */
-async function parseUpload(deps: KnowledgeDeps, source: ClaimedSource): Promise<{ blocks: Block[]; uri: string }> {
+async function parseUpload(deps: KnowledgeDeps, sourceId: string, source: ClaimedSource): Promise<{ blocks: Block[]; uri: string }> {
   const key = source.storageKey
   if (!key) throw new ParseError('parse_failed', 'object missing')
 
@@ -108,13 +130,20 @@ async function parseUpload(deps: KnowledgeDeps, source: ClaimedSource): Promise<
   // object in the parent's heap first — bounded by the 20 MiB upload cap, not by the child's limits.
   const dir = await mkdtemp(join(tmpdir(), 'aesa-ingest-'))
   const path = join(dir, 'source')
+  /** The child stops appending blocks at the chunker's own ceiling and says so; the document is
+   *  ingested anyway (a truncated policy PDF still answers most of what it covers), but the owner's
+   *  file is NOT fully in the knowledge base and an operator should be able to see that. */
+  const noteTruncation = (result: { blocks: Block[]; truncated: boolean }): Block[] => {
+    if (result.truncated) deps.logger.warn({ sourceId }, 'knowledge.ingest: parser output truncated at the block ceiling')
+    return result.blocks
+  }
   try {
     await writeFile(path, bytes)
     switch (source.mime) {
       case 'application/pdf':
-        return { blocks: (await parseInChild({ kind: 'pdf', path, limits: DEFAULT_PARSE_LIMITS })).blocks, uri }
+        return { blocks: noteTruncation(await parseInChild({ kind: 'pdf', path, limits: DEFAULT_PARSE_LIMITS })), uri }
       case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
-        return { blocks: (await parseInChild({ kind: 'docx', path, limits: DEFAULT_PARSE_LIMITS })).blocks, uri }
+        return { blocks: noteTruncation(await parseInChild({ kind: 'docx', path, limits: DEFAULT_PARSE_LIMITS })), uri }
       case 'text/markdown':
         return { blocks: parseMarkdown(Buffer.from(bytes).toString('utf8')), uri }
       case 'text/plain':
@@ -131,19 +160,31 @@ export async function runKnowledgeIngest(deps: KnowledgeDeps, payload: Knowledge
   const { orgId, sourceId } = payload
   const now = deps.now?.() ?? new Date()
 
-  // tx1: claim. `queued` only — a source already `processing` belongs to another run, and a `ready`
-  // or `failed` one needs the api to re-queue it before anything here touches it again.
+  // tx1: the advisory-locked claim (`knowledge.crawl`'s shape). `queued` always; `processing` only
+  // once `INGEST_LEASE_SECONDS` has lapsed — a death mid-parse (a deploy's 30 s pg-boss stop then
+  // process.exit, an OOM kill) used to strand the source `processing` with a token forever, which
+  // no sweep clears and `completeUpload` cannot re-queue (final-B3). A `ready` or `failed` source
+  // still needs the api to re-queue it before anything here touches it again. The lock is what
+  // makes the stale re-claim exclusive: the status is `processing` on both sides of it, so two
+  // attempts reading the same stale row would otherwise both pass the status guard.
   const claimToken = randomUUID()
   const source = await withOrg(deps.db, orgId, async (tx) => {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`knowledge-ingest:${orgId}`}))`)
+
     const [row] = await tx
       .select({
         kind: knowledgeSources.kind, title: knowledgeSources.title, storageKey: knowledgeSources.storageKey,
         mime: knowledgeSources.mime, pastedText: knowledgeSources.pastedText,
+        status: knowledgeSources.status,
+        stale: sql<boolean>`${knowledgeSources.updatedAt} < now() - make_interval(secs => ${INGEST_LEASE_SECONDS})`,
       })
       .from(knowledgeSources)
       .where(eq(knowledgeSources.id, sourceId))
     if (!row) return null
-    const claimed = await guardedSourceWrite(tx, sourceId, ['queued'], {
+
+    const from: KnowledgeSourceStatus[] =
+      row.status === 'queued' ? ['queued'] : row.status === 'processing' && row.stale ? ['processing'] : []
+    const claimed = await guardedSourceWrite(tx, sourceId, from, {
       status: 'processing', failureReason: null, failureDetail: null, completedAt: null, claimToken,
     })
     return claimed ? row : null
@@ -156,7 +197,7 @@ export async function runKnowledgeIngest(deps: KnowledgeDeps, payload: Knowledge
     const { blocks, uri } =
       source.kind === 'paste'
         ? { blocks: parseMarkdown(source.pastedText ?? ''), uri: `paste:${sourceId}` }
-        : await parseUpload(deps, source)
+        : await parseUpload(deps, sourceId, source)
     prepared = prepareDocument({ blocks, uri, title: source.title })
   } catch (err) {
     if (err instanceof ParseError) {
@@ -169,15 +210,48 @@ export async function runKnowledgeIngest(deps: KnowledgeDeps, payload: Knowledge
       return
     }
     // Retryable: hand the claim back so pg-boss's next attempt can take it, then let it fail loudly.
-    await withOrg(deps.db, orgId, (tx) =>
-      guardedSourceWrite(tx, sourceId, ['processing'], { status: 'queued', claimToken: null }, claimToken))
+    await handBack(deps, orgId, sourceId, claimToken)
     throw err
   }
 
   // tx2: replace the source's document set outright. One source, one document — the delete cascades
   // to its chunks, so a re-ingest can never leave a stale chunk behind for retrieval to find.
   const flagged = prepared.chunks.filter((c) => c.injectionFlagged).length
-  const documentId = await withOrg(deps.db, orgId, async (tx) => {
+  let documentId: string | null
+  try {
+    documentId = await persistDocument(deps, orgId, sourceId, claimToken, prepared, flagged)
+  } catch (err) {
+    // The same hand-back-then-throw the parse path takes: a database failure HERE (a dropped
+    // connection mid-insert) would otherwise leave the source `processing` with a token held, and
+    // the retry would sit out the whole lease before it could re-claim.
+    await handBack(deps, orgId, sourceId, claimToken)
+    // Never the raw error: a `DrizzleQueryError`'s message is `Failed query: <sql>\nparams: <…>`,
+    // and those params are the document's own text — pg-boss serialises what is thrown into
+    // `pgboss.job.output`. `cause` is non-enumerable, which is exactly why it does not travel there
+    // (serialize-error walks own enumerable properties) while still being there for a local log.
+    throw new Error('knowledge.ingest: persist failed', { cause: err })
+  }
+
+  // After the commit: the embed job reads rows that must already exist.
+  if (documentId) await deps.enqueueEmbedBatch(orgId, documentId)
+}
+
+/** Releases the claim so pg-boss's next attempt can take the source. */
+async function handBack(deps: KnowledgeDeps, orgId: string, sourceId: string, claimToken: string): Promise<void> {
+  await withOrg(deps.db, orgId, (tx) =>
+    guardedSourceWrite(tx, sourceId, ['processing'], { status: 'queued', claimToken: null }, claimToken))
+}
+
+/** tx2 itself. Returns null when the source stopped being ours while we were parsing. */
+async function persistDocument(
+  deps: KnowledgeDeps,
+  orgId: string,
+  sourceId: string,
+  claimToken: string,
+  prepared: PreparedDocument,
+  flagged: number,
+): Promise<string | null> {
+  return withOrg(deps.db, orgId, async (tx) => {
     const written = await guardedSourceWrite(tx, sourceId, ['processing'], {
       documentCount: 1, chunkCount: prepared.chunks.length, contentHash: prepared.contentHash,
     }, claimToken)
@@ -202,9 +276,6 @@ export async function runKnowledgeIngest(deps: KnowledgeDeps, payload: Knowledge
     })
     return doc!.id
   })
-
-  // After the commit: the embed job reads rows that must already exist.
-  if (documentId) await deps.enqueueEmbedBatch(orgId, documentId)
 }
 
 export async function registerKnowledgeIngest(boss: PgBoss, deps: KnowledgeDeps): Promise<void> {

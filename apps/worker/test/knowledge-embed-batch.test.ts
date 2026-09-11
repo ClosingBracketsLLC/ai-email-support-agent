@@ -13,7 +13,7 @@ import {
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
 import { createHashEmbedder, createMemoryStore, EmbedError, type Embedder } from '@aesa/knowledge'
-import { runKnowledgeEmbedBatch } from '../src/jobs/knowledge-embed-batch.ts'
+import { knowledgeEmbedBatchJob, runKnowledgeEmbedBatch, type EmbedAttempt } from '../src/jobs/knowledge-embed-batch.ts'
 import type { KnowledgeDeps } from '../src/knowledge-deps.ts'
 
 const rand = () => randomBytes(4).toString('hex')
@@ -94,8 +94,11 @@ const failingEmbedder = (err: unknown): Embedder => ({
   embed: async () => { throw err },
 })
 
-const run = (deps: KnowledgeDeps, documentId: string) =>
-  runKnowledgeEmbedBatch(deps, { orgId, documentId }, new AbortController().signal)
+const run = (deps: KnowledgeDeps, documentId: string, attempt?: EmbedAttempt) =>
+  runKnowledgeEmbedBatch(deps, { orgId, documentId }, new AbortController().signal, attempt)
+
+/** What `registerJob` hands the handler off pg-boss's job metadata on the attempt with nothing after it. */
+const LAST_ATTEMPT: EmbedAttempt = { retryCount: 5, retryLimit: 5 }
 
 describe('knowledge.embed-batch', () => {
   it('fills every null embedding, meters embed_tokens and flips the ingest source to `ready`', async () => {
@@ -123,6 +126,15 @@ describe('knowledge.embed-batch', () => {
     ])
   })
 
+  it('the queue gives the retries a real window: five, 30 s apart, with backoff', () => {
+    // pg-boss's default base delay is 1 s, which put the five retries at ~1/2/4/8/16 s — one minute
+    // of Voyage outage exhausted the whole budget. 30 s with backoff spans ~15 minutes instead, and
+    // the LAST attempt lands a verdict rather than rethrowing (the two halves of final-B1).
+    expect(knowledgeEmbedBatchJob.queue).toEqual({
+      expireInSeconds: 300, retryLimit: 5, retryDelay: 30, retryBackoff: true, policy: 'short',
+    })
+  })
+
   it('a retryable EmbedError rethrows for pg-boss and leaves every row null', async () => {
     const { sourceId, documentId } = await seedDocument()
     const deps = makeDeps({ embedder: failingEmbedder(new EmbedError('rate_limit', 'voyage: 429')) })
@@ -132,6 +144,37 @@ describe('knowledge.embed-batch', () => {
     expect(await unembeddedCount(documentId)).toBe(3)
     expect(await meter('embed_tokens')).toBe(0)
     expect((await getSource(sourceId)).status).toBe('processing')
+  })
+
+  it('the LAST attempt records `embed_failed` instead of rethrowing — an ingest source never strands `processing`', async () => {
+    const { sourceId, documentId } = await seedDocument()
+    const deps = makeDeps({ embedder: failingEmbedder(new EmbedError('rate_limit', 'voyage: 429 rate limited')) })
+
+    // Second to last: still rethrows, because there is another attempt coming.
+    await expect(run(deps, documentId, { retryCount: 4, retryLimit: 5 })).rejects.toThrow(EmbedError)
+    expect((await getSource(sourceId)).status).toBe('processing')
+
+    await expect(run(deps, documentId, LAST_ATTEMPT)).resolves.toBeUndefined()
+
+    const source = await getSource(sourceId)
+    expect(source.status).toBe('failed')
+    expect(source.failureReason).toBe('embed_failed')
+    expect(source.failureDetail).toContain('429')
+    // The claim the ingest run took is released with the landing — nothing else would ever clear it.
+    expect(source.claimToken).toBeNull()
+    expect(await unembeddedCount(documentId)).toBe(3)
+  })
+
+  it('the last attempt on a NON-EmbedError records a detail with no provider internals', async () => {
+    const { sourceId, documentId } = await seedDocument()
+    const deps = makeDeps({ embedder: failingEmbedder(new Error('ECONNRESET https://api.voyageai.com/v1/embeddings?key=shh')) })
+
+    await expect(run(deps, documentId, LAST_ATTEMPT)).resolves.toBeUndefined()
+
+    const source = await getSource(sourceId)
+    expect(source.status).toBe('failed')
+    expect(source.failureReason).toBe('embed_failed')
+    expect(source.failureDetail).toBe('the embedding provider could not be reached')
   })
 
   it('a non-retryable EmbedError fails the source `embed_failed` — no throw', async () => {
@@ -206,6 +249,67 @@ describe('knowledge.embed-batch', () => {
     expect(source.status).toBe('processing')
     expect(source.failureReason).toBe('cap_reached')
     expect(await unembeddedCount(documentId)).toBe(3)
+  })
+
+  it("a verdict arriving AFTER the crawl landed `ready` flips it to `failed` (the last batch's embed jobs)", async () => {
+    // The crawl's end transition runs as soon as its last batch is enqueued, so those documents'
+    // embed jobs can report after it. Guarding on `processing` alone matched nothing and left the
+    // source `ready` with chunks that never got vectors (final-B2).
+    const completedAt = new Date('2026-09-11T11:59:00Z')
+    const { sourceId, documentId } = await seedDocument({
+      kind: 'crawl', url: 'https://shop.test/', pastedText: null, status: 'ready', claimToken: null, completedAt,
+    })
+    const deps = makeDeps({ embedder: failingEmbedder(new EmbedError('auth', 'voyage: 401 invalid key')) })
+
+    await run(deps, documentId)
+
+    const source = await getSource(sourceId)
+    expect(source.status).toBe('failed')
+    expect(source.failureReason).toBe('embed_failed')
+    expect(source.failureDetail).toContain('401')
+    // The walk really did finish then — only the verdict changed.
+    expect(source.completedAt?.toISOString()).toBe(completedAt.toISOString())
+    expect((await auditRows(sourceId)).map((r) => r.action)).toEqual(['knowledge.source.embed_failed'])
+  })
+
+  it('records a crawl source\'s FIRST verdict only — 200 failing documents write one audit row', async () => {
+    const { sourceId, documentId } = await seedDocument({ kind: 'crawl', url: 'https://shop.test/', pastedText: null })
+    const deps = makeDeps({ embedder: failingEmbedder(new EmbedError('auth', 'voyage: 401 invalid key')) })
+
+    await run(deps, documentId)
+    await run(deps, documentId)
+    await run(deps, documentId)
+
+    expect((await getSource(sourceId)).failureReason).toBe('embed_failed')
+    expect(await auditRows(sourceId)).toHaveLength(1)
+  })
+
+  it('checks the daily cap before EVERY Voyage call, not once per job', async () => {
+    // 130 chunks is two batches (batchTexts caps a batch at 128 texts). The cap is untouched when
+    // the first one starts and used up by the time the second would, so exactly one call happens.
+    const { sourceId, documentId } = await seedDocument()
+    await withOrg(app.db, orgId, async (tx) => {
+      await tx.insert(orgSettings).values({ orgId, key: 'knowledge.daily_embed_tokens_cap', value: 100 })
+      await tx.insert(knowledgeChunks).values(
+        Array.from({ length: 130 }, (_, i) => ({
+          orgId, documentId, ordinal: i + CONTENTS.length,
+          content: `Gift card number ${i} never expires and can be topped up at any time.`, tokenCount: 18,
+        })),
+      )
+      await tx.update(knowledgeDocuments).set({ chunkCount: 130 + CONTENTS.length }).where(eq(knowledgeDocuments.id, documentId))
+    })
+    let calls = 0
+    const hash = createHashEmbedder()
+    const deps = makeDeps({ embedder: { ...hash, embed: async (...args) => { calls++; return hash.embed(...args) } } })
+
+    await run(deps, documentId)
+
+    expect(calls).toBe(1)
+    const source = await getSource(sourceId)
+    expect(source.status).toBe('failed')
+    expect(source.failureReason).toBe('cap_reached')
+    // The first batch's vectors stand — the rows already written are never rolled back.
+    expect(await unembeddedCount(documentId)).toBe(130 + CONTENTS.length - 128)
   })
 
   it('a source whose OTHER document still has unembedded chunks is not flipped yet', async () => {
