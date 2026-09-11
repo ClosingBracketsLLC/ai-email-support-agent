@@ -24,6 +24,10 @@ export const knowledgeSources = pgTable('knowledge_sources', {
   chunkCount: integer('chunk_count').notNull().default(0),
   failureReason: text('failure_reason'),              // contracts KNOWLEDGE_FAILURE_REASONS
   failureDetail: text('failure_detail'),
+  // Fresh per claim (knowledge.ingest / knowledge.crawl), cleared on every terminal landing; the
+  // same shape outbound_sends uses. Every guarded write a claiming run makes carries it, so a late
+  // write from an attempt whose lease has lapsed matches nothing instead of clobbering the holder.
+  claimToken: uuid('claim_token'),
   createdBy: uuid('created_by').references(() => user.id, { onDelete: 'set null' }),
   createdAt: createdAt(),
   updatedAt: updatedAt(),

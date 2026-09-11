@@ -106,6 +106,13 @@
       "when": 1789099651312,
       "tag": "0014_knowledge_hardening",
       "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1789120254006,
+      "tag": "0015_wakeful_tarot",
+      "breakpoints": true
     }
   ]
 }

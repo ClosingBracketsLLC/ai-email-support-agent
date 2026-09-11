@@ -1,4 +1,4 @@
-import { sql } from 'drizzle-orm'
+import { and, eq, sql } from 'drizzle-orm'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { bumpKnowledgeVersion, knowledgeChunks, knowledgeDocuments, knowledgeSources, withOrg, workspaces } from '../src/index.ts'
 import { createDb } from '../src/raw.ts'
@@ -46,6 +46,27 @@ describe('knowledge tables', () => {
       const [doc] = await tx.insert(knowledgeDocuments).values({ orgId, sourceId: src!.id, uri: 'paste:2', contentHash: 'h' }).returning({ id: knowledgeDocuments.id })
       await tx.insert(knowledgeChunks).values({ orgId, documentId: doc!.id, ordinal: 0, content: 'x'.repeat(3001), tokenCount: 1 })
     })).rejects.toMatchObject({ cause: { constraint: 'knowledge_chunks_content_check' } })
+  })
+
+  it('claim_token is a nullable uuid: a claiming job writes one and a mismatched token matches nothing', async () => {
+    const tokenA = crypto.randomUUID()
+    const tokenB = crypto.randomUUID()
+    await withOrg(handle.db, orgId, async (tx) => {
+      const [src] = await tx.insert(knowledgeSources).values({ orgId, kind: 'crawl', title: 'shop.test', url: 'https://shop.test/' })
+        .returning({ id: knowledgeSources.id, claimToken: knowledgeSources.claimToken })
+      expect(src!.claimToken).toBeNull()   // nullable, and nothing defaults it
+
+      await tx.update(knowledgeSources).set({ status: 'processing', claimToken: tokenA }).where(eq(knowledgeSources.id, src!.id))
+      // The shape every guarded write of a claiming run uses: status AND token.
+      const mismatched = await tx.update(knowledgeSources).set({ status: 'ready' })
+        .where(and(eq(knowledgeSources.id, src!.id), eq(knowledgeSources.status, 'processing'), eq(knowledgeSources.claimToken, tokenB)))
+        .returning({ id: knowledgeSources.id })
+      expect(mismatched).toHaveLength(0)
+      const matched = await tx.update(knowledgeSources).set({ status: 'ready', claimToken: null })
+        .where(and(eq(knowledgeSources.id, src!.id), eq(knowledgeSources.status, 'processing'), eq(knowledgeSources.claimToken, tokenA)))
+        .returning({ id: knowledgeSources.id })
+      expect(matched).toHaveLength(1)
+    })
   })
 
   it('bumpKnowledgeVersion increments and returns the new version', async () => {
