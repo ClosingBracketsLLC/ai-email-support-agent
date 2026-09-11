@@ -22,8 +22,11 @@ const GUIDANCE_PLACEHOLDER = [
  * directly (`@aesa/agent/policy`'s `buildReplyPolicy` feeds it to every guardrail gate). Pristine-reset
  * discipline (Phase 1 ruling, `ProfileForm`, also followed by `agent-edit.tsx`): re-seed from `initial`
  * only while nothing has been edited since mount, so a background refetch never clobbers an in-progress edit.
+ * `canManage` false (a plain member) hides "Save guidance" and makes the field read-only — read-only
+ * knowledge for members; the api's own `updateGuidance` is `managerProcedure`-gated regardless, this
+ * just keeps the UI from offering an edit that could never actually save.
  */
-export function GuidanceEditor({ initial }: { initial: string }) {
+export function GuidanceEditor({ initial, canManage }: { initial: string; canManage: boolean }) {
   const trpc = useTRPC()
   const queryClient = useQueryClient()
   const [text, setText] = useState(initial)
@@ -57,13 +60,15 @@ export function GuidanceEditor({ initial }: { initial: string }) {
     <Card testID="guidance-editor">
       <Heading>Operating guidance</Heading>
       <TextField
-        label="Rules the agent should always follow" value={text} onChangeText={onChange}
+        label="Rules the agent should always follow" value={text} onChangeText={onChange} editable={canManage}
         multiline numberOfLines={6} maxLength={GUIDANCE_MAX} placeholder={GUIDANCE_PLACEHOLDER} testID="guidance-text"
       />
       <Muted testID="guidance-counter">{`${text.length}/${GUIDANCE_MAX}`}</Muted>
       {error ? <Banner tone="error">{error}</Banner> : null}
       {saved ? <Banner tone="success">Saved.</Banner> : null}
-      <Button label="Save guidance" onPress={submit} loading={save.isPending} disabled={!dirty || save.isPending} testID="save-guidance" />
+      {canManage ? (
+        <Button label="Save guidance" onPress={submit} loading={save.isPending} disabled={!dirty || save.isPending} testID="save-guidance" />
+      ) : null}
     </Card>
   )
 }

@@ -22,14 +22,14 @@ jest.mock('@/lib/trpc', () => ({
 }))
 
 const teardowns: Array<() => Promise<void> | void> = []
-async function setup() {
+async function setup(canManage = true) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: 0, refetchOnWindowFocus: false, refetchOnReconnect: false }, mutations: { retry: false, gcTime: 0 } },
   })
   function Wrapper({ children }: { children: ReactNode }) {
     return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
   }
-  const rendered = await render(<FlaggedChunks />, { wrapper: Wrapper })
+  const rendered = await render(<FlaggedChunks canManage={canManage} />, { wrapper: Wrapper })
   teardowns.push(rendered.unmount, () => queryClient.unmount())
   return rendered
 }
@@ -71,4 +71,12 @@ test('renders nothing while there are no flagged chunks', async () => {
   mockChunks = []
   await setup()
   await waitFor(() => expect(screen.queryByTestId('flagged-chunks')).toBeNull())
+})
+
+test('canManage: false hides Allow/Delete but keeps the flagged content visible (read-only for a plain member)', async () => {
+  await setup(false)
+  await waitFor(() => expect(screen.getByTestId('flagged-chunk-ch1')).toBeTruthy())
+  expect(screen.getByText('Returns › Sale items')).toBeTruthy()
+  expect(screen.queryByTestId('allow-ch1')).toBeNull()
+  expect(screen.queryByTestId('delete-chunk-ch1')).toBeNull()
 })

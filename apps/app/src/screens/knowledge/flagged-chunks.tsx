@@ -21,9 +21,10 @@ function excerpt(content: string): string {
  * the chunks as a prop, so it stays self-contained (own loading/error/mutation state, like every
  * other card on this screen). Deleting a chunk is a single tap — unlike a source, a flagged chunk was
  * never doing anything useful yet (it is quarantined, never retrieved), so there is nothing a second
- * tap protects against.
+ * tap protects against. `canManage` false (a plain member) hides Allow/Delete — read-only knowledge
+ * for members — but the content itself, and why it was flagged, stays visible either way.
  */
-export function FlaggedChunks() {
+export function FlaggedChunks({ canManage }: { canManage: boolean }) {
   const trpc = useTRPC()
   const flagged = useQuery(trpc.knowledge.flaggedChunks.queryOptions())
   const [error, setError] = useState<string | null>(null)
@@ -49,10 +50,12 @@ export function FlaggedChunks() {
           <Body>{chunk.headingPath.length > 0 ? chunk.headingPath.join(' › ') : chunk.sourceTitle}</Body>
           <Muted>{excerpt(chunk.content)}</Muted>
           {chunk.reason ? <Muted>{chunk.reason}</Muted> : null}
-          <View style={styles.actions}>
-            <Button variant="secondary" label="Allow" onPress={() => { setError(null); unflag.mutate({ chunkId: chunk.id }) }} loading={unflag.isPending} testID={`allow-${chunk.id}`} />
-            <Button variant="danger" label="Delete" onPress={() => { setError(null); del.mutate({ chunkId: chunk.id }) }} loading={del.isPending} testID={`delete-chunk-${chunk.id}`} />
-          </View>
+          {canManage ? (
+            <View style={styles.actions}>
+              <Button variant="secondary" label="Allow" onPress={() => { setError(null); unflag.mutate({ chunkId: chunk.id }) }} loading={unflag.isPending} testID={`allow-${chunk.id}`} />
+              <Button variant="danger" label="Delete" onPress={() => { setError(null); del.mutate({ chunkId: chunk.id }) }} loading={del.isPending} testID={`delete-chunk-${chunk.id}`} />
+            </View>
+          ) : null}
         </View>
       ))}
       {error ? <Banner tone="error">{error}</Banner> : null}

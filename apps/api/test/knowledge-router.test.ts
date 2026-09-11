@@ -110,6 +110,38 @@ describe('knowledge router', () => {
     expect(res.sources[1]).toMatchObject({ kind: 'upload', status: 'processing', mime: 'application/pdf', byteSize: 1234, crawlProgress: null })
   })
 
+  it('list returns caps resolved the SAME way the mutations clamp with (org override wins over the plan default), and canManage false for a plain member', async () => {
+    const org = await seedOrg()
+    const defaults = await org.c.knowledge.list.query()
+    // Core settings-catalog defaults (packages/core/src/settings-catalog.ts): a brand-new org with no
+    // org_settings override and no plan override sits on the code defaults.
+    expect(defaults.caps).toEqual({ maxSources: 100, maxCrawlPages: 200 })
+    expect(defaults.canManage).toBe(true)
+
+    await setCap(org.orgId, 'knowledge.max_sources', 5)
+    await setCap(org.orgId, 'knowledge.max_crawl_pages', 7)
+    const overridden = await org.c.knowledge.list.query()
+    expect(overridden.caps).toEqual({ maxSources: 5, maxCrawlPages: 7 })
+
+    // A plain member sees the same caps but canManage: false — same invite → accept → set-active
+    // round trip team.test.ts's "accept" case uses.
+    const memberEmail = `knowledge-member-${seq}@example.com`
+    const memberSignIn = await signInWithOtp(t.app, t.mail, memberEmail, 'Bob')
+    const { invitationId } = await org.c.team.invite.mutate({ email: memberEmail, role: 'member' })
+    await t.app.inject({
+      method: 'POST', url: '/api/auth/organization/accept-invitation',
+      headers: { origin: WEB, cookie: memberSignIn.cookie, 'content-type': 'application/json' }, payload: { invitationId },
+    })
+    await t.app.inject({
+      method: 'POST', url: '/api/auth/organization/set-active',
+      headers: { origin: WEB, cookie: memberSignIn.cookie, 'content-type': 'application/json' }, payload: { organizationId: org.orgId },
+    })
+    const memberClient = client(base, memberSignIn.cookie)
+    const asMember = await memberClient.knowledge.list.query()
+    expect(asMember.canManage).toBe(false)
+    expect(asMember.caps).toEqual({ maxSources: 5, maxCrawlPages: 7 })
+  })
+
   // ── startUpload / completeUpload ────────────────────────────────────────
 
   it('startUpload presigns a PUT and audits; completeUpload enqueues knowledge.ingest; a wrong kind is BAD_REQUEST', async () => {

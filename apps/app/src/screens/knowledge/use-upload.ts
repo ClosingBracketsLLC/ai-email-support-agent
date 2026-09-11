@@ -2,24 +2,48 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
 import { KNOWLEDGE_MAX_UPLOAD_BYTES, KNOWLEDGE_UPLOAD_MIMES, type KnowledgeUploadMime } from '@aesa/contracts'
 import { useTRPC } from '@/lib/trpc'
-import { uploadToPresignedUrl, type PickedFile } from '@/lib/upload'
+import { inferMime, uploadToPresignedUrl, type PickedFile } from '@/lib/upload'
 
 export type UploadProgress = 'signing' | 'uploading' | 'queued' | 'failed'
-export interface PendingUpload { name: string; progress: UploadProgress }
+/** Every `failed` `PendingUpload` carries one — always renderable in the owner's own words next to
+ * the progress label (`source-cards.tsx`'s `UPLOAD_REASON_LABEL`). */
+export type UploadFailureReason = 'too_large' | 'wrong_type' | 'unknown_size' | 'cap' | 'upload_failed'
+export interface PendingUpload { id: string; name: string; progress: UploadProgress; reason: UploadFailureReason | null }
+export interface StartUploadOutcome { stoppedBy: 'cap' | null }
 
 function isKnowledgeMime(mime: string): mime is KnowledgeUploadMime {
   return (KNOWLEDGE_UPLOAD_MIMES as readonly string[]).includes(mime)
 }
-function isAcceptable(file: PickedFile): boolean {
-  return file.size <= KNOWLEDGE_MAX_UPLOAD_BYTES && isKnowledgeMime(file.mime)
+
+/** A stable per-pick id, decoupled from the file's own name (two picks — or two files dropped in the
+ * same batch — can share one): `crypto.randomUUID` where the runtime has it, the pick's own index
+ * otherwise. Never the file name, which `pending`'s list key used to be. */
+function pickId(index: number): string {
+  return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : `pick-${index}`
+}
+
+/** The refusal a file earns before it ever reaches the network — `null` means it's acceptable.
+ * Mime is inferred from the extension FIRST (`inferMime`), so a browser's empty `File.type` for a
+ * `.md` drop, or a native picker's absent `mimeType`, never reads as `wrong_type` on its own. */
+function refusalReason(file: PickedFile): UploadFailureReason | null {
+  if (file.size === null) return 'unknown_size'
+  if (file.size > KNOWLEDGE_MAX_UPLOAD_BYTES) return 'too_large'
+  if (!isKnowledgeMime(inferMime(file.name, file.mime))) return 'wrong_type'
+  return null
+}
+
+function errorCode(err: unknown): string | undefined {
+  return (err as { data?: { code?: string } } | null)?.data?.code
 }
 
 /**
  * The Upload card's own pipeline (spec §Product step 4): one file at a time, in order (`for`, not
- * `Promise.all`) — a predictable "signs → uploads → completes" per file, and a slow or failed file
- * never blocks the ones behind it since each is wrapped in its own try/catch. A file over
- * `KNOWLEDGE_MAX_UPLOAD_BYTES` or outside `KNOWLEDGE_UPLOAD_MIMES` never reaches `knowledge.startUpload`
- * at all — it lands in `pending` as `failed` immediately, before any network call.
+ * `Promise.all`) — a predictable "signs → uploads → completes" per file. A refusal (too large, wrong
+ * type, an unreadable size) never reaches `knowledge.startUpload` at all. A `FORBIDDEN` from
+ * `startUpload` (the plan's source cap, `checkSourceCap` in `apps/api/src/knowledge/service.ts`)
+ * stops the WHOLE batch immediately — every file still waiting its turn is marked `failed`/`cap`
+ * without ever being signed — and `start` resolves `{ stoppedBy: 'cap' }` so `SourceCards` can raise
+ * the shared cap banner instead of a generic per-file failure.
  */
 export function useUpload() {
   const trpc = useTRPC()
@@ -28,27 +52,45 @@ export function useUpload() {
   const completeUpload = useMutation(trpc.knowledge.completeUpload.mutationOptions())
   const [pending, setPending] = useState<PendingUpload[]>([])
 
-  function setProgress(name: string, progress: UploadProgress) {
-    setPending((prev) => prev.map((p) => (p.name === name ? { ...p, progress } : p)))
+  function setProgress(id: string, progress: UploadProgress, reason: UploadFailureReason | null) {
+    setPending((prev) => prev.map((p) => (p.id === id ? { ...p, progress, reason } : p)))
   }
 
-  async function start(files: PickedFile[]) {
-    setPending(files.map((f) => ({ name: f.name, progress: isAcceptable(f) ? 'signing' : 'failed' })))
+  async function start(files: PickedFile[]): Promise<StartUploadOutcome> {
+    const ids = files.map((_, i) => pickId(i))
+    setPending(files.map((f, i) => {
+      const reason = refusalReason(f)
+      return { id: ids[i]!, name: f.name, progress: reason ? 'failed' : 'signing', reason }
+    }))
 
-    for (const file of files) {
-      if (!isAcceptable(file)) continue
+    let stoppedByCap = false
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i]!
+      const id = ids[i]!
+      if (refusalReason(file)) continue // already landed in `pending` as `failed` above
+      if (stoppedByCap) { setProgress(id, 'failed', 'cap'); continue }
+      const size = file.size
+      if (size === null) continue // unreachable — `refusalReason` already filtered this — keeps TS honest
+
       try {
-        const signed = await startUpload.mutateAsync({ fileName: file.name, mime: file.mime as KnowledgeUploadMime, byteSize: file.size })
-        setProgress(file.name, 'uploading')
+        const mime = inferMime(file.name, file.mime) as KnowledgeUploadMime
+        const signed = await startUpload.mutateAsync({ fileName: file.name, mime, byteSize: size })
+        setProgress(id, 'uploading', null)
         await uploadToPresignedUrl({ url: signed.url, headers: signed.headers, file })
         await completeUpload.mutateAsync({ sourceId: signed.sourceId })
-        setProgress(file.name, 'queued')
-      } catch {
-        setProgress(file.name, 'failed')
+        setProgress(id, 'queued', null)
+      } catch (err) {
+        if (errorCode(err) === 'FORBIDDEN') {
+          stoppedByCap = true
+          setProgress(id, 'failed', 'cap')
+        } else {
+          setProgress(id, 'failed', 'upload_failed')
+        }
       }
     }
 
     await queryClient.invalidateQueries({ queryKey: trpc.knowledge.list.queryKey() })
+    return { stoppedBy: stoppedByCap ? 'cap' : null }
   }
 
   return { start, pending }

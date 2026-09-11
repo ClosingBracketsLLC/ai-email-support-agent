@@ -133,9 +133,16 @@ export interface KnowledgeListResult {
   knowledgeVersion: number
   counts: { sources: number; readyChunks: number; flaggedChunks: number }
   sources: KnowledgeSourceView[]
+  /** The SAME org-resolved values `checkSourceCap`/`startCrawl` clamp against (org override > plan
+   * default > code default) — the app's own page-cap control and cap-reached copy read these rather
+   * than hard-coding a number the api could silently outgrow. */
+  caps: { maxSources: number; maxCrawlPages: number }
+  /** Echoes the caller's own role check (`canManageWorkspace`) — the router resolves it, since role
+   * belongs to `ctx.member`, not to anything this service otherwise reads. */
+  canManage: boolean
 }
 
-export async function listSources(deps: KnowledgeServiceDeps, orgId: string): Promise<KnowledgeListResult> {
+export async function listSources(deps: KnowledgeServiceDeps, orgId: string, canManage: boolean): Promise<KnowledgeListResult> {
   return deps.api.withOrg(orgId, async (tx) => {
     const [workspace] = await tx.select({ knowledgeVersion: workspaces.knowledgeVersion }).from(workspaces).where(eq(workspaces.orgId, orgId)).limit(1)
     const rows = await tx.select(SOURCE_LIST_COLUMNS).from(knowledgeSources).where(eq(knowledgeSources.orgId, orgId)).orderBy(desc(knowledgeSources.createdAt))
@@ -145,10 +152,16 @@ export async function listSources(deps: KnowledgeServiceDeps, orgId: string): Pr
       flagged: sql<number>`count(*) FILTER (WHERE ${knowledgeChunks.injectionFlagged})`,
     }).from(knowledgeChunks).where(eq(knowledgeChunks.orgId, orgId))
 
+    const settings = await loadOrgSettings(tx, ['knowledge.max_sources', 'knowledge.max_crawl_pages'])
+    const maxSources = resolveSetting('knowledge.max_sources', { org: settings })
+    const maxCrawlPages = resolveSetting('knowledge.max_crawl_pages', { org: settings })
+
     return {
       knowledgeVersion: workspace?.knowledgeVersion ?? 0,
       counts: { sources: rows.length, readyChunks: Number(chunkCounts?.ready ?? 0), flaggedChunks: Number(chunkCounts?.flagged ?? 0) },
       sources: rows.map(toSourceView),
+      caps: { maxSources, maxCrawlPages },
+      canManage,
     }
   })
 }

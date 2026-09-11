@@ -12,10 +12,23 @@ interface Source {
   title: string; url: string | null; documentCount: number; chunkCount: number
   failureReason: string | null; failureDetail: string | null; crawlProgress: unknown
 }
-interface ListData { knowledgeVersion: number; counts: { sources: number; readyChunks: number; flaggedChunks: number }; sources: Source[] }
+interface ListData {
+  knowledgeVersion: number
+  counts: { sources: number; readyChunks: number; flaggedChunks: number }
+  sources: Source[]
+  caps: { maxSources: number; maxCrawlPages: number }
+  canManage: boolean
+}
+
+const DEFAULT_CAPS = { maxSources: 100, maxCrawlPages: 200 }
+
+function defaultListData(): ListData {
+  return { knowledgeVersion: 0, counts: { sources: 0, readyChunks: 0, flaggedChunks: 0 }, sources: [], caps: DEFAULT_CAPS, canManage: true }
+}
 
 let mockWorkspace = { websiteUrl: 'https://acme.example.com', operatingGuidance: '' }
-let mockListData: ListData = { knowledgeVersion: 0, counts: { sources: 0, readyChunks: 0, flaggedChunks: 0 }, sources: [] }
+let mockWorkspaceImpl: () => Promise<typeof mockWorkspace> = () => Promise.resolve(mockWorkspace)
+let mockListData: ListData = defaultListData()
 let mockListImpl: () => Promise<ListData> = () => Promise.resolve(mockListData)
 let mockListQueryCalls = 0
 const mockAdvanceCalls: unknown[] = []
@@ -30,7 +43,10 @@ jest.mock('expo-document-picker', () => ({ getDocumentAsync: jest.fn(() => Promi
 jest.mock('@/lib/trpc', () => ({
   useTRPC: () => ({
     workspace: {
-      get: { queryOptions: () => ({ queryKey: ['workspace', 'get'], queryFn: () => Promise.resolve(mockWorkspace) }), queryKey: () => ['workspace', 'get'] },
+      get: {
+        queryOptions: () => ({ queryKey: ['workspace', 'get'], queryFn: () => mockWorkspaceImpl() }),
+        queryKey: () => ['workspace', 'get'],
+      },
       updateGuidance: { mutationOptions: (o: object) => ({ mutationFn: () => Promise.resolve(mockWorkspace), ...o }) },
       advanceOnboarding: { mutationOptions: (o: object) => ({ mutationFn: () => { mockAdvanceCalls.push(true); return mockAdvanceImpl() }, ...o }) },
     },
@@ -74,9 +90,17 @@ function sourceRow(overrides: Partial<Source> = {}): Source {
   return { id: 's1', kind: 'crawl', status: 'processing', title: 'https://acme.example.com', url: 'https://acme.example.com', documentCount: 0, chunkCount: 0, failureReason: null, failureDetail: null, crawlProgress: null, ...overrides }
 }
 
+/** A promise this test resolves by hand — same idiom `use-gate.test.tsx` uses. */
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((res) => { resolve = res })
+  return { promise, resolve }
+}
+
 beforeEach(() => {
   mockWorkspace = { websiteUrl: 'https://acme.example.com', operatingGuidance: '' }
-  mockListData = { knowledgeVersion: 0, counts: { sources: 0, readyChunks: 0, flaggedChunks: 0 }, sources: [] }
+  mockWorkspaceImpl = () => Promise.resolve(mockWorkspace)
+  mockListData = defaultListData()
   mockListImpl = () => Promise.resolve(mockListData)
   mockListQueryCalls = 0
   mockAdvanceCalls.length = 0
@@ -86,11 +110,11 @@ beforeEach(() => {
 })
 afterEach(async () => { for (const teardown of teardowns.splice(0)) await teardown() })
 
-test('shows the live "Ready: N sources · M chunks" counter', async () => {
-  mockListData = { knowledgeVersion: 1, counts: { sources: 3, readyChunks: 212, flaggedChunks: 0 }, sources: [] }
+test('shows the live "Ready: N of M sources · P chunks" counter', async () => {
+  mockListData = { knowledgeVersion: 1, counts: { sources: 3, readyChunks: 212, flaggedChunks: 0 }, sources: [], caps: DEFAULT_CAPS, canManage: true }
   await setup()
   await waitFor(() => expect(screen.getByTestId('knowledge-counter')).toBeTruthy())
-  expect(screen.getByText('Ready: 3 sources · 212 chunks')).toBeTruthy()
+  expect(screen.getByText('Ready: 3 of 100 sources · 212 chunks')).toBeTruthy()
 })
 
 test('polls knowledge.list while a source is queued or processing, and stops once it turns ready', async () => {
@@ -98,7 +122,7 @@ test('polls knowledge.list while a source is queued or processing, and stops onc
   mockListImpl = () => {
     call += 1
     const status = call < 3 ? 'processing' : 'ready'
-    mockListData = { knowledgeVersion: 1, counts: { sources: 1, readyChunks: 0, flaggedChunks: 0 }, sources: [sourceRow({ status })] }
+    mockListData = { knowledgeVersion: 1, counts: { sources: 1, readyChunks: 0, flaggedChunks: 0 }, sources: [sourceRow({ status })], caps: DEFAULT_CAPS, canManage: true }
     return Promise.resolve(mockListData)
   }
   await setup('settings', 5)
@@ -117,7 +141,7 @@ test('onboarding: Continue is disabled with zero sources', async () => {
 })
 
 test('onboarding: Continue is enabled once at least one source exists and none is processing', async () => {
-  mockListData = { knowledgeVersion: 1, counts: { sources: 1, readyChunks: 5, flaggedChunks: 0 }, sources: [sourceRow({ status: 'ready' })] }
+  mockListData = { knowledgeVersion: 1, counts: { sources: 1, readyChunks: 5, flaggedChunks: 0 }, sources: [sourceRow({ status: 'ready' })], caps: DEFAULT_CAPS, canManage: true }
   await setup('onboarding')
   await waitFor(() => expect(screen.getByTestId('continue').props.accessibilityState.disabled).toBe(false))
 })
@@ -139,4 +163,42 @@ test('settings mode renders without the onboarding stepper or Continue/Skip', as
   await waitFor(() => expect(screen.getByTestId('knowledge')).toBeTruthy())
   expect(screen.queryByTestId('continue')).toBeNull()
   expect(screen.queryByTestId('skip')).toBeNull()
+})
+
+test('onboarding: the loading gate keeps the Stepper shell, the way MailboxStep does', async () => {
+  const gate = deferred<ListData>()
+  mockListImpl = () => gate.promise
+  await setup('onboarding')
+
+  await waitFor(() => expect(screen.getByTestId('onboarding-knowledge')).toBeTruthy())
+  expect(screen.getByTestId('step-knowledge')).toBeTruthy()
+  expect(screen.getByTestId('loading')).toBeTruthy()
+
+  gate.resolve(defaultListData())
+  await waitFor(() => expect(screen.queryByTestId('loading')).toBeNull())
+})
+
+test('a load failure shows an error banner with a working "Try again", and Skip stays available in onboarding', async () => {
+  mockListImpl = () => Promise.reject(new Error('network down'))
+  await setup('onboarding')
+
+  await waitFor(() => expect(screen.getByTestId('knowledge-retry')).toBeTruthy())
+  expect(screen.getByTestId('step-knowledge')).toBeTruthy()
+  expect(screen.getByTestId('skip')).toBeTruthy()
+
+  const callsBeforeRetry = mockListQueryCalls
+  mockListImpl = () => Promise.resolve(defaultListData())
+  await fireEvent.press(screen.getByTestId('knowledge-retry'))
+  await waitFor(() => expect(mockListQueryCalls).toBeGreaterThan(callsBeforeRetry))
+  await waitFor(() => expect(screen.getByTestId('knowledge-counter')).toBeTruthy())
+})
+
+test('canManage: false hides the add cards behind a read-only notice, but still shows the list/guidance/gaps', async () => {
+  mockListData = { ...defaultListData(), canManage: false }
+  await setup('settings')
+  await waitFor(() => expect(screen.getByTestId('knowledge-readonly')).toBeTruthy())
+  expect(screen.getByText('Only owners and admins can change knowledge.')).toBeTruthy()
+  expect(screen.queryByTestId('crawl-card')).toBeNull()
+  expect(screen.getByTestId('guidance-editor')).toBeTruthy()
+  expect(screen.queryByTestId('save-guidance')).toBeNull()
 })

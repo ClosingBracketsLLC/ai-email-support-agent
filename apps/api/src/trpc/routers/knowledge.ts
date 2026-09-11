@@ -5,7 +5,7 @@
  * (adding, removing or re-queuing a knowledge source is workspace management).
  */
 import { TRPCError } from '@trpc/server'
-import { ChunkIdInput, CompleteUploadInput, PasteInput, SourceIdInput, StartCrawlInput, StartUploadInput } from '@aesa/contracts'
+import { canManageWorkspace, ChunkIdInput, CompleteUploadInput, PasteInput, SourceIdInput, StartCrawlInput, StartUploadInput } from '@aesa/contracts'
 import type { AuditActor } from '@aesa/db'
 import type { ObjectStore } from '@aesa/knowledge/storage'
 import type pino from 'pino'
@@ -42,7 +42,7 @@ function knowledgeError(code: 'not_found' | 'forbidden_cap' | 'bad_request', mes
 }
 
 export const knowledgeRouter = router({
-  list: orgProcedure.query(({ ctx }) => listSources(serviceDeps(ctx), ctx.orgId)),
+  list: orgProcedure.query(({ ctx }) => listSources(serviceDeps(ctx), ctx.orgId, canManageWorkspace(ctx.member.role))),
 
   startUpload: managerProcedure.input(StartUploadInput).mutation(async ({ ctx, input }) => {
     const res = await startUpload(serviceDeps(ctx), ctx.orgId, appActor(ctx), input)

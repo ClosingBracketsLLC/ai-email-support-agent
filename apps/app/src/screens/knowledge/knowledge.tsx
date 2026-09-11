@@ -33,7 +33,10 @@ export interface KnowledgeScreenProps {
  * (`app/(app)/settings/knowledge.tsx`) and onboarding step 3 (`screens/onboarding/knowledge.tsx`'s
  * `KnowledgeStep`). Three "add knowledge" cards, a live counter that polls while anything is still
  * queued or processing, the source list, flagged content (only while any exists), the guidance
- * editor, and the gaps report — plus, in onboarding mode only, Continue/Skip.
+ * editor, and the gaps report — plus, in onboarding mode only, Continue/Skip. `knowledge.list`'s
+ * `canManage` (the caller's own role, resolved server-side) gates the three add cards, every
+ * Delete/Refresh/Allow, and the guidance editor's Save: a plain member gets a read-only view of the
+ * SAME data, never a call that would just 403.
  */
 export function KnowledgeScreen({ mode, pollMs = POLL_MS_DEFAULT }: KnowledgeScreenProps) {
   const trpc = useTRPC()
@@ -46,29 +49,69 @@ export function KnowledgeScreen({ mode, pollMs = POLL_MS_DEFAULT }: KnowledgeScr
   }))
 
   const refreshList = () => { void list.refetch() }
-
+  function retry() {
+    void ws.refetch()
+    void list.refetch()
+  }
   function handleSkip() {
     if (!skipConfirming) { setSkipConfirming(true); return }
     advance.mutate()
   }
 
-  if (!ws.data || !list.data) return <Loading />
+  const testID = mode === 'onboarding' ? 'onboarding-knowledge' : 'knowledge'
+  const hasError = ws.isError || list.isError
 
-  const canContinue = list.data.counts.sources > 0 && !list.data.sources.some((s) => s.status === 'processing')
+  // Loading and error both keep the SAME shell (Screen + Stepper) `MailboxStep` keeps for its own
+  // loading gate, rather than returning a bare `<Loading />` with no onboarding chrome — and in
+  // onboarding mode, "Skip for now" stays available even if the load itself failed, so a knowledge
+  // outage can never strand someone mid-funnel.
+  if (!ws.data || !list.data) {
+    return (
+      <Screen testID={testID}>
+        {mode === 'onboarding' ? <Stepper current="knowledge" /> : null}
+        <Heading>Knowledge</Heading>
+        {hasError ? (
+          <>
+            <Banner tone="error">Could not load your knowledge base.</Banner>
+            <Button label="Try again" onPress={retry} testID="knowledge-retry" />
+            {mode === 'onboarding' ? (
+              <>
+                {skipConfirming ? <Banner tone="info">Without knowledge the agent answers from your profile and guidance only</Banner> : null}
+                <Button
+                  variant={skipConfirming ? 'danger' : 'secondary'}
+                  label={skipConfirming ? 'Confirm skip' : 'Skip for now'}
+                  onPress={handleSkip} loading={advance.isPending} testID="skip"
+                />
+              </>
+            ) : null}
+          </>
+        ) : (
+          <Loading />
+        )}
+      </Screen>
+    )
+  }
+
+  const { caps, canManage, counts, sources } = list.data
+  const canContinue = counts.sources > 0 && !sources.some((s) => s.status === 'processing')
 
   return (
-    <Screen testID={mode === 'onboarding' ? 'onboarding-knowledge' : 'knowledge'}>
+    <Screen testID={testID}>
       {mode === 'onboarding' ? <Stepper current="knowledge" /> : null}
       <Heading>Knowledge</Heading>
 
-      <SourceCards websiteUrl={ws.data.websiteUrl} />
+      {canManage ? (
+        <SourceCards websiteUrl={ws.data.websiteUrl} caps={caps} />
+      ) : (
+        <Muted testID="knowledge-readonly">Only owners and admins can change knowledge.</Muted>
+      )}
 
-      <Muted testID="knowledge-counter">{`Ready: ${list.data.counts.sources} sources · ${list.data.counts.readyChunks} chunks`}</Muted>
-      <SourceList sources={list.data.sources} onChanged={refreshList} />
+      <Muted testID="knowledge-counter">{`Ready: ${counts.sources} of ${caps.maxSources} sources · ${counts.readyChunks} chunks`}</Muted>
+      <SourceList sources={sources} onChanged={refreshList} canManage={canManage} />
 
-      {list.data.counts.flaggedChunks > 0 ? <FlaggedChunks /> : null}
+      {counts.flaggedChunks > 0 ? <FlaggedChunks canManage={canManage} /> : null}
 
-      <GuidanceEditor initial={ws.data.operatingGuidance} />
+      <GuidanceEditor initial={ws.data.operatingGuidance} canManage={canManage} />
 
       <GapsCard />
 

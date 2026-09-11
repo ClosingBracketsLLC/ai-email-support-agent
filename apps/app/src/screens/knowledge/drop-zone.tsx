@@ -16,7 +16,11 @@ export function DropZone({ onFiles, disabled }: DropZoneProps) {
   async function pick() {
     const result = await DocumentPicker.getDocumentAsync({ type: [...KNOWLEDGE_UPLOAD_MIMES], multiple: true, copyToCacheDirectory: true })
     if (result.canceled || !result.assets) return
-    onFiles(result.assets.map((a) => ({ name: a.name, mime: a.mimeType ?? 'application/octet-stream', size: a.size ?? 0, uri: a.uri, file: a.file })))
+    // `mimeType`/`size` are both optional on `DocumentPickerAsset` — an absent MIME is left empty
+    // (`use-upload.ts`'s `inferMime` guesses from the extension before ever refusing it as
+    // `wrong_type`) and an absent size stays `null`, never defaulted to `0` (a `0`-byte file would
+    // silently pass the client-side size cap and only fail once it reaches the server).
+    onFiles(result.assets.map((a) => ({ name: a.name, mime: a.mimeType ?? '', size: a.size ?? null, uri: a.uri, file: a.file })))
   }
   return <Button variant="secondary" label="Choose files" onPress={pick} disabled={disabled} testID="drop-zone-picker" />
 }

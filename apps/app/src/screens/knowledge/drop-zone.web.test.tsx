@@ -1,30 +1,77 @@
-import { fireEvent, render, screen } from '@testing-library/react-native'
-import { DropZone } from './drop-zone.web'
+import { bindDropZone, type DropZoneNode } from './drop-zone.web'
 
-/**
- * A direct smoke test only — jest-expo's default project resolves the platform-suffixed sibling
- * `drop-zone.tsx` for every other test in this suite (`knowledge.test.tsx` included), so this file is
- * the only place `drop-zone.web.tsx` is ever mounted (task brief, "Platform files").
- */
-test('a drop with files calls onFiles', async () => {
-  const onFiles = jest.fn()
-  await render(<DropZone onFiles={onFiles} />)
-  const zone = screen.getByTestId('drop-zone')
+const DRAG_EVENTS = ['dragenter', 'dragover', 'dragleave', 'drop'] as const
 
-  const file = { name: 'notes.pdf', type: 'application/pdf', size: 42 } as unknown as File
-  await fireEvent(zone, 'drop', { preventDefault: () => {}, dataTransfer: { files: [file] } })
+/** A fake DOM node — no jsdom, no react-native-web — that records listeners the way a real
+ * `EventTarget` would, and lets a test dispatch a fabricated event straight to them. */
+class FakeNode implements DropZoneNode {
+  private listeners = new Map<string, Set<EventListener>>()
+  addEventListener(type: string, listener: EventListener) {
+    if (!this.listeners.has(type)) this.listeners.set(type, new Set())
+    this.listeners.get(type)!.add(listener)
+  }
+  removeEventListener(type: string, listener: EventListener) {
+    this.listeners.get(type)?.delete(listener)
+  }
+  countFor(type: string): number {
+    return this.listeners.get(type)?.size ?? 0
+  }
+  dispatch(type: string, event: unknown) {
+    for (const listener of this.listeners.get(type) ?? []) listener(event as Event)
+  }
+}
 
-  expect(onFiles).toHaveBeenCalledTimes(1)
-  expect(onFiles).toHaveBeenCalledWith([{ name: 'notes.pdf', mime: 'application/pdf', size: 42, uri: 'notes.pdf', file }])
+function fakeDragEvent(dataTransfer?: { files: File[] }) {
+  return { preventDefault: jest.fn(), dataTransfer }
+}
+
+test('binds all four drag events', () => {
+  const node = new FakeNode()
+  bindDropZone(node, { onFiles: jest.fn() })
+  for (const type of DRAG_EVENTS) expect(node.countFor(type)).toBe(1)
 })
 
-test('disabled ignores a drop', async () => {
+test('preventDefault is called on every one of the four events', () => {
+  const node = new FakeNode()
+  bindDropZone(node, { onFiles: jest.fn() })
+  for (const type of DRAG_EVENTS) {
+    const event = fakeDragEvent()
+    node.dispatch(type, event)
+    expect(event.preventDefault).toHaveBeenCalledTimes(1)
+  }
+})
+
+test('drop hands the dropped files to onFiles', () => {
+  const node = new FakeNode()
   const onFiles = jest.fn()
-  await render(<DropZone onFiles={onFiles} disabled />)
-  const zone = screen.getByTestId('drop-zone')
-
+  bindDropZone(node, { onFiles })
   const file = { name: 'notes.pdf', type: 'application/pdf', size: 42 } as unknown as File
-  await fireEvent(zone, 'drop', { preventDefault: () => {}, dataTransfer: { files: [file] } })
+  node.dispatch('drop', fakeDragEvent({ files: [file] }))
+  expect(onFiles).toHaveBeenCalledTimes(1)
+  expect(onFiles).toHaveBeenCalledWith([file])
+})
 
-  expect(onFiles).not.toHaveBeenCalled()
+test('a drop with no dataTransfer files calls onFiles with an empty array', () => {
+  const node = new FakeNode()
+  const onFiles = jest.fn()
+  bindDropZone(node, { onFiles })
+  node.dispatch('drop', fakeDragEvent(undefined))
+  expect(onFiles).toHaveBeenCalledWith([])
+})
+
+test('onDragState toggles true on dragenter and false on drop', () => {
+  const node = new FakeNode()
+  const onDragState = jest.fn()
+  bindDropZone(node, { onFiles: jest.fn(), onDragState })
+  node.dispatch('dragenter', fakeDragEvent())
+  expect(onDragState).toHaveBeenLastCalledWith(true)
+  node.dispatch('drop', fakeDragEvent({ files: [] }))
+  expect(onDragState).toHaveBeenLastCalledWith(false)
+})
+
+test('the returned unbind removes all four listeners', () => {
+  const node = new FakeNode()
+  const unbind = bindDropZone(node, { onFiles: jest.fn() })
+  unbind()
+  for (const type of DRAG_EVENTS) expect(node.countFor(type)).toBe(0)
 })

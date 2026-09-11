@@ -56,9 +56,10 @@ function subtitleFor(s: SourceRow): string {
  * The source list (spec §Product step 4): one `Card` per source, its status `Chip`, a crawl's
  * progress line, "Refresh" for a crawl sitting `ready`/`failed` (the only statuses `refreshCrawl`
  * actually accepts server-side — `apps/api/src/knowledge/service.ts`), and a two-tap "Delete" (the
- * same idiom `agent-edit.tsx`'s disable button and `mailboxes.tsx`'s disconnect use).
+ * same idiom `agent-edit.tsx`'s disable button and `mailboxes.tsx`'s disconnect use). `canManage`
+ * false (a plain member) hides both actions entirely — read-only knowledge for members.
  */
-export function SourceList({ sources, onChanged }: { sources: SourceRow[]; onChanged: () => void }) {
+export function SourceList({ sources, onChanged, canManage }: { sources: SourceRow[]; onChanged: () => void; canManage: boolean }) {
   const trpc = useTRPC()
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -91,27 +92,37 @@ export function SourceList({ sources, onChanged }: { sources: SourceRow[]; onCha
 
   return (
     <View style={styles.stack}>
-      {sources.map((s) => (
-        <Card key={s.id} testID={`source-${s.id}`}>
-          <ListRow title={s.title} subtitle={subtitleFor(s)} />
-          <Chip tone={STATUS_TONE[s.status]} testID={`source-status-${s.id}`}>{chipLabel(s)}</Chip>
-          {s.kind === 'crawl' && s.crawlProgress ? (
-            <Muted testID={`crawl-progress-${s.id}`}>
-              {`${s.crawlProgress.ingested}/${s.crawlProgress.fetched} pages ingested${s.crawlProgress.skipped > 0 ? ` · ${s.crawlProgress.skipped} skipped` : ''}`}
-            </Muted>
-          ) : null}
-          <View style={styles.actions}>
-            {s.kind === 'crawl' && (s.status === 'ready' || s.status === 'failed') ? (
-              <Button variant="secondary" label="Refresh" onPress={() => handleRefresh(s.id)} loading={refreshCrawl.isPending} testID={`refresh-${s.id}`} />
+      {sources.map((s) => {
+        // Both mutations are ONE shared instance across every row — `.isPending` alone would show
+        // every row's button spinning while only one source is actually being refreshed/deleted.
+        // `.variables` is whichever row's own call is in flight, so an armed "Confirm delete" on a
+        // DIFFERENT row keeps showing its label instead of flickering to a spinner that isn't its own.
+        const refreshingThis = refreshCrawl.isPending && refreshCrawl.variables?.sourceId === s.id
+        const deletingThis = deleteSource.isPending && deleteSource.variables?.sourceId === s.id
+        return (
+          <Card key={s.id} testID={`source-${s.id}`}>
+            <ListRow title={s.title} subtitle={subtitleFor(s)} />
+            <Chip tone={STATUS_TONE[s.status]} testID={`source-status-${s.id}`}>{chipLabel(s)}</Chip>
+            {s.kind === 'crawl' && s.crawlProgress ? (
+              <Muted testID={`crawl-progress-${s.id}`}>
+                {`${s.crawlProgress.ingested}/${s.crawlProgress.fetched} pages ingested${s.crawlProgress.skipped > 0 ? ` · ${s.crawlProgress.skipped} skipped` : ''}`}
+              </Muted>
             ) : null}
-            <Button
-              variant={confirmingDeleteId === s.id ? 'danger' : 'secondary'}
-              label={confirmingDeleteId === s.id ? 'Confirm delete' : 'Delete'}
-              onPress={() => handleDelete(s.id)} loading={deleteSource.isPending} testID={`delete-${s.id}`}
-            />
-          </View>
-        </Card>
-      ))}
+            {canManage ? (
+              <View style={styles.actions}>
+                {s.kind === 'crawl' && (s.status === 'ready' || s.status === 'failed') ? (
+                  <Button variant="secondary" label="Refresh" onPress={() => handleRefresh(s.id)} loading={refreshingThis} testID={`refresh-${s.id}`} />
+                ) : null}
+                <Button
+                  variant={confirmingDeleteId === s.id ? 'danger' : 'secondary'}
+                  label={confirmingDeleteId === s.id ? 'Confirm delete' : 'Delete'}
+                  onPress={() => handleDelete(s.id)} loading={deletingThis} testID={`delete-${s.id}`}
+                />
+              </View>
+            ) : null}
+          </Card>
+        )
+      })}
       {error ? <Banner tone="error" testID="source-list-error">{error}</Banner> : null}
     </View>
   )

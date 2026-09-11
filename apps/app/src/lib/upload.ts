@@ -1,14 +1,39 @@
 import { Platform } from 'react-native'
 import { uploadAsync } from 'expo-file-system/legacy'
+import type { KnowledgeUploadMime } from '@aesa/contracts'
 
 /** One file chosen by the native picker or the web drop zone — `file` is web-only (the real `File`
- * object, which is what actually goes on the wire there); native streams `uri` instead. */
+ * object, which is what actually goes on the wire there); native streams `uri` instead. `size` is
+ * `null` when the picker/drop couldn't report one (an `expo-document-picker` asset's `size` is
+ * optional) — never defaulted to `0`, which would silently pass the upload-cap check client-side and
+ * only die server-side. */
 export interface PickedFile {
   name: string
   mime: string
-  size: number
+  size: number | null
   uri: string
   file?: File
+}
+
+/** `.pdf`/`.docx`/`.md`/`.txt` → the matching `KNOWLEDGE_UPLOAD_MIMES` entry. */
+const EXTENSION_MIME: Record<string, KnowledgeUploadMime> = {
+  pdf: 'application/pdf',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  md: 'text/markdown',
+  txt: 'text/plain',
+}
+
+/**
+ * A picker or a browser drop can hand back an empty or absent MIME — Chrome reports `File.type ===
+ * ''` for a `.md` drop, and `expo-document-picker`'s `DocumentPickerAsset.mimeType` is optional —
+ * so a bare `declared` string is never enough to decide `wrong_type` on its own. Falls back to the
+ * file's extension first; an unrecognized extension (or no extension) keeps whatever was declared,
+ * even if that is still empty, so the caller's own "not a supported type" check still fires.
+ */
+export function inferMime(name: string, declared: string): string {
+  if (declared) return declared
+  const ext = name.slice(name.lastIndexOf('.') + 1).toLowerCase()
+  return EXTENSION_MIME[ext] ?? declared
 }
 
 /**

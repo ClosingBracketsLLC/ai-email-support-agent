@@ -19,14 +19,14 @@ jest.mock('@/lib/trpc', () => ({
 }))
 
 const teardowns: Array<() => Promise<void> | void> = []
-async function setup(initial = '') {
+async function setup(initial = '', canManage = true) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: 0, refetchOnWindowFocus: false, refetchOnReconnect: false }, mutations: { retry: false, gcTime: 0 } },
   })
   function Wrapper({ children }: { children: ReactNode }) {
     return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
   }
-  const rendered = await render(<GuidanceEditor initial={initial} />, { wrapper: Wrapper })
+  const rendered = await render(<GuidanceEditor initial={initial} canManage={canManage} />, { wrapper: Wrapper })
   teardowns.push(rendered.unmount, () => queryClient.unmount())
   return rendered
 }
@@ -68,4 +68,11 @@ test('a failed save shows an error banner', async () => {
   await fireEvent.changeText(screen.getByTestId('guidance-text'), 'Existing. Edited.')
   await fireEvent.press(screen.getByTestId('save-guidance'))
   await waitFor(() => expect(screen.getByText('Could not save guidance. Try again.')).toBeTruthy())
+})
+
+test('canManage: false hides Save and makes the field read-only (read-only for a plain member)', async () => {
+  await setup('Existing guidance.', false)
+  await waitFor(() => expect(screen.getByTestId('guidance-text')).toBeTruthy())
+  expect(screen.getByTestId('guidance-text').props.editable).toBe(false)
+  expect(screen.queryByTestId('save-guidance')).toBeNull()
 })
