@@ -341,10 +341,32 @@ describe('crawlSite', () => {
           delivered.push(pages.map((p) => p.url))
         },
       }),
-    ).rejects.toMatchObject({ name: 'CrawlError', code: 'crawl_failed' })
+    ).rejects.toMatchObject({
+      name: 'CrawlError', code: 'crawl_failed',
+      // `origin` is what tells the caller this was ITS failure, not the site's: the caller re-queues
+      // and retries instead of telling the owner their site is broken. The cause rides along for
+      // logging, and the MESSAGE deliberately carries none of it — a driver message must never end
+      // up in an owner-facing `failure_detail`.
+      origin: 'consumer', message: 'batch persistence failed',
+    })
     // The first batch (b, a) was delivered exactly once, before the second batch's failure aborted
     // the crawl — it is not retried, re-delivered, or rolled back.
     expect(delivered).toEqual([[`${SITE}/b`, `${SITE}/a`]])
+  })
+
+  it("17b. an engine-origin CrawlError is the default, and a consumer one carries its cause", async () => {
+    const site = fakeSite({})
+    // The start URL the engine itself refuses: the crawl could not run at all — terminal for the source.
+    await expect(
+      crawlSite({ startUrl: 'http://acme.example', maxPages: 1, delayMs: 0, fetch: site.fetch, resolver: site.resolver, signal: signal(), onBatch: async () => {} }),
+    ).rejects.toMatchObject({ origin: 'engine' })
+    expect(new CrawlError('crawl_failed').origin).toBe('engine')
+
+    const boom = new Error('connection terminated unexpectedly')
+    const wrapped = new CrawlError('crawl_failed', 'batch persistence failed', { origin: 'consumer', cause: boom })
+    expect(wrapped.origin).toBe('consumer')
+    expect(wrapped.cause).toBe(boom)
+    expect(wrapped.message).not.toContain('connection terminated')
   })
 
   it('18. the start URL is queued before sitemap seeds, so a full frontier cap never silently drops the homepage (review finding 5)', async () => {

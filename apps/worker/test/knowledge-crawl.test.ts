@@ -18,7 +18,8 @@ import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
 import { createHashEmbedder, createMemoryStore } from '@aesa/knowledge'
 import { fakeSite } from '@aesa/knowledge/testing'
-import { runKnowledgeCrawl } from '../src/jobs/knowledge-crawl.ts'
+import { CRAWL_LEASE_SECONDS, knowledgeCrawlJob, runKnowledgeCrawl } from '../src/jobs/knowledge-crawl.ts'
+import { guardedSourceWrite } from '../src/knowledge/sources.ts'
 import type { KnowledgeDeps } from '../src/knowledge-deps.ts'
 
 const rand = () => randomBytes(4).toString('hex')
@@ -38,17 +39,22 @@ function site() {
 
 let t: Awaited<ReturnType<typeof createTestDatabase>>
 let app: ReturnType<typeof createDb>
+/** The table owner: one test revokes a privilege from `aesa_app` to make the batch transaction — and
+ *  only that transaction — fail the way a dropped connection would. */
+let owner: ReturnType<typeof createDb>
 let userId: string
 let orgId: string
 
 beforeAll(async () => {
   t = await createTestDatabase()
   app = createDb(t.url, { role: 'app' })
+  owner = createDb(t.url, { role: 'owner' })
   const [u] = await app.db.insert(user).values({ name: 'Owner', email: `owner-${rand()}@example.com` }).returning()
   userId = u!.id
 })
 afterAll(async () => {
   await app.pool.end()
+  await owner.pool.end()
   await t.drop()
 })
 beforeEach(async () => {
@@ -101,8 +107,8 @@ function makeDeps(pages: Record<string, { body: string }>, over: Partial<Knowled
   return { deps, embedded, hits: fake.hits }
 }
 
-const run = (deps: KnowledgeDeps, sourceId: string) =>
-  runKnowledgeCrawl(deps, { orgId, sourceId }, new AbortController().signal)
+const run = (deps: KnowledgeDeps, sourceId: string, signal = new AbortController().signal) =>
+  runKnowledgeCrawl(deps, { orgId, sourceId }, signal)
 
 describe('knowledge.crawl', () => {
   it('the three-page site becomes three documents, meters crawl_pages, writes progress and lands `ready`', async () => {
@@ -130,7 +136,8 @@ describe('knowledge.crawl', () => {
     expect(progress?.fetched).toBeGreaterThanOrEqual(3)
     expect((source.crawlConfig as { maxPages?: number }).maxPages).toBe(50)
 
-    expect(await knowledgeVersion()).toBeGreaterThanOrEqual(1)
+    // Exactly one bump: three pages under the 20-page first batch is ONE onBatch transaction.
+    expect(await knowledgeVersion()).toBe(1)
     expect(embedded.sort()).toEqual(docs.map((d) => d.id).sort())
     const finished = (await auditRows(sourceId)).filter((r) => r.action === 'knowledge.crawl.finished')
     expect(finished).toHaveLength(1)
@@ -216,6 +223,151 @@ describe('knowledge.crawl', () => {
     expect((await auditRows(sourceId)).filter((r) => r.action === 'knowledge.crawl.finished')).toHaveLength(1)
     // Exactly one of the two ever reached the site.
     expect([a.hits.length === 0, b.hits.length === 0].filter(Boolean)).toHaveLength(1)
+  })
+
+  it('the queue options keep the single retry BEHIND the lease, so it can actually re-claim', () => {
+    // A retry that fires before `CRAWL_LEASE_SECONDS` has lapsed finds the source still `processing`,
+    // cannot claim, and silently does nothing — the delay and the lease are one mechanism.
+    expect(knowledgeCrawlJob.queue).toEqual({ expireInSeconds: 1800, retryLimit: 1, retryDelay: 300, retryBackoff: false, policy: 'short' })
+    expect(CRAWL_LEASE_SECONDS).toBe(300)
+    expect(knowledgeCrawlJob.queue.retryDelay).toBe(CRAWL_LEASE_SECONDS)
+  })
+
+  it('an abort mid-walk re-queues the source and FAILS the job — a partial site is never `ready`', async () => {
+    const sourceId = await seedCrawlSource()
+    const controller = new AbortController()
+    const fake = fakeSite(site())
+    const { deps } = makeDeps(site(), {
+      // Abort once the first real page has been fetched: the walk stops between waves and returns a
+      // PARTIAL summary, which must never be mistaken for a finished crawl.
+      crawlFetch: async (url, init) => {
+        const res = await fake.fetch(url, init)
+        if (!url.endsWith('/robots.txt') && !url.endsWith('/sitemap.xml')) controller.abort()
+        return res
+      },
+      resolver: fake.resolver,
+    })
+
+    await expect(run(deps, sourceId, controller.signal)).rejects.toThrow(/aborted before completion/)
+
+    const source = await getSource(sourceId)
+    expect(source.status).toBe('queued')
+    expect(source.claimToken).toBeNull()
+    expect(source.failureReason).toBeNull()
+    expect(source.completedAt).toBeNull()
+    // Progress survives the hand-back — it is what the owner's screen has been showing.
+    expect((source.crawlConfig as { progress?: { fetched: number } }).progress?.fetched).toBeGreaterThanOrEqual(1)
+    const aborted = (await auditRows(sourceId)).filter((r) => r.action === 'knowledge.crawl.aborted')
+    expect(aborted).toHaveLength(1)
+    expect(aborted[0]!.detail).toMatchObject({ ingested: expect.any(Number), fetched: expect.any(Number) })
+    expect((await auditRows(sourceId)).some((r) => r.action === 'knowledge.crawl.finished')).toBe(false)
+  })
+
+  it("OUR persistence failing (a consumer-origin CrawlError) re-queues and rethrows — the owner's site is never blamed", async () => {
+    const sourceId = await seedCrawlSource()
+    const { deps } = makeDeps(site())
+    // The batch transaction — and only it — fails: the chunk insert loses its privilege. The
+    // document insert and every `knowledge_sources` write still work, so this is precisely the
+    // "onBatch threw" path, not a progress-write failure.
+    await owner.pool.query('REVOKE INSERT ON knowledge_chunks FROM aesa_app')
+    let thrown: unknown
+    try {
+      thrown = await run(deps, sourceId).then(() => null, (err: unknown) => err)
+    } finally {
+      await owner.pool.query('GRANT INSERT ON knowledge_chunks TO aesa_app')
+    }
+    // The ORIGINAL error reaches pg-boss, not the CrawlError wrapper: drizzle's own
+    // `DrizzleQueryError` ("Failed query: insert into knowledge_chunks …") with pg's
+    // "permission denied" on its `cause`.
+    expect(thrown).toBeInstanceOf(Error)
+    expect((thrown as Error).message).toMatch(/insert into "knowledge_chunks"/)
+    expect(String(((thrown as { cause?: { message?: string } }).cause)?.message)).toMatch(/permission denied/)
+
+    const source = await getSource(sourceId)
+    expect(source.status).toBe('queued')          // re-queued for pg-boss's retry, NOT failed
+    expect(source.claimToken).toBeNull()
+    expect(source.failureReason).toBeNull()
+    expect(source.failureDetail).toBeNull()       // no driver message ever reaches the owner
+  })
+
+  it('a crawl carrying an embed failure reason lands `failed` with that reason, not `ready`', async () => {
+    const sourceId = await seedCrawlSource()
+    const fake = fakeSite(site())
+    const { deps } = makeDeps(site(), {
+      // What `knowledge.embed-batch` does to a crawl source: records the reason, touches no status.
+      crawlFetch: async (url, init) => {
+        const res = await fake.fetch(url, init)
+        if (url.endsWith('/b')) {
+          await withOrg(app.db, orgId, (tx) =>
+            tx.update(knowledgeSources).set({ failureReason: 'cap_reached', failureDetail: 'budget used up' }).where(eq(knowledgeSources.id, sourceId)))
+        }
+        return res
+      },
+      resolver: fake.resolver,
+    })
+
+    await run(deps, sourceId)
+
+    const source = await getSource(sourceId)
+    expect(source.status).toBe('failed')
+    expect(source.failureReason).toBe('cap_reached')
+    expect(source.failureDetail).toBe('budget used up')
+    expect(source.completedAt?.toISOString()).toBe(NOW.toISOString())
+    expect((await auditRows(sourceId)).find((r) => r.action === 'knowledge.crawl.finished')!.detail).toMatchObject({ failureReason: 'cap_reached' })
+  })
+
+  it("a lapsed attempt's late writes no-op: the claim token, isolated from the status guard", async () => {
+    const sourceId = await seedCrawlSource({ status: 'processing' })
+    const tokenA = crypto.randomUUID()
+    const tokenB = crypto.randomUUID()
+    await withOrg(app.db, orgId, (tx) => tx.update(knowledgeSources).set({ claimToken: tokenA }).where(eq(knowledgeSources.id, sourceId)))
+    // Attempt B re-claims after A's lease lapsed. The STATUS is `processing` throughout, so only the
+    // token can tell A's late writes apart from B's.
+    await withOrg(app.db, orgId, (tx) => guardedSourceWrite(tx, sourceId, ['processing'], { claimToken: tokenB }, tokenA))
+
+    // Sequential, not Promise.all: one transaction is one connection, and pg refuses to run two
+    // queries on it at once.
+    const [handBack, ready, progress] = await withOrg(app.db, orgId, async (tx) => [
+      await guardedSourceWrite(tx, sourceId, ['processing'], { status: 'queued', claimToken: null }, tokenA),
+      await guardedSourceWrite(tx, sourceId, ['processing'], { status: 'ready', completedAt: NOW }, tokenA),
+      await guardedSourceWrite(tx, sourceId, ['processing'], { documentCount: 99 }, tokenA),
+    ])
+    expect([handBack, ready, progress]).toEqual([false, false, false])
+
+    const source = await getSource(sourceId)
+    expect(source.status).toBe('processing')
+    expect(source.claimToken).toBe(tokenB)
+    expect(source.documentCount).toBe(0)
+    // B still owns it, and its own write lands.
+    expect(await withOrg(app.db, orgId, (tx) => guardedSourceWrite(tx, sourceId, ['processing'], { status: 'ready', claimToken: null }, tokenB))).toBe(true)
+  })
+
+  it("a re-claim while attempt A is still walking: A's landing never overwrites B's", async () => {
+    const sourceId = await seedCrawlSource()
+    const fake = fakeSite(site())
+    const b = makeDeps({})   // B crawls a site with no pages at all, so it lands `crawl_no_pages`
+    const { deps } = makeDeps(site(), {
+      crawlFetch: async (url, init) => {
+        const res = await fake.fetch(url, init)
+        if (url.endsWith('/robots.txt')) {
+          // A's lease lapses and B takes the source over while A is still walking.
+          await withOrg(app.db, orgId, (tx) =>
+            tx.update(knowledgeSources).set({ updatedAt: new Date(Date.now() - 2 * CRAWL_LEASE_SECONDS * 1000) }).where(eq(knowledgeSources.id, sourceId)))
+          await run(b.deps, sourceId)
+        }
+        return res
+      },
+      resolver: fake.resolver,
+    })
+
+    await run(deps, sourceId)
+
+    const source = await getSource(sourceId)
+    expect(source.status).toBe('failed')             // B's verdict stands
+    expect(source.failureReason).toBe('crawl_no_pages')
+    expect(source.claimToken).toBeNull()
+    expect(source.documentCount).toBe(0)             // A's count updates no-opped too
+    expect((await auditRows(sourceId)).some((r) => r.action === 'knowledge.crawl.finished')).toBe(false)
   })
 
   it('re-enters a `processing` source whose lease has expired (the crashed-mid-crawl retry)', async () => {

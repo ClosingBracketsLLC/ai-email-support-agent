@@ -10,12 +10,19 @@
  * Failure kinds:
  *  - a RETRYABLE `EmbedError` (429, 5xx) rethrows: pg-boss retries with backoff and the rows it
  *    already wrote stay written, so the retry only embeds what is still null.
- *  - a non-retryable one (a bad key, a permanent refusal) fails the source `embed_failed` and returns.
- *  - the org's daily embed-token cap fails the source `cap_reached` before the first call.
+ *  - a non-retryable one (a bad key, a permanent refusal) records `embed_failed` and returns.
+ *  - the org's daily embed-token cap records `cap_reached` before the first call.
+ *
+ * "Records" is not always "fails": on an UPLOAD or PASTE source this job owns the terminal status and
+ * flips it to `failed`, but on a CRAWL source it writes only `failure_reason`/`failure_detail` and
+ * leaves the status alone. A crawl is still walking while its first documents are embedding — flipping
+ * that source to `failed` here would strand a live crawl whose own claim it does not hold. The crawl
+ * job reads the reason at the end of its walk and lands `failed` with it instead of `ready`.
  */
 import { and, asc, eq, isNull, sql } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import { z } from 'zod'
+import type { KnowledgeFailureReason } from '@aesa/contracts'
 import { resolveSetting } from '@aesa/core'
 import {
   audit, bumpMeter, knowledgeChunks, knowledgeDocuments, knowledgeSources, KNOWLEDGE_METERS,
@@ -24,7 +31,7 @@ import {
 import { batchTexts, EmbedError, vectorLiteral } from '@aesa/knowledge'
 import { defineJob, enqueue, JOB_NAMES, registerJob, type JobDefinition } from '@aesa/queue'
 import { utcDayString } from '../date-utils.ts'
-import { failSource, guardedSourceWrite, loadOrgSettings } from '../knowledge/sources.ts'
+import { failSource, FAILURE_DETAIL_MAX, guardedSourceWrite, loadOrgSettings } from '../knowledge/sources.ts'
 import type { KnowledgeDeps } from '../knowledge-deps.ts'
 
 export const KnowledgeEmbedBatchPayload = z.object({ orgId: z.string(), documentId: z.string() })
@@ -49,6 +56,34 @@ interface Pending {
   sourceStatus: string
   chunks: { id: string; content: string }[]
   capExhausted: boolean
+}
+
+/** Records this job's verdict on the source. An ingest source is flipped `failed` outright; a crawl
+ * source only carries the reason, and `knowledge.crawl`'s end transition turns it into a status. */
+async function recordFailure(
+  deps: KnowledgeDeps,
+  orgId: string,
+  pending: Pending,
+  reason: KnowledgeFailureReason,
+  detail: string,
+  now: Date,
+): Promise<void> {
+  if (pending.sourceKind !== 'crawl') {
+    await failSource(deps.db, { orgId, sourceId: pending.sourceId, actor: ACTOR, reason, detail, now })
+    return
+  }
+  await withOrg(deps.db, orgId, async (tx) => {
+    // No status, no claim token: the crawl holds both. Guarded on `processing` all the same, so a
+    // crawl that has already landed keeps whatever verdict it reached.
+    const written = await guardedSourceWrite(tx, pending.sourceId, ['processing'], {
+      failureReason: reason, failureDetail: detail.slice(0, FAILURE_DETAIL_MAX),
+    })
+    if (!written) return
+    await audit(tx, {
+      actor: ACTOR, action: 'knowledge.source.embed_failed', entityType: 'knowledge_source', entityId: pending.sourceId,
+      detail: { reason },
+    })
+  })
 }
 
 /** One read transaction: the document's source, its unembedded chunks, and today's token spend. */
@@ -101,7 +136,7 @@ async function maybeFlipSourceReady(deps: KnowledgeDeps, orgId: string, pending:
       .where(and(eq(knowledgeDocuments.sourceId, pending.sourceId), sql`${knowledgeDocuments.embeddedCount} < ${knowledgeDocuments.chunkCount}`))
     if ((outstanding?.value ?? 0) > 0) return
 
-    const written = await guardedSourceWrite(tx, pending.sourceId, ['processing'], { status: 'ready', completedAt: now })
+    const written = await guardedSourceWrite(tx, pending.sourceId, ['processing'], { status: 'ready', completedAt: now, claimToken: null })
     if (!written) return
     await audit(tx, { actor: ACTOR, action: 'knowledge.source.ready', entityType: 'knowledge_source', entityId: pending.sourceId, detail: {} })
   })
@@ -118,10 +153,10 @@ export async function runKnowledgeEmbedBatch(deps: KnowledgeDeps, payload: Knowl
   if (pending.capExhausted) {
     // The owner sees a failed source rather than a silently half-embedded one; re-running it after
     // midnight UTC is Phase 7's sweep, not this job's business.
-    await failSource(deps.db, {
-      orgId, sourceId: pending.sourceId, actor: ACTOR, reason: 'cap_reached',
-      detail: "the workspace's daily embedding budget is used up; this source resumes after midnight UTC", now,
-    })
+    await recordFailure(
+      deps, orgId, pending, 'cap_reached',
+      "the workspace's daily embedding budget is used up; this source resumes after midnight UTC", now,
+    )
     return
   }
 
@@ -140,7 +175,7 @@ export async function runKnowledgeEmbedBatch(deps: KnowledgeDeps, payload: Knowl
         embedded = await deps.embedder.embed(batch, 'document', signal)
       } catch (err) {
         if (err instanceof EmbedError && !err.retryable) {
-          await failSource(deps.db, { orgId, sourceId: pending.sourceId, actor: ACTOR, reason: 'embed_failed', detail: err.message, now })
+          await recordFailure(deps, orgId, pending, 'embed_failed', err.message, now)
           return
         }
         throw err // retryable (or unknown): pg-boss retries with backoff, already-written rows stand

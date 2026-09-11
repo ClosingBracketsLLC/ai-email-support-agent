@@ -832,6 +832,11 @@ describe('runTicketDraft', () => {
     const [run1] = await runsFor(ticketId)
     expect(run1!.status).toBe('failed')
     expect(run1!.errorCode).toBe('retrieval')
+    // The trace still opens with the prompt event: a run whose ONLY event is `error` says nothing
+    // about what was built, which is exactly what a failed retrieval needs to be debugged.
+    const events = await eventsFor(run1!.id)
+    expect(events.map((e) => e.kind)).toEqual(['prompt', 'error'])
+    expect(events[0]!.payload).toMatchObject({ knowledge: { retrieved: 0, mode: null } })
   })
 
   it('7c. grounding: a detailed retriever fills score/mode/knowledgeVersion, and the prompt event records the retrieval', async () => {

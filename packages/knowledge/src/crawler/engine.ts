@@ -33,11 +33,20 @@ const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
 
 export class CrawlError extends Error {
   code: KnowledgeFailureReason
+  /**
+   * WHOSE failure this was. `engine` is the crawl itself (a refused start URL, a site that gave
+   * nothing) and is terminal for the source — re-walking it would fail identically. `consumer` is
+   * the caller's own `onBatch` throwing: the site was fine and the pages are real, so the caller
+   * should retry rather than tell the owner their site failed. The two used to be indistinguishable,
+   * which turned one dropped database connection into a permanently failed knowledge source.
+   */
+  readonly origin: 'engine' | 'consumer'
 
-  constructor(code: KnowledgeFailureReason, message?: string) {
-    super(message ?? code)
+  constructor(code: KnowledgeFailureReason, message?: string, opts?: { origin?: 'engine' | 'consumer'; cause?: unknown }) {
+    super(message ?? code, opts?.cause === undefined ? undefined : { cause: opts.cause })
     this.name = 'CrawlError'
     this.code = code
+    this.origin = opts?.origin ?? 'engine'
   }
 }
 
@@ -503,7 +512,10 @@ export async function crawlSite(opts: CrawlOptions): Promise<CrawlSummary> {
     }
   } catch (err) {
     if (err instanceof BatchFlushError) {
-      throw new CrawlError('crawl_failed', err.cause instanceof Error ? err.cause.message : String(err.cause))
+      // The message deliberately carries NO detail from `err.cause`: a consumer failure is a driver
+      // or database message, which must never reach an owner-facing `failure_detail`. The cause
+      // rides along on `cause` for the caller's own logging.
+      throw new CrawlError('crawl_failed', 'batch persistence failed', { origin: 'consumer', cause: err.cause })
     }
     throw err
   }

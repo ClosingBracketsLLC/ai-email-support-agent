@@ -10,7 +10,7 @@
  * the throws below are the second line of that same defence, reachable only if the gates drift.
  */
 import type pino from 'pino'
-import { Secret, type Resolver } from '@aesa/crypto'
+import type { Resolver } from '@aesa/crypto'
 import type { Db } from '@aesa/db'
 import {
   createHashEmbedder, createMemoryStore, createS3Store, createVoyageEmbedder, createVoyageReranker,
@@ -36,9 +36,8 @@ export interface KnowledgeDeps {
 
 /** S3 (minio/R2/S3) when configured; in dev/test an in-memory store, which serves paste and crawl fine. */
 export function createKnowledgeStore(config: WorkerConfig, logger: pino.Logger): ObjectStore {
-  if (config.s3) {
-    return createS3Store({ ...config.s3, secretAccessKey: new Secret(config.s3.secretAccessKey) })
-  }
+  // `config.s3.secretAccessKey` is already a `Secret` (loadConfig wraps it); createS3Store takes it as is.
+  if (config.s3) return createS3Store(config.s3)
   if (config.env === 'production') {
     throw new Error('S3_* are required in production when WORKER_ROLES includes `knowledge` (upload storage)')
   }

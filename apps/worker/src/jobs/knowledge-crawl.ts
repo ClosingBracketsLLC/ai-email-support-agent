@@ -8,14 +8,21 @@
  * the next fetch, and `onProgress` writes one tiny row update. The chunking itself is done BEFORE
  * the batch transaction opens — it is pure CPU, and it has no business inside a tenant transaction.
  *
- * Per-org crawl concurrency is 1 (plan deviation 9): the claim below takes
- * `pg_advisory_xact_lock(hashtext('knowledge-crawl:' || org_id))` so two runs for one org can never
- * interleave their claims, and a second run then finds the source already `processing` and returns.
- * The lock is transaction-scoped — it is the CLAIM that serializes, not the crawl, which would
- * otherwise hold a database connection for half an hour. A source stuck `processing` past
- * `CRAWL_LEASE_MS` (the job's own expiry) belongs to a process that is already gone, and the next
- * attempt re-enters it: progress lives in `crawl_config.progress`, so it resumes rather than restarts.
+ * One crawl per SOURCE at a time (plan deviation 9's per-org concurrency is the `knowledge` role's
+ * pg-boss teamSize, not this): the claim below takes
+ * `pg_advisory_xact_lock(hashtext('knowledge-crawl:' || org_id))` so two runs for one ORG can never
+ * interleave their claims, and the `processing` status plus the claim token then keep a second run
+ * off the SAME source. Two different sources of one org still crawl concurrently. The lock is
+ * transaction-scoped — it is the CLAIM that serializes, not the crawl, which would otherwise hold a
+ * database connection for half an hour.
+ *
+ * A source stuck `processing` past `CRAWL_LEASE_SECONDS` belongs to an attempt that is already gone,
+ * and the next attempt re-claims it. That re-entry RE-WALKS the site from the start URL — nothing is
+ * resumed; `crawl_config.progress` is a progress display, not a cursor. Unchanged pages cost a fetch
+ * and then skip on their `content_hash`, so the re-walk is cheap in database terms, not in requests.
+ * The claim token is what keeps the abandoned attempt from writing over the new one if it wakes up.
  */
+import { randomUUID } from 'node:crypto'
 import { and, eq, sql } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import { z } from 'zod'
@@ -39,10 +46,12 @@ export type KnowledgeCrawlPayload = z.infer<typeof KnowledgeCrawlPayload>
 
 const ACTOR = 'system:knowledge.crawl' as const
 
-/** Matches the queue's `expireInSeconds`: past it the run that claimed the source is gone. Measured
+/** How long a claim holds the source. Deliberately SHORTER than the queue's `expireInSeconds` and
+ * equal to its `retryDelay`, so the single retry always fires after the lease has lapsed and can
+ * actually re-claim; a lease as long as the expiry would make every retry a silent no-op. Measured
  * against the DATABASE's clock (`now()`), never an injected one — `updated_at` is written by whoever
  * last touched the row, so a caller's idea of "now" says nothing about how old the claim is. */
-export const CRAWL_LEASE_SECONDS = 1_800
+export const CRAWL_LEASE_SECONDS = 300
 
 /** How many ingested pages the FIRST persistence batch carries ("first 20 pages fast", spec §Knowledge). */
 const FIRST_BATCH = 20
@@ -50,9 +59,11 @@ const FIRST_BATCH = 20
 export const knowledgeCrawlJob: JobDefinition<KnowledgeCrawlPayload> = defineJob({
   name: JOB_NAMES.knowledgeCrawl,
   schema: KnowledgeCrawlPayload,
-  // retryLimit 1: a crawl that died mid-way resumes from `crawl_config.progress`; past that the
-  // owner sees a failed source rather than a site being re-walked over and over.
-  queue: { expireInSeconds: 1800, retryLimit: 1, policy: 'short' },
+  // retryLimit 1 with a FIXED 300 s delay (no backoff): the one retry must land after
+  // `CRAWL_LEASE_SECONDS` has lapsed, otherwise it finds the source still `processing`, cannot
+  // claim, and quietly does nothing. Past that one retry the owner sees a failed source rather than
+  // a site being re-walked over and over.
+  queue: { expireInSeconds: 1800, retryLimit: 1, retryDelay: CRAWL_LEASE_SECONDS, retryBackoff: false, policy: 'short' },
   handler: async () => {
     throw new Error('knowledge.crawl: this definition has no bound deps — register it through registerKnowledgeCrawl(boss, deps)')
   },
@@ -61,6 +72,8 @@ export const knowledgeCrawlJob: JobDefinition<KnowledgeCrawlPayload> = defineJob
 interface ClaimedCrawl {
   url: string
   maxPages: number
+  /** This attempt's claim token: every later write of this run is guarded on it. */
+  token: string
 }
 
 /** `{ maxPages, progress }` — jsonb, so it is read defensively rather than trusted. */
@@ -87,15 +100,16 @@ async function claim(deps: KnowledgeDeps, orgId: string, sourceId: string): Prom
 
     const from: KnowledgeSourceStatus[] =
       row.status === 'queued' ? ['queued'] : row.status === 'processing' && row.stale ? ['processing'] : []
+    const token = randomUUID()
     const claimed = await guardedSourceWrite(tx, sourceId, from, {
-      status: 'processing', failureReason: null, failureDetail: null, completedAt: null,
+      status: 'processing', failureReason: null, failureDetail: null, completedAt: null, claimToken: token,
     })
     if (!claimed) return null
 
     const config = crawlConfigOf(row.crawlConfig)
     const requested = typeof config.maxPages === 'number' && config.maxPages > 0 ? config.maxPages : KNOWLEDGE_DEFAULT_CRAWL_PAGES
     const cap = resolveSetting('knowledge.max_crawl_pages', { org: await loadOrgSettings(tx, ['knowledge.max_crawl_pages']) })
-    return { url: row.url, maxPages: Math.min(requested, cap) }
+    return { url: row.url, maxPages: Math.min(requested, cap), token }
   })
 }
 
@@ -183,7 +197,7 @@ export async function runKnowledgeCrawl(deps: KnowledgeDeps, payload: KnowledgeC
       await guardedSourceWrite(tx, sourceId, ['processing'], {
         documentCount: sql`${knowledgeSources.documentCount} + ${documentDelta}`,
         chunkCount: sql`${knowledgeSources.chunkCount} + ${chunkDelta}`,
-      })
+      }, claimed.token)
       // Same transaction as the chunk set it describes.
       await bumpKnowledgeVersion(tx, orgId)
       await bumpMeter(tx, orgId, day, KNOWLEDGE_METERS.crawlPages, pages.length)
@@ -197,7 +211,13 @@ export async function runKnowledgeCrawl(deps: KnowledgeDeps, payload: KnowledgeC
     await withOrg(deps.db, orgId, (tx) =>
       guardedSourceWrite(tx, sourceId, ['processing'], {
         crawlConfig: sql`${knowledgeSources.crawlConfig} || ${JSON.stringify({ progress })}::jsonb`,
-      }))
+      }, claimed.token))
+  }
+
+  /** Releases the claim so the next attempt can take the source; `crawl_config.progress` stays put. */
+  const handBack = async (): Promise<void> => {
+    await withOrg(deps.db, orgId, (tx) =>
+      guardedSourceWrite(tx, sourceId, ['processing'], { status: 'queued', claimToken: null }, claimed.token))
   }
 
   let summary: CrawlSummary
@@ -213,24 +233,48 @@ export async function runKnowledgeCrawl(deps: KnowledgeDeps, payload: KnowledgeC
       onProgress,
     })
   } catch (err) {
-    // Terminal: a refused start URL, or a persistence failure the engine already unwound.
     if (err instanceof CrawlError) {
-      await failSource(deps.db, { orgId, sourceId, actor: ACTOR, reason: err.code, detail: err.message, now })
+      // The site was fine and our OWN persistence failed: the owner must not be told their site is
+      // broken, and the detail (a driver message) must never reach `failure_detail`. Re-queue and
+      // rethrow the underlying error so pg-boss retries after the lease lapses.
+      if (err.origin === 'consumer') {
+        deps.logger.warn({ sourceId, err: err.cause }, 'knowledge.crawl: batch persistence failed; re-queueing the source')
+        await handBack()
+        throw err.cause ?? err
+      }
+      // Terminal: the crawl itself could not run (a refused start URL, a dead site).
+      await failSource(deps.db, { orgId, sourceId, actor: ACTOR, reason: err.code, detail: err.message, now, claimToken: claimed.token })
       return
     }
-    await withOrg(deps.db, orgId, (tx) => guardedSourceWrite(tx, sourceId, ['processing'], { status: 'queued' }))
+    await handBack()
     throw err
+  }
+
+  // The job's own deadline fired mid-walk (pg-boss's expiry margin, or a shutdown). What was
+  // persisted stands, but the source is NOT `ready` — it has only part of the site. Re-queue it and
+  // fail the job so the one retry re-walks.
+  if (signal.aborted) {
+    await withOrg(deps.db, orgId, async (tx) => {
+      const written = await guardedSourceWrite(tx, sourceId, ['processing'], { status: 'queued', claimToken: null }, claimed.token)
+      if (!written) return
+      await audit(tx, {
+        actor: ACTOR, action: 'knowledge.crawl.aborted', entityType: 'knowledge_source', entityId: sourceId,
+        detail: { fetched: summary.fetched, ingested: summary.ingested },
+      })
+    })
+    throw new Error('knowledge.crawl: aborted before completion')
   }
 
   if (summary.ingested === 0) {
     await failSource(deps.db, {
       orgId, sourceId, actor: ACTOR, reason: 'crawl_no_pages',
       detail: `fetched ${summary.fetched}, skipped ${summary.skipped}, refused ${summary.refused.length}`, now,
+      claimToken: claimed.token,
     })
     return
   }
 
-  // The end: recount rather than trust the per-batch deltas (a concurrent delete, a resumed crawl).
+  // The end: recount rather than trust the per-batch deltas (a concurrent delete, a re-walk).
   await withOrg(deps.db, orgId, async (tx) => {
     const [counts] = await tx
       .select({
@@ -239,16 +283,27 @@ export async function runKnowledgeCrawl(deps: KnowledgeDeps, payload: KnowledgeC
       })
       .from(knowledgeDocuments)
       .where(eq(knowledgeDocuments.sourceId, sourceId))
+    // `knowledge.embed-batch` never flips a crawl source's status — it records its verdict as a
+    // failure reason and leaves the transition here, because only this job knows the walk is over.
+    const [source] = await tx
+      .select({ failureReason: knowledgeSources.failureReason })
+      .from(knowledgeSources)
+      .where(eq(knowledgeSources.id, sourceId))
+    const failed = source?.failureReason != null
     const written = await guardedSourceWrite(tx, sourceId, ['processing'], {
-      status: 'ready',
+      status: failed ? 'failed' : 'ready',
       completedAt: now,
+      claimToken: null,
       documentCount: counts?.documents ?? 0,
       chunkCount: counts?.chunks ?? 0,
-    })
+    }, claimed.token)
     if (!written) return
     await audit(tx, {
       actor: ACTOR, action: 'knowledge.crawl.finished', entityType: 'knowledge_source', entityId: sourceId,
-      detail: { fetched: summary.fetched, ingested: summary.ingested, skipped: summary.skipped, refused: summary.refused.length },
+      detail: {
+        fetched: summary.fetched, ingested: summary.ingested, skipped: summary.skipped,
+        refused: summary.refused.length, ...(failed ? { failureReason: source?.failureReason } : {}),
+      },
     })
   })
 }

@@ -18,29 +18,39 @@ export type SourcePatch = PgUpdateSetSource<typeof knowledgeSources>
 /** Never the file's, the paste's or the page's own text — a failure detail is operator-facing. */
 export const FAILURE_DETAIL_MAX = 500
 
+/**
+ * `claimToken` is the second half of the guard (`outbound_sends`' pre-send UPDATE, same shape): a
+ * claiming run mints one with its `processing` flip and passes it to every later write it makes, so
+ * a write arriving from an attempt whose lease has already lapsed — and whose source has since been
+ * re-claimed by another attempt — matches nothing instead of clobbering the current holder.
+ */
 export async function guardedSourceWrite(
   tx: OrgTx,
   sourceId: string,
   fromStatuses: KnowledgeSourceStatus[],
   patch: SourcePatch,
+  claimToken?: string,
 ): Promise<boolean> {
   if (fromStatuses.length === 0) return false
+  const guards = [eq(knowledgeSources.id, sourceId), inArray(knowledgeSources.status, fromStatuses)]
+  if (claimToken !== undefined) guards.push(eq(knowledgeSources.claimToken, claimToken))
   const rows = await tx
     .update(knowledgeSources)
     .set(patch)
-    .where(and(eq(knowledgeSources.id, sourceId), inArray(knowledgeSources.status, fromStatuses)))
+    .where(and(...guards))
     .returning({ id: knowledgeSources.id })
   return rows.length > 0
 }
 
 /**
- * The terminal landing shared by all three jobs: `failed` + a reason the Knowledge screen can label,
- * a truncated detail, and one audit row. Guarded on `processing` — the status the job claimed the
- * source at — so a source an owner has already deleted or re-queued is left alone.
+ * The terminal landing shared by the claiming jobs: `failed` + a reason the Knowledge screen can
+ * label, a truncated detail, one audit row, and the claim released. Guarded on `processing` — and,
+ * when the caller holds one, on its claim token — so a source an owner has already deleted or
+ * re-queued, or one another attempt has since claimed, is left alone.
  */
 export async function failSource(
   db: Db,
-  p: { orgId: string; sourceId: string; actor: AuditActor; reason: KnowledgeFailureReason; detail: string; now: Date },
+  p: { orgId: string; sourceId: string; actor: AuditActor; reason: KnowledgeFailureReason; detail: string; now: Date; claimToken?: string },
 ): Promise<void> {
   await withOrg(db, p.orgId, async (tx) => {
     const written = await guardedSourceWrite(tx, p.sourceId, ['processing'], {
@@ -48,7 +58,8 @@ export async function failSource(
       failureReason: p.reason,
       failureDetail: p.detail.slice(0, FAILURE_DETAIL_MAX),
       completedAt: p.now,
-    })
+      claimToken: null,
+    }, p.claimToken)
     if (!written) return
     await audit(tx, {
       actor: p.actor, action: 'knowledge.source.failed', entityType: 'knowledge_source', entityId: p.sourceId,

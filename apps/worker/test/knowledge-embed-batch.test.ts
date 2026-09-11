@@ -2,7 +2,7 @@
  * `runKnowledgeEmbedBatch` against real Postgres with the deterministic hash embedder — no pg-boss,
  * no Voyage, no S3. One `it` per behavior in the task brief's `knowledge.embed-batch` bullet.
  */
-import { randomBytes } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { eq, isNull } from 'drizzle-orm'
 import pino from 'pino'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
@@ -46,12 +46,13 @@ beforeEach(async () => {
   await withOrg(app.db, orgId, (tx) => tx.insert(workspaces).values({ orgId, businessName: 'Acme Dog Supplies', timezone: 'UTC' }))
 })
 
-/** One source + one document + `CONTENTS.length` unembedded chunks — what knowledge.ingest leaves behind. */
+/** One source + one document + `CONTENTS.length` unembedded chunks — what knowledge.ingest leaves
+ *  behind, claim token included (it is still `processing`: the pipeline ends here, not there). */
 async function seedDocument(over: Partial<typeof knowledgeSources.$inferInsert> = {}): Promise<{ sourceId: string; documentId: string }> {
   return withOrg(app.db, orgId, async (tx) => {
     const [source] = await tx.insert(knowledgeSources).values({
       orgId, kind: 'paste', status: 'processing', title: 'Returns FAQ', pastedText: CONTENTS.join('\n\n'),
-      documentCount: 1, chunkCount: CONTENTS.length, createdBy: userId, ...over,
+      documentCount: 1, chunkCount: CONTENTS.length, createdBy: userId, claimToken: randomUUID(), ...over,
     }).returning({ id: knowledgeSources.id })
     const [doc] = await tx.insert(knowledgeDocuments).values({
       orgId, sourceId: source!.id, uri: `paste:${source!.id}`, title: 'Returns FAQ', contentHash: 'h'.repeat(64), chunkCount: CONTENTS.length,
@@ -109,11 +110,14 @@ describe('knowledge.embed-batch', () => {
     expect(chunks.every((c) => c.embeddingModel === deps.embedder.model && c.embeddingVersion === deps.embedder.version)).toBe(true)
 
     expect((await getDocument(documentId)).embeddedCount).toBe(3)
-    expect(await meter('embed_tokens')).toBeGreaterThan(0)
+    // The exact sum the embedder reported for this one batch — not "more than zero".
+    const { tokens } = await createHashEmbedder().embed(CONTENTS, 'document')
+    expect(await meter('embed_tokens')).toBe(tokens)
 
     const source = await getSource(sourceId)
     expect(source.status).toBe('ready')
     expect(source.completedAt?.toISOString()).toBe(NOW.toISOString())
+    expect(source.claimToken).toBeNull()   // the pipeline's end releases the ingest run's claim
     expect((await auditRows(sourceId)).map((r) => ({ actor: r.actor, action: r.action }))).toEqual([
       { actor: 'system:knowledge.embed-batch', action: 'knowledge.source.ready' },
     ])
@@ -170,6 +174,38 @@ describe('knowledge.embed-batch', () => {
     expect(await unembeddedCount(documentId)).toBe(0)
     expect((await getSource(sourceId)).status).toBe('processing')
     expect(await auditRows(sourceId)).toHaveLength(0)
+  })
+
+  it("a crawl source's embed failure records the REASON and leaves the status to the crawl job", async () => {
+    const { sourceId, documentId } = await seedDocument({ kind: 'crawl', url: 'https://shop.test/', pastedText: null })
+    const deps = makeDeps({ embedder: failingEmbedder(new EmbedError('auth', 'voyage: 401 invalid key')) })
+
+    await run(deps, documentId)
+
+    const source = await getSource(sourceId)
+    // Still `processing`: the crawl may well still be walking, and flipping it `failed` here would
+    // strand a live crawl whose claim this job does not hold. The crawl's end transition reads this
+    // reason and lands `failed` with it.
+    expect(source.status).toBe('processing')
+    expect(source.failureReason).toBe('embed_failed')
+    expect(source.failureDetail).toContain('401')
+    expect(source.completedAt).toBeNull()
+    expect((await auditRows(sourceId)).map((r) => r.action)).toEqual(['knowledge.source.embed_failed'])
+  })
+
+  it("a crawl source's cap_reached is recorded the same way — reason only, status untouched", async () => {
+    const { sourceId, documentId } = await seedDocument({ kind: 'crawl', url: 'https://shop.test/', pastedText: null })
+    await withOrg(app.db, orgId, async (tx) => {
+      await tx.insert(orgSettings).values({ orgId, key: 'knowledge.daily_embed_tokens_cap', value: 10 })
+      await tx.insert(usageCounters).values({ orgId, day: TODAY, meter: 'embed_tokens', value: 10 })
+    })
+
+    await run(makeDeps(), documentId)
+
+    const source = await getSource(sourceId)
+    expect(source.status).toBe('processing')
+    expect(source.failureReason).toBe('cap_reached')
+    expect(await unembeddedCount(documentId)).toBe(3)
   })
 
   it('a source whose OTHER document still has unembedded chunks is not flipped yet', async () => {

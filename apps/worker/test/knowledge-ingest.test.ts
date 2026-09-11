@@ -108,6 +108,8 @@ describe('knowledge.ingest', () => {
     expect(source.chunkCount).toBeGreaterThan(0)
     expect(source.contentHash).toMatch(/^[0-9a-f]{64}$/)
     expect(source.failureReason).toBeNull()
+    // Still claimed: the pipeline is not done until knowledge.embed-batch flips it `ready`.
+    expect(source.claimToken).not.toBeNull()
 
     const docs = await documentsFor(sourceId)
     expect(docs).toHaveLength(1)
@@ -161,6 +163,10 @@ describe('knowledge.ingest', () => {
     expect(source.failureReason).toBe('too_large')
     expect(source.failureDetail).toMatch(/22020096|bytes/)
     expect(store.objects.has(key)).toBe(false)
+    // The key must not outlive the object it names: a later re-ingest would otherwise report
+    // "object missing" instead of the real reason, and the api would presign against a dead key.
+    expect(source.storageKey).toBeNull()
+    expect(source.claimToken).toBeNull()
     expect(await documentsFor(sourceId)).toHaveLength(0)
     expect(embedded).toHaveLength(0)
     expect(await knowledgeVersion()).toBe(0)
@@ -179,6 +185,7 @@ describe('knowledge.ingest', () => {
     expect(source.status).toBe('failed')
     expect(source.failureReason).toBe('wrong_type')
     expect(store.objects.has(key)).toBe(false)
+    expect(source.storageKey).toBeNull()
   })
 
   it('a pdf goes through parseInChild, and a ParseError fails the source terminally — no throw, no retry', async () => {
@@ -202,6 +209,9 @@ describe('knowledge.ingest', () => {
     expect(source.status).toBe('failed')
     expect(source.failureReason).toBe('parse_timeout')
     expect(source.failureDetail).toBe('parser exceeded 60000 ms')
+    expect(source.claimToken).toBeNull()
+    // A parse failure says nothing about the object — the key stays, so the owner can retry it.
+    expect(source.storageKey).not.toBeNull()
     expect(embedded).toHaveLength(0)
     expect(await auditActions(sourceId)).toEqual([
       { actor: 'system:knowledge.ingest', action: 'knowledge.source.failed', detail: { reason: 'parse_timeout' } },
@@ -231,6 +241,8 @@ describe('knowledge.ingest', () => {
     const source = await getSource(sourceId)
     expect(source.status).toBe('queued')
     expect(source.failureReason).toBeNull()
+    // The claim is released with the hand-back, so the retry's own claim can take it.
+    expect(source.claimToken).toBeNull()
   })
 
   it('a re-ingest replaces the old document and chunks and bumps knowledge_version twice', async () => {

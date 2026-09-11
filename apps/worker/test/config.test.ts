@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
+import { Secret } from '@aesa/crypto'
 import { loadConfig } from '../src/config.ts'
 
 const DATABASE_URL = 'postgres://aesa:aesa@localhost:5434/aesa_dev'
@@ -165,9 +166,13 @@ describe('worker config', () => {
       expect(() => loadConfig({ DATABASE_URL, KNOWLEDGE_RERANK: 'yes' })).toThrow(/KNOWLEDGE_RERANK/)
     })
 
-    it('parses the six S3_* into one config, and refuses a half-configured set', () => {
+    it('parses the six S3_* into one config with the secret wrapped, and refuses a half-configured set', () => {
       const config = loadConfig({ DATABASE_URL, ...s3Env })
-      expect(config.s3).toEqual({ endpoint: 'http://localhost:9000', region: 'us-east-1', bucket: 'aesa-dev', accessKeyId: 'aesa', secretAccessKey: 'aesaaesa', forcePathStyle: true })
+      expect(config.s3).toMatchObject({ endpoint: 'http://localhost:9000', region: 'us-east-1', bucket: 'aesa-dev', accessKeyId: 'aesa', forcePathStyle: true })
+      // Same rule as every other credential here: the bucket's secret never survives a config dump.
+      expect(config.s3?.secretAccessKey).toBeInstanceOf(Secret)
+      expect(config.s3?.secretAccessKey.expose()).toBe('aesaaesa')
+      expect(JSON.stringify(config.s3)).not.toContain('aesaaesa')
       expect(() => loadConfig({ DATABASE_URL, S3_BUCKET: 'aesa-dev' })).toThrow(/S3_\* variables are all-or-none/)
     })
 

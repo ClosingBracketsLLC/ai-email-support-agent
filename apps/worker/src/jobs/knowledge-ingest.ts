@@ -14,6 +14,7 @@
  *    the source back as `queued` first so the retry's own claim can take it — the claim below only
  *    accepts `queued`, so without that hand-back the retry would be a silent no-op.
  */
+import { randomUUID } from 'node:crypto'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -67,6 +68,16 @@ function baseContentType(raw: string | null): string | null {
   return base ? base : null
 }
 
+/** Thrown by `parseUpload` after it has deleted the object: the caller clears `storage_key` too, so
+ * the row never points at a key that is gone (a later re-ingest would read "object missing" and
+ * report the wrong reason, and the api would presign against a stale key). */
+class ObjectRefused extends ParseError {
+  constructor(code: ParseError['code'], message: string) {
+    super(code, message)
+    this.name = 'ObjectRefused'
+  }
+}
+
 /** Reads the source's bytes and turns them into blocks. Never inside a transaction. */
 async function parseUpload(deps: KnowledgeDeps, source: ClaimedSource): Promise<{ blocks: Block[]; uri: string }> {
   const key = source.storageKey
@@ -77,14 +88,14 @@ async function parseUpload(deps: KnowledgeDeps, source: ClaimedSource): Promise<
   if (head.contentLength > KNOWLEDGE_MAX_UPLOAD_BYTES) {
     // The bytes are never downloaded, and the object goes: nothing else will ever read it.
     await deps.store.delete(key)
-    throw new ParseError('too_large', `object is ${head.contentLength} bytes, over the ${KNOWLEDGE_MAX_UPLOAD_BYTES} byte limit`)
+    throw new ObjectRefused('too_large', `object is ${head.contentLength} bytes, over the ${KNOWLEDGE_MAX_UPLOAD_BYTES} byte limit`)
   }
   const actualType = baseContentType(head.contentType)
   // A store that reports no content-type at all cannot contradict the declared mime — the parser
   // dispatch below (and, for pdf/docx, the bounded child) is what actually has to survive the bytes.
   if (actualType !== null && actualType !== source.mime) {
     await deps.store.delete(key)
-    throw new ParseError('wrong_type', `object is ${actualType}, declared ${source.mime}`)
+    throw new ObjectRefused('wrong_type', `object is ${actualType}, declared ${source.mime}`)
   }
 
   const bytes = await deps.store.get(key)
@@ -92,7 +103,9 @@ async function parseUpload(deps: KnowledgeDeps, source: ClaimedSource): Promise<
   const parseInChild = deps.parseInChild ?? runParserInChild
 
   // One temp directory per ingest, removed whatever happens: the forked PDF/DOCX parser reads a
-  // path, not a buffer (it must never hold the whole file in the parent's heap).
+  // PATH, not a buffer, so the parse itself (the memory-hungry half, and the one running under
+  // `--max-old-space-size`) never happens in this process. The download above does put the whole
+  // object in the parent's heap first — bounded by the 20 MiB upload cap, not by the child's limits.
   const dir = await mkdtemp(join(tmpdir(), 'aesa-ingest-'))
   const path = join(dir, 'source')
   try {
@@ -120,6 +133,7 @@ export async function runKnowledgeIngest(deps: KnowledgeDeps, payload: Knowledge
 
   // tx1: claim. `queued` only — a source already `processing` belongs to another run, and a `ready`
   // or `failed` one needs the api to re-queue it before anything here touches it again.
+  const claimToken = randomUUID()
   const source = await withOrg(deps.db, orgId, async (tx) => {
     const [row] = await tx
       .select({
@@ -130,7 +144,7 @@ export async function runKnowledgeIngest(deps: KnowledgeDeps, payload: Knowledge
       .where(eq(knowledgeSources.id, sourceId))
     if (!row) return null
     const claimed = await guardedSourceWrite(tx, sourceId, ['queued'], {
-      status: 'processing', failureReason: null, failureDetail: null, completedAt: null,
+      status: 'processing', failureReason: null, failureDetail: null, completedAt: null, claimToken,
     })
     return claimed ? row : null
   })
@@ -146,11 +160,17 @@ export async function runKnowledgeIngest(deps: KnowledgeDeps, payload: Knowledge
     prepared = prepareDocument({ blocks, uri, title: source.title })
   } catch (err) {
     if (err instanceof ParseError) {
-      await failSource(deps.db, { orgId, sourceId, actor: ACTOR, reason: err.code, detail: err.message, now })
+      if (err instanceof ObjectRefused) {
+        // The object is gone; the key must not outlive it.
+        await withOrg(deps.db, orgId, (tx) =>
+          guardedSourceWrite(tx, sourceId, ['processing'], { storageKey: null }, claimToken))
+      }
+      await failSource(deps.db, { orgId, sourceId, actor: ACTOR, reason: err.code, detail: err.message, now, claimToken })
       return
     }
     // Retryable: hand the claim back so pg-boss's next attempt can take it, then let it fail loudly.
-    await withOrg(deps.db, orgId, (tx) => guardedSourceWrite(tx, sourceId, ['processing'], { status: 'queued' }))
+    await withOrg(deps.db, orgId, (tx) =>
+      guardedSourceWrite(tx, sourceId, ['processing'], { status: 'queued', claimToken: null }, claimToken))
     throw err
   }
 
@@ -160,7 +180,7 @@ export async function runKnowledgeIngest(deps: KnowledgeDeps, payload: Knowledge
   const documentId = await withOrg(deps.db, orgId, async (tx) => {
     const written = await guardedSourceWrite(tx, sourceId, ['processing'], {
       documentCount: 1, chunkCount: prepared.chunks.length, contentHash: prepared.contentHash,
-    })
+    }, claimToken)
     if (!written) return null // the owner deleted or re-queued the source while we were parsing
 
     await tx.delete(knowledgeDocuments).where(eq(knowledgeDocuments.sourceId, sourceId))

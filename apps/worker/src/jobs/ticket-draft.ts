@@ -513,6 +513,15 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
   let knowledge: { chunks: RetrievedChunk[]; answers: RetrievedAnswer[] }
   let knowledgeMode: 'hybrid' | 'lexical' | null = null
   let knowledgeVersion: number | null = null
+
+  /** The `prompt` trace event, once all FIVE blocks are known. It stays the run's FIRST event on
+   *  every path — including the retrieval failure below, whose trace would otherwise open with an
+   *  `error` event and no record of what the run was even built from. */
+  const writePromptEvent = async (retrieved: number): Promise<void> => {
+    await withOrg(deps.db, orgId, (tx) =>
+      appendRunEvent(tx, runId, 'prompt', { ...ctx.promptEvent, knowledge: { retrieved, mode: knowledgeMode } }))
+  }
+
   try {
     const input = { orgId, questions: ticket.triageQuestions, text: ctx.latestInboundBody, signal: watchdog }
     if ('retrieveDetailed' in deps.retriever) {
@@ -524,18 +533,13 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
       knowledge = await deps.retriever.retrieve(input)
     }
   } catch (err) {
+    await writePromptEvent(0)
     const aborted = watchdog.aborted
     if (await fail(aborted ? 'watchdog' : 'retrieval', errorToDetail(err), aborted ? 'aborted' : 'failed')) return
     throw err
   }
 
-  // The `prompt` trace event, now that all FIVE blocks are known. It stays the run's first event:
-  // retrieval writes nothing of its own, and the model call is still ahead.
-  await withOrg(deps.db, orgId, (tx) =>
-    appendRunEvent(tx, runId, 'prompt', {
-      ...ctx.promptEvent,
-      knowledge: { retrieved: knowledge.chunks.length, mode: knowledgeMode },
-    }))
+  await writePromptEvent(knowledge.chunks.length)
 
   const promptInput = (guardrailRetry: { codes: string[] } | null, effort: 'medium' | 'high'): DraftPromptInput => ({
     ticket: {

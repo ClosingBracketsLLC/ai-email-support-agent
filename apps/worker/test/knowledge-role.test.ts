@@ -7,8 +7,7 @@ import type PgBoss from 'pg-boss'
 import { describe, expect, it } from 'vitest'
 import { Secret } from '@aesa/crypto'
 import type { Db } from '@aesa/db'
-import type { S3Config } from '@aesa/knowledge'
-import type { WorkerConfig } from '../src/config.ts'
+import type { WorkerConfig, WorkerS3Config } from '../src/config.ts'
 import type { KnowledgeDeps } from '../src/knowledge-deps.ts'
 import { maybeRegisterKnowledgeRole, type KnowledgeRoleRegistrars } from '../src/knowledge-role.ts'
 import { createWorkerLogger } from '../src/logging.ts'
@@ -16,9 +15,9 @@ import { createWorkerLogger } from '../src/logging.ts'
 const fakeDb = {} as Db
 const fakeBoss = {} as PgBoss
 
-const s3: S3Config = {
+const s3: WorkerS3Config = {
   endpoint: 'http://localhost:9000', region: 'us-east-1', bucket: 'aesa-dev',
-  accessKeyId: 'aesa', secretAccessKey: 'aesaaesa', forcePathStyle: true,
+  accessKeyId: 'aesa', secretAccessKey: new Secret('aesaaesa'), forcePathStyle: true,
 }
 
 function baseConfig(overrides: Partial<WorkerConfig> = {}): WorkerConfig {
