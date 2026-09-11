@@ -380,10 +380,19 @@ instruction from him in the session.
   provenance, not a cache key. It tracks the set of RETRIEVABLE chunks, and a chunk is retrievable
   (lexically) from the moment ingest stores it, so `knowledge.embed-batch` filling in vectors never
   bumps it; "fully embedded" is `embedded_count = chunk_count` on the source, a different question.
-- **Lock order.** Any transaction touching more than one of the three row kinds takes them in ONE
-  global order, in the api AND the worker: **`outbound_sends` → `drafts` → `tickets`**. That is the
-  order every `send.execute` path already takes; `approveDraft`, `holdDraft` and `resolveTicket`
-  follow it, and the worker's draft landings lock the ticket's live drafts before the ticket flip.
+- **Lock order.** Any transaction touching more than one of the FOUR row kinds takes them in ONE
+  global order, in the api AND the worker:
+  **`outbound_sends` → `drafts` → `tickets` → `resolved_answers` / `workspaces`**. The first three
+  are the order every `send.execute` path already takes; `approveDraft`, `holdDraft` and
+  `resolveTicket` follow it, and the worker's draft landings lock the ticket's live drafts before the
+  ticket flip. The FOURTH position is Phase 5's (task 9 review): a transaction that touches
+  `resolved_answers` or `workspaces` beside a ticket takes them **LAST**, never before it — the
+  worker's `applyDraftOutcome` locks the ticket and THEN flags a conflicting answer `needs_review` in
+  the same transaction, and the api's `rejectDraft` does its ticket work first and only then strikes
+  the used answers, appends the guidance line and runs `maybeDemote` (whose
+  `agent_category_policies` / `notifications` writes ride in that same fourth position). Taking them
+  first is a real `40P01` cycle, which is why `rejectDraft` is wrapped in `withDeadlockRetry` like its
+  siblings. `apps/api/src/drafts/service.ts`'s header spells the same order out call by call.
 - **Secrets.** Never logged, never returned by an API. `Secret` serializes as `[redacted]`; the api
   error handler strips SQL parameters and redacts URLs before anything reaches a log or a client.
 - **App bundle.** `apps/app` never value-imports a server package — `@aesa/db`, `@aesa/core`,

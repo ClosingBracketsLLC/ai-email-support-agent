@@ -140,8 +140,10 @@ function isDeadlock(error: unknown): boolean {
 /**
  * Re-runs a whole transaction once when Postgres picks it as a deadlock victim.
  *
- * The three functions that touch two of the three row kinds all take them in the global order
- * (`outbound_sends` → `drafts` → `tickets`), which removes every ordinary inversion — but one narrow
+ * The four functions that touch more than one row kind (`approveDraft`, `holdDraft`, `rejectDraft`,
+ * `resolveTicket`) all take them in the global order
+ * (`outbound_sends` → `drafts` → `tickets` → `resolved_answers` / `workspaces`; see this file's
+ * header), which removes every ordinary inversion — but one narrow
  * three-way window survives it: a send row created by an approve that commits WHILE `resolveTicket`
  * waits on the draft lock cannot have been locked by resolve's first statement, so a `holdDraft` or a
  * second `approveDraft` that grabbed that send row and is now waiting on the draft can deadlock with
