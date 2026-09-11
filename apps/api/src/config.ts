@@ -1,5 +1,6 @@
 import { hkdfSync } from 'node:crypto'
 import { Secret } from '@aesa/crypto'
+import { parseMailConfig, type MailConfig } from '@aesa/platform-mail'
 import { z } from 'zod'
 
 const isHttpUrl = (v: string) => { try { return ['http:', 'https:'].includes(new URL(v).protocol) } catch { return false } }
@@ -56,7 +57,8 @@ const EnvSchema = z.object({
 })
 
 export interface OAuthClient { clientId: string; clientSecret: Secret }
-export type MailConfig = { transport: 'resend'; apiKey: Secret; from: string } | { transport: 'devsink'; from: string }
+/** Re-exported so `ApiConfig.mail`'s type keeps its old import path; the definition lives in @aesa/platform-mail. */
+export type { MailConfig }
 
 export interface ApiConfig {
   env: 'development' | 'test' | 'production'
@@ -119,16 +121,9 @@ export function loadConfig(env: NodeJS.ProcessEnv): ApiConfig {
   const d = parsed.data
   const production = d.NODE_ENV === 'production'
 
-  const transport = d.EMAIL_TRANSPORT ?? (production ? 'resend' : 'devsink')
-  if (transport === 'devsink' && production) throw new Error('EMAIL_TRANSPORT=devsink is not allowed in production')
-  let mail: MailConfig
-  if (transport === 'resend') {
-    if (!d.RESEND_API_KEY) throw new Error('RESEND_API_KEY is required when EMAIL_TRANSPORT=resend')
-    if (!d.MAIL_FROM) throw new Error('MAIL_FROM is required when EMAIL_TRANSPORT=resend')
-    mail = { transport, apiKey: new Secret(d.RESEND_API_KEY), from: d.MAIL_FROM }
-  } else {
-    mail = { transport, from: d.MAIL_FROM ?? 'aesa <onboarding@resend.dev>' }
-  }
+  // The api ALWAYS sends platform mail (sign-in codes, invitations, verification codes), so it is
+  // always `requireInProduction` — the same four rules this function used to inline.
+  const mail = parseMailConfig({ EMAIL_TRANSPORT: d.EMAIL_TRANSPORT, RESEND_API_KEY: d.RESEND_API_KEY, MAIL_FROM: d.MAIL_FROM }, { production, requireInProduction: true })
 
   // Normalize origins once: strip trailing slashes so they match browser Origin headers exactly.
   const appBaseUrl = d.APP_BASE_URL.replace(/\/+$/, '')

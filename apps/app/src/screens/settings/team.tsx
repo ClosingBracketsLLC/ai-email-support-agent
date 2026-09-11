@@ -71,7 +71,7 @@ export function TeamScreen() {
           <View style={styles.roles}>
             {(['member', 'admin'] as const).map((r) => (
               <Pressable key={r} role="radio" accessibilityState={{ checked: role === r }} onPress={() => setRole(r)} testID={`invite-role-${r}`}
-                style={[styles.role, { borderColor: role === r ? c.primary : c.border, backgroundColor: role === r ? c.info : c.bg }]}>
+                style={[styles.role, { borderColor: role === r ? c.primary : c.border, backgroundColor: role === r ? c.primaryTint : c.bg }]}>
                 <Text style={[typeScale.body, { color: c.text }]}>{r === 'admin' ? 'Admin — can edit settings and manage the team' : 'Member — can review, cannot change settings'}</Text>
               </Pressable>
             ))}

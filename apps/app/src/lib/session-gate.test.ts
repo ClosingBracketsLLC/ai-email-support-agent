@@ -18,6 +18,15 @@ describe('resolveGate', () => {
     expect(resolveGate({ session, organizations: [], workspace: { onboardingStep: 'knowledge' } })).toEqual({ kind: 'onboarding', step: 'knowledge' })
     expect(resolveGate({ session, organizations: [], workspace: { onboardingStep: 'done' } })).toEqual({ kind: 'app' })
   })
+  it('lets the go-live step open the agent\'s first draft, and nothing else', () => {
+    const session = { activeOrganizationId: 'o1' }
+    // "Review it" on the go-live test-email box: the ticket route is admitted to the app.
+    expect(resolveGate({ session, organizations: [], workspace: { onboardingStep: 'go_live' }, route: '/ticket/abc' })).toEqual({ kind: 'app' })
+    // Any other route during go_live still belongs to onboarding...
+    expect(resolveGate({ session, organizations: [], workspace: { onboardingStep: 'go_live' }, route: '/inbox' })).toEqual({ kind: 'onboarding', step: 'go_live' })
+    // ...and no earlier step gets the same hole, whatever the route.
+    expect(resolveGate({ session, organizations: [], workspace: { onboardingStep: 'mailbox' }, route: '/ticket/abc' })).toEqual({ kind: 'onboarding', step: 'mailbox' })
+  })
   it('maps targets to routes', () => {
     expect(hrefFor({ kind: 'sign-in' })).toBe('/sign-in')
     expect(hrefFor({ kind: 'create-workspace' })).toBe('/create-workspace')

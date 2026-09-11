@@ -13,13 +13,16 @@ type Ticket = {
   id: string; subject: string | null; customerEmail: string | null; customerName: string | null; status: string
   needsOwnerReason: string | null; categoryKey: string | null; categoryLabel: string | null; sentiment: string | null
   lastInboundAt: Date | null; inboundCount: number; agentAddress: string | null; spamFlagged: boolean; hasAttachments: boolean
+  draft: null
 }
 type ListInput = { section: string }
 
 // Every variable a jest.mock() factory closes over must be prefixed `mock` (case-insensitive) — see
 // agents.test.tsx's note; jest.mock() itself is hoisted above these declarations.
 let mockTicketsBySection: Record<string, Ticket[]> = {}
+let mockDegraded = false
 let mockListInputs: ListInput[] = []
+let mockWorkspace = { agentEnabled: true, role: 'owner' }
 const mockPush = jest.fn()
 
 jest.mock('expo-router', () => ({
@@ -28,6 +31,11 @@ jest.mock('expo-router', () => ({
 
 jest.mock('@/lib/trpc', () => ({
   useTRPC: () => ({
+    // <AgentOffBanner /> sits at the top of the screen and reads the workspace for itself.
+    workspace: {
+      get: { queryOptions: () => ({ queryKey: ['workspace', 'get'], queryFn: () => Promise.resolve(mockWorkspace) }), queryKey: () => ['workspace', 'get'] },
+      setAgentEnabled: { mutationOptions: (o: object) => ({ mutationFn: () => Promise.resolve(mockWorkspace), ...o }) },
+    },
     inbox: {
       list: {
         infiniteQueryOptions: (
@@ -37,7 +45,7 @@ jest.mock('@/lib/trpc', () => ({
           mockListInputs.push(input)
           return {
             queryKey: ['inbox', 'list', input.section],
-            queryFn: () => Promise.resolve({ tickets: mockTicketsBySection[input.section] ?? [], nextCursor: null }),
+            queryFn: () => Promise.resolve({ tickets: mockTicketsBySection[input.section] ?? [], nextCursor: null, degraded: mockDegraded }),
             initialPageParam: undefined,
             getNextPageParam: opts.getNextPageParam,
             refetchInterval: opts.refetchInterval,
@@ -52,7 +60,7 @@ function oneTicket(overrides: Partial<Ticket> = {}): Ticket {
   return {
     id: 't1', subject: 'Help', customerEmail: 'a@b.com', customerName: 'A B', status: 'needs_owner',
     needsOwnerReason: null, categoryKey: null, categoryLabel: null, sentiment: null, lastInboundAt: null,
-    inboundCount: 1, agentAddress: 'support@acme.com', spamFlagged: false, hasAttachments: false, ...overrides,
+    inboundCount: 1, agentAddress: 'support@acme.com', spamFlagged: false, hasAttachments: false, draft: null, ...overrides,
   }
 }
 
@@ -71,7 +79,9 @@ async function setup() {
 
 beforeEach(() => {
   mockTicketsBySection = { to_review: [], auto_sending: [], recent: [] }
+  mockDegraded = false
   mockListInputs = []
+  mockWorkspace = { agentEnabled: true, role: 'owner' }
   mockPush.mockClear()
 })
 afterEach(async () => { for (const teardown of teardowns.splice(0)) await teardown() })
@@ -119,4 +129,27 @@ test('renders one row per returned ticket, and pressing it pushes to the ticket 
 
   fireEvent.press(screen.getByTestId('ticket-row-t1'))
   expect(mockPush).toHaveBeenCalledWith('/ticket/t1')
+})
+
+test('a degraded page warns that tickets may be missing', async () => {
+  mockDegraded = true
+  mockTicketsBySection.to_review = [oneTicket({ id: 't1' })]
+  await setup()
+
+  await waitFor(() => expect(screen.getByTestId('inbox-degraded')).toBeTruthy())
+  expect(screen.getByText('Some tickets may be missing — pull down to refresh.')).toBeTruthy()
+})
+
+test('no degraded banner on an ordinary page', async () => {
+  mockTicketsBySection.to_review = [oneTicket({ id: 't1' })]
+  await setup()
+
+  await waitFor(() => expect(screen.getByTestId('ticket-row-t1')).toBeTruthy())
+  expect(screen.queryByTestId('inbox-degraded')).toBeNull()
+})
+
+test('an agent that is switched off is called out above the list', async () => {
+  mockWorkspace = { agentEnabled: false, role: 'owner' }
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('agent-off')).toBeTruthy())
 })

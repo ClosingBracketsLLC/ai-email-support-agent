@@ -1,5 +1,6 @@
 import { loadKekRing, Secret, type KekRing } from '@aesa/crypto'
 import { parseFirstAddrSpec } from '@aesa/mail'
+import { parseMailConfig, type MailConfig } from '@aesa/platform-mail'
 import { z } from 'zod'
 import { parseWorkerRoles, type WorkerRole } from './roles.ts'
 
@@ -30,6 +31,16 @@ const EnvSchema = z.object({
   // Duplicated across apps/api/.env and apps/worker/.env because each app reads only its own .env
   // (CLAUDE.md); the two MUST name the same address in any real deployment.
   MAIL_FROM: z.string().optional(),
+  // Platform mail (the `cron` role's daily digest email). Same three variables the api reads, and
+  // MAIL_FROM MUST name the same address in both apps (see its own comment above).
+  EMAIL_TRANSPORT: z.string().optional(),
+  RESEND_API_KEY: z.string().optional(),
+  // The api's public origin — the base of the digest email's one-click review links
+  // (`<APP_BASE_URL>/a/<draftId>?t=<token>`). Optional: without it the digest email pass stays off.
+  APP_BASE_URL: z.string().optional(),
+  // The Expo web origin — the base of the digest email's "open the ticket" links
+  // (`<APP_WEB_ORIGIN>/ticket/<ticketId>`). Optional, same as APP_BASE_URL.
+  APP_WEB_ORIGIN: z.string().optional(),
 })
 
 export interface OAuthClient {
@@ -50,6 +61,22 @@ export interface WorkerConfig {
   webhookPublicUrl: string | null
   /** Lowercased addr-spec parsed out of MAIL_FROM (which may carry a display name); null when unset. */
   platformSender: string | null
+  /** How the `cron` role's daily digest email is sent; devsink on any replica that never sends one. */
+  mail: MailConfig
+  /** The api's public origin, trailing slash stripped; null disables the digest email pass. */
+  appBaseUrl: string | null
+  /** The Expo web origin, trailing slash stripped; null disables the digest email pass. */
+  appWebOrigin: string | null
+}
+
+const isHttpUrl = (v: string) => { try { return ['http:', 'https:'].includes(new URL(v).protocol) } catch { return false } }
+
+/** Optional http(s) origin, normalized like the api's own (trailing slashes stripped so links join cleanly). */
+function optionalOrigin(name: 'APP_BASE_URL' | 'APP_WEB_ORIGIN', raw: string | undefined): string | null {
+  const value = raw?.trim()
+  if (!value) return null
+  if (!isHttpUrl(value)) throw new Error(`${name} must be an http(s) URL`)
+  return value.replace(/\/+$/, '')
 }
 
 function oauthPair(name: 'GMAIL_OAUTH' | 'MS_OAUTH', id: string | undefined, secret: string | undefined): OAuthClient | null {
@@ -90,5 +117,13 @@ export function loadConfig(env: NodeJS.ProcessEnv): WorkerConfig {
     gmailPubsubTopic: d.GMAIL_PUBSUB_TOPIC?.trim() || null,
     webhookPublicUrl: d.WEBHOOK_PUBLIC_URL ? d.WEBHOOK_PUBLIC_URL.replace(/\/+$/, '') : null,
     platformSender,
+    // Only the `cron` role sends platform mail (notify.digest's email pass), so only it must be
+    // fully configured in production — a sync/agent/send replica lands on the devsink it never calls.
+    mail: parseMailConfig(
+      { EMAIL_TRANSPORT: d.EMAIL_TRANSPORT, RESEND_API_KEY: d.RESEND_API_KEY, MAIL_FROM: d.MAIL_FROM },
+      { production, requireInProduction: roles.has('cron') },
+    ),
+    appBaseUrl: optionalOrigin('APP_BASE_URL', d.APP_BASE_URL),
+    appWebOrigin: optionalOrigin('APP_WEB_ORIGIN', d.APP_WEB_ORIGIN),
   }
 }

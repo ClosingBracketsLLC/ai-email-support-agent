@@ -1,4 +1,5 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { usePathname } from 'expo-router'
 import { useEffect, useRef, useState } from 'react'
 import { authClient } from './auth-client'
 import { resolveGate, type GateTarget } from './session-gate'
@@ -21,6 +22,9 @@ export function useGate(): GateTarget {
   const { data: session, isPending: sessionPending, error: sessionError, refetch } = authClient.useSession()
   const { data: organizations, isPending: orgsPending } = authClient.useListOrganizations()
   const active = session?.session.activeOrganizationId ?? null
+  // Only the go-live step reads this: resolveGate lets a `/ticket/...` route through while onboarding
+  // is otherwise still holding the user on that step.
+  const route = usePathname()
   const workspace = useQuery({ ...trpc.workspace.get.queryOptions(), enabled: Boolean(session && active), retry: false })
 
   const target = resolveGate({
@@ -30,6 +34,7 @@ export function useGate(): GateTarget {
       : workspace.isPending ? undefined
       : workspace.error ? (classifyWorkspaceError(workspace.error) === 'missing' ? 'missing' : undefined)
       : { onboardingStep: workspace.data.onboardingStep },
+    route,
   })
 
   // Guards against a retry storm: activating.current is left set to the org id for the whole chain — including
@@ -46,7 +51,7 @@ export function useGate(): GateTarget {
     const orgId = target.orgId
     activating.current = orgId
     authClient.organization.setActive({ organizationId: orgId })
-      .then(() => refetch())
+      .then(() => refetch({ query: { disableCookieCache: true } }))
       .then(() => queryClient.invalidateQueries())
       .then(() => { activating.current = null; setActivateError(null) })
       .catch(() => setActivateError({ orgId, message: 'Could not open your workspace.' }))

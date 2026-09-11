@@ -275,6 +275,14 @@ describe('mailbox connect flow', () => {
     expect(syncCall!.data.orgId).toBe(orgId)
   })
 
+  it('a successful claim emails the claimed mailbox naming the claiming user and the settings link (Phase 3 pre-flight, reverse-phish trail)', async () => {
+    const mail = t.mail.latestTo('support@acme.test')
+    expect(mail).toBeDefined()
+    expect(mail!.subject).toContain('connected to aesa')
+    expect(mail!.text).toContain(userA.email)
+    expect(mail!.text).toContain('/settings/mailboxes')
+  })
+
   it('claimConnection by a DIFFERENT user in the same org is FORBIDDEN (the account-linking fix)', async () => {
     providerOverrides.gmail = fakeGmailProvider(fixedExchange({
       tokens: { refreshToken: 'rt-2', accessToken: 'at-2', accessTokenExpiresAt: null },
@@ -303,10 +311,21 @@ describe('mailbox connect flow', () => {
     expect(stillPending?.status).toBe('pending_claim')
   })
 
-  it('claimConnection called twice is idempotent — the second call returns the same connection', async () => {
+  it('a claim that fails (FORBIDDEN, the wrong user) sends no claim-time email', async () => {
+    expect(t.mail.latestTo('support2@acme.test')).toBeUndefined()
+  })
+
+  it('claimConnection called twice is idempotent — the second call returns the same connection and sends NO second email', async () => {
+    // Ledger 39 / fix wave A6: the claim-time mail is the mailbox owner's paper trail of WHO attached
+    // their mailbox. A replayed claim (a retried mutation, a double tap) used to re-mail them about a
+    // connection nothing actually changed.
+    const mailsTo = () => t.mail.all().filter((m) => m.to === 'support@acme.test').length
+    const before = mailsTo()
+
     const first = await a.mailboxes.claimConnection.mutate({ flowId })
     const second = await a.mailboxes.claimConnection.mutate({ flowId })
     expect(second).toEqual(first)
+    expect(mailsTo()).toBe(before)
   })
 
   it('an expired flow 400s at the callback', async () => {

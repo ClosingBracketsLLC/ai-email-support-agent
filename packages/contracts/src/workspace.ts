@@ -13,6 +13,9 @@ export const CreateWorkspaceInput = z.object({
 })
 export type CreateWorkspaceInput = z.infer<typeof CreateWorkspaceInput>
 
+export const SetAgentEnabledInput = z.object({ enabled: z.boolean() })
+export type SetAgentEnabledInput = z.infer<typeof SetAgentEnabledInput>
+
 export const UpdateProfileInput = z.object({
   websiteUrl: HttpUrl.nullable(),
   description: z.string().trim().max(500),

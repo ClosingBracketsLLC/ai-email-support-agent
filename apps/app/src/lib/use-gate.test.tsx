@@ -4,9 +4,13 @@ import type { ReactNode } from 'react'
 import type { GateTarget } from './session-gate'
 import { classifyWorkspaceError, useGate } from './use-gate'
 
+let mockPathname = '/inbox'
 const mockSetActive = jest.fn()
 const mockUseSession = jest.fn()
 const mockUseListOrganizations = jest.fn()
+
+// Read lazily (inside the returned function), so this factory is safe to hoist above the declaration.
+jest.mock('expo-router', () => ({ usePathname: () => mockPathname }))
 
 jest.mock('@/lib/auth-client', () => ({
   authClient: {
@@ -61,6 +65,7 @@ beforeEach(() => {
   mockUseSession.mockReset()
   mockUseListOrganizations.mockReset()
   mockWorkspaceQueryFn = () => Promise.resolve({ onboardingStep: 'done' })
+  mockPathname = '/inbox'
 })
 
 afterEach(async () => {
@@ -85,6 +90,49 @@ describe('useGate — activating the first membership', () => {
 
     await act(() => { asError(result.current).retry() })
     await waitFor(() => expect(mockSetActive).toHaveBeenCalledTimes(2))
+  })
+
+  it('a rejected setActive reports "Could not open your workspace." and retry() calls setActive again', async () => {
+    mockUseSession.mockReturnValue({ data: { session: { activeOrganizationId: null } }, isPending: false, error: null, refetch: jest.fn() })
+    mockUseListOrganizations.mockReturnValue({ data: [{ id: 'o1' }], isPending: false })
+    mockSetActive.mockRejectedValue(new Error('nope'))
+
+    const { result } = await setupGate()
+
+    await waitFor(() => expect(asError(result.current)).toMatchObject({ kind: 'error', message: 'Could not open your workspace.' }))
+    expect(mockSetActive).toHaveBeenCalledTimes(1)
+
+    await act(() => { asError(result.current).retry() })
+    await waitFor(() => expect(mockSetActive).toHaveBeenCalledTimes(2))
+  })
+
+  it('activates the first membership exactly once and re-reads the session without the cookie cache', async () => {
+    const setActiveGate = deferred<void>()
+    mockSetActive.mockReturnValue(setActiveGate.promise)
+
+    const refetchGate = deferred<void>()
+    const refetch = jest.fn(() => refetchGate.promise)
+
+    mockUseSession.mockReturnValue({ data: { session: { activeOrganizationId: null } }, isPending: false, error: null, refetch })
+    mockUseListOrganizations.mockReturnValue({ data: [{ id: 'o1' }], isPending: false })
+
+    const { rerender } = await setupGate()
+
+    await waitFor(() => expect(mockSetActive).toHaveBeenCalledTimes(1))
+    expect(mockSetActive).toHaveBeenCalledWith({ organizationId: 'o1' })
+    expect(refetch).not.toHaveBeenCalled()
+
+    await act(async () => {
+      setActiveGate.resolve()
+      await Promise.resolve()
+    })
+    await waitFor(() => expect(refetch).toHaveBeenCalledWith({ query: { disableCookieCache: true } }))
+
+    // refetch is still pending: the guard holds, so re-rendering with the same, unchanged session must
+    // not fire a second activation attempt.
+    await rerender(undefined)
+    await rerender(undefined)
+    expect(mockSetActive).toHaveBeenCalledTimes(1)
   })
 
   it('a successful activation keeps the guard set through the session refetch race, so setActive fires only once', async () => {
@@ -210,5 +258,24 @@ describe('classifyWorkspaceError', () => {
     expect(classifyWorkspaceError({ data: null })).toBe('error')
     expect(classifyWorkspaceError(null)).toBe('error')
     expect(classifyWorkspaceError(undefined)).toBe('error')
+  })
+})
+
+describe('useGate — the go-live ticket exception', () => {
+  // `(app)/_layout.tsx` renders its children (the Shell, and so the ticket route) exactly when this
+  // hook reports `app`, and redirects to `hrefFor(gate)` otherwise — so this IS the layout's decision
+  // for the go-live "Review it" tap.
+  it('feeds the current pathname to resolveGate: a go_live workspace reaches the app on a ticket route only', async () => {
+    mockUseSession.mockReturnValue({ data: { session: { activeOrganizationId: 'o1' } }, isPending: false, error: null, refetch: jest.fn() })
+    mockUseListOrganizations.mockReturnValue({ data: [], isPending: false })
+    mockWorkspaceQueryFn = () => Promise.resolve({ onboardingStep: 'go_live' })
+    mockPathname = '/ticket/t1'
+
+    const { result, rerender } = await setupGate()
+    await waitFor(() => expect(result.current.kind).toBe('app'))
+
+    mockPathname = '/inbox'
+    await rerender(undefined)
+    expect(result.current).toEqual({ kind: 'onboarding', step: 'go_live' })
   })
 })

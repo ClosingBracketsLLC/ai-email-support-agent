@@ -144,6 +144,25 @@ describe('notify.dispatch', () => {
     expect(calls[0]).toEqual({ to: [device.expoPushToken], title: 'Reconnect your mailbox', body: 'Body text', data: { kind: 'escalation', ticketId } })
   })
 
+  it("a 'draft_review' push carries the actionable categoryId; an 'escalation' carries none", async () => {
+    const orgId = await newOrg()
+    const device = await seedDevice(orgId)
+    const ticketId = await seedTicket(orgId)
+    const reviewId = await seedNotification(orgId, { kind: 'draft_review', payload: { ticketId, draftId: 'd1' } })
+    const escalationId = await seedNotification(orgId, { kind: 'escalation', payload: { ticketId } })
+    const { send, calls } = createStubPush({ ok: true, invalidTokens: [] })
+
+    await runNotifyDispatch(makeDeps(send), { orgId, notificationId: reviewId })
+    await runNotifyDispatch(makeDeps(send), { orgId, notificationId: escalationId })
+
+    expect(calls).toHaveLength(2)
+    expect(calls[0]).toEqual({
+      to: [device.expoPushToken], title: 'Reconnect your mailbox', body: 'Body text',
+      data: { kind: 'draft_review', ticketId, draftId: 'd1' }, categoryId: 'draft_review',
+    })
+    expect(calls[1]).not.toHaveProperty('categoryId')
+  })
+
   it('rule 1: a notification not pending is a no-op (idempotent re-delivery) — no push, no meter change', async () => {
     const orgId = await newOrg()
     await seedDevice(orgId)

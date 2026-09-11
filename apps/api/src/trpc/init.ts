@@ -1,9 +1,31 @@
 import { initTRPC, TRPCError } from '@trpc/server'
 import { APIError } from 'better-auth/api'
 import superjson from 'superjson'
-import { ORG_ROLES, canManageWorkspace, type OrgRole } from '@aesa/contracts'
+import { GUARDRAIL_CODES, ORG_ROLES, canManageWorkspace, type GuardrailCode, type OrgRole } from '@aesa/contracts'
+import type { GuardrailFinding } from '@aesa/core'
 import type { AuditActor } from '@aesa/db'
 import type { TrpcContext } from './context.ts'
+
+/**
+ * tRPC's error shape has no room for structured detail — `data` is a fixed set of fields and `cause`
+ * never crosses the wire — so `drafts.approve`'s BAD_REQUEST 'guardrail' hands its findings over in
+ * `cause` and this lifts them onto `data.findings`. Rebuilt field by field, never spread: whatever a
+ * thrower put in that object, only these three strings reach a client.
+ */
+function guardrailFindings(cause: unknown): GuardrailFinding[] | null {
+  if (typeof cause !== 'object' || cause === null) return null
+  const raw = (cause as { findings?: unknown }).findings
+  if (!Array.isArray(raw)) return null
+  const findings: GuardrailFinding[] = []
+  for (const entry of raw) {
+    if (typeof entry !== 'object' || entry === null) return null
+    const { code, severity, detail } = entry as { code?: unknown; severity?: unknown; detail?: unknown }
+    if (typeof code !== 'string' || !(GUARDRAIL_CODES as readonly string[]).includes(code)) return null
+    if (severity !== 'fail' && severity !== 'warn') return null
+    findings.push({ code: code as GuardrailCode, severity, detail: typeof detail === 'string' ? detail : '' })
+  }
+  return findings
+}
 
 // isDev: false — never emit a stack, even outside production (tRPC's own default is
 // `process.env.NODE_ENV !== 'production'`, which would otherwise leak one in dev/test). The
@@ -16,7 +38,12 @@ const t = initTRPC.context<TrpcContext>().create({
   transformer: superjson,
   isDev: false,
   errorFormatter({ shape, error }) {
-    if (error.code !== 'INTERNAL_SERVER_ERROR') return shape
+    if (error.code !== 'INTERNAL_SERVER_ERROR') {
+      // Non-500s only, and only this one shape: the 500 branch below runs first, so an internal
+      // error that happens to carry a `findings` cause is still masked to a bare message.
+      const findings = guardrailFindings(error.cause)
+      return findings === null ? shape : { ...shape, data: { ...shape.data, findings } }
+    }
     // isDev:false already keeps getErrorShape from ever setting shape.data.stack, but delete (not
     // `stack: undefined`) belt-and-braces that for any future isDev flip: superjson — the transformer
     // below — encodes an `undefined` property as a real `"stack":null` field plus a meta marker, so

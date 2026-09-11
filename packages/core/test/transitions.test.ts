@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { IllegalTransitionError, defineTransitions, draftTransitions, ticketTransitions } from '../src/transitions.ts'
+import * as contracts from '@aesa/contracts'
+import {
+  AGENT_RUN_STATUSES, DRAFT_STATUSES, IllegalTransitionError, OUTBOUND_SEND_STATUSES, agentRunTransitions,
+  defineTransitions, draftTransitions, outboundSendTransitions, ticketTransitions,
+} from '../src/transitions.ts'
 
 describe('transitions', () => {
   it('self-transitions are always illegal', () => {
@@ -13,9 +17,34 @@ describe('transitions', () => {
     expect(ticketTransitions.can('resolved', 'triaged')).toBe(false)
   })
   it('draft terminal states have no exits', () => {
-    for (const s of ['sent', 'rejected', 'superseded', 'expired', 'failed'] as const)
+    for (const s of ['sent', 'rejected', 'superseded', 'expired'] as const)
       expect(draftTransitions.can(s, 'pending')).toBe(false)
     expect(() => draftTransitions.assert('sent', 'pending')).toThrow(IllegalTransitionError)
+  })
+  it('draft: failed → pending is the ONE way back — the owner fixes the cause and returns the reply to review', () => {
+    // A send that failed terminally (a guardrail refusal at the third pass, a dead letter) leaves the
+    // draft `failed`. Without this edge `drafts.resume` has nothing to move and the runbook's
+    // "fix the cause, tap Back to review, approve again" is a dead button (final-E I2 / fix wave A3).
+    expect(draftTransitions.can('failed', 'pending')).toBe(true)
+    // Only `pending`: a failed draft never jumps straight back to approved or into a send.
+    expect(draftTransitions.can('failed', 'approved')).toBe(false)
+    expect(draftTransitions.can('failed', 'sending')).toBe(false)
+    expect(draftTransitions.can('failed', 'held')).toBe(false)
+    expect(() => draftTransitions.assert('failed', 'approved')).toThrow(IllegalTransitionError)
+  })
+  it('draft: sending → held is legal — a crashed send whose retry finds a kill lever must not strand the draft', () => {
+    expect(draftTransitions.can('sending', 'held')).toBe(true)
+    expect(draftTransitions.can('sending', 'sent')).toBe(true)
+    expect(draftTransitions.can('sending', 'failed')).toBe(true)
+    // Still not a way back into the review queue directly: a held draft re-enters via `pending`.
+    expect(draftTransitions.can('sending', 'approved')).toBe(false)
+    expect(draftTransitions.can('held', 'pending')).toBe(true)
+  })
+  it('ticket: needs_owner → awaiting_review is legal — resuming a send-failed draft puts the ticket back in To review', () => {
+    // The other half of the failed-draft return path (fix wave A3): `resumeDraft` flips the ticket
+    // back only from `needs_owner` + `needs_owner_reason = 'send_failed'`, which is exactly the state
+    // `landTerminal`/`landDeadLetter` left it in, and where a live `pending` draft belongs again.
+    expect(ticketTransitions.can('needs_owner', 'awaiting_review')).toBe(true)
   })
   it('defineTransitions rejects a matrix that lists a self-transition', () => {
     expect(() => defineTransitions({ a: ['a'], b: [] } as const)).toThrow(/self/)
@@ -25,5 +54,34 @@ describe('transitions', () => {
     // @ts-expect-error 'bogus' is not a status
     defineTransitions<S>({ x: ['y'], y: [], bogus: [] })
     expect(true).toBe(true)
+  })
+
+  it('outbound-send happy path: queued → claimed → sent', () => {
+    expect(outboundSendTransitions.can('queued', 'claimed')).toBe(true)
+    expect(outboundSendTransitions.can('claimed', 'sent')).toBe(true)
+  })
+  it('outbound-send: claimed → queued is legal (released for retry-later)', () => {
+    expect(outboundSendTransitions.can('claimed', 'queued')).toBe(true)
+  })
+  it('outbound-send terminal states: sent has no exits; failed only re-queues', () => {
+    expect(outboundSendTransitions.can('sent', 'queued')).toBe(false)
+    expect(() => outboundSendTransitions.assert('sent', 'queued')).toThrow(IllegalTransitionError)
+    expect(outboundSendTransitions.can('failed', 'queued')).toBe(true)
+    expect(outboundSendTransitions.can('failed', 'claimed')).toBe(false)
+    expect(outboundSendTransitions.can('failed', 'held')).toBe(false)
+  })
+
+  it('agent-run happy path: running → succeeded', () => {
+    expect(agentRunTransitions.can('running', 'succeeded')).toBe(true)
+  })
+  it('agent-run terminal states have no exits', () => {
+    for (const s of ['succeeded', 'failed', 'aborted'] as const) expect(agentRunTransitions.can(s, 'running')).toBe(false)
+    expect(() => agentRunTransitions.assert('succeeded', 'running')).toThrow(IllegalTransitionError)
+  })
+
+  it('DRAFT_STATUSES, OUTBOUND_SEND_STATUSES and AGENT_RUN_STATUSES equal their @aesa/contracts mirrors', () => {
+    expect(DRAFT_STATUSES).toEqual(contracts.DRAFT_STATUSES)
+    expect(OUTBOUND_SEND_STATUSES).toEqual(contracts.OUTBOUND_SEND_STATUSES)
+    expect(AGENT_RUN_STATUSES).toEqual(contracts.AGENT_RUN_STATUSES)
   })
 })

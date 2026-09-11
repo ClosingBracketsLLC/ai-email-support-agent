@@ -30,6 +30,34 @@ export async function withOrg<T>(db: Db, orgId: string, fn: (tx: OrgTx) => Promi
 }
 
 /**
+ * Lets a cross-org platform sweep (Task 14's backstop/daily crons) call an org-scoped helper —
+ * `escalateTicket`, today — for ONE row while still running as `aesa_platform`. Unlike `withOrg`,
+ * this does NOT set `app.org_id` or switch role: the transaction it is handed is already a
+ * `PlatformTx` (or a SAVEPOINT of one), RLS is already bypassed (`<table>_platform_all` USING
+ * true), and every write the helper makes is keyed by an explicit row id (`ticketId`), never by
+ * `app.org_id`. `orgId` here feeds ONLY `audit()`'s `tx.orgId` read and the notification insert's
+ * explicit `orgId` column — it is identity for the audit trail, not a security boundary. Call it
+ * fresh per row (never on the shared outer platform tx, which spans every row in the pass) so one
+ * row's identity can never leak into another's audit row.
+ *
+ * Typed on the unbranded `Tx`, not `PlatformTx`: the usual caller passes a per-row SAVEPOINT
+ * (`tx.transaction((tx2) => ...)`), and drizzle's own `transaction()` callback parameter is `Tx`,
+ * not the branded type of the transaction it was opened on — `PlatformTx` would reject it. `Tx`
+ * still accepts the outer `PlatformTx` too (a strict superset), so either can be passed.
+ *
+ * Returns a NEW object rather than branding the caller's. `Object.create(tx)` puts `orgId` on a
+ * wrapper whose prototype IS the transaction, so every drizzle method and field still resolves
+ * through the chain (drizzle's pg-core classes hold no `#private` state that a receiver swap would
+ * break — `test/tenant.test.ts` proves a real query and a real audit row still work through the
+ * wrapper), while the transaction the caller passed in is left un-branded. Mutating it, as this used
+ * to, left "call it fresh per row" a rule nothing could enforce: one mistaken call on the shared
+ * outer platform tx would have branded it permanently, for every row after it.
+ */
+export function withOrgIdentity(tx: Tx, orgId: string): OrgTx {
+  return Object.assign(Object.create(tx) as Tx, { orgId }) as unknown as OrgTx
+}
+
+/**
  * Cross-organization access for sweeps and crons. `reason` is required so every call site documents
  * why it needs to see all tenants. Switches the transaction's role to aesa_platform; the session user
  * (owner/admin) is a member of it via migration 0002. Every call writes one `audit_log` row (org_id NULL,

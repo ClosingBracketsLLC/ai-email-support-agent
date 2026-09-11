@@ -61,6 +61,13 @@ const SPAM_LABELS = new Set(['SPAM', 'JUNK'])
 const SKIP_LABELS = ['DRAFT', 'TRASH']
 /** The address-verification code the platform mails to an alias (see `interceptVerification`). */
 const VERIFICATION_CODE_RE = /\b(\d{6})\b/
+/** Controller ruling (Task 12): `messages.draft_id` is a `uuid` column, so an outbound message's
+ * `X-Aesa-Draft` marker is only written through when it is syntactically uuid-shaped — anything
+ * else (never expected from either real adapter, but not something this walk can assume) becomes
+ * NULL instead of throwing and failing the whole sync of that mailbox. Deliberately looser than
+ * `@aesa/db`'s `isUuid` (no version/variant nibble check): any string postgres itself would accept
+ * as a `uuid` literal is written through. */
+const DRAFT_ID_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 export interface SyncDeps {
   db: Db
@@ -460,6 +467,7 @@ async function ingestMessageId(ctx: SyncContext, messageId: string): Promise<voi
       authResults: full.authenticationResults,
       dmarcPass,
       attachments: full.attachments,
+      draftId: full.markerDraftId && DRAFT_ID_UUID_RE.test(full.markerDraftId) ? full.markerDraftId : null,
       sentAt: full.internalDate,
     })
     if (!inserted) return { ...base, inserted: false, reopened: false, tripwired: false }

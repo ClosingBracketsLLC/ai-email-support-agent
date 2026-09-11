@@ -1,11 +1,15 @@
 import { STATUS_CODES } from 'node:http'
 import cors from '@fastify/cors'
+import formbody from '@fastify/formbody'
 import rateLimit from '@fastify/rate-limit'
 import { fastifyTRPCPlugin, type FastifyTRPCPluginOptions } from '@trpc/server/adapters/fastify'
 import { fromNodeHeaders } from 'better-auth/node'
 import Fastify, { type FastifyBaseLogger, type FastifyError, type FastifyInstance } from 'fastify'
+import { registerBrandAssets } from './brand/assets.ts'
 import { registerConnectRoutes } from './connect/routes.ts'
 import type { ServerDeps } from './deps.ts'
+import { redactUrl } from './redact.ts'
+import { registerReviewRoutes } from './review/routes.ts'
 import { createContextFactory } from './trpc/context.ts'
 import { appRouter, type AppRouter } from './trpc/router.ts'
 import { registerGmailWebhook } from './webhooks/gmail.ts'
@@ -64,6 +68,16 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     return reply.code(status).send({ statusCode: status, ...(fastifyCode ? { code: fastifyCode } : {}), error: generic, message: fastifyCode ? err.message : generic })
   })
 
+  // Fastify's stock 404 (`basic404`) builds `Route ${method}:${url} not found`, logs that string at info
+  // AND sends it as the response body — the raw url, query string included. Harmless for /trpc, not for
+  // a review link: a mail client that mangles `/a/:draftId?t=…` (they do) would put a live, unconsumed
+  // action token in plaintext in the log. Same discipline as the error handler above: a scrubbed body and
+  // a redacted log line.
+  app.setNotFoundHandler(async (req, reply) => {
+    req.log.info({ url: redactUrl(req.url) }, 'route not found')
+    return reply.code(404).send({ statusCode: 404, error: 'Not Found' })
+  })
+
   // Browser CSRF guard for mutations: a POST that carries an Origin must come from a trusted web origin
   // (config.webOrigins). Native clients send no Origin (and no ambient cookies), so they pass; CORS already
   // blocks other browsers' reads. A plain onRequest hook on the root instance, unlike @fastify/rate-limit's
@@ -112,6 +126,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       return reply.code(h.db === 'ok' ? 200 : 503).send({ status: h.db === 'ok' ? 'ok' : 'degraded', db: h.db, migrations: h.migrations, uptimeSeconds: Math.round((Date.now() - startedAt) / 1000) })
     })
 
+    // The six brand files (favicons, apple-touch-icon, og.png) — declared inside this register() for the
+    // same reason as every other plain route here: only a route inside register() is wrapped by
+    // @fastify/rate-limit's `global: true` onRoute hook.
+    registerBrandAssets(routes)
+
     // Only exists with the devsink transport, which loadConfig refuses in production.
     if (deps.mail.kind === 'devsink') {
       const sink = deps.mail
@@ -132,6 +151,24 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // carries a session; each has its own trust anchor (the OIDC bearer token, clientState) instead.
     registerGmailWebhook(routes, deps)
     registerMicrosoftWebhook(routes, deps)
+
+    // Task 19: the session-less one-click review pages (review/routes.ts). Same "why here, not on
+    // `app`" reasoning again — and the rate limit matters more here than anywhere else in this block:
+    // /a/:draftId is the one public URL whose path a stranger can guess.
+    //
+    // Its OWN register(), for @fastify/formbody's sake (fix wave A4, final-C M1). The Approve/Hold
+    // buttons are real <form method="post"> submissions, so the browser sends
+    // application/x-www-form-urlencoded — a media type Fastify ships no parser for. formbody is
+    // fastify-plugin-wrapped, so registering it on the shared context above added that parser to
+    // /api/auth/*, /trpc's siblings and both provider webhooks as well, where the 415 it replaced is
+    // a real barrier: urlencoded is a CORS "simple" content type (no preflight) and the /trpc origin
+    // hook covers only /trpc. One extra encapsulation keeps the parser where the forms are.
+    // @fastify/rate-limit's `global: true` still reaches inside — its onRoute hook lives on `app` and
+    // Fastify propagates onRoute into every descendant context.
+    await routes.register(async (review) => {
+      await review.register(formbody)
+      registerReviewRoutes(review, deps)
+    })
   })
 
   app.register(fastifyTRPCPlugin, {

@@ -21,18 +21,18 @@ const appImports = {
     ...rawDbImports.paths,
     ...[
       '@aesa/db', '@aesa/core', '@aesa/crypto', '@aesa/queue', '@aesa/api',
-      '@aesa/mail', '@aesa/llm', '@aesa/agent', '@aesa/test-kit',
+      '@aesa/mail', '@aesa/platform-mail', '@aesa/llm', '@aesa/agent', '@aesa/test-kit',
       'drizzle-orm', 'fastify', 'better-auth/node',
     ].map((name) => ({ name, message: APP_MESSAGE, allowTypeImports: true })),
   ],
   patterns: [
     ...rawDbImports.patterns,
-    { group: ['@aesa/db/*', '@aesa/api/*', 'drizzle-orm/*', 'node:*'], message: APP_MESSAGE, allowTypeImports: true },
+    { group: ['@aesa/db/*', '@aesa/api/*', '@aesa/agent/*', 'drizzle-orm/*', 'node:*'], message: APP_MESSAGE, allowTypeImports: true },
   ],
 }
 
 export default tseslint.config(
-  { ignores: ['**/node_modules/**', '**/dist/**', '**/migrations/**', '**/.expo/**', '**/playwright-report/**', '**/test-results/**'] },
+  { ignores: ['**/node_modules/**', '**/dist/**', '**/migrations/**', '**/.expo/**', '**/playwright-report/**', '**/test-results/**', '**/.venv/**'] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {

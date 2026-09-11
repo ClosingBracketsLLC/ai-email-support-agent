@@ -184,7 +184,10 @@ describe('SECURITY DEFINER resolvers', () => {
   // could resolve provider/email -> org_id cross-org. Asserting the aesa_app side alone proves nothing
   // (it was already true either way); the PUBLIC assertion is the one that actually catches the bug.
   it('locks the resolvers down to aesa_app only — PUBLIC has no EXECUTE', async () => {
-    for (const sig of ['resolve_mailbox_connection(text,text)', 'resolve_mailbox_subscription(text)', 'resolve_oauth_flow(uuid)']) {
+    for (const sig of [
+      'resolve_mailbox_connection(text,text)', 'resolve_mailbox_subscription(text)', 'resolve_oauth_flow(uuid)',
+      'resolve_draft_action_token(text)',
+    ]) {
       const priv = await admin.query<{ public_exec: boolean; app_exec: boolean }>(
         `SELECT has_function_privilege('public', $1, 'EXECUTE') AS public_exec,
                 has_function_privilege('aesa_app', $1, 'EXECUTE') AS app_exec`,

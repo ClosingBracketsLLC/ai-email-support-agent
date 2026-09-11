@@ -22,11 +22,11 @@ import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import { z } from 'zod'
 import { runTriageCall, TRIAGE_BODY_COUNT, TRIAGE_MAX_BODY_CHARS } from '@aesa/agent'
-import { type NeedsOwnerReason, type TriageVerdict } from '@aesa/contracts'
+import { type TriageVerdict } from '@aesa/contracts'
 import { resolveSetting, type SettingKey } from '@aesa/core'
 import {
-  audit, categories, messages, notifications, orgSettings, tickets, usageCounters, withOrg, workspaces,
-  type Db, type OrgTx,
+  audit, categories, escalationDedupeKey, insertEscalationNotification, messages, orgSettings, tickets,
+  usageCounters, withOrg, workspaces, type Db, type OrgTx,
 } from '@aesa/db'
 import type { LlmProvider } from '@aesa/llm'
 import { defineJob, registerJob, JOB_NAMES, type JobDefinition } from '@aesa/queue'
@@ -60,6 +60,13 @@ export interface TicketTriageDeps {
   logger: pino.Logger
   /** index.ts wires this to `enqueueNotifyDispatch` (`notify-dispatch.ts`, Task 16). */
   enqueueNotify: (orgId: string, notificationId: string) => Promise<void>
+  /**
+   * Phase 3 hand-off: a ticket that lands on `triaged` is drafting work. Called AFTER the verdict
+   * transaction commits (and only when the guarded write actually landed), so the draft job can
+   * never read a ticket the verdict has not been written for yet. Optional so Phase 2's own tests
+   * and any caller that only wants triage keep working.
+   */
+  enqueueDraft?: (orgId: string, ticketId: string) => Promise<void>
   now?: () => Date
 }
 
@@ -190,48 +197,6 @@ async function guardedWrite(tx: OrgTx, ticketId: string, selectedStatus: string,
   return rows.length > 0
 }
 
-function escalationCopy(reason: NeedsOwnerReason): { title: string; body: string } {
-  switch (reason) {
-    case 'triage_flags':
-      return { title: 'Ticket flagged for review', body: 'A message on this ticket was flagged during triage and needs your attention.' }
-    case 'sentiment_angry':
-      return { title: 'Angry customer', body: "This ticket's latest message reads as angry and needs your attention." }
-    case 'triage_failed':
-      return { title: 'Triage failed twice', body: 'This ticket could not be triaged automatically and needs your attention.' }
-    case 'triage_cap':
-      return { title: 'Daily triage limit reached', body: "This ticket is waiting because today's triage limit was reached." }
-    default:
-      return { title: 'Needs your attention', body: 'This ticket needs your attention.' }
-  }
-}
-
-/**
- * Day-scoped, not lifetime-scoped (controller ruling, fix review): `escalation:${ticketId}` alone
- * would mean the FIRST escalation ever notified for this ticket permanently wins the unique index —
- * a ticket that gets resolved and later re-escalates (a second `triage_failed`, a fresh angry
- * follow-up after a reopen, …) would then insert nothing and page nobody. Scoping by UTC day makes
- * the dedupe "at most one push per ticket per day", same pattern the cap path already uses, while
- * `escalation_notified_at` (cleared on every transition INTO `needs_owner`) stays the authoritative
- * "has this escalation episode been notified" stamp — this key only governs the notification row.
- */
-function escalationDedupeKey(ticketId: string, day: string): string {
-  return `escalation:${ticketId}:${day}`
-}
-
-/** `ON CONFLICT (dedupe_key) DO NOTHING` — a second escalation for the same dedupe key (e.g. the
- * same ticket capped twice in one UTC day) is a silent no-op: no duplicate row, no second page. */
-async function insertEscalationNotification(
-  tx: OrgTx, orgId: string, ticketId: string, dedupeKey: string, reason: NeedsOwnerReason,
-): Promise<string | undefined> {
-  const { title, body } = escalationCopy(reason)
-  const [row] = await tx
-    .insert(notifications)
-    .values({ orgId, kind: 'escalation', title, body, dedupeKey, payload: { ticketId } })
-    .onConflictDoNothing({ target: notifications.dedupeKey })
-    .returning({ id: notifications.id })
-  return row?.id
-}
-
 // -- Verdict precedence (rule 6) --
 
 type Outcome = { status: 'resolved' } | { status: 'triaged' } | { status: 'needs_owner'; reason: 'triage_flags' | 'sentiment_angry' }
@@ -360,7 +325,7 @@ export async function runTicketTriage(deps: TicketTriageDeps, payload: TicketTri
   const outcome = computeOutcome(verdict)
   const categoryId = resolveCategoryId(cats, verdict.categoryKey)
 
-  const notificationId = await withOrg(deps.db, orgId, async (tx) => {
+  const applied = await withOrg(deps.db, orgId, async (tx) => {
     const patch: TicketPatch = {
       status: outcome.status,
       categoryId,
@@ -380,7 +345,7 @@ export async function runTicketTriage(deps: TicketTriageDeps, payload: TicketTri
     if (outcome.status === 'needs_owner') patch.escalationNotifiedAt = null
 
     const written = await guardedWrite(tx, ticketId, ticket.status, patch)
-    if (!written) return undefined
+    if (!written) return { written: false as const }
 
     let notifId: string | undefined
     if (outcome.status === 'needs_owner') {
@@ -390,7 +355,10 @@ export async function runTicketTriage(deps: TicketTriageDeps, payload: TicketTri
       actor: 'system:ticket.triage', action: 'ticket.triaged', entityType: 'ticket', entityId: ticketId,
       detail: { categoryKey: verdict.categoryKey, sentiment: verdict.sentiment, outcome: outcome.status },
     })
-    return notifId
+    return notifId === undefined ? { written: true as const } : { written: true as const, notificationId: notifId }
   })
-  if (notificationId) await deps.enqueueNotify(orgId, notificationId)
+  if (applied.notificationId) await deps.enqueueNotify(orgId, applied.notificationId)
+  // Post-commit hand-off to `ticket.draft` (Phase 3). Only on a verdict that actually landed on
+  // `triaged`: a lost race wrote nothing, and every other outcome is either resolved or an owner's.
+  if (applied.written && outcome.status === 'triaged') await deps.enqueueDraft?.(orgId, ticketId)
 }

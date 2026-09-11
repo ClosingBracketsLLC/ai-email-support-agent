@@ -42,7 +42,7 @@ export async function createQueueRetrying(boss: PgBoss, name: string, options?: 
 export interface CronJobOptions {
   retryLimit?: number
   expireInSeconds?: number
-  policy?: 'standard' | 'singleton' | 'stately'
+  policy?: 'standard' | 'short' | 'singleton' | 'stately'
   singletonKey?: string
 }
 

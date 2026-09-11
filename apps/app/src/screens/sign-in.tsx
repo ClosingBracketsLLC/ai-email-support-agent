@@ -3,6 +3,7 @@ import { Link, useLocalSearchParams, useRouter } from 'expo-router'
 import { useEffect, useState } from 'react'
 import { Platform } from 'react-native'
 import { Banner } from '@/components/banner'
+import { Lockup } from '@/components/brand'
 import { Button } from '@/components/button'
 import { Screen } from '@/components/screen'
 import { TextField } from '@/components/text-field'
@@ -43,7 +44,8 @@ export function SignInScreen() {
 
   return (
     <Screen testID="sign-in">
-      <Title>Sign in to aesa</Title>
+      <Lockup height={28} testID="brand-lockup" />
+      <Title>Sign in</Title>
       <Muted>We email you a 6-digit code. No password to remember.</Muted>
       <TextField label="Work email" value={email} onChangeText={setEmail} autoCapitalize="none" autoCorrect={false} keyboardType="email-address" autoComplete="email" textContentType="emailAddress" testID="email" onSubmitEditing={sendCode} />
       <Button label="Send code" onPress={sendCode} loading={busy} disabled={!looksLikeEmail(email)} testID="send-code" />

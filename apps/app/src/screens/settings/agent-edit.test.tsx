@@ -37,7 +37,14 @@ jest.mock('@/lib/trpc', () => ({
         queryOptions: (input: { agentId: string }) => ({ queryKey: ['agents', 'categories', input], queryFn: () => Promise.resolve({ categories: mockCategories }) }),
       },
       update: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => mockUpdateImpl(v), ...o }) },
+      // <SandboxCard/> (Task 22) is mounted for every active agent below — never exercised by these
+      // tests, but it must not crash on mount: `sandboxStart` needs a resolvable mutation and
+      // `useTRPCClient()` needs to exist.
+      sandboxStart: { mutationOptions: (o: object) => ({ mutationFn: () => Promise.resolve({ runId: 'run-1' }), ...o }) },
     },
+  }),
+  useTRPCClient: () => ({
+    agents: { sandboxGet: { query: () => Promise.resolve({ status: 'running', output: null, errorCode: null, startedAt: null, finishedAt: null }) } },
   }),
 }))
 
@@ -241,4 +248,27 @@ test('no reply-from card for a primary-address agent (address === connectionEmai
   await setup()
   await waitFor(() => expect(screen.getByTestId('display-name')).toBeTruthy())
   expect(screen.queryByTestId('reply-from')).toBeNull()
+})
+
+test('an active agent gets the "Try it" sandbox card under the persona card (Task 22)', async () => {
+  mockAgents = [baseAgent({ status: 'active' })]
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('sandbox-card')).toBeTruthy())
+  expect(screen.queryByTestId('sandbox-pending')).toBeNull()
+})
+
+test('a disabled agent is told to switch the agent on, not to verify an address it already verified', async () => {
+  mockAgents = [baseAgent({ status: 'disabled' })]
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('sandbox-pending')).toBeTruthy())
+  expect(screen.getByText('Available once the agent is active.')).toBeTruthy()
+  expect(screen.queryByTestId('sandbox-card')).toBeNull()
+})
+
+test('a pending-verification agent sees "Available once the address is verified" instead of the sandbox', async () => {
+  mockAgents = [baseAgent({ status: 'pending_verification' })]
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('sandbox-pending')).toBeTruthy())
+  expect(screen.getByText('Available once the address is verified.')).toBeTruthy()
+  expect(screen.queryByTestId('sandbox-card')).toBeNull()
 })

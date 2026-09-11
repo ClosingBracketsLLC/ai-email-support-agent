@@ -5,7 +5,7 @@ import { createdAt, id, orgId, tenantPolicies } from './helpers.ts'
 /** The owner-facing notification outbox (push/email digest fan-out, Phase 2's notify.dispatch job). */
 export const notifications = pgTable('notifications', {
   id: id(), orgId: orgId(),
-  kind: text('kind').notNull(),                                // escalation | mailbox_reauth | digest
+  kind: text('kind').notNull(),                                // escalation | mailbox_reauth | digest | draft_review
   title: text('title').notNull(), body: text('body').notNull(),
   dedupeKey: text('dedupe_key').notNull(),
   payload: jsonb('payload').notNull().default(sql`'{}'::jsonb`),  // e.g. { ticketId } for deep links

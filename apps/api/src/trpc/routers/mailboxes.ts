@@ -12,7 +12,7 @@ import { and, count, eq } from 'drizzle-orm'
 import {
   AddAddressInput, AdminConsentInfoInput, ClaimConnectionInput, ConsentAddressInput, DisconnectInput,
   MAX_AGENTS_PER_DOMAIN, RequestGmailAccessInput, ResendVerificationInput, StartConnectInput, emailDomain,
-  type AgentStatus,
+  type AgentStatus, type MailProvider,
 } from '@aesa/contracts'
 import {
   agentCategoryPolicies, agents, audit, categories, ensureDefaultCategories, getOrgBoxPublicKeyOrNull,
@@ -21,7 +21,7 @@ import {
 import { hashToken } from '@aesa/crypto'
 import { JOB_NAMES } from '@aesa/queue'
 import { createFlow } from '../../connect/flows.ts'
-import type { OutgoingMail } from '../../mail/transport.ts'
+import { mailboxClaimedMail, verificationMail } from '../../mail/templates.ts'
 import { isUniqueViolation } from '../../pg-error.ts'
 import { managerProcedure, orgProcedure, router } from '../init.ts'
 
@@ -36,34 +36,15 @@ function issueVerificationCode(): { code: string; hash: string; expiresAt: Date 
   return { code, hash: hashToken('action', code), expiresAt: new Date(Date.now() + VERIFICATION_TTL_MS) }
 }
 
-/**
- * The code rides in the subject (so it survives even if the body is stripped) AND the body (belt and
- * braces, since the worker's regex scans `subject + '\n' + bodyText`). This mail's `from` is whatever
- * `deps.mail` sends as (`ApiConfig.mail.from`, i.e. this api's own `MAIL_FROM`) — the worker's sync
- * walk only intercepts a code from `ctx.platformSender`, its OWN `MAIL_FROM` parsed the same way
- * (`apps/worker/src/config.ts`). The two must be the SAME address in every real deployment, or a
- * verification mail lands as an ordinary, unauthenticated customer message instead of being caught
- * before ticketing (`packages/mail/src/sync.ts`'s `interceptVerification`).
- */
-function verificationMail(address: string, code: string): OutgoingMail {
-  return {
-    to: address,
-    subject: `aesa address verification ${code}`,
-    text: `Someone added ${address} as a support address on your aesa workspace.\n\n` +
-      `Verification code: ${code}\n\n` +
-      `You don't need to reply or do anything with this code yourself — as soon as this address ` +
-      `receives any email carrying it, aesa's mailbox sync notices it automatically and activates the ` +
-      `address. This code expires in 24 hours.`,
-  }
-}
-
 type ClaimOutcome =
   | { kind: 'not_found' }
   | { kind: 'failed'; reason: string }
   | { kind: 'not_ready' }
   | { kind: 'rejected' }
   | { kind: 'not_connectable'; status: string }
-  | { kind: 'ok'; connectionId: string; emailAddress: string }
+  /** `justClaimed` is true ONLY for the call that actually flipped `pending_claim → connected` — the
+   * claim-time email keys off it, so an idempotent re-claim does not re-mail the mailbox owner. */
+  | { kind: 'ok'; connectionId: string; emailAddress: string; provider: MailProvider; justClaimed: boolean }
 
 export const mailboxesRouter = router({
   /** provider configured? enqueue keys.provision (idempotent, debounced) so a brand-new org's DEK/box
@@ -114,17 +95,26 @@ export const mailboxesRouter = router({
       if (!conn) return { kind: 'not_found' }
 
       if (conn.status === 'pending_claim') {
-        await tx.update(mailboxConnections).set({ status: 'connected' }).where(eq(mailboxConnections.id, conn.id))
+        // Guarded on the status it was read at, and `justClaimed` comes off the ROW COUNT: two
+        // concurrent claims both read `pending_claim`, and only the one whose UPDATE matched a row
+        // may say it did the flip (and therefore send the mail).
+        const flipped = await tx.update(mailboxConnections)
+          .set({ status: 'connected' })
+          .where(and(eq(mailboxConnections.id, conn.id), eq(mailboxConnections.status, 'pending_claim')))
+          .returning({ id: mailboxConnections.id })
+        if (flipped.length === 0) {
+          return { kind: 'ok', connectionId: conn.id, emailAddress: conn.emailAddress, provider: conn.provider as MailProvider, justClaimed: false }
+        }
         await ensureDefaultCategories(tx)
         await audit(tx, {
           actor: ctx.actor, action: 'mailbox.connected', entityType: 'mailbox_connection', entityId: conn.id,
           detail: { emailAddress: conn.emailAddress }, ip: ctx.ip, userAgent: ctx.userAgent,
         })
-        return { kind: 'ok', connectionId: conn.id, emailAddress: conn.emailAddress }
+        return { kind: 'ok', connectionId: conn.id, emailAddress: conn.emailAddress, provider: conn.provider as MailProvider, justClaimed: true }
       }
       if (conn.status === 'connected') {
         // Idempotent: a second call for an already-connected row returns the same result with no writes.
-        return { kind: 'ok', connectionId: conn.id, emailAddress: conn.emailAddress }
+        return { kind: 'ok', connectionId: conn.id, emailAddress: conn.emailAddress, provider: conn.provider as MailProvider, justClaimed: false }
       }
       // 'disabled' (disconnected since this flow was consumed) or 'reauth_required': claiming it now
       // would silently report success for a mailbox that isn't actually usable (Task 17 review,
@@ -145,6 +135,22 @@ export const mailboxesRouter = router({
     // none and nothing is ingested — and re-enqueuing on the idempotent second call above is harmless
     // (singletonKey dedupes it).
     await ctx.deps.enqueue(JOB_NAMES.mailboxSync, { orgId: ctx.orgId, connectionId: outcome.connectionId }, { entityId: outcome.connectionId })
+
+    // Also post-tx, same reason: this is the mailbox owner's own paper trail of who attached it (Phase 2
+    // review's reverse-phish note) — platform mail must never fail the claim itself. Only on the call
+    // that actually made the connection: a replayed claim changed nothing, so there is nothing to
+    // tell the mailbox owner about, and re-mailing them looks like a second attachment (ledger 39).
+    if (outcome.justClaimed) {
+      try {
+        await ctx.deps.mail.send(mailboxClaimedMail({
+          to: outcome.emailAddress, emailAddress: outcome.emailAddress, provider: outcome.provider,
+          claimedByEmail: ctx.user.email, settingsUrl: `${ctx.deps.config.appWebOrigin}/settings/mailboxes`,
+        }))
+      } catch (err) {
+        ctx.deps.logger.warn({ err }, 'mailbox.claim_email_failed')
+      }
+    }
+
     return { connectionId: outcome.connectionId, emailAddress: outcome.emailAddress }
   }),
 

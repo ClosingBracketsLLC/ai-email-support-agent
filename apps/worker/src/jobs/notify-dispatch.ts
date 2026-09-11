@@ -30,7 +30,10 @@ export type NotifyDispatchPayload = z.infer<typeof NotifyDispatchPayload>
 export const notifyDispatchJob: JobDefinition<NotifyDispatchPayload> = defineJob({
   name: JOB_NAMES.notifyDispatch,
   schema: NotifyDispatchPayload,
-  queue: { expireInSeconds: 60, retryLimit: 2 },
+  // `short`: one delivery per notification id while the job is still `created` — the producers'
+  // dedupe-keyed re-insert and the poll sweep's stuck-pending retry both re-enqueue the same id
+  // (fix wave W8: `singletonKey` dedupes nothing on `standard`).
+  queue: { policy: 'short', expireInSeconds: 60, retryLimit: 2 },
   handler: async () => {
     throw new Error('notify.dispatch: this definition has no bound deps — register it through registerNotifyDispatch(boss, deps)')
   },
@@ -130,6 +133,10 @@ export async function runNotifyDispatch(deps: NotifyDispatchDeps, payload: Notif
     title: ready.title,
     body: ready.body,
     data: { kind: ready.kind, ...((ready.payload as Record<string, unknown> | null) ?? {}) },
+    // Only the review push is actionable from the notification shade — the app registers this
+    // category with a `Review` and a `Hold` button. Every other kind is informational, so it
+    // carries no category and the OS renders no action buttons.
+    ...(ready.kind === 'draft_review' ? { categoryId: 'draft_review' } : {}),
   })
 
   if (!result.ok) {

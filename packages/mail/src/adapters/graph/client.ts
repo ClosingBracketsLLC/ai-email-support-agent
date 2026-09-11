@@ -418,6 +418,10 @@ export function createGraphClient(opts: CreateGraphClientOptions): MailboxClient
         )) as { id: string; conversationId: string }
         draftId = created.id
         threadId = created.conversationId
+        // Persist BEFORE the PATCH/send below — a crash after this point is recoverable through
+        // `existingDraftId` (the re-entry branch above). A throw here aborts the send outright;
+        // it is never called on the re-entry path itself, since there is nothing new to persist.
+        await r.onDraftCreated?.(created.id)
       }
 
       const markerValue = r.extraHeaders?.[MARKER_HEADER]

@@ -2,8 +2,8 @@
   "name": "@aesa/agent",
   "private": true,
   "type": "module",
-  "exports": { ".": "./src/index.ts" },
+  "exports": { ".": "./src/index.ts", "./policy": "./src/policy.ts" },
   "scripts": { "typecheck": "tsc --noEmit", "test": "vitest run" },
-  "dependencies": { "@aesa/llm": "workspace:*", "@aesa/contracts": "workspace:*", "zod": "^4.0.0" },
+  "dependencies": { "@aesa/llm": "workspace:*", "@aesa/contracts": "workspace:*", "@aesa/core": "workspace:*", "zod": "^4.0.0" },
   "devDependencies": { "@types/node": "^22", "tsx": "^4.20.0", "typescript": "^5.9.2", "vitest": "^3.2.0" }
 }

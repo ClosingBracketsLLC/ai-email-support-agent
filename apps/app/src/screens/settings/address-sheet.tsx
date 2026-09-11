@@ -122,14 +122,14 @@ export function AddressSheet({ connectionId, connectionAddress, onDone }: {
             <Pressable
               role="radio" accessibilityState={{ checked: !a.replyFromConnection, disabled: done }} disabled={done}
               onPress={() => setReplyFrom(a.key, false)} testID={`reply-from-alias-${a.address}`}
-              style={[styles.radioBox, { borderColor: !a.replyFromConnection ? c.primary : c.border, backgroundColor: !a.replyFromConnection ? c.info : c.bg }]}
+              style={[styles.radioBox, { borderColor: !a.replyFromConnection ? c.primary : c.border, backgroundColor: !a.replyFromConnection ? c.primaryTint : c.bg }]}
             >
               <Text style={[typeScale.caption, { color: c.text }]}>Replies come from {a.address}</Text>
             </Pressable>
             <Pressable
               role="radio" accessibilityState={{ checked: a.replyFromConnection, disabled: done }} disabled={done}
               onPress={() => setReplyFrom(a.key, true)} testID={`reply-from-connection-${a.address}`}
-              style={[styles.radioBox, { borderColor: a.replyFromConnection ? c.primary : c.border, backgroundColor: a.replyFromConnection ? c.info : c.bg }]}
+              style={[styles.radioBox, { borderColor: a.replyFromConnection ? c.primary : c.border, backgroundColor: a.replyFromConnection ? c.primaryTint : c.bg }]}
             >
               <Text style={[typeScale.caption, { color: c.text }]}>Replies come from {connectionAddress}</Text>
             </Pressable>

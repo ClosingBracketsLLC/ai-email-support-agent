@@ -40,6 +40,14 @@ export interface ApiFacade {
   resolveMailboxConnection(provider: MailProvider, email: string): Promise<{ connectionId: string; orgId: string; clientStateHash: string | null } | null>
   resolveMailboxSubscription(subscriptionId: string): Promise<{ connectionId: string; orgId: string; clientStateHash: string | null } | null>
   /**
+   * Task 19's `/a/:draftId?t=` review pages are session-less too — the one-click link lands from a mail
+   * client, so the org is only known once the token's HASH resolves through 0011's
+   * `resolve_draft_action_token(text)` (SECURITY DEFINER, `aesa_app` EXECUTE). Returns the row as it
+   * stands (expired or already consumed included): the caller decides, so an expired and an unknown
+   * token can render the SAME friendly page.
+   */
+  resolveDraftActionToken(tokenHash: string): Promise<{ tokenId: string; orgId: string; draftId: string; userId: string; expiresAt: Date; consumedAt: Date | null } | null>
+  /**
    * `webhook_events` (RLS-exempt platform table, migration 0005/0006): INSERT ... ON CONFLICT
    * (provider, external_id) DO NOTHING. Returns false when the row already existed — a duplicate
    * delivery the caller should ack without redoing any enqueue.
@@ -70,6 +78,13 @@ export function createApiFacade(handle: { db: Db; pool: pg.Pool }): ApiFacade {
       const row = res.rows[0]
       return row ? { connectionId: row.connection_id, orgId: row.org_id, clientStateHash: row.client_state_hash } : null
     },
+    async resolveDraftActionToken(tokenHash) {
+      const res = await handle.pool.query<{ token_id: string; org_id: string; draft_id: string; user_id: string; expires_at: Date; consumed_at: Date | null }>(
+        'SELECT * FROM resolve_draft_action_token($1)', [tokenHash],
+      )
+      const row = res.rows[0]
+      return row ? { tokenId: row.token_id, orgId: row.org_id, draftId: row.draft_id, userId: row.user_id, expiresAt: row.expires_at, consumedAt: row.consumed_at } : null
+    },
     async recordWebhookEvent(provider, externalId, envelope) {
       const inserted = await handle.db.insert(webhookEvents)
         .values({ provider, externalId, envelope })
@@ -94,7 +109,7 @@ export function createApiFacade(handle: { db: Db; pool: pg.Pool }): ApiFacade {
 export type EnqueueFn = (
   name: string,
   data: { orgId: string } & Record<string, unknown>,
-  opts: { entityId: string; debounceSeconds?: number },
+  opts: { entityId: string; debounceSeconds?: number; startAfter?: Date },
 ) => Promise<string | null>
 
 // Loose on purpose: the api only ever sends by job NAME (JOB_NAMES.*) — it never registers a handler, so

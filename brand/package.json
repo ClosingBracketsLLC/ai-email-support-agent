@@ -1,0 +1,14 @@
+{
+  "name": "@aesa/brand",
+  "private": true,
+  "type": "module",
+  "scripts": { "typecheck": "tsc --noEmit", "test": "vitest run", "build": "tsx scripts/build.ts" },
+  "devDependencies": {
+    "@aesa/contracts": "workspace:*",
+    "@resvg/resvg-js": "2.6.2",
+    "@types/node": "^22",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.0"
+  }
+}

@@ -4,10 +4,25 @@
  * `mailboxes.addAddress` already seeded (one per org category, mode 'review').
  */
 import { TRPCError } from '@trpc/server'
-import { and, asc, eq } from 'drizzle-orm'
-import { AgentIdInput, UpdateAgentInput } from '@aesa/contracts'
-import { agentCategoryPolicies, agents, audit, categories, mailboxConnections } from '@aesa/db'
+import { and, asc, eq, sql } from 'drizzle-orm'
+import { AgentIdInput, DRAFT_MODEL_ID, SandboxOutputView, SandboxRunInput, SandboxStartInput, UpdateAgentInput } from '@aesa/contracts'
+import { resolveSetting, type SettingKey } from '@aesa/core'
+import {
+  agentCategoryPolicies, agentRuns, agents, audit, bumpMeter, categories, mailboxConnections, orgSettings,
+  SANDBOX_METERS, usageCounters,
+} from '@aesa/db'
+import { JOB_NAMES } from '@aesa/queue'
 import { managerProcedure, orgProcedure, router } from '../init.ts'
+
+const utcDayString = (d: Date): string => d.toISOString().slice(0, 10)
+
+/** Mirrors the worker's `buildOrgSettings` (apps/worker/src/jobs/ticket-draft.ts) — turns the
+ * `org_settings` rows for one key into the map `resolveSetting` expects. */
+function buildOrgSettings(rows: { key: string; value: unknown }[]): Partial<Record<SettingKey, unknown>> {
+  const out: Partial<Record<SettingKey, unknown>> = {}
+  for (const row of rows) out[row.key as SettingKey] = row.value
+  return out
+}
 
 /** Owner-authored free text (personaText/guidanceExtra/signature can run to thousands of characters) —
  * the audit row logs a length, never the body. Everything else changed by this input is short and
@@ -102,4 +117,88 @@ export const agentsRouter = router({
         .orderBy(asc(categories.key)),
     })),
   ),
+
+  /**
+   * The owner's "Try it" — one hand-typed question through the real draft pipeline, against a
+   * synthetic thread (`apps/worker/src/jobs/agent-sandbox.ts` does the actual model call; this
+   * procedure only ever inserts the `agent_runs` row and enqueues it). The cap check, the insert and
+   * the meter bump are ONE transaction, fail-closed: the cap is read and compared BEFORE the insert,
+   * so a capped org never gets a `running` row at all. Under READ COMMITTED that alone still lets two
+   * concurrent calls both read the counter before either writes — an org-scoped
+   * `pg_advisory_xact_lock`, the FIRST statement of the transaction, serializes them (same shape as
+   * the worker's draft gate, `apps/worker/src/drafting/caps.ts`'s `gateAndRecordRun`).
+   */
+  sandboxStart: orgProcedure.input(SandboxStartInput).mutation(async ({ ctx, input }) => {
+    const now = new Date()
+    const day = utcDayString(now)
+
+    const runId = await ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`sandbox-gate:${ctx.orgId}`}))`)
+
+      const [agent] = await tx.select({ status: agents.status }).from(agents)
+        .where(and(eq(agents.orgId, ctx.orgId), eq(agents.id, input.agentId)))
+      if (!agent || agent.status !== 'active') {
+        throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'agent is not active' })
+      }
+
+      // The `orgId` predicate is a brace, not the lock: RLS already scopes this read. It is here
+      // because every other read in this file carries it, and because a table that ever landed in
+      // `RLS_EXEMPT`'s list would otherwise silently read another org's cap (fix wave A5, final-C M3).
+      const settingsRows = await tx.select({ key: orgSettings.key, value: orgSettings.value })
+        .from(orgSettings).where(and(eq(orgSettings.orgId, ctx.orgId), eq(orgSettings.key, 'sandbox.daily_cap')))
+      const cap = resolveSetting('sandbox.daily_cap', { org: buildOrgSettings(settingsRows) })
+
+      const [counter] = await tx.select({ value: usageCounters.value }).from(usageCounters)
+        .where(and(eq(usageCounters.orgId, ctx.orgId), eq(usageCounters.day, day), eq(usageCounters.meter, SANDBOX_METERS.runs)))
+      if ((counter?.value ?? 0) >= cap) {
+        throw new TRPCError({ code: 'TOO_MANY_REQUESTS', message: 'sandbox.daily_cap reached for today' })
+      }
+
+      const [run] = await tx.insert(agentRuns).values({
+        orgId: ctx.orgId, kind: 'sandbox', agentId: input.agentId, provider: 'anthropic', model: DRAFT_MODEL_ID,
+        status: 'running', input: { subject: input.subject, question: input.question },
+      }).returning({ id: agentRuns.id })
+
+      await bumpMeter(tx, ctx.orgId, day, SANDBOX_METERS.runs, 1)
+
+      await audit(tx, {
+        actor: ctx.actor, action: 'agent.sandbox_started', entityType: 'agent_run', entityId: run!.id,
+        detail: { runId: run!.id, questionLen: input.question.length }, ip: ctx.ip, userAgent: ctx.userAgent,
+      })
+      return run!.id
+    })
+
+    const jobId = await ctx.deps.enqueue(JOB_NAMES.agentSandbox, { orgId: ctx.orgId, runId }, { entityId: runId })
+    if (jobId === null) {
+      // No backstop sweep exists for a sandbox run (unlike ticket.draft/send.execute) — this run
+      // would otherwise sit `running` forever with the owner staring at a spinner. Fail it outright;
+      // the client reads this back through sandboxGet.
+      await ctx.deps.api.withOrg(ctx.orgId, (tx) =>
+        tx.update(agentRuns).set({ status: 'failed', errorCode: 'enqueue_failed', finishedAt: new Date() })
+          .where(and(eq(agentRuns.id, runId), eq(agentRuns.status, 'running'))),
+      )
+    }
+    return { runId }
+  }),
+
+  /** The sandbox panel's poll target. The stored `output` is parsed defensively — an unparsable value
+   * (should never happen, but the api must never 500 over stored JSON it didn't validate on the way in). */
+  sandboxGet: orgProcedure.input(SandboxRunInput).query(async ({ ctx, input }) => {
+    const row = await ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
+      const [r] = await tx.select({
+        status: agentRuns.status, output: agentRuns.output, errorCode: agentRuns.errorCode,
+        startedAt: agentRuns.startedAt, finishedAt: agentRuns.finishedAt,
+      })
+        .from(agentRuns)
+        .where(and(eq(agentRuns.orgId, ctx.orgId), eq(agentRuns.id, input.runId), eq(agentRuns.kind, 'sandbox')))
+      return r ?? null
+    })
+    if (!row) throw new TRPCError({ code: 'NOT_FOUND', message: 'sandbox run not found' })
+
+    const parsed = SandboxOutputView.safeParse(row.output)
+    return {
+      status: row.status, output: parsed.success ? parsed.data : null,
+      errorCode: row.errorCode, startedAt: row.startedAt, finishedAt: row.finishedAt,
+    }
+  }),
 })

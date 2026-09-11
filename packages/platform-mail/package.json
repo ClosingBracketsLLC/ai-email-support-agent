@@ -1,0 +1,9 @@
+{
+  "name": "@aesa/platform-mail",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": { "typecheck": "tsc --noEmit", "test": "vitest run" },
+  "dependencies": { "@aesa/contracts": "workspace:*", "@aesa/crypto": "workspace:*", "resend": "^6.26.0" },
+  "devDependencies": { "@types/node": "^22", "tsx": "^4.20.0", "typescript": "^5.9.2", "vitest": "^3.2.0" }
+}

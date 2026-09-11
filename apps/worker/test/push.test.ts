@@ -91,6 +91,21 @@ describe('createExpoPush', () => {
     expect(result).toEqual({ ok: true, invalidTokens: ['tok-dead'] })
   })
 
+  it('forwards an actionable categoryId to the Expo message, and omits it when unset', async () => {
+    const seen: unknown[] = []
+    const client: ExpoLikeClient = {
+      chunkPushNotifications: (messages) => { seen.push(...messages); return [messages] },
+      sendPushNotificationsAsync: vi.fn(async (): Promise<ExpoPushTicket[]> => [{ status: 'ok', id: 'r1' }]),
+    }
+    const send = createExpoPush(pino({ level: 'silent' }), client)
+
+    await send({ to: ['tok-1'], title: 't', body: 'b', categoryId: 'draft_review' })
+    await send({ to: ['tok-1'], title: 't', body: 'b' })
+
+    expect(seen[0]).toMatchObject({ categoryId: 'draft_review' })
+    expect(seen[1]).not.toHaveProperty('categoryId')
+  })
+
   it('never rejects: a thrown error from the client resolves ok:false with no invalid tokens', async () => {
     const client: ExpoLikeClient = {
       chunkPushNotifications: (messages) => [messages],

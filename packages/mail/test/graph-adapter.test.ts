@@ -681,6 +681,79 @@ describe('graphProvider', () => {
       ).rejects.toMatchObject({ name: 'MailApiError', status: 0, reason: 'timeout' })
       expect(sendCalls).toBe(1)
     })
+
+    describe('onDraftCreated', () => {
+      it('is awaited with the createReply draft id BEFORE the PATCH fires', async () => {
+        const fetchFn = vi.fn(fixtureFetch({ createReply: sendCreateReplyFixture, patch: sendPatchFixture, send: sendSendFixture }))
+        const client = graphProvider(fetchFn).client('tok-1', SELF_ADDRESS)
+        const onDraftCreated = vi.fn(async (id: string) => {
+          // Call order proof: only the createReply request has fired when this runs.
+          expect(id).toBe('draft-1')
+          expect(fetchFn).toHaveBeenCalledTimes(1)
+          const [, createInit] = fetchFn.mock.calls[0]!
+          expect(createInit?.method).toBe('POST')
+        })
+
+        const result = await client.sendReply({
+          threadId: 'thread-ignored',
+          to: 'jane@example.com',
+          subject: 'x',
+          inReplyTo: '<a@b>',
+          references: '<a@b>',
+          bodyText: 'hi',
+          replyToProviderMessageId: 'msg-reply-target-1',
+          onDraftCreated,
+        })
+
+        expect(onDraftCreated).toHaveBeenCalledTimes(1)
+        expect(result).toEqual({ id: 'draft-1', threadId: 'thread-100', providerDraftId: 'draft-1' })
+        expect(fetchFn).toHaveBeenCalledTimes(3) // createReply, PATCH, send — all still ran
+      })
+
+      it('a throwing callback aborts the send before the PATCH', async () => {
+        const fetchFn = vi.fn(fixtureFetch({ createReply: sendCreateReplyFixture, patch: sendPatchFixture, send: sendSendFixture }))
+        const client = graphProvider(fetchFn).client('tok-1', SELF_ADDRESS)
+        const boom = new Error('persist failed')
+
+        await expect(
+          client.sendReply({
+            threadId: 'thread-ignored',
+            to: 'jane@example.com',
+            subject: 'x',
+            inReplyTo: '<a@b>',
+            references: '<a@b>',
+            bodyText: 'hi',
+            replyToProviderMessageId: 'msg-reply-target-1',
+            onDraftCreated: async () => {
+              throw boom
+            },
+          }),
+        ).rejects.toBe(boom)
+
+        // Only the createReply call happened — the throw aborted before the PATCH and the send.
+        expect(fetchFn).toHaveBeenCalledTimes(1)
+      })
+
+      it('is never called on the existingDraftId re-entry path', async () => {
+        const fetchFn = vi.fn(fixtureFetch({ existing: sendExistingDraftNotDraftFixture }))
+        const client = graphProvider(fetchFn).client('tok-1', SELF_ADDRESS)
+        const onDraftCreated = vi.fn(async () => {})
+
+        const result = await client.sendReply({
+          threadId: 'thread-ignored',
+          to: 'jane@example.com',
+          subject: 'x',
+          inReplyTo: '<a@b>',
+          references: '<a@b>',
+          bodyText: 'hi',
+          existingDraftId: 'existing-draft-1',
+          onDraftCreated,
+        })
+
+        expect(result).toEqual({ id: 'existing-draft-1', threadId: 'thread-200', providerDraftId: 'existing-draft-1' })
+        expect(onDraftCreated).not.toHaveBeenCalled()
+      })
+    })
   })
 
   describe('client: subscribe / renewSubscription / unsubscribe', () => {

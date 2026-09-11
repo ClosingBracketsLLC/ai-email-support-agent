@@ -1,0 +1,6 @@
+export type { MailConfig, MailEnv, ParseMailConfigOptions } from './config.ts'
+export { DEVSINK_DEFAULT_FROM, parseMailConfig } from './config.ts'
+export type { DevSink, MailTransport, OutgoingMail, ResendLike, ResendTransport } from './transport.ts'
+export { createDevSink, createMailTransport, createResendTransport } from './transport.ts'
+export type { DigestDraftItem, DigestEscalationItem } from './templates.ts'
+export { DIGEST_MAX_ITEMS, digestMail, invitationMail, mailboxClaimedMail, otpMail, verificationMail } from './templates.ts'

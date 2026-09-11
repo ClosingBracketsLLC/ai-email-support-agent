@@ -1,8 +1,8 @@
 import { eq } from 'drizzle-orm'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { auditLog, orgSettings, workspaces, type OrgTx } from '../src/index.ts'
+import { audit, auditLog, orgSettings, workspaces, type OrgTx } from '../src/index.ts'
 import { createDb } from '../src/raw.ts'
-import { withOrg, withPlatform } from '../src/tenant.ts'
+import { withOrg, withOrgIdentity, withPlatform } from '../src/tenant.ts'
 import { createTestDatabase, createTestOrganization } from './helpers/test-db.ts'
 
 const acceptOrgTx = (_tx: OrgTx) => { void _tx }
@@ -84,6 +84,36 @@ describe('tenant isolation', () => {
       tx.select().from(auditLog).where(eq(auditLog.actor, `system:${reason}`)))
     expect(rows).toHaveLength(1)
     expect(rows[0]).toMatchObject({ orgId: null, actor: `system:${reason}`, action: 'platform.access', entityType: 'platform', entityId: reason })
+  })
+
+  it('withOrgIdentity brands a NEW object, leaving the caller\'s transaction un-branded', async () => {
+    // M3 (final-B): it used to `Object.assign(tx, …)`, so one mistaken call on the shared outer
+    // platform tx would have branded it for every row after it.
+    await withPlatform(app.db, 'test:org-identity', async (tx) => {
+      const a = withOrgIdentity(tx, orgA)
+      const b = withOrgIdentity(tx, orgB)
+
+      expect(a.orgId).toBe(orgA)
+      expect(b.orgId).toBe(orgB)
+      expect((tx as Partial<OrgTx>).orgId).toBeUndefined()
+    })
+  })
+
+  it('a withOrgIdentity wrapper still runs real drizzle queries and writes its own audit row', async () => {
+    const action = `test.identity-${crypto.randomUUID()}`
+    await withPlatform(app.db, 'test:org-identity-query', async (tx) => {
+      const orgTx = withOrgIdentity(tx, orgA)
+      // A read and a write through the prototype chain — `Object.create(tx)` swaps the receiver, so
+      // this is what proves drizzle's methods do not depend on `this` being the transaction itself.
+      const rows = await orgTx.select().from(workspaces).where(eq(workspaces.orgId, orgA))
+      expect(rows.map((r) => r.businessName)).toEqual(['A'])
+      await audit(orgTx, { actor: 'system:test', action, entityType: 'ticket', entityId: crypto.randomUUID() })
+    })
+
+    const written = await withPlatform(app.db, 'test:org-identity-read', (tx) =>
+      tx.select().from(auditLog).where(eq(auditLog.action, action)))
+    expect(written).toHaveLength(1)
+    expect(written[0]).toMatchObject({ orgId: orgA, actor: 'system:test' })
   })
 
   it('withOrg rejects a non-uuid org id before touching the database', async () => {
