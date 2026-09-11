@@ -23,7 +23,7 @@ Requires Node >= 22, pnpm 10, Docker.
     pnpm brand:build                             # rebuild the brand assets after changing a brand/ source; see brand/README.md
 
 Layout: `apps/api` (Fastify + Better Auth + tRPC), `apps/worker` (pg-boss), `apps/app` (Expo),
-`packages/{contracts,db,crypto,core,queue,mail,platform-mail,llm,agent,test-kit}`, `brand`
+`packages/{contracts,db,crypto,core,queue,mail,platform-mail,llm,agent,knowledge,test-kit}`, `brand`
 (the `@aesa/brand` workspace package — see `brand/README.md`).
 Ports: the api listens on 3001 (`PORT`; `HOST` defaults to `0.0.0.0`), the worker binds no port, Postgres
 is on 5434. `APP_BASE_URL` is the api's public origin (Better Auth baseURL, OAuth redirect URIs);
@@ -39,11 +39,23 @@ already set in the process environment.
 - `WORKER_ROLES` — comma-separated subset of `sync,agent,send,knowledge,cron`; it is what partitions
   the job registrations across replicas. `sync` runs the mailbox lifecycle, `agent` runs
   `ticket.triage`/`ticket.draft`/`agent.sandbox`, `send` runs `send.execute` (the only process that
-  sends a customer reply), `cron` runs the sweeps and the digest.
+  sends a customer reply), `knowledge` runs
+  `knowledge.ingest`/`knowledge.crawl`/`knowledge.embed-batch` (the only process that reads an
+  uploaded file's bytes), `cron` runs the sweeps and the digest.
 - `AESA_KEK_V<n>` / `AESA_KEK_ACTIVE` — the KEK ring. Required in production when `WORKER_ROLES`
   includes `sync` or `send`: mailbox credentials are sealed under it and there is no other way to
   reach a provider.
 - `ANTHROPIC_API_KEY` — required in production when `WORKER_ROLES` includes `agent`.
+- `VOYAGE_API_KEY` — embeddings. Required in production when `WORKER_ROLES` includes `knowledge`
+  (every chunk's vector) or `agent` (every retrieval query); outside production a missing key falls
+  back to a deterministic hash embedder whose vectors are NOT comparable with Voyage's.
+  `KNOWLEDGE_EMBED_MODEL` (default `voyage-4`) is stored on every chunk and is part of the vector
+  leg's filter; `KNOWLEDGE_RERANK` (default `off`) adds Voyage's cross-encoder pass.
+- `S3_ENDPOINT` / `S3_REGION` / `S3_BUCKET` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` /
+  `S3_FORCE_PATH_STYLE` — object storage for knowledge uploads: minio locally (`pnpm db:up` starts
+  it, `pnpm s3:init` creates the bucket), S3/R2 in production. All six or none. Required in
+  production when `WORKER_ROLES` includes `knowledge`; **the api reads the same six names for its
+  presigned PUT, so point both apps at one bucket.**
 - `GMAIL_OAUTH_CLIENT_ID`/`_SECRET`, `MS_OAUTH_CLIENT_ID`/`_SECRET` — all-or-none pairs, one per
   provider. At least one is required in production for **`send`** — `maybeRegisterSendRole`
   (`apps/worker/src/send-role.ts`) refuses to boot without one. `sync` is not gated on a pair at

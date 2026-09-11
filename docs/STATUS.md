@@ -1,6 +1,6 @@
 # Project status
 
-Updated 2026-09-10. The spec (`docs/superpowers/specs/2026-09-07-ai-email-support-agent-design.md`)
+Updated 2026-09-11. The spec (`docs/superpowers/specs/2026-09-07-ai-email-support-agent-design.md`)
 defines seven build phases; this file records where the build stands against them.
 
 ## Done
@@ -826,38 +826,252 @@ the record)</summary>
   (`pnpm --filter @aesa/worker test test/e2e-phase3.test.ts`), and `apps/worker` has no dependency
   on anything this wave touched.
 
-## Next: Phase 4 — knowledge
+### Phase 4 — knowledge (complete on branch `phase-4`; PR not yet opened)
 
-**Where to start.** `phase-3` is complete on its branch and lands on `main` through a GitHub PR with
-a merge commit on Robert's go-ahead (the standing flow from his 2026-09-09 instruction). Once it is
-merged, check out `main`, pull, and branch `phase-4` off it. Start with
-`superpowers:writing-plans` against the spec's *Build phases → Phase 4* section. Run the local setup
-from `CLAUDE.md` and confirm the 1,641-test baseline above before writing the plan. The `brand`
-branch (cut from `phase-3`) is complete and lands on `main` the same way, through its own PR with a
-merge commit, on Robert's go-ahead, after PR #3. A dev Postgres volume created before Phase 4 predates
+- Plan: `docs/superpowers/plans/2026-09-10-phase-4-knowledge.md` (11 tasks, executed with
+  subagent-driven development). Commits **`de35bf9..HEAD`** on `phase-4`, branched from `main` at
+  `de35bf9` — the plan commit, the Phase 3 carry-over task, ten implementation tasks with their
+  per-task fix commits, the Task 11 close-out (the E2E, the external-setup runbook and the docs)
+  and this docs commit. The per-task list, newest last:
+  `8586ea2` plan · `f7e722d` T0 carries (the `short` queues' pre-create policy, the `boss.send`
+  lint, the review pages' CSP/frame/nosniff headers) · `202b1bf` T2 contracts+core ·
+  `d283136`+`a2e2218` T3 the three `knowledge_*` tables · `cdb6340`+`f171c0a` T4 parsers, the
+  bounded child, the chunker, the injection screen · `e29e510`+`05f60cf` T5 the `Embedder` and
+  `ObjectStore` ports, minio in compose and CI · `0aafc2f`+`8bf9315`+`18ee8c7` T6 hybrid per-org
+  retrieval and the relaxed tsquery · `52b53ff`+`aebe431`+`fcb2e72`+`50b97f4` T7 `prepareDocument`
+  and the SSRF-safe crawler · `837f612`+`2aada9a`+`be4b333` T8 the three jobs, the `knowledge`
+  role, the real retriever in the `agent` role, grounding on the draft, `claim_token` ·
+  `a4946c7`+`7a2d18d` T9 the knowledge router/service and the two pure sub-paths ·
+  `4797688`+`6c7782f` T10 the Knowledge screen · `2e7a2c6` T11 the E2E. The per-task execution
+  ledger was an ephemeral SDD artifact; everything load-bearing from it is distilled below, and the
+  git history plus the review record that follows are the durable account.
+  Gate at the close-out commit (minio up, `S3_*` exported so the storage suite runs): typecheck and
+  lint clean across all **15** packages/apps (`@aesa/knowledge` added); `pnpm test` green with
+  **2,077 tests** plus 4 conditional skips (`@aesa/contracts` 24, `@aesa/crypto` 44,
+  `@aesa/platform-mail` 18, `brand` 110, `@aesa/core` 205, `@aesa/llm` 98, `@aesa/agent` 65,
+  `@aesa/db` 77, `@aesa/queue` 17, `@aesa/mail` 237, `@aesa/knowledge` 129, `@aesa/test-kit` 43
+  [39 run + 4 conditional skips], `apps/api` 244, `apps/worker` 426 [including the 8-scenario
+  `e2e-phase2`, `e2e-phase3` and `e2e-phase4` files], `apps/app` 344 jest across 50 suites — no
+  database); `db:check` reports no drift; the Expo web export produces **22 static routes** (up
+  from 21 — `(app)/settings/knowledge` is the one new route file); the Playwright signup smoke
+  passes (still ending at the gated mailbox step, per Phase 2's Task 20 ruling). The pre-existing
+  `e2e-phase3.test.ts` case-10 timing flake did NOT fire in this run.
+- What exists now:
+  - `packages/contracts` — the knowledge kinds/statuses/failure reasons, the upload/paste/crawl
+    inputs and the four size limits (20 MiB upload, 50k paste chars, 3,000 chunk chars, 50 default
+    crawl pages), and the guidance input.
+  - `packages/core` — the three `knowledge.*` settings (`max_sources`, `max_crawl_pages`,
+    `daily_embed_tokens_cap`) in the catalog and per plan.
+  - `packages/db` — `knowledge_sources` / `knowledge_documents` / `knowledge_chunks` with
+    `vector(1024)`, a generated `tsvector`, FORCE RLS and the tenant policies, the partial
+    unembedded index, `knowledge_sources.claim_token` (migration 0015), `bumpKnowledgeVersion` and
+    `KNOWLEDGE_METERS` (`embed_tokens`, `crawl_pages`). Migrations 0012–0015.
+  - `packages/knowledge` — the new package: the HTML/Markdown/text/PDF/DOCX block parsers and the
+    bounded forked parser child, the heading-aware chunker, the injection screen, `prepareDocument`,
+    the `Embedder`/`Reranker` ports (Voyage + the deterministic hash fallback) and the `ObjectStore`
+    port (S3/minio + in-memory), the SSRF-safe crawler (robots, sitemap-first, re-validated
+    redirects, first-20 batches, politeness), and hybrid per-org retrieval (`createRetriever`,
+    exact cosine + the relaxed prefix-OR tsquery, RRF fusion, `assertSameOrg`, optional rerank).
+    Two PURE sub-paths (`./storage`, `./url`) plus `./testing`'s `fakeSite`.
+  - `apps/worker` — the `knowledge` role and its three jobs (`knowledge.ingest`, `knowledge.crawl`,
+    `knowledge.embed-batch`), `knowledge/sources.ts`'s `guardedSourceWrite`/`failSource`,
+    `knowledge-deps.ts` as the ONE place the store/embedder/reranker are chosen, the REAL retriever
+    in the `agent` role, and `confidence_breakdown.grounding` + `retrieved_chunk_ids` /
+    `cited_chunk_ids` on every draft.
+  - `apps/api` — the `knowledge` router over one service module (`src/knowledge/service.ts`,
+    `@aesa/api/knowledge`): presigned uploads, paste, crawl/refresh, list (with `caps` and
+    `canManage`), delete, flagged chunks, unflag/delete chunk, gaps — plus
+    `workspace.updateGuidance`. The api imports `@aesa/knowledge` only through the two pure
+    sub-paths, so neither the parsers nor an LLM client enter its module graph.
+  - `apps/app` — the Knowledge screen (crawl card with the plan page cap, paste, upload via the web
+    drop zone and the native picker, the source list with per-row status and failure copy, the
+    flagged-chunk view, the guidance editor and the gaps card), and the onboarding knowledge step.
+- Deviations from the spec's Phase 4 list, as recorded in the plan (the spec wins on everything
+  else):
+  1. Uploads are a presigned **PUT plus a post-hoc size/type check**, not an S3 POST policy — POST
+     policies are not portable across S3, minio and R2.
+  2. **Rerank is wired but off** (`KNOWLEDGE_RERANK=on` routes the fused top-20 through Voyage
+     `rerank-2.5`), tested against a fake and never live in CI.
+  3. A **deterministic hash embedder (`hash-v1`)** is the dev/test fallback so the whole pipeline
+     runs with no Voyage key; production refuses to boot without one on `agent`/`knowledge`.
+  4. **`knowledge_version` has no cache to bust** (Phase 3 made the knowledge block volatile) — it
+     is bumped in the same transaction as every chunk-set change and recorded on the draft's
+     grounding as the provenance Phase 5's staleness rule needs.
+  5. **The gaps report is a card on the Knowledge screen**, not an Analytics dashboard.
+  6. **Crawl page caps are plan settings** and "first 20 pages fast" is the first persisted batch.
+  7. **One `knowledge.embed-batch` job per document**, not per arbitrary chunk batch.
+  8. **Parsers:** `pdfjs-dist` (no OCR — an image-only PDF fails `no_text`) and `mammoth` → HTML →
+     the same block extractor; the "zip bounds" are the byte cap plus the child's heap and clock.
+  9. **Per-org crawl concurrency is 1** (an advisory lock around the claim); platform parallelism is
+     the `knowledge` role's pg-boss `teamSize`.
+  10. **The web drag-drop zone is a `.web.tsx` platform file**; native uses `expo-document-picker`;
+      share-sheet intake is Phase 7.
+  11. **Carries folded in (Task 0):** the `short` queues' pre-creation now carries `policy: 'short'`
+      in both lists; a bare `boss.send` is banned by ESLint outside `packages/queue` and tests; the
+      review pages gained CSP/`X-Frame-Options`/`X-Content-Type-Options`. The rest of Phase 3's
+      carry list moves on unchanged — see *Next: Phase 5*.
+  12. **`RetrievalResult.answers` stays `[]`** — resolved answers are Phase 5; the shape carries the
+      slot.
+  13. **The Playwright smoke still ends at the mailbox step** (providerless CI cannot reach the
+      knowledge step); the knowledge UI is proven by jest and by the worker E2E.
+- The E2E: `apps/worker/test/e2e-phase4.test.ts`, **8 scenarios**, one throwaway database, one
+  pg-boss schema of its own, the REAL api knowledge service, the REAL three knowledge jobs, the
+  REAL sync walk and the REAL retriever — (1) paste → ingest → embed-batch → ready, one embedded
+  chunk, `knowledge_version` 1, `embed_tokens` metered; (2) an inbound returns question drafts with
+  that chunk retrieved AND cited, `grounding.score > 0` / `mode: 'hybrid'` / `knowledgeVersion: 1`,
+  and the model's own knowledge block carries the passage text; (3) a crawl of the fake site
+  ingests 3 pages, refuses the `.internal` link and the 302 to the metadata address without
+  fetching either, meters `crawl_pages` 3, lands `ready`, and a shipping question cites the crawled
+  chunk; (4) an injection page is chunked, flagged `override_instructions`, never retrieved, listed
+  by `knowledge.flaggedChunks`, and retrievable again after `unflagChunk` (which bumps the
+  version); (5) the embedder failing on the QUERY still lands a draft, `mode: 'lexical'`, the
+  Returns chunk cited from the tsvector leg alone; (6) `deleteSource` takes the chunks and the
+  stored object with it, bumps the version, and the next draft retrieves nothing with a null
+  grounding score; (7) an object over the 20 MiB cap fails the source `too_large` with the object
+  deleted and `storage_key` cleared, and an abandoned `queued` upload contributes no ready chunks;
+  (8) org B's identical FAQ is never retrieved for org A, proven by ids in both directions. No
+  wall-clock sleeps: every wait polls for the state it expects under a bounded deadline.
+  **Observed numbers worth pinning:** `knowledge_version` is bumped by `knowledge.ingest` (once per
+  ingest), by `knowledge.crawl` (once per persisted batch), by `deleteSource`, `unflagChunk` and
+  `deleteChunk` — and NOT by `knowledge.embed-batch`, which only fills vectors in. So a paste alone
+  leaves the workspace at version **1**, not 2.
+- Execution-time rulings recorded during the build (the owner's words, one line each):
+  1. Work in the main checkout on branch `phase-4` — the repo's standing practice; no worktree.
+  2. `fakeSite` lives in `packages/knowledge/src/testing.ts` behind a `./testing` subpath (the
+     `@aesa/db/testing` pattern), so the worker suites and the E2E never reach into another
+     package's `test/`.
+  3. The knowledge write/read logic lives in `apps/api/src/knowledge/service.ts` exported as
+     `@aesa/api/knowledge` (the `drafts/service.ts` pattern), the router being a thin wrapper; the
+     E2E calls the service with `{ api, enqueue, store, logger }` rather than a tRPC caller.
+  4. The queue-policy test uses throwaway queue names and never deletes shared `pgboss_test`
+     queues; the four real names' policy is proven by reading both pre-create lists in review.
+  5. `parseHtml` collects `<a href>` everywhere except inside `script`/`style`/`template`; only
+     TEXT is dropped inside nav/footer/header/aside.
+  6. If `pnpm db:up --wait` ever fails on compose's `mc ready local` minio healthcheck, switch to
+     `curl -f http://localhost:9000/minio/health/live` and say so.
+  7. The knowledge jobs get their own `guardedSourceWrite` rather than widening the drafting
+     helper.
+  8. The Task 1 evidence gap does not enter a fix loop; from there every implementer dispatch
+     demands PASTED gate output, not a summary.
+  9. Fold minors 2, 4 and 7 into fix round 1 — including `createTestDatabase` installing pgvector
+     itself, which removes the stale-volume failure mode for the test suite.
+  10. Loose text (outside the eight block tags, not in a skipped subtree) accumulates into a
+      `paragraph` block flushed at the next boundary — the spec's "a crawled page yields its text"
+      wins over the brief's tag list.
+  11. `invisible_text` counts only zero-width and bidi format characters, never U+00AD — hyphenated
+      PDF/Word exports stay retrievable.
+  12. The parser child's stderr is `'ignore'` (a `'pipe'` nobody reads is a hang vector), and a
+      heading block ALWAYS flushes the current chunk.
+  13. Task 4's fix loop ends with six parser/chunker carry-overs riding into Task 7's dispatch in
+      the same package (anchor labels as text, a second `<title>`, `dl/dt/dd`, `<p>` inside `<li>`,
+      the chunker's sentence-window overlap, a stale comment).
+  14. Local and CI minio CORS is server-wide (`MINIO_API_CORS_ALLOW_ORIGIN`), `s3-init` tolerates
+      ONLY minio's 501 from `PutBucketCors` and rethrows everything else, and the minio-gated
+      storage test issues a real cross-origin preflight against the presigned URL.
+  15. The lexical leg queries a RELAXED tsquery built in TypeScript (content words ≥ 3 chars minus
+      a ~60-word stop list, each a prefix match, OR-joined, bound as one parameter); the stored
+      `tsv` stays `simple`, and the lexical-only golden hit rate is asserted ≥ 0.75 — a Voyage
+      outage only means something if the lexical leg answers real questions.
+  16. Fold minors 2 and 9 into fix round 1; `@aesa/agent` stays a type-only devDependency of
+      `@aesa/knowledge` with a comment at the import — a deferred minor.
+  17. `PinnedFetchInit` gains `redirect?: 'error' | 'manual'` (default unchanged) so the crawler can
+      re-validate each hop itself; a crypto test pins both modes.
+  18. `parseHtml` inserts a single space at an `<a>` open/close boundary so adjacent anchors do not
+      run together.
+  19. Fold seven crawler minors into fix round 1 (a shared content-hash helper, a typed refusal
+      reason union, `invalid_location` for a rejected redirect target, robots re-checked on a
+      redirect, whitespace-only blocks → `no_text`, an empty `<title>` → null, two missing tests).
+  20. A `claim_token uuid` column on `knowledge_sources` (migration 0015) is the ownership proof:
+      the claim mints one, every later guarded write of that run adds `AND claim_token = $mine`, and
+      ready/failed/hand-back clear it.
+  21. A crawl abort hands the claim back to `queued` (progress kept) and THROWS so pg-boss retries;
+      the crawl lease is 300 s AND the queue's `retryDelay` is 300 with no backoff, so a retry
+      always finds a crashed run stale. True resume is a carry-over.
+  22. `CrawlError` gains `origin: 'engine' | 'consumer'`: a consumer-origin error (our own
+      persistence) is retryable and its message never reaches `failure_detail`; only engine-origin
+      errors are terminal.
+  23. For a CRAWL source, `knowledge.embed-batch` never changes status — it writes
+      `failure_reason`/`failure_detail` only, and the crawl's end transition lands `failed` when a
+      reason is present, else `ready`.
+  24. `@aesa/knowledge` gains two PURE sub-paths (`./storage`, `./url`) and the api imports ONLY
+      those; `error-surface.test.ts` gains a second module-graph probe asserting no
+      `@anthropic-ai/*`, `@aesa/llm`, `pdfjs-dist` or `mammoth` specifier reaches the api.
+  25. The api stores and matches a crawl URL through `normalizeUrl` (null → `bad_request`, "Crawls
+      need an https:// address"), which also closes the `http://` seam without touching contracts.
+  26. `startCrawl` on a `ready` match re-queues with the CALLER's clamped `maxPages`; `refreshCrawl`
+      keeps the row's stored budget. The source cap's read-then-insert race and concurrent
+      same-URL inserts are accepted and commented (a failed crawl must stay re-addable).
+  27. `knowledge.list` returns `caps: { maxSources, maxCrawlPages }` and `canManage`; the crawl card
+      hides page options above the cap with a "Plan cap: N pages" hint, the counter reads "N of M
+      sources", and non-managers see the screen read-only.
+  28. The web drop target binds imperatively — an exported pure `bindDropZone(node, handlers)`
+      attached through a ref, tested with a fake EventTarget, because React Native Web forwards no
+      drag props.
+  29. `useUpload().start(files)` resolves `{ stoppedBy: 'cap' | null }` and stops the batch at the
+      first refusal; every per-file reason is rendered in the owner's words, an absent picker size
+      is refused client-side and an absent MIME is inferred from the extension first.
+- **Carried into the final review** (the ledger's deferred items; the whole-branch review that
+  follows this task triages them):
+  - `knowledge.ingest` has **no lease** — a hard death mid-parse strands the source at `processing`
+    (the claim token prevents damage, not the stall); copy the crawl's lease pattern, with Phase 7's
+    sweep.
+  - `knowledge.embed-batch` holds **no claim token** (by ruling) — its ingest-source status flips are
+    guarded on status alone.
+  - `@aesa/agent` is a type-only **devDependency** of `@aesa/knowledge`; a consumer typechecking
+    `@aesa/knowledge` without `@aesa/agent` would fail (none exists today).
+
+## Next: Phase 5 — autonomy and learning
+
+**Where to start.** `phase-4` is complete on its branch and lands on `main` through a GitHub PR with
+a merge commit on Robert's go-ahead (the standing flow from his 2026-09-09 instruction), after
+`phase-3` (PR #3, which carries `brand`). Once it is merged, check out `main`, pull, and branch
+`phase-5` off it. Start with `superpowers:writing-plans` against the spec's *Build phases → Phase 5*
+section. Run the local setup from `CLAUDE.md` — including `pnpm db:up && pnpm s3:init` and the
+`S3_*` exports, so the minio-gated storage suite actually runs — and confirm the 2,077-test baseline
+above before writing the plan. A dev Postgres volume created before Phase 4 predates
 `scripts/db-init/001-roles.sql`'s pgvector install and needs `pnpm db:down && pnpm db:up` to pick it
 up. In production, install the `vector` extension once, as the cluster superuser, before deploying
 Phase 4's migrations — `packages/db/migrations/0012_pgvector.sql` runs as the non-superuser
-`aesa_owner` and cannot install it itself (the Phase 4 runbook will repeat this).
+`aesa_owner` and cannot install it itself (`docs/runbooks/2026-09-phase-4-external-setup.md` repeats
+this, and is what Phase 4 needs from Robert before a real customer document is ever embedded).
 
-**The hand-off.** Phase 4 is knowledge: the document parsers, the site crawler, Voyage embeddings,
-retrieval, and the `minio`/R2 upload path. Two seams are already in place and waiting for it:
+**The hand-off.** Phase 5 is autonomy and learning: `resolved_answers` and
+`category_stats_daily`, the jobs `memory.capture` and `stats.rollup` plus memory retirement in
+`sweeps.daily`, pre-retrieval of past answers into the knowledge block, the **evidence score** and
+`decide()`'s auto branch, `auto_sending` with the Hold window and auto-sent sampling, the Agents &
+autonomy screen (Off/Review/Auto per category with the cold-start lock, thresholds, `auto_graduate`,
+graduation and demotion notices), the Learned answers screen with delete-by-customer, and
+"Add to guidance" from rejects. Four seams are already in place and waiting for it:
 
-- **`Retriever` in `@aesa/agent`.** `ticket.draft` and `agent.sandbox` both call
-  `deps.retriever.retrieve({ orgId, questions, text, signal })` OUTSIDE every transaction, before the
-  prompt is built, and both already thread the result through the knowledge block, the
-  `retrieved_chunk_ids`/`cited_chunk_ids`/`retrieved_answer_ids`/`used_answer_ids` columns on
-  `drafts`, and `collectGroundedNumbers`' sources. Phase 3 wires `emptyRetriever`; Phase 4 replaces
-  it and nothing above it changes shape. Two Phase 3 behaviours become load-bearing the moment it
-  returns anything: the draft job re-filters every id the model cites against what retrieval
-  actually returned (a model must not be able to make a draft look grounded by inventing an id), and
-  `confidence_breakdown.grounding` is the `null` slot Phase 4 fills.
-- **`knowledge_version`.** The prompt's knowledge block is the cacheable per-org layer, so a
-  knowledge change has to bust that cache; Phase 4 owns the version column and threading it into the
-  block's stability hint.
+- **`RetrievalResult.answers` is `[]`.** `createRetriever` already returns the slot and
+  `knowledgeBlock` already renders an "Answers this business has given before" section from it; the
+  draft job already threads `retrieved_answer_ids` / `used_answer_ids` / `memory_conflict_ids`
+  through to the row and re-filters every id the model returns. Phase 5 fills the list; nothing
+  above it changes shape.
+- **`confidence_breakdown.grounding`.** Every draft now carries
+  `{ score, mode, knowledgeVersion, retrieved, cited }`, where `score` is the best VALIDATED
+  citation's retrieval score. `evidence` is still the `null` slot beside it, and `decide()`'s auto
+  branch is written, table-tested and unreachable until it is filled.
+- **`knowledge_version` on the draft's grounding.** `workspaces.knowledge_version` is bumped in the
+  same transaction as every chunk-set change, and the version retrieval ran against is recorded on
+  the draft — the provenance `resolved_answers.knowledge_version`'s staleness rule needs.
+- **`onSent` in `send-execute.ts`.** Called post-commit with `{ orgId, ticketId, draftId }` and
+  never allowed to fail a delivered send; Phase 4 still passes a no-op. It is where
+  `memory.capture` hooks in.
 
-**Carries still open** (fix in the first Phase 4 task that touches the file, or record why it moves
+**Carries still open** (fix in the first Phase 5 task that touches the file, or record why it moves
 again):
+
+- **From Phase 4** — a stuck-source sweep is the biggest of them: `knowledge.ingest` takes no lease,
+  so a hard death mid-parse strands a source at `processing` with no way back but a delete-and-re-add;
+  a crawl that keeps failing on a consumer-origin error re-queues and re-walks; and an abandoned
+  `queued` upload (the owner presigned and never PUT) holds a `knowledge.max_sources` slot forever.
+  All three want one daily sweep, ledgered for **Phase 7** alongside `platform.access` retention.
+- **From Phase 4** — the source cap's read-then-insert race and two concurrent `startCrawl` calls for
+  one brand-new URL are both accepted and commented, not guarded: the first can land one row over the
+  cap, the second can insert two sources for one site. Revisit only if either is seen.
+- **From Phase 4** — a crawl does not resume: a re-entry re-walks from the start URL, and unchanged
+  pages cost a fetch before they skip on their content hash. Cheap in the database, not in requests.
 
 - The api's rate limiters (Better Auth's in-memory limiter, `@fastify/rate-limit`, `team.invite`'s
   per-org throttle) are all in-memory and therefore per-replica — move to shared/database storage
@@ -896,7 +1110,9 @@ again):
   does not exist yet.
 
 **Carried out of the whole-branch review** — one line each; none is believed to block the live
-verification walk:
+verification walk. Three of the original list are CLOSED by Phase 4's Task 0 (plan deviation 11):
+the keyless-`boss.send` collapse (ESLint now bans a bare `boss.send`), the pre-create lists not
+carrying `policy: 'short'` (both now do), and the review pages' missing CSP/frame/nosniff headers:
 
 - **The org-cap arm of the backstop-sweep busy loop.** The fix wave closed the killswitch arm only.
   An org that has hit its daily draft or spend cap keeps satisfying sub-sweep (a)'s predicate, so
@@ -919,15 +1135,6 @@ verification walk:
   `send.execute` queue, a re-approve whose previous job is still `created` gets a `null` back
   instead of a second job; the already-scheduled job runs, finds `send_after` still in the future
   and returns, and the backstop sweep's arm (d) re-picks the row on its next pass. No send is lost.
-- **Two KEYLESS `boss.send` calls on a `short` queue collapse into one.** `short`'s index is over
-  `COALESCE(singleton_key,'')`. Production never does that — everything goes through `enqueue()`,
-  which always sets `${orgId}:${entityId}` — and the E2E's raw triggers now mint a throwaway key
-  each, but a future bare `boss.send` on one of the four queues would dedupe silently. A lint rule
-  making `enqueue` the only send path is the Phase 4 option.
-- **The four queues' pre-creation does not carry the policy.** `apps/worker/src/index.ts` and
-  `apps/api/src/boss.ts` pre-create them with no options, so a queue first created by an api-only
-  boot stays `standard` until a worker replica that registers the job runs `updateQueue`.
-  Correctness never depends on the dedupe, so this is a cold-start inefficiency only.
 - **A resume of a stale-`failed` draft onto a `triaged` ticket is wasteful when a re-draft is
   already in flight** — see fix-wave ruling 6: it self-corrects at the send gate, at the cost of one
   run.
@@ -947,10 +1154,6 @@ verification walk:
   predicate is `sortKey < cursor` with no `id` tiebreaker while the `ORDER BY` carries one, and the
   cursor is a millisecond ISO string cut from a microsecond `timestamptz`. Fix as a row-comparison
   keyset `(sortKey, id) < (cursorTs, cursorId)` carrying the raw value.
-- **The review pages set no `Content-Security-Policy` / `X-Frame-Options` / `X-Content-Type-Options`.**
-  Defense in depth only — every interpolation is escaped and the pages have no script and no
-  external resource — but `default-src 'none'; form-action 'self'`, `DENY` and `nosniff` on
-  `reviewReply` cost one line each and keep the four failure pages header-identical.
 - **The cache-hit fixture is still hand-authored.** `packages/llm/test/fixtures/anthropic/draft-cache-hit.json`
   pins the field mapping and the pricing, not that Anthropic really returned those numbers. The
   runbook's `LLM_RECORD=1` recorder step is the only thing that proves caching end to end, and
@@ -1018,7 +1221,6 @@ these 18 carry:
 
 ## Later phases (see the spec for scope and verification)
 
-- Phase 4 — knowledge (parsers, crawler, Voyage embeddings, retrieval, `minio`/R2 uploads).
 - Phase 5 — autonomy and learning (resolved-answer memory, evidence score, graduation).
 - Phase 6 — provider choice (BYOK adapters, probes, per-agent model config).
 - Phase 7 — billing, caps, launch hardening.
@@ -1049,6 +1251,28 @@ send/reply/follow-up walk against both providers from both a Gmail and an outloo
 recording the cache-hit fixture (`LLM_RECORD=1 … tsx packages/llm/scripts/record-cache-hit.ts`) and
 committing it, an EAS dev build to verify the Review/Hold push actions on iOS and Android, and
 confirming the 08:00-local digest email with working one-click links.
+
+The Phase 4 external-setup runbook (`docs/runbooks/2026-09-phase-4-external-setup.md`) is what
+Phase 4 needs before a real customer document is ever embedded or stored: the `vector` extension
+installed once by a superuser BEFORE the migrations run (migration 0012 runs as `aesa_owner` and
+cannot install it itself), the Voyage AI account and `VOYAGE_API_KEY` on every `knowledge`/`agent`
+replica (plus `KNOWLEDGE_EMBED_MODEL`, which cannot be changed on a live workspace without hiding
+every existing chunk from the vector leg, and a Voyage console billing limit as the backstop to
+`knowledge.daily_embed_tokens_cap`), the Cloudflare R2 bucket + API token + the six `S3_*` values
+identical in BOTH apps and the bucket's `PUT`/`GET` CORS rule for `APP_WEB_ORIGIN` (a missing rule
+is a browser upload that fails with no server-side error anywhere), the crawler's User-Agent
+(`aesa-crawler/1.0 (+https://aesa.app)`, robots token `aesa-crawler`) published on the public site
+so a customer can opt out, the live walk (crawl a real site, upload a real PDF and DOCX from the web
+AND from a phone, ask a question the document answers and check the draft's
+`confidence_breakdown.grounding`), and the DPA/privacy-policy update — **Voyage and the object store
+are new sub-processors, and customer documents are now stored at rest.**
+
+Open the Knowledge screen in a browser once, signed in. No gate renders it: the Playwright smoke
+still ends at the gated mailbox step, and jest-expo exercises the components but not the real DOM.
+The three things only a browser can prove are the web drag-and-drop zone (`bindDropZone`'s real
+`dragenter`/`dragover`/`dragleave`/`drop` events), the presigned PUT's CORS preflight against minio
+(`MINIO_API_CORS_ALLOW_ORIGIN=http://localhost:8081` must match the Expo web origin), and — on a
+phone — the native document picker.
 
 Brand deviation 14: whether the phone inbox should get a small header lockup, now that spec §6's
 header lockup is met only on wide layouts and the sign-in screen — a phone shows no brand chrome

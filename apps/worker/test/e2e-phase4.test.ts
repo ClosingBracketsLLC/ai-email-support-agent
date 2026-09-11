@@ -22,8 +22,8 @@
  *
  * FOUR harness-level seams, all arrangement rather than assertion:
  *
- *  1. **The api is driven through its SERVICE module, not a tRPC caller.** `apps/api/src/init.ts`
- *     exports no caller factory, and `apps/api/src/knowledge/service.ts` is where every knowledge
+ *  1. **The api is driven through its SERVICE module, not a tRPC caller.** The api exports no
+ *     `createCaller` factory anywhere, and `apps/api/src/knowledge/service.ts` is where every knowledge
  *     write and read actually lives (the router is a thin code-to-`TRPCError` map) — the same
  *     pattern `e2e-phase3.test.ts` uses for `@aesa/api/drafts`.
  *  2. **The draft script cites by MARKER, not by id.** A fake script is a static object, but the

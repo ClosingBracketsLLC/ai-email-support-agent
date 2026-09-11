@@ -78,10 +78,23 @@ instruction from him in the session.
   `RESEND_API_KEY` (required in production on a `cron` replica) plus `APP_BASE_URL` and
   `APP_WEB_ORIGIN` (the digest links' two bases; **either one unset disables the digest email
   pass entirely** — the gate is `!mail || !appBaseUrl || !appWebOrigin` — while the push digest
-  still runs). `apps/api`: the same `GMAIL_OAUTH_CLIENT_ID`/`_SECRET`
+  still runs), `VOYAGE_API_KEY` (**required in production when `WORKER_ROLES` includes `knowledge`
+  OR `agent`** — the first writes every chunk's vector, the second embeds every retrieval query;
+  outside production a missing key falls back to the deterministic hash embedder with one warning,
+  and its vectors are NOT comparable with Voyage's), `KNOWLEDGE_EMBED_MODEL` (`voyage-4` default;
+  stored on every chunk as `embedding_model` and part of the vector leg's `WHERE`, so changing it
+  on a live workspace hides every existing chunk from that leg until Phase 6's re-embed job) and
+  `KNOWLEDGE_RERANK` (`off` default; `on` adds Voyage's cross-encoder pass, inert without a key).
+  `apps/api`: the same `GMAIL_OAUTH_CLIENT_ID`/`_SECRET`
   and `MS_OAUTH_CLIENT_ID`/`_SECRET` pairs (the connect flow's own OAuth, distinct from Better
   Auth's `GOOGLE_CLIENT_ID`/`MICROSOFT_CLIENT_ID` SSO login), `GMAIL_PUBSUB_AUDIENCE`/`_SA_EMAIL`
-  (the webhook's OIDC verification), and `MAIL_FROM`. **`MAIL_FROM`, `APP_BASE_URL` and
+  (the webhook's OIDC verification), and `MAIL_FROM`. **Both apps** read the same six
+  `S3_ENDPOINT`/`S3_REGION`/`S3_BUCKET`/`S3_ACCESS_KEY_ID`/`S3_SECRET_ACCESS_KEY`/`S3_FORCE_PATH_STYLE`
+  (`parseS3Env`, all-or-none — a half-configured set throws at boot) and must point at ONE bucket:
+  the api issues the presigned PUT, a `knowledge`-role worker reads the bytes back. Required in
+  production for the api, and for a worker whose `WORKER_ROLES` includes `knowledge`; in dev/test a
+  missing set falls back to an in-memory store (paste and crawl still work; every upload fails
+  "object missing"). **`MAIL_FROM`, `APP_BASE_URL` and
   `APP_WEB_ORIGIN` must be identical in both `.env` files** — the worker's sync walk
   (platform-sender skip), the api's verification-code interception and the digest email's
   `/a/:draftId` + `/ticket/:id` links all key off them, and drift breaks each silently, with no
@@ -94,7 +107,8 @@ instruction from him in the session.
   libpq startup options), `withOrg` / `withPlatform` / `withOrgIdentity` (lending a platform sweep's
   per-row SAVEPOINT tx one org's identity), per-org data keys, `escalateTicket` (the single entry
   into `needs_owner` — see the Escalation rule below), the meter sink (`createMeterSink`,
-  `bumpMeter`, `LLM_METERS` / `SEND_METERS` / `SANDBOX_METERS`), and `createTestDatabase`.
+  `bumpMeter`, `LLM_METERS` / `SEND_METERS` / `SANDBOX_METERS` / `KNOWLEDGE_METERS`),
+  `bumpKnowledgeVersion`, and `createTestDatabase`.
 - `packages/crypto` — `Secret`, domain-separated token hashing, AES-256-GCM envelope with a KEK ring,
   libsodium sealed boxes, the SSRF guard (`validateOutboundUrl`, `resolvePublic`, `pinnedFetch`).
 - `packages/core` — tripwire, state-transition matrices, settings catalog, plans, startup
@@ -114,8 +128,9 @@ instruction from him in the session.
   table, `createManagedProvider`, and `createFakeProvider` for tests. No database dependency (the
   `MeterSink` it consumes is implemented in `packages/db`).
 - `packages/agent` — the triage prompt and one-model-call (`runTriageCall`), the six-layer draft
-  prompt with its stability hints and `runDraftCall`, the `Retriever` seam (empty until Phase 4),
-  the usage accumulator and the run watchdog; no database dependency — `apps/worker`'s
+  prompt with its stability hints and `runDraftCall`, the `Retriever` seam (`emptyRetriever` here;
+  `@aesa/knowledge`'s `createRetriever` is what implements it), the usage accumulator and the run
+  watchdog; no database dependency — `apps/worker`'s
   `ticket.triage` / `ticket.draft` jobs own every read and write around it. Its second entry point
   `@aesa/agent/policy` (`src/policy.ts`) is the ONE builder of a tenant's `WorkspacePolicy` —
   `buildReplyPolicy` / `personaFor`, the four trusted texts in a fixed order (platform hard rules,
@@ -124,6 +139,17 @@ instruction from him in the session.
   own prompt-text modules and nothing else, so the api can build the identical policy without the
   Anthropic SDK entering its module graph (held by `packages/agent/test/policy.test.ts` and
   `apps/api/test/error-surface.test.ts`, which both walk the real module graph).
+- `packages/knowledge` — Phase 4's knowledge pipeline, with no job and no queue of its own:
+  the HTML/Markdown/text/PDF/DOCX block parsers and the bounded parser child
+  (`parsers/`, `bounds.ts`), the heading-aware chunker, the prompt-injection screen,
+  `prepareDocument` (chunk + screen + hash), the `Embedder`/`Reranker` ports with the Voyage and
+  deterministic-hash adapters, the `ObjectStore` port with its S3 and in-memory adapters
+  (`storage/`), the SSRF-safe crawler (robots, sitemap-first, re-validated redirects, first-20
+  batches) and hybrid per-org retrieval (`createRetriever`, `assertSameOrg`, the relaxed tsquery,
+  RRF fusion). Two PURE sub-paths the api imports and nothing else — `@aesa/knowledge/storage` and
+  `@aesa/knowledge/url` — keep the parsers and the LLM client out of the api's module graph
+  (`apps/api/test/error-surface.test.ts` walks it); `./testing` exports `fakeSite`. `@aesa/agent` is
+  a type-only devDependency (`RetrievedChunk`/`Retriever` erase at runtime).
 - `packages/platform-mail` — the platform's own outbound mail (sign-in codes, invitations,
   address-verification codes, the daily digest): the `MailTransport` port with a Resend transport
   and a devsink, plus the templates. Shared by `apps/api` and `apps/worker`; no database dependency.
@@ -143,7 +169,10 @@ instruction from him in the session.
   redraft, mark viewed) — which shares ONE service module (`src/drafts/service.ts`, exported as
   `@aesa/api/drafts`) with the session-less `/a/:draftId?t=` one-click review pages and with
   `inbox`'s draft view and resolve — plus a separate `activity` router (counts, cost, recent sends)
-  that reads its own aggregates and touches no draft service. The approve gate screens the owner's
+  that reads its own aggregates and touches no draft service, and Phase 4's `knowledge` router
+  (presigned uploads, paste, crawl, list, delete, flagged chunks, gaps), which is likewise a thin
+  code-to-`TRPCError` wrapper over ONE service module (`src/knowledge/service.ts`, exported as
+  `@aesa/api/knowledge`). The approve gate screens the owner's
   body through the SAME policy the draft and send gates use — the api depends on `@aesa/agent`, but
   only through the pure `@aesa/agent/policy` sub-path, never the package root. The api never holds
   the KEK, never calls a model, never
@@ -156,8 +185,14 @@ instruction from him in the session.
   `mailbox.sync` / `mailbox.poll-sweep` / `mailbox.renew-watch` / `mailbox.store-credentials` /
   `mailbox.revoke` (mailbox lifecycle, `sync` role), `ticket.triage` / `ticket.draft` /
   `agent.sandbox` (`agent` role; `drafting/` holds the claim protocol, the caps gate, the run
-  context, the outcome table and the reply policy), `send.execute` (`send` role — the only process
-  that ever sends a customer reply), `notify.dispatch` / `notify.digest` (escalation and
+  context, the outcome table and the reply policy), `knowledge.ingest` / `knowledge.crawl` /
+  `knowledge.embed-batch` (`knowledge` role — one upload or paste becomes one document and its
+  chunks; one crawl becomes one document per page, streamed in batches under a 300 s claim lease;
+  one document's missing vectors are filled in ≤ 128-text embed calls — `knowledge/sources.ts`
+  holds `guardedSourceWrite`/`failSource` and `knowledge-deps.ts` is the ONE place the store,
+  embedder and reranker are chosen from `WorkerConfig`, shared with the `agent` role's retriever so
+  a worker can never write vectors with one model and query with another), `send.execute` (`send`
+  role — the only process that ever sends a customer reply), `notify.dispatch` / `notify.digest` (escalation and
   collapsed-overflow push, plus the daily digest EMAIL via `digest-email.ts`), and the crons
   `ticket.backstop-sweep` (every minute, five arms: (a) missed/stuck draft runs, (a2) tickets
   stranded at the agent failure ceiling, (b) stuck run rows, (c) orphaned tickets, (d) due sends —
@@ -190,8 +225,9 @@ instruction from him in the session.
   `registerJob` hands the handler an `AbortSignal` that fires at `expireInSeconds` minus
   `JOB_SIGNAL_MARGIN_SECONDS` (owned by `@aesa/core`). **`singletonKey` only does something on a
   queue whose `policy` says so.** pg-boss 10 gates its singleton indexes on the queue's policy, and
-  `defineJob` defaults to `standard`, on which no index applies and the key is inert. The four
-  Phase 3 queues — `ticket.draft`, `send.execute`, `agent.sandbox`, `notify.dispatch` — declare
+  `defineJob` defaults to `standard`, on which no index applies and the key is inert. The seven
+  `short` queues — Phase 3's `ticket.draft`, `send.execute`, `agent.sandbox`, `notify.dispatch` and
+  Phase 4's `knowledge.ingest`, `knowledge.crawl`, `knowledge.embed-batch` — declare
   `policy: 'short'` in `defineJob`'s `queue` options, which collapses a duplicate only while the
   first job is still `created` (a job that has gone `active`, or that is sitting in `retry`, never
   swallows a newer event; `enqueue` returns `null` when a duplicate was collapsed).
@@ -199,14 +235,18 @@ instruction from him in the session.
   webhook, and those enqueues pass `enqueue`'s `debounceSeconds` (pg-boss `singletonSeconds`),
   which is policy-independent — and `mailbox.sync`'s own per-connection lease serializes whatever
   still gets through. `short`'s
-  index keys on `COALESCE(singleton_key,'')`, so two KEYLESS `boss.send` calls on one of those four
-  queues collapse into one — always enqueue through `enqueue`. **A new queue is added in FOUR
+  index keys on `COALESCE(singleton_key,'')`, so two KEYLESS `boss.send` calls on one of those
+  queues collapse into one — **`enqueue` is the only send path, and ESLint bans a bare `boss.send`
+  outside `packages/queue` and tests.** **A new queue is added in FOUR
   places** —
   `JOB_NAMES` (`packages/queue/src/names.ts`), the worker's `apps/worker/src/index.ts` pre-create
   list (any queue another role or a cron enqueues), the api's `apps/api/src/boss.ts` pre-create list
   (any queue the api sends), and `apps/worker/test/queue-preflight.test.ts`'s `it.each`. pg-boss 10
   silently returns `null` from `send` on a queue that does not exist yet, so a missed pre-create is
-  a job that never runs and never errors; the preflight test is what catches it.
+  a job that never runs and never errors; the preflight test is what catches it. **Both pre-create
+  lists carry the queue's `policy`** — `createQueue` ignores a second call, so whichever process
+  boots first decides, and a `short` queue first created by an api-only boot with no options would
+  stay `standard` until a worker replica ran `updateQueue`.
 - **Escalation.** Every entry into `needs_owner` from the drafting, send and api paths goes through
   `escalateTicket` (`@aesa/db`) — it owns the guarded transition, the `escalation_notified_at` reset,
   the audit row and the deduped notification, and its `dedupeKey` is reason-scoped where a second
@@ -230,6 +270,30 @@ instruction from him in the session.
   cleared. The approve gate differs from the send gate in exactly one deliberate way — it passes no
   `groundedNumbers` (the owner is the grounding for their own edit, and `unbacked_number` is a
   `warn` that flips no outcome).
+- **Retrieval.** Every retrieval leg filters `org_id` in SQL (`retrieval/sql.ts`) AND runs inside
+  `withOrg`, and `assertSameOrg` re-checks every row again before any of it can reach a prompt — it
+  throws rather than filtering, because a foreign row in that set is evidence the filter is broken.
+  Scoring is an **exact cosine scan inside one org's rows** over the `(org_id, document_id)` btree:
+  **never a global vector index** (no HNSW/IVFFlat — an EXPLAIN test pins the access path), and the
+  vector leg additionally matches `embedding_model` so a workspace embedded by another model scores
+  nothing rather than nonsense. An `injection_flagged` chunk is excluded by both legs and again by
+  the re-read. An embedder failure **degrades to the lexical (`tsvector`) leg alone**
+  (`mode: 'lexical'`, `degraded: true`, one warn) and never fails a draft — a Voyage outage costs
+  grounding quality, not replies. `apps/worker`'s `ticket.draft` records the provenance
+  (`score`, `mode`, `knowledgeVersion`, `retrieved`, `cited`) in `confidence_breakdown.grounding`
+  and re-filters every id the model cites against what retrieval actually returned.
+- **Knowledge bounds.** PDF and DOCX are parsed in a **forked child** (`runParserInChild`) under
+  `--max-old-space-size=512` and a 60 s clock, never in the worker process; uploads are capped at
+  `KNOWLEDGE_MAX_UPLOAD_BYTES` (20 MiB) declared to the api AND re-checked by `knowledge.ingest`'s
+  HEAD, which deletes the object and clears `storage_key` when it refuses. A paste is capped at
+  `KNOWLEDGE_MAX_PASTE_CHARS`, a chunk at `KNOWLEDGE_CHUNK_MAX_CHARS`; a crawl is https-only,
+  same-site, one request at a time per host with a politeness delay, at most 3 redirect hops each
+  re-validated through the SSRF guard, and bounded by `knowledge.max_crawl_pages`. Sources are
+  bounded by `knowledge.max_sources` and embedding by `knowledge.daily_embed_tokens_cap`, all three
+  resolved per org through `resolveSetting`. Every chunk is screened by `screenChunk` before it is
+  stored, and a flagged chunk is stored but never retrieved until an owner clears the flag.
+  `workspaces.knowledge_version` is bumped **in the same transaction as the chunk-set change that
+  caused it** (ingest, each crawl batch, delete, unflag) — it is provenance, not a cache key.
 - **Lock order.** Any transaction touching more than one of the three row kinds takes them in ONE
   global order, in the api AND the worker: **`outbound_sends` → `drafts` → `tickets`**. That is the
   order every `send.execute` path already takes; `approveDraft`, `holdDraft` and `resolveTicket`
