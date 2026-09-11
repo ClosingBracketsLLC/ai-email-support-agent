@@ -93,12 +93,23 @@ instruction from him in the session.
   (`parseS3Env`, all-or-none — a half-configured set throws at boot) and must point at ONE bucket:
   the api issues the presigned PUT, a `knowledge`-role worker reads the bytes back. Required in
   production for the api, and for a worker whose `WORKER_ROLES` includes `knowledge`; in dev/test a
-  missing set falls back to an in-memory store (paste and crawl still work; every upload fails
-  "object missing"). **`MAIL_FROM`, `APP_BASE_URL` and
+  missing set falls back to an in-memory store (paste and crawl still work; an upload's presign
+  hands the browser a `memory://` URL, the PUT fails in the browser and the row simply sits
+  `queued` — `knowledge.ingest`'s "object missing" only fires if `completeUpload` is somehow
+  reached). `S3_CORS_ORIGIN` is read by `pnpm s3:init` ALONE, never by either app: it is the single
+  origin written into the bucket's CORS rule, so the browser's cross-origin PUT is allowed. It
+  defaults to `http://localhost:8081` and **must be set to `APP_WEB_ORIGIN` whenever `s3:init` is
+  run against a real bucket** — otherwise every upload dies in a CORS preflight. **`MAIL_FROM`,
+  `APP_BASE_URL` and
   `APP_WEB_ORIGIN` must be identical in both `.env` files** — the worker's sync walk
   (platform-sender skip), the api's verification-code interception and the digest email's
   `/a/:draftId` + `/ticket/:id` links all key off them, and drift breaks each silently, with no
-  error at boot in either app.
+  error at boot in either app. **`KNOWLEDGE_EMBED_MODEL` must likewise be identical on every
+  `knowledge` AND `agent` replica** — the first writes it onto each chunk as `embedding_model`, the
+  second embeds the query and filters the vector leg by it, so a drifted replica retrieves nothing
+  from the vector leg at all and silently degrades every draft to the lexical one. Nothing refuses
+  it at boot; the retriever warns once per process per org when the vector leg comes back empty and
+  a different `embedding_model` is stored.
 
 ## Layout
 
@@ -187,7 +198,9 @@ instruction from him in the session.
   `agent.sandbox` (`agent` role; `drafting/` holds the claim protocol, the caps gate, the run
   context, the outcome table and the reply policy), `knowledge.ingest` / `knowledge.crawl` /
   `knowledge.embed-batch` (`knowledge` role — one upload or paste becomes one document and its
-  chunks; one crawl becomes one document per page, streamed in batches under a 300 s claim lease;
+  chunks; both ingest and crawl claim their source under a 300 s lease, so a replica that died
+  mid-parse is re-claimed rather than stranded `processing`; one crawl becomes one document per
+  page, streamed in batches under that lease;
   one document's missing vectors are filled in ≤ 128-text embed calls — `knowledge/sources.ts`
   holds `guardedSourceWrite`/`failSource` and `knowledge-deps.ts` is the ONE place the store,
   embedder and reranker are chosen from `WorkerConfig`, shared with the `agent` role's retriever so
@@ -287,13 +300,16 @@ instruction from him in the session.
   `KNOWLEDGE_MAX_UPLOAD_BYTES` (20 MiB) declared to the api AND re-checked by `knowledge.ingest`'s
   HEAD, which deletes the object and clears `storage_key` when it refuses. A paste is capped at
   `KNOWLEDGE_MAX_PASTE_CHARS`, a chunk at `KNOWLEDGE_CHUNK_MAX_CHARS`; a crawl is https-only,
-  same-site, one request at a time per host with a politeness delay, at most 3 redirect hops each
+  same-site, with starts spaced >= 250 ms apart per host and at most two requests in flight, at most 3 redirect hops each
   re-validated through the SSRF guard, and bounded by `knowledge.max_crawl_pages`. Sources are
   bounded by `knowledge.max_sources` and embedding by `knowledge.daily_embed_tokens_cap`, all three
   resolved per org through `resolveSetting`. Every chunk is screened by `screenChunk` before it is
   stored, and a flagged chunk is stored but never retrieved until an owner clears the flag.
   `workspaces.knowledge_version` is bumped **in the same transaction as the chunk-set change that
-  caused it** (ingest, each crawl batch, delete, unflag) — it is provenance, not a cache key.
+  caused it** (ingest, each crawl batch that actually changed something, delete, unflag) — it is
+  provenance, not a cache key. It tracks the set of RETRIEVABLE chunks, and a chunk is retrievable
+  (lexically) from the moment ingest stores it, so `knowledge.embed-batch` filling in vectors never
+  bumps it; "fully embedded" is `embedded_count = chunk_count` on the source, a different question.
 - **Lock order.** Any transaction touching more than one of the three row kinds takes them in ONE
   global order, in the api AND the worker: **`outbound_sends` → `drafts` → `tickets`**. That is the
   order every `send.execute` path already takes; `approveDraft`, `holdDraft` and `resolveTicket`
@@ -302,9 +318,12 @@ instruction from him in the session.
   error handler strips SQL parameters and redacts URLs before anything reaches a log or a client.
 - **App bundle.** `apps/app` never value-imports a server package — `@aesa/db`, `@aesa/core`,
   `@aesa/crypto`, `@aesa/queue`, `@aesa/mail`, `@aesa/platform-mail`, `@aesa/llm`, `@aesa/agent`,
-  `@aesa/test-kit`, `@aesa/api`, `drizzle-orm`, `fastify`, `better-auth/node` or `node:*` — nor any of their sub-paths
-  (`@aesa/db/*`, `@aesa/api/*`, `@aesa/agent/*`, `drizzle-orm/*`); `import type` is allowed
-  throughout (ESLint block for `apps/app/**`). Share types through `@aesa/contracts`.
+  `@aesa/knowledge`, `@aesa/test-kit`, `@aesa/api`, `drizzle-orm`, `fastify`, `better-auth/node` or
+  `node:*` — nor any of their sub-paths (`@aesa/db/*`, `@aesa/api/*`, `@aesa/agent/*`,
+  `@aesa/knowledge/*`, `drizzle-orm/*`); `import type` is allowed
+  throughout (ESLint block for `apps/app/**`). Share types through `@aesa/contracts`. The two PURE
+  `@aesa/knowledge` sub-paths are pure for the API's sake, not the app's: they still reach `node:*`
+  and the AWS SDK.
 - **Brand files are generated.** `brand/mark-{ink,paper,lifted}.svg`, `brand/lockup-{horizontal,
   stacked}.svg`, `brand/og-image.svg`,
   `apps/app/assets/{icon,adaptive-icon,splash-icon,notification-icon,favicon}.png`,

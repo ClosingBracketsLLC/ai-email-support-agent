@@ -50,12 +50,18 @@ already set in the process environment.
   (every chunk's vector) or `agent` (every retrieval query); outside production a missing key falls
   back to a deterministic hash embedder whose vectors are NOT comparable with Voyage's.
   `KNOWLEDGE_EMBED_MODEL` (default `voyage-4`) is stored on every chunk and is part of the vector
-  leg's filter; `KNOWLEDGE_RERANK` (default `off`) adds Voyage's cross-encoder pass.
+  leg's filter, so it **must be identical on every `knowledge` and `agent` replica** — a drifted
+  one retrieves nothing from the vector leg and silently degrades to lexical grounding, with no
+  boot-time refusal; `KNOWLEDGE_RERANK` (default `off`) adds Voyage's cross-encoder pass.
 - `S3_ENDPOINT` / `S3_REGION` / `S3_BUCKET` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` /
   `S3_FORCE_PATH_STYLE` — object storage for knowledge uploads: minio locally (`pnpm db:up` starts
   it, `pnpm s3:init` creates the bucket), S3/R2 in production. All six or none. Required in
   production when `WORKER_ROLES` includes `knowledge`; **the api reads the same six names for its
-  presigned PUT, so point both apps at one bucket.**
+  presigned PUT, so point both apps at one bucket.** Without them the api hands the browser a
+  `memory://` URL, the PUT fails client-side and the source row just sits `queued`.
+  `S3_CORS_ORIGIN` is a seventh name neither app reads: `pnpm s3:init` alone reads it and writes it
+  into the bucket's CORS rule, so it must equal `APP_WEB_ORIGIN` whenever `s3:init` is run against
+  a real bucket (it defaults to `http://localhost:8081`).
 - `GMAIL_OAUTH_CLIENT_ID`/`_SECRET`, `MS_OAUTH_CLIENT_ID`/`_SECRET` — all-or-none pairs, one per
   provider. At least one is required in production for **`send`** — `maybeRegisterSendRole`
   (`apps/worker/src/send-role.ts`) refuses to boot without one. `sync` is not gated on a pair at

@@ -39,6 +39,17 @@ dev volume created before Phase 4 needs `pnpm db:down && pnpm db:up` once.
    a live workspace hides every existing chunk from the vector leg** until Phase 6's re-embed job
    runs (the tsvector leg keeps answering meanwhile). Pick one before the first customer document
    is ingested.
+
+   **It must be IDENTICAL on every `knowledge` and every `agent` replica** — the same
+   deploy-wide identity rule `MAIL_FROM` / `APP_BASE_URL` / `APP_WEB_ORIGIN` already have. The
+   `knowledge` role writes the model onto each chunk; the `agent` role embeds the query with its
+   own model and filters the vector leg by it, so a replica set to a different value retrieves
+   nothing from that leg and every draft it makes silently degrades to lexical-only grounding.
+   Nothing refuses the mismatch at boot. The one signal is a warning the retriever logs once per
+   process per org when its vector leg comes back empty and the org has chunks stored under a
+   different `embedding_model` — worth an alert on:
+
+       knowledge retrieval: the vector leg is empty and stored chunks use a different embedding model
 4. **`KNOWLEDGE_RERANK`** — leave it `off`. `on` adds a Voyage `rerank-2.5` cross-encoder pass over
    the fused top-20 candidates: one extra API call per retrieval, for a better top-6 order. It is
    inert without `VOYAGE_API_KEY`. Turn it on only with a measurement to compare against.
@@ -49,8 +60,15 @@ dev volume created before Phase 4 needs `pnpm db:down && pnpm db:up` once.
    pg-boss (`knowledge.embed-batch`: `retryLimit: 5`, backoff on), resuming from whatever is still
    unembedded.
 6. **The daily spend cap lives in OUR database, not theirs.** `knowledge.daily_embed_tokens_cap`
-   (code default 5,000,000 tokens per org per UTC day; per-plan values in
-   `packages/core/src/plans.ts`) is read per org by `knowledge.embed-batch` before its first call.
+   (5,000,000 tokens per org per UTC day) is read per org by `knowledge.embed-batch` before its
+   first call.
+
+   **Plan-tier resolution is not live yet.** `packages/core/src/plans.ts` carries per-plan values,
+   but nothing calls `planSettingDefaults`: every `resolveSetting` site passes `{ org }` only, so
+   **today every org sits on the settings-catalog defaults — 100 sources, 200 crawl pages,
+   5,000,000 embed tokens a day — unless an `org_settings` row overrides it.** Plan tiers arrive
+   with Phase 7's billing, which owns the org's `plan` column and the `{ plan }` argument. Until
+   then, an `org_settings` row is the ONLY way to give one org a different cap.
    Over the cap, the source records `cap_reached` and the owner sees a failed source that resumes
    after midnight UTC. Override it for one org with a row in `org_settings`. Set a **billing limit
    in the Voyage console too**, as the platform-wide backstop — the same relationship the Anthropic
@@ -93,8 +111,22 @@ the only process that ever reads the bytes back.
        ExposeHeaders:  [ ETag ]
        MaxAgeSeconds:  3000
 
-   A real S3/R2 bucket supports `PutBucketCors`, so `pnpm s3:init` with production `S3_*` exported
-   will set it — or set it by hand in the R2 dashboard. **MinIO does not**: `PutBucketCors` always
+   A real S3/R2 bucket supports `PutBucketCors`, so `pnpm s3:init` will set it — or set it by hand
+   in the R2 dashboard. **`S3_CORS_ORIGIN` is what the script writes into `AllowedOrigins`, and it
+   is NOT one of the six `S3_*` variables the apps read**: it is read by `scripts/s3-init.ts` alone
+   and defaults to `http://localhost:8081`, so exporting only the six would quietly point a
+   production bucket's CORS rule at a localhost dev server. Export it with the rest:
+
+       S3_ENDPOINT=https://<account id>.r2.cloudflarestorage.com \
+       S3_REGION=auto \
+       S3_BUCKET=aesa-prod \
+       S3_ACCESS_KEY_ID=<id> \
+       S3_SECRET_ACCESS_KEY=<secret> \
+       S3_FORCE_PATH_STYLE=false \
+       S3_CORS_ORIGIN=<APP_WEB_ORIGIN> \
+       pnpm s3:init
+
+   **MinIO does not**: `PutBucketCors` always
    answers `501 NotImplemented` there, which is why local and CI CORS is server-wide instead, via
    `MINIO_API_CORS_ALLOW_ORIGIN` on the minio container (`compose.yaml`, and the CI `docker run`
    step). `s3:init` tolerates ONLY that 501 and rethrows everything else.
@@ -126,7 +158,8 @@ out of part of their site adds
     Disallow: /members
 
 to their robots.txt; we honour it (a disallowed URL is never fetched, and counts as skipped). The
-crawl is one request at a time per host with a 250 ms politeness delay, https only, same-site only,
+crawl starts its requests at least 250 ms apart per host with at most two in flight, https only,
+same-site only,
 at most 3 redirect hops — each one re-validated against the SSRF guard — and capped by the
 workspace's `knowledge.max_crawl_pages` plan setting. **Put that User-Agent string and this
 paragraph on the public site** before the first customer crawl: it is the answer to "what is this

@@ -833,7 +833,7 @@ the record)</summary>
   `de35bf9` — the plan commit, the Phase 3 carry-over task, ten implementation tasks with their
   per-task fix commits, the Task 11 close-out (the E2E, the external-setup runbook and the docs)
   and this docs commit. The per-task list, newest last:
-  `8586ea2` plan · `f7e722d` T0 carries (the `short` queues' pre-create policy, the `boss.send`
+  `8586ea2` plan · `f7e722d` T1 carries (the `short` queues' pre-create policy, the `boss.send`
   lint, the review pages' CSP/frame/nosniff headers) · `202b1bf` T2 contracts+core ·
   `d283136`+`a2e2218` T3 the three `knowledge_*` tables · `cdb6340`+`f171c0a` T4 parsers, the
   bounded child, the chunker, the injection screen · `e29e510`+`05f60cf` T5 the `Embedder` and
@@ -861,7 +861,12 @@ the record)</summary>
     inputs and the four size limits (20 MiB upload, 50k paste chars, 3,000 chunk chars, 50 default
     crawl pages), and the guidance input.
   - `packages/core` — the three `knowledge.*` settings (`max_sources`, `max_crawl_pages`,
-    `daily_embed_tokens_cap`) in the catalog and per plan.
+    `daily_embed_tokens_cap`) in the catalog, with per-plan values alongside them in `plans.ts`.
+    The plan values are **constants, not yet a resolution layer**: `planSettingDefaults` has no
+    caller and every knowledge `resolveSetting` site passes `{ org }` only, so today every org sits
+    on the catalog defaults — **100 sources, 200 crawl pages, 5,000,000 embed tokens a day** —
+    unless an `org_settings` row overrides it. Plan tiers arrive with Phase 7's billing, which owns
+    the org's `plan` column and the `{ plan }` argument at every site.
   - `packages/db` — `knowledge_sources` / `knowledge_documents` / `knowledge_chunks` with
     `vector(1024)`, a generated `tsvector`, FORCE RLS and the tenant policies, the partial
     unembedded index, `knowledge_sources.claim_token` (migration 0015), `bumpKnowledgeVersion` and
@@ -898,7 +903,11 @@ the record)</summary>
      is bumped in the same transaction as every chunk-set change and recorded on the draft's
      grounding as the provenance Phase 5's staleness rule needs.
   5. **The gaps report is a card on the Knowledge screen**, not an Analytics dashboard.
-  6. **Crawl page caps are plan settings** and "first 20 pages fast" is the first persisted batch.
+  6. **Crawl page caps are a setting** (`knowledge.max_crawl_pages`) and "first 20 pages fast" is
+     the first persisted batch. The spec's "per plan" half is DEFERRED, not built: `plans.ts`
+     carries the per-plan numbers but nothing resolves against them, so the effective cap is the
+     org's own `org_settings` override or the catalog default (200) — see the `packages/core` line
+     above and runbook §1.6.
   7. **One `knowledge.embed-batch` job per document**, not per arbitrary chunk batch.
   8. **Parsers:** `pdfjs-dist` (no OCR — an image-only PDF fails `no_text`) and `mammoth` → HTML →
      the same block extractor; the "zip bounds" are the byte cap plus the child's heap and clock.
@@ -906,7 +915,7 @@ the record)</summary>
      the `knowledge` role's pg-boss `teamSize`.
   10. **The web drag-drop zone is a `.web.tsx` platform file**; native uses `expo-document-picker`;
       share-sheet intake is Phase 7.
-  11. **Carries folded in (Task 0):** the `short` queues' pre-creation now carries `policy: 'short'`
+  11. **Carries folded in (Task 1):** the `short` queues' pre-creation now carries `policy: 'short'`
       in both lists; a bare `boss.send` is banned by ESLint outside `packages/queue` and tests; the
       review pages gained CSP/`X-Frame-Options`/`X-Content-Type-Options`. The rest of Phase 3's
       carry list moves on unchanged — see *Next: Phase 5*.
@@ -1010,8 +1019,14 @@ the record)</summary>
   29. `useUpload().start(files)` resolves `{ stoppedBy: 'cap' | null }` and stops the batch at the
       first refusal; every per-file reason is rendered in the owner's words, an absent picker size
       is refused client-side and an absent MIME is inferred from the extension first.
-- **Carried into the final review** (the ledger's deferred items; the whole-branch review that
-  follows this task triages them):
+  30. **Amends ruling 24** (from Task 9's re-review): the "api imports ONLY the two pure sub-paths"
+      rule binds **production sources only** — `apps/api/src/**`. A test file may import the
+      `@aesa/knowledge` root (`knowledge-router.test.ts` takes `vectorLiteral` from it), because
+      what the rule protects is the api's shipped module graph, which
+      `error-surface.test.ts`'s probes walk from `config.ts` and `trpc/router.ts`, not from `test/`.
+- **Carried into the final review** (the ledger's deferred items, as they stood at the close-out
+  commit; the whole-branch review below triaged all three — the ingest lease SHIPPED, the other two
+  parks HELD):
   - `knowledge.ingest` has **no lease** — a hard death mid-parse strands the source at `processing`
     (the claim token prevents damage, not the stall); copy the crawl's lease pattern, with Phase 7's
     sweep.
@@ -1019,6 +1034,138 @@ the record)</summary>
     guarded on status alone.
   - `@aesa/agent` is a type-only **devDependency** of `@aesa/knowledge`; a consumer typechecking
     `@aesa/knowledge` without `@aesa/agent` would fail (none exists today).
+- **Whole-branch final review (2026-09-11).** Reviewed at **`8ee8da3`** by four reviewers reading in
+  parallel — `@aesa/knowledge` (A), `apps/worker` + `packages/db` (B), `apps/api` + `apps/app` (C),
+  and the cross-cutting seams (D). Verdict **approve with fixes**: **0 Critical, 21 Important**
+  across the four, overlapping into **17 distinct fixes**, plus two whole classes of minor. All 12
+  seams held and no execution-time ruling was found to contradict the spec. The fix wave ran as ONE
+  wave with THREE implementers in sequence on a shared index — **`97357bb`** (knowledge +
+  contracts), **`cfb4fd2`** (worker), **`bdf5767`** (api + app + eslint + the one remaining worker
+  line) — and this docs commit, which records the wave.
+  - **`@aesa/knowledge`.** The injection screen was quarantining ordinary support prose: "We will
+    never email you your password", "we send a one-time token to the address on file" and two more
+    probed sentences all flagged. The `override_instructions` and `exfiltration` verbs now have to
+    stand in IMPERATIVE position (a line start, a sentence-ending mark, or "and …"), so a verb with
+    a subject in front of it does not match, and the four sentences are CLEAN fixtures. The eight
+    reason codes moved to `@aesa/contracts` as `KNOWLEDGE_INJECTION_REASONS` — the app renders a
+    label per code and may not value-import a server package. The forked parser child's IPC reply is
+    now bounded by the chunker's own ceiling (2,000 × `KNOWLEDGE_CHUNK_MAX_CHARS` = 6 MB, with a
+    `truncated` flag), so a 20 MiB PDF can no longer inflate to ~100 MB the parent has to buffer and
+    `JSON.parse`. Off-site links are dropped SYNTACTICALLY at discovery rather than occupying
+    frontier slots and costing a DNS lookup each — 500 outbound links on a `maxPages: 5` plan no
+    longer starve same-site discovery. And a crawl wave is `Promise.allSettled`ed with a failure
+    latch, so once `crawlSite` has rejected, nothing fires again (the engine's own contract, which
+    the claim protocol assumes). Minors: the `::vector` probe is a bound parameter, `\p{M}` joins the
+    tokenizer classes, a ZWNJ between two letters is no longer "invisible text", the batcher gained
+    a character ceiling for CJK, and three unused dependencies went.
+  - **`apps/worker`.** `knowledge.embed-batch`'s five retries fired at ~1/2/4/8/16 s — one minute of
+    Voyage outage exhausted the job, and the handler's final rethrow left the ingest source
+    `processing` with its claim token and nothing to release it. `retryDelay: 30` widens that to
+    ~15 minutes, and on the LAST attempt the job now lands `failed`/`embed_failed` instead of
+    rethrowing. A crawl's embed verdict arriving after the walk had already landed `ready` matched
+    nothing at all (the guard was `processing`-only), leaving chunks with no vectors and no failure
+    reason; it now flips `ready → failed` with the reason. `knowledge.ingest` gained the crawl's
+    300 s lease — the deferral is REVERSED, deploys being routine — plus an advisory lock on the
+    claim, and its second transaction hands the claim back before it throws. The crawl's end
+    transition is one `CASE` write returning its own post-image, so the status and the reason it
+    describes can no longer disagree. No crawled page text reaches a log line: a `DrizzleQueryError`
+    carries the page in both `message` and `params`, so the warn logs the CrawlError's own fixed
+    message plus a driver summary, and the consumer-origin rethrow is a fixed-message wrapper with
+    the real error on a NON-enumerable `cause` — serialize-error copies own enumerable properties
+    into `pgboss.job.output`, and `cause` from the options bag is not one.
+  - **`apps/api` + `apps/app`.** The web drop zone unbound its four listeners while `disabled`, so a
+    second drop during an upload navigated the tab to the dropped file and killed every in-flight
+    `completeUpload`; it is now bound for the life of the zone, `preventDefault` is unconditional,
+    and `disabled` is read through a ref at event time. A failed PUT or `completeUpload` left the
+    minted `queued` row behind — "Queued for processing" forever, a `max_sources` slot held, and the
+    screen polling with no job coming — so the pipeline now deletes that row best-effort, and the
+    poll only counts `queued` rows younger than the presigned URL's own 10 minutes. A bad crawl URL
+    showed zod 4's stringified issue JSON under the field; the contract is parsed client-side first
+    and a server `BAD_REQUEST` renders fixed copy. Only a `FORBIDDEN` raises the plan-cap banner now
+    — any other failure said "your plan is full" and sent the owner off to delete sources they still
+    needed. Injection reasons render as sentences in the owner's words (with `role_marker`'s pasted
+    -transcript false positive said out loud), Allow/Delete invalidate `knowledge.list`, and
+    `Banner` gained a `warning` tone for the onboarding Skip confirmation. On the api: `refreshCrawl`
+    also accepts `queued`, the presign runs before the transaction so a presign failure strands no
+    row, the cap message names the limit rather than the settings key, `unflagChunk` returns
+    `embedding IS NULL` instead of a 1024-dimension vector, the review pages' CSP gained
+    `base-uri 'none'`, and cross-org `NOT_FOUND` is pinned for all four id-taking mutations.
+  - **Seams and docs.** `@aesa/knowledge` and its sub-paths joined ESLint's app-bundle block (the one
+    server package the rule had never named), and the `boss.send` ban gained a second selector so
+    `deps.boss.send(` is caught as well as a bare `boss.send(`. `S3_CORS_ORIGIN` — read by
+    `pnpm s3:init` alone, defaulting to `http://localhost:8081` — was undocumented, and the runbook's
+    "run `s3:init` with production `S3_*` exported" would have written a localhost origin onto the R2
+    bucket's CORS rule; it is now in CLAUDE.md, the runbook's command and both `.env.example`s.
+    `KNOWLEDGE_EMBED_MODEL` joined `MAIL_FROM`/`APP_BASE_URL`/`APP_WEB_ORIGIN` as a value that must
+    be IDENTICAL across replicas, with the retriever warning once per process per org when its
+    vector leg comes back empty and a different `embedding_model` is stored. And the docs stopped
+    describing a plan tier that is not live (see the `packages/core` line and deviation 6 above).
+  - **Rulings the review added:**
+    1. **ONE wave, THREE implementers run SEQUENTIALLY** on `phase-4` over a shared index, each
+       committing its own area; the last one's docs commit records the wave.
+    2. **REVERSED — the Task 8 deferral of the ingest lease.** `knowledge.ingest` claims with the
+       crawl's 300 s stale-`updated_at` window (plus an advisory lock, since the status is
+       `processing` on both sides of a stale re-claim). A deploy that stops pg-boss with its 30 s
+       default and exits is routine, and the fix was the crawl's own six lines.
+    3. **`refreshCrawl` also accepts `queued`** — a second job is harmless, because the two race for
+       the same claim and the loser's guarded write matches zero rows. It is the owner's only way
+       out of a crawl stranded by an exhausted retry until the Phase 7 sweep ships, so the source
+       list offers Refresh on every crawl that is not `processing`.
+    4. **Off-site links are filtered at discovery**, replacing the Task 7 park that preserved a
+       `private_address` classification nothing ever consumed. The DNS-classifying order stays for
+       the start URL and redirect hops, where it is load-bearing.
+    5. **`knowledge.embed-batch` does NOT bump `knowledge_version`.** The version tracks the set of
+       RETRIEVABLE chunks, and a chunk is lexically retrievable from ingest onward; "fully embedded"
+       is `embedded_count = chunk_count`, a different question.
+  - **Residuals after the final review** (parked, each with its reason):
+    - **Queue options reach `pgboss.queue` only at a queue's FIRST-EVER registration.** `createQueue`
+      inserts NULLs and ignores a second call; `insertJob` captures `COALESCE(job, queue, boss
+      default)`, so a job sent before the first registration carries `retry_limit` 2, delay 0 and a
+      15-minute expiry. Benign for crawl, an Important-1 in miniature for embed-batch in a
+      first-deploy window. The fix is a `QUEUE_OPTIONS` table in `@aesa/queue` consumed by
+      `defineJob` and BOTH pre-create lists — Phase 5.
+    - **The Phase 7 stuck-source sweep now has three named customers:** a `queued` crawl with no job
+      (after its retry is exhausted — `refreshCrawl` is today's manual escape), a `processing`
+      source with unembedded chunks, and a `queued` upload that was never completed.
+    - **The source cap can land one row over.** Read-then-insert with no lock, deliberately unlike
+      the sandbox cap's advisory lock: this guards a count in the hundreds, not a real-money call. A
+      partial unique index `(org_id, url) WHERE kind = 'crawl' AND status <> 'failed'` would also
+      make `startCrawl`'s fresh insert and `refreshCrawl`'s resurrect consistent for a `failed` URL —
+      Phase 5 polish.
+    - **Crawler semantics recorded as deviations:** `sameSite` is the same hostname modulo `www.`
+      (subdomains excluded, stricter than the plan's "registrable host"); CJK is Voyage-only for
+      lexical purposes; a trailing slash is kept as a distinct URL.
+    - **`knowledge.embed-batch` still holds no claim token** (the Task 8 ruling stands): its
+      ingest-source status flips are guarded on status alone, and its crawl-source writes now also
+      on `failure_reason IS NULL`.
+    - **`EmbedError.retryAfterMs` is not honoured.** pg-boss computes a retry's `start_after` from
+      the QUEUE's `retry_delay` inside `failJobs`; a handler cannot ask for a longer wait, and
+      sleeping in-handler would hold the worker slot and burn the job's own expiry. The 30 s base is
+      the answer instead; recorded in the module docstring.
+    - **The `registerJob`-level drizzle-error scrub is parked for Phase 5.** Every job that rethrows
+      a `DrizzleQueryError` puts its `query` and `params` into `pgboss.job.output`; the two knowledge
+      paths that could carry customer text are fixed at the call site, and the general fix (rethrow a
+      scrubbed error for every queue) is a `@aesa/queue` change worth doing once, deliberately.
+    - **Parked Task 4–9 minors, by name:** `td`/`th` cells as separate blocks; the `push()`-returns
+      -false branch; `@napi-rs/canvas` for PDF image extraction; the lockfile churn from A's
+      dependency removal; `<br><br>` as a paragraph break; the preflight test's `'*'` branch; the
+      content cap dropping the lowest-reranked passage; the retrieval coverage notes; the
+      clamped-cosine-0 case; `relaxedTsQuery`'s English-shaped stop list; the `org_id` predicates
+      that are not falsifiable under RLS; the lexical leg ignoring `embedding_model`; `ANALYZE`
+      needing an owner; `collapse()` and French spacing; NXDOMAIN labelled `private_address`; the
+      homepage fetched after the sitemap; `onProgress.ingested` counting buffered chunks;
+      `child-runner`'s exit-vs-close race (never reproduced). On the api/app side: `deleteSource` on
+      a `processing` source; `detail.title` as free text in an audit row; `gaps-card`'s unused
+      `lastTicketId`.
+  - **Gate after the wave** (minio up, the CI `S3_*` exported so the storage suite runs): typecheck
+    and lint clean across all 15 packages/apps; `pnpm test` green with **2,129 tests** plus 4
+    conditional skips (`@aesa/contracts` 25, `@aesa/crypto` 44, `@aesa/platform-mail` 18, `brand`
+    110, `@aesa/core` 205, `@aesa/llm` 98, `@aesa/agent` 65, `@aesa/db` 77, `@aesa/queue` 17,
+    `@aesa/mail` 237, `@aesa/knowledge` 144, `@aesa/test-kit` 43 [39 run + 4 conditional skips],
+    `apps/api` 251, `apps/worker` 435 [including the three E2E files], `apps/app` 364 jest across 52
+    suites — no database); `db:check` reports no drift; the Expo web export still produces **22
+    static routes**; the Playwright signup smoke passes. The `e2e-phase3` case-10 timing flake did
+    not fire.
 
 ## Next: Phase 5 — autonomy and learning
 
@@ -1062,11 +1209,14 @@ graduation and demotion notices), the Learned answers screen with delete-by-cust
 **Carries still open** (fix in the first Phase 5 task that touches the file, or record why it moves
 again):
 
-- **From Phase 4** — a stuck-source sweep is the biggest of them: `knowledge.ingest` takes no lease,
-  so a hard death mid-parse strands a source at `processing` with no way back but a delete-and-re-add;
-  a crawl that keeps failing on a consumer-origin error re-queues and re-walks; and an abandoned
-  `queued` upload (the owner presigned and never PUT) holds a `knowledge.max_sources` slot forever.
-  All three want one daily sweep, ledgered for **Phase 7** alongside `platform.access` retention.
+- **From Phase 4** — a stuck-source sweep is the biggest of them, and the final review named its
+  three customers: a `queued` crawl with no job coming (its retries exhausted — `refreshCrawl`
+  accepting `queued` is today's manual escape); a `processing` source whose chunks never got their
+  vectors; and an abandoned `queued` upload (the owner presigned and never PUT), which the app now
+  deletes best-effort on a failed PUT but which survives a closed tab. Both the ingest and crawl
+  leases landed in the final fix wave, so a hard death mid-parse is re-claimed rather than stranded
+  — what is left is the rows nothing is coming back for. One daily sweep, ledgered for **Phase 7**
+  alongside `platform.access` retention.
 - **From Phase 4** — the source cap's read-then-insert race and two concurrent `startCrawl` calls for
   one brand-new URL are both accepted and commented, not guarded: the first can land one row over the
   cap, the second can insert two sources for one site. Revisit only if either is seen.
@@ -1110,7 +1260,7 @@ again):
   does not exist yet.
 
 **Carried out of the whole-branch review** — one line each; none is believed to block the live
-verification walk. Three of the original list are CLOSED by Phase 4's Task 0 (plan deviation 11):
+verification walk. Three of the original list are CLOSED by Phase 4's Task 1 (plan deviation 11):
 the keyless-`boss.send` collapse (ESLint now bans a bare `boss.send`), the pre-create lists not
 carrying `policy: 'short'` (both now do), and the review pages' missing CSP/frame/nosniff headers:
 
@@ -1267,12 +1417,27 @@ AND from a phone, ask a question the document answers and check the draft's
 `confidence_breakdown.grounding`), and the DPA/privacy-policy update — **Voyage and the object store
 are new sub-processors, and customer documents are now stored at rest.**
 
-Open the Knowledge screen in a browser once, signed in. No gate renders it: the Playwright smoke
-still ends at the gated mailbox step, and jest-expo exercises the components but not the real DOM.
-The three things only a browser can prove are the web drag-and-drop zone (`bindDropZone`'s real
-`dragenter`/`dragover`/`dragleave`/`drop` events), the presigned PUT's CORS preflight against minio
-(`MINIO_API_CORS_ALLOW_ORIGIN=http://localhost:8081` must match the Expo web origin), and — on a
-phone — the native document picker.
+Open the Knowledge screen in a browser once, signed in, and once on a phone. No gate renders it: the
+Playwright smoke still ends at the gated mailbox step, and jest-expo exercises the components but
+not the real DOM. Six things only a real device can prove, all of them touched by the final fix
+wave:
+
+- **Drag and drop for real** — `bindDropZone`'s four events against an actual `DataTransfer`, and
+  then **a second drop while the first upload is still going**: the zone must swallow it (the fix
+  keeps the listeners bound and only skips `onFiles`), and the tab must not navigate away.
+- **Cancel the file-picker dialog** without choosing anything. The throwaway `<input>` is hidden and
+  removes itself on `cancel` as well as on `change`; `cancel` is the event with the least uniform
+  browser support of the two.
+- **Drop a `.md` file in Chrome against minio** — the one combination that exercises both the
+  extension-first MIME inference (Chrome reports an empty `File.type` for `.md`) and the presigned
+  PUT's CORS preflight (`MINIO_API_CORS_ALLOW_ORIGIN` must equal the Expo web origin).
+- **A phone picker with a size-less asset**, then `uploadAsync` against a real R2 bucket — the
+  native path shares no code with the web one past `useUpload`.
+- **VoiceOver / TalkBack on the crawl page-cap control** — it is a hand-rolled `radiogroup` of
+  `Pressable`s with `role="radio"` and `accessibilityState.checked`, never a platform control.
+- **Dark mode** on the whole screen, including the new `warning` Banner tone.
+
+Neither the web drag-drop path nor the phone upload path has ever run outside jest.
 
 Brand deviation 14: whether the phone inbox should get a small header lockup, now that spec §6's
 header lockup is met only on wide layouts and the sign-in screen — a phone shows no brand chrome
