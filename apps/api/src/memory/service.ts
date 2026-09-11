@@ -240,7 +240,10 @@ export async function rejectCandidate(
  * the audit row carries a count alone.
  *
  * A workspace with no salt has never captured an answer against a customer, so there is nothing to
- * match — and minting one here just to prove that would create a lasting secret for a no-op.
+ * match — and minting one here just to prove that would create a lasting secret for a no-op. It still
+ * audits (`count: 0`): every tRPC mutation writes exactly one audit row (CLAUDE.md), and "someone
+ * asked us to forget this customer and there was nothing to forget" is precisely the kind of request
+ * a privacy trail has to show (task 9 review).
  */
 export async function deleteByCustomer(
   deps: MemoryServiceDeps, orgId: string, email: string, actor: MemoryActor,
@@ -248,17 +251,18 @@ export async function deleteByCustomer(
   return deps.api.withOrg(orgId, async (tx) => {
     const [workspace] = await tx.select({ salt: workspaces.customerHashSalt })
       .from(workspaces).where(eq(workspaces.orgId, orgId)).limit(1)
-    if (!workspace?.salt) return { deleted: 0 }
 
-    const deleted = await tx.delete(resolvedAnswers)
-      .where(and(eq(resolvedAnswers.orgId, orgId), eq(resolvedAnswers.sourceCustomerHash, customerHash(workspace.salt, email))))
-      .returning({ id: resolvedAnswers.id })
+    const count = workspace?.salt
+      ? (await tx.delete(resolvedAnswers)
+        .where(and(eq(resolvedAnswers.orgId, orgId), eq(resolvedAnswers.sourceCustomerHash, customerHash(workspace.salt, email))))
+        .returning({ id: resolvedAnswers.id })).length
+      : 0
 
     await audit(tx, {
       actor: actor.actor, action: 'memory.deleted_by_customer', entityType: 'workspace', entityId: orgId,
-      detail: { count: deleted.length }, ip: actor.ip, userAgent: actor.userAgent,
+      detail: { count }, ip: actor.ip, userAgent: actor.userAgent,
     })
-    return { deleted: deleted.length }
+    return { deleted: count }
   })
 }
 

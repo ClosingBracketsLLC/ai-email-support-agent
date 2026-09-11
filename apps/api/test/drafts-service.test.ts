@@ -870,6 +870,86 @@ describe('draft service', () => {
     expect(await flagAutoSent(deps, org.orgId, randomUUID(), org.actor)).toEqual({ ok: false, code: 'not_found' })
   })
 
+  // Task 9 review, Important 1: the learning writes (`resolved_answers`, `workspaces`,
+  // `agent_category_policies`) are the FOURTH position in the global lock order and must run AFTER
+  // the ticket work — the worker's `applyDraftOutcome` locks the ticket and THEN flags a conflicting
+  // answer `needs_review` in one transaction, so taking them first could deadlock a landing against a
+  // reject that shares one answer id. This pins the REDRAFT branch, the one that returns early: every
+  // write still lands, in one transaction, on the branch most at risk of skipping them.
+  it('a reject that re-drafts does its ticket work first and still lands every learning write: the ticket flip, the strike, the guidance line and the demotion', async () => {
+    const org = await seedOrg()
+    const { categoryId } = await seedAutoSending(org)
+    const used = await seedAnswer(org.orgId, { status: 'active', strikes: 1 })
+
+    /** A reviewable ticket + draft in the auto category. */
+    async function seedInCategory() {
+      const ticket = await insertTicket(t.api, org.orgId, {
+        connectionId: org.connectionId, agentId: org.agentId, status: 'awaiting_review', categoryId,
+      })
+      const seeded = await seedPendingDraft(t.api, org.orgId, ticket.id, { agentId: org.agentId, viewedAt: new Date() })
+      await t.api.withOrg(org.orgId, (tx) => tx.update(drafts).set({ categoryId }).where(eq(drafts.id, seeded.id)))
+      return { ticket, draft: seeded }
+    }
+
+    // One earlier rejection in the 7-day window, so THIS reject is the second and demotes.
+    const first = await seedInCategory()
+    await rejectDraft(deps, org.orgId, { draftId: first.draft.id, action: 'handle', reason: '', addToGuidance: false }, org.actor)
+    expect(await readPolicy(org.orgId, org.agentId, categoryId)).toMatchObject({ mode: 'auto' })
+
+    const second = await seedInCategory()
+    await t.api.withOrg(org.orgId, (tx) => tx.update(drafts).set({ usedAnswerIds: [used.id] }).where(eq(drafts.id, second.draft.id)))
+    sent.length = 0
+
+    const reason = 'Never quote a courier ETA.'
+    const res = await rejectDraft(deps, org.orgId, { draftId: second.draft.id, action: 'redraft', reason, addToGuidance: true }, org.actor)
+    expect(res).toEqual({ ok: true, resolution: 'redraft', guidanceAdded: true })
+
+    // The ticket work happened...
+    expect(await readTicket(org.orgId, second.ticket.id)).toMatchObject({ status: 'triaged', ownerRedraftFeedback: reason, redraftCount: 1 })
+    const redraftAudit = await readAudit(org.orgId, 'draft.rejected_for_redraft')
+    expect(redraftAudit).toHaveLength(1)
+    expect(redraftAudit[0]!.detail).toMatchObject({ draftId: second.draft.id, ticketId: second.ticket.id })
+
+    // ...and every learning write still landed, on the branch that returns early.
+    expect(await readAnswer(org.orgId, used.id)).toMatchObject({ status: 'retired', strikes: 2, retiredReason: 'strikes' })
+    expect((await readWorkspace(org.orgId))!.operatingGuidance).toBe(`- ${reason}`)
+    const appended = await readAudit(org.orgId, 'workspace.guidance.append')
+    expect(appended).toHaveLength(1)
+    expect(appended[0]!.detail).toMatchObject({ length: `- ${reason}`.length, draftId: second.draft.id })
+    expect(await readPolicy(org.orgId, org.agentId, categoryId)).toMatchObject({ mode: 'review', demotedReason: 'rejections' })
+
+    const [demotion] = await readNotifications(org.orgId, 'demotion')
+    expect(sent).toEqual([
+      { name: JOB_NAMES.ticketDraft, data: { orgId: org.orgId, ticketId: second.ticket.id }, opts: { entityId: second.ticket.id } },
+      { name: JOB_NAMES.notifyDispatch, data: { orgId: org.orgId, notificationId: demotion!.id }, opts: { entityId: demotion!.id } },
+    ])
+  })
+
+  it('a deadlocked reject retries with a FRESH clock, exactly as approve/hold/resolve do', async () => {
+    const org = await seedOrg()
+    const { ticket, draft } = await seedReviewable(org)
+    const t0 = new Date('2026-09-10T10:00:00.000Z')
+    const t1 = new Date('2026-09-10T10:00:05.000Z')
+    const stamps = [t0, t1]
+    let attempts = 0
+    const deadlock = (): Error => Object.assign(new Error('Failed query: update "drafts" …'), {
+      cause: Object.assign(new Error('deadlock detected'), { code: '40P01' }),
+    })
+    const api: ApiFacade = {
+      ...t.api,
+      withOrg: (id, fn) => { if (++attempts === 1) throw deadlock(); return t.api.withOrg(id, fn) },
+    }
+
+    const res = await rejectDraft(
+      { ...deps, api, now: () => stamps.shift() ?? t1 }, org.orgId,
+      { draftId: draft.id, action: 'handle', reason: '', addToGuidance: false }, org.actor,
+    )
+    expect(res).toEqual({ ok: true, resolution: 'escalate_terminal', guidanceAdded: false })
+    expect(attempts).toBe(2)
+    expect((await readDraft(org.orgId, draft.id))!.decidedAt!.toISOString()).toBe(t1.toISOString())
+    expect(await readTicket(org.orgId, ticket.id)).toMatchObject({ status: 'needs_owner', needsOwnerReason: 'owner_handling' })
+  })
+
   // -- markViewed / resolveTicket --
 
   it('markViewed stamps a pending draft once and returns false for a decided one', async () => {

@@ -188,11 +188,18 @@ describe('memory router', () => {
     expect(JSON.stringify(rows[0]!.detail)).not.toContain('casey')
     expect(JSON.stringify(rows[0]!.detail)).not.toContain(hash)
 
-    // A workspace that has never captured an answer has no salt — and mints none just to delete.
+    // A workspace that has never captured an answer has no salt — and mints none just to delete. It
+    // still writes its audit row (every tRPC mutation writes exactly one): the request itself is the
+    // thing a privacy trail has to show, whether or not it matched anything.
     const fresh = await setupOrg()
     expect(await fresh.c.memory.deleteByCustomer.mutate({ email: 'casey@customer.test' })).toEqual({ deleted: 0 })
     const [ws] = await t.api.withOrg(fresh.orgId, (tx) => tx.select().from(workspaces).where(eq(workspaces.orgId, fresh.orgId)))
     expect(ws!.customerHashSalt).toBeNull()
+    const freshRows = await readAudit(fresh.orgId, 'memory.deleted_by_customer')
+    expect(freshRows).toHaveLength(1)
+    expect(freshRows[0]).toMatchObject({ actor: `user:${fresh.userId}`, entityType: 'workspace', entityId: fresh.orgId })
+    expect(freshRows[0]!.detail).toEqual({ count: 0 })
+    expect(JSON.stringify(freshRows[0]!.detail)).not.toContain('casey')
   })
 
   it('members can read; only managers can mutate', async () => {
