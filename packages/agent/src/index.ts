@@ -9,6 +9,15 @@ export {
 } from './triage.ts'
 
 export {
+  buildGuidanceSuggestPrompt,
+  runGuidanceSuggestCall,
+  GuidanceSuggestion,
+  GUIDANCE_SUGGEST_MODEL,
+  GUIDANCE_SUGGEST_TIMEOUT_MS,
+  type GuidanceSuggestInput,
+} from './guidance/suggest.ts'
+
+export {
   DraftDecision,
   ESCALATE_REASONS,
   NO_REPLY_REASONS,
