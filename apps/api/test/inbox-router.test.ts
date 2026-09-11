@@ -1,10 +1,10 @@
 import { randomUUID } from 'node:crypto'
 import { createTRPCClient, httpBatchLink } from '@trpc/client'
-import { eq } from 'drizzle-orm'
+import { eq, sql } from 'drizzle-orm'
 import superjson from 'superjson'
 import { afterAll, beforeAll, describe, expect, expectTypeOf, it } from 'vitest'
 import { drafts, messages, outboundSends, tickets, workspaces } from '@aesa/db'
-import { loadTicketSummary, parseCursor, type TicketDraftSummary, type TicketSummary } from '../src/trpc/routers/inbox.ts'
+import { encodeInboxCursor, loadTicketSummary, parseCursor, type TicketDraftSummary, type TicketSummary } from '../src/trpc/routers/inbox.ts'
 import type { AppRouter } from '../src/trpc/router.ts'
 import { SEED_DRAFT_BODY, WEB, createTestApi, insertAgent, insertConnectedMailbox, listen, seedPendingDraft, signInWithOtp } from './helpers/app.ts'
 
@@ -23,6 +23,16 @@ describe('inbox router (read-only)', () => {
       tx.insert(tickets).values({ orgId, connectionId, providerThreadId: `thread-${randomUUID()}`, status: 'new', ...overrides }).returning(),
     )
     return row!
+  }
+
+  /** A fresh owner, a fresh workspace, and one already-`connected` mailbox — the shared starting
+   * point for the keyset-cursor tests below. */
+  async function setupOrgWithMailbox(ownerEmail: string, mailboxEmail: string) {
+    const signed = await signInWithOtp(t.app, t.mail, ownerEmail, 'Owner')
+    const c = client(base, signed.cookie)
+    const { orgId } = await c.workspace.create.mutate({ businessName: 'Acme', timezone: 'UTC' })
+    const connectionId = await insertConnectedMailbox(t.api, orgId, signed.user.id, mailboxEmail)
+    return { orgId, userId: signed.user.id, cookie: signed.cookie, client: c, connectionId }
   }
 
   it('routes tickets into the right section by status', async () => {
@@ -88,6 +98,34 @@ describe('inbox router (read-only)', () => {
 
     const allIds = [...page1.tickets.map((tk) => tk.id), ...page2.tickets.map((tk) => tk.id)]
     expect(new Set(allIds).size).toBe(26) // neither skipped nor duplicated across pages
+  })
+
+  it('pages without dropping or repeating a ticket when several share the same millisecond (Phase 2 carry: row-comparison keyset)', async () => {
+    const { client: c, orgId, connectionId } = await setupOrgWithMailbox('owner-keyset@example.com', 'support@keyset.test')
+    // Five tickets whose sort key differs only in MICROseconds — a millisecond ISO cursor cannot tell them apart.
+    const base = new Date('2026-09-11T10:00:00.123Z')
+    for (let i = 0; i < 5; i++) {
+      await t.api.withOrg(orgId, (tx) => tx.execute(sql`
+        INSERT INTO tickets (org_id, connection_id, provider_thread_id, status, last_inbound_at)
+        VALUES (${orgId}::uuid, ${connectionId}::uuid, ${`thread-keyset-${i}`}, 'needs_owner', ${base.toISOString()}::timestamptz + (${i} * interval '100 microseconds'))`))
+    }
+    const seen: string[] = []
+    let cursor: string | undefined
+    for (let page = 0; page < 6; page++) {
+      const res = await c.inbox.list.query({ section: 'to_review', limit: 2, ...(cursor ? { cursor } : {}) })
+      expect(res.degraded).toBe(false)
+      seen.push(...res.tickets.map((row) => row.id))
+      if (!res.nextCursor) break
+      cursor = res.nextCursor
+    }
+    expect(new Set(seen).size).toBe(5)
+    expect(seen).toHaveLength(5)
+  })
+
+  it('serves the newest page and says degraded for a cursor that is not one it minted', async () => {
+    const { client: c } = await setupOrgWithMailbox('owner-badcursor@example.com', 'support@badcursor.test')
+    const res = await c.inbox.list.query({ section: 'to_review', cursor: 'not-a-cursor' })
+    expect(res.degraded).toBe(true)
   })
 
   it('inbox.ticket returns messages ordered ascending by sentAt; a cross-org id is NOT_FOUND', async () => {
@@ -246,16 +284,17 @@ describe('inbox router (read-only)', () => {
     expect((await c.inbox.ticket.query({ ticketId: handling.id })).draft).toBeNull()
   })
 
-  it('a cursor that passes zod but is not a real instant is served WITHOUT the cursor and flagged degraded', async () => {
-    // zod 4's own `.datetime()` rejects everything a Date cannot represent (an impossible calendar day
-    // included — and V8 would silently ROLL '2026-02-31' over to March rather than refusing it), so
-    // `degraded` is the belt on that brace, unit-tested at its source: whatever passes the input
-    // schema, `list` never hands drizzle an Invalid Date.
-    expect(parseCursor('9999-99-99T99:99:99Z')).toEqual({ cursorDate: null, degraded: true })
-    expect(parseCursor(undefined)).toEqual({ cursorDate: null, degraded: false })
-    const parsed = parseCursor('2026-01-01T00:00:00.000Z')
-    expect(parsed.degraded).toBe(false)
-    expect(parsed.cursorDate?.toISOString()).toBe('2026-01-01T00:00:00.000Z')
+  it('parseCursor decodes exactly what encodeInboxCursor minted and flags anything else as degraded', async () => {
+    // The cursor is opaque (base64url JSON, not an ISO instant) — `degraded` is the belt for
+    // anything that isn't a cursor `inbox.list` itself minted: unparseable base64/JSON, a missing
+    // field, a non-uuid id, or a `ts` that isn't a real instant.
+    expect(parseCursor(undefined)).toEqual({ cursorTs: null, cursorId: null, degraded: false })
+    expect(parseCursor('not-a-cursor')).toEqual({ cursorTs: null, cursorId: null, degraded: true })
+    expect(parseCursor(Buffer.from(JSON.stringify({ ts: '9999-99-99T99:99:99Z', id: randomUUID() }), 'utf8').toString('base64url')))
+      .toEqual({ cursorTs: null, cursorId: null, degraded: true })
+    const id = randomUUID()
+    const minted = encodeInboxCursor({ ts: '2026-01-01 00:00:00+00', id })
+    expect(parseCursor(minted)).toEqual({ cursorTs: '2026-01-01 00:00:00+00', cursorId: id, degraded: false })
 
     const signed = await signInWithOtp(t.app, t.mail, 'owner-degraded@example.com', 'Owner')
     const c = client(base, signed.cookie)
@@ -266,7 +305,9 @@ describe('inbox router (read-only)', () => {
     const res = await c.inbox.list.query({ section: 'recent' })
     expect(res.degraded).toBe(false)
     expect(res.tickets.map((tk) => tk.id)).toEqual([ticket.id])
-    await expect(c.inbox.list.query({ section: 'recent', cursor: '2026-02-31T00:00:00Z' })).rejects.toThrow(/Invalid ISO datetime/)
+    const bad = await c.inbox.list.query({ section: 'recent', cursor: 'not-a-cursor' })
+    expect(bad.degraded).toBe(true)
+    expect(bad.tickets.map((tk) => tk.id)).toEqual([ticket.id])
   })
 
   it('TicketSummary is a concrete type, not a bag of unknown — drafts.get hands it straight to the app', async () => {

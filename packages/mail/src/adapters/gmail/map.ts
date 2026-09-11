@@ -10,6 +10,10 @@ import { scrubCardNumbers } from '../../scrub.ts'
 import { tokenizeReferences } from '../../threading.ts'
 import { MARKER_HEADER, type NormalizedMessage } from '../../types.ts'
 
+/** Gmail's own `Authentication-Results` authserv-id — always this, never the sending domain's. Used
+ * to distinguish Gmail's real stamp from an upstream relay's (or a forged one) that reached the top. */
+export const GMAIL_AUTHSERV_ID = 'mx.google.com'
+
 /**
  * Order is significant on the wire (repeated `metadataHeaders` query params) — a metadata fetch
  * returns ONLY the headers named here. `MARKER_HEADER` (`X-Aesa-Draft`) MUST be on this list or

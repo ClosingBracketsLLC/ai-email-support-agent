@@ -7,7 +7,7 @@
 import { TRPCError } from '@trpc/server'
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm'
 import { InboxListInput, ResolveTicketInput, TicketIdInput, type DraftStatus, type InboxSection } from '@aesa/contracts'
-import { agents, categories, drafts, messages, tickets, type OrgTx } from '@aesa/db'
+import { agents, categories, drafts, isUuid, messages, tickets, type OrgTx } from '@aesa/db'
 import { LIVE_DRAFT_STATUSES, loadLiveDraftView, resolveTicket } from '../../drafts/service.ts'
 import { orgProcedure, router } from '../init.ts'
 
@@ -118,16 +118,24 @@ function toSummary(row: TicketSummaryRow): TicketSummary {
   }
 }
 
-/**
- * A cursor that passed the input schema but is still not a real instant never reaches drizzle: the
- * page is served WITHOUT it and the response says `degraded`, so the app can say "showing the newest"
- * instead of the client hanging on an error (Phase 2 carry-over). zod's own `.datetime()` already
- * rejects an impossible calendar day; this is the belt on that brace.
- */
-export function parseCursor(cursor: string | undefined): { cursorDate: Date | null; degraded: boolean } {
-  if (cursor === undefined) return { cursorDate: null, degraded: false }
-  const parsed = new Date(cursor)
-  return Number.isNaN(parsed.getTime()) ? { cursorDate: null, degraded: true } : { cursorDate: parsed, degraded: false }
+/** The keyset cursor: the sort key exactly as Postgres rendered it (microseconds intact) plus the
+ * row's id, so the next page's predicate is a ROW comparison `(sortKey, id) < (ts, id)` that can
+ * neither skip a row sharing the millisecond nor repeat the last one (Phase 2 carry). */
+export function encodeInboxCursor(c: { ts: string; id: string }): string {
+  return Buffer.from(JSON.stringify(c), 'utf8').toString('base64url')
+}
+
+export function parseCursor(cursor: string | undefined): { cursorTs: string | null; cursorId: string | null; degraded: boolean } {
+  if (cursor === undefined) return { cursorTs: null, cursorId: null, degraded: false }
+  try {
+    const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as { ts?: unknown; id?: unknown }
+    if (typeof parsed.ts !== 'string' || typeof parsed.id !== 'string' || Number.isNaN(new Date(parsed.ts).getTime()) || !isUuid(parsed.id)) {
+      return { cursorTs: null, cursorId: null, degraded: true }
+    }
+    return { cursorTs: parsed.ts, cursorId: parsed.id, degraded: false }
+  } catch {
+    return { cursorTs: null, cursorId: null, degraded: true }
+  }
 }
 
 // A ticket that has never had an inbound message (an owner-initiated thread still awaiting its first
@@ -158,7 +166,7 @@ export async function loadTicketSummary(tx: OrgTx, orgId: string, ticketId: stri
 
 export const inboxRouter = router({
   list: orgProcedure.input(InboxListInput).query(async ({ ctx, input }) => {
-    const { cursorDate, degraded } = parseCursor(input.cursor)
+    const { cursorTs, cursorId, degraded } = parseCursor(input.cursor)
     const rows = await ctx.deps.api.withOrg(ctx.orgId, (tx) =>
       tx.select({ ...ticketSummaryColumns, ...draftSummaryColumns, sortKey })
         .from(tickets)
@@ -168,7 +176,7 @@ export const inboxRouter = router({
         .where(and(
           eq(tickets.orgId, ctx.orgId),
           inArray(tickets.status, SECTION_STATUSES[input.section]),
-          ...(cursorDate ? [sql`${sortKey} < ${cursorDate}`] : []),
+          ...(cursorTs && cursorId ? [sql`(${sortKey}, ${tickets.id}) < (${cursorTs}::timestamptz, ${cursorId}::uuid)`] : []),
         ))
         .orderBy(sql`${sortKey} DESC`, desc(tickets.id))
         .limit(input.limit + 1),
@@ -177,11 +185,7 @@ export const inboxRouter = router({
     const hasMore = rows.length > input.limit
     const page = hasMore ? rows.slice(0, input.limit) : rows
     const last = page[page.length - 1]
-    // `sortKey` is a raw SQL expression, not a plain column reference — drizzle only runs a column's
-    // own driver-value mapping (string → Date) for fields tied to a real `Column`, so this comes back
-    // from node-postgres as Postgres' own timestamptz text ('2026-01-01 00:00:00+00'), not a `Date`.
-    // `new Date(...)` parses that format correctly (verified against Node's Date parser).
-    const nextCursor = hasMore && last ? new Date(last.sortKey).toISOString() : null
+    const nextCursor = hasMore && last ? encodeInboxCursor({ ts: last.sortKey, id: last.id }) : null
     return { tickets: page.map(toSummary), nextCursor, degraded }
   }),
 

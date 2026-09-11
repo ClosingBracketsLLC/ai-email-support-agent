@@ -5,7 +5,9 @@ export type InboxSection = (typeof INBOX_SECTIONS)[number]
 
 export const InboxListInput = z.object({
   section: z.enum(INBOX_SECTIONS),
-  cursor: z.string().datetime().optional(),
+  // Opaque, minted by `inbox.list` — `base64url(JSON { ts, id })`; the api treats anything it
+  // cannot decode as "no cursor, degraded".
+  cursor: z.string().max(300).optional(),
   limit: z.number().int().min(1).max(50).default(20),
 })
 export type InboxListInput = z.infer<typeof InboxListInput>

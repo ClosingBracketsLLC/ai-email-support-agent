@@ -30,6 +30,17 @@ describe('parseAuthResults', () => {
   it('does not treat "dmarc=passing" as a pass (result token must be exactly "pass")', () => {
     expect(parseAuthResults('mx.google.com; dmarc=passing').dmarcPass).toBe(false)
   })
+
+  it.each([
+    ['mx.google.com; dkim=pass header.i=@x.test; spf=pass; dmarc=pass (p=NONE) header.from=x.test', 'mx.google.com', true],
+    // A header that is NOT Gmail's own stamp — an upstream relay's, or a forged one that somehow reached the top — is not trusted.
+    ['relay.evil.test; dmarc=pass header.from=x.test', 'mx.google.com', false],
+    ['dmarc=pass header.from=x.test', 'mx.google.com', false],
+    // No expectation (Microsoft's format carries no authserv-id): unchanged behaviour.
+    ['spf=pass (sender IP is 1.2.3.4) smtp.mailfrom=x.test; dkim=pass; dmarc=pass action=none header.from=x.test', undefined, true],
+  ])('parseAuthResults(%j, authservId %s).dmarcPass === %s', (raw, authservId, want) => {
+    expect(parseAuthResults(raw, authservId ? { authservId } : undefined).dmarcPass).toBe(want)
+  })
 })
 
 describe('detectAutomated', () => {

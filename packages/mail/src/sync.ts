@@ -26,6 +26,7 @@
 import { tripwireHit } from '@aesa/core'
 import { hashToken, hashesEqual } from '@aesa/crypto'
 import { audit, withOrg, type Db } from '@aesa/db'
+import { GMAIL_AUTHSERV_ID } from './adapters/gmail/map.ts'
 import { detectAutomated, parseAuthResults } from './auth-results.ts'
 import { CursorExpiredError, isMessageGone } from './errors.ts'
 import {
@@ -412,7 +413,13 @@ async function ingestMessageId(ctx: SyncContext, messageId: string): Promise<voi
     return
   }
 
-  const dmarcPass = parseAuthResults(full.authenticationResults).dmarcPass
+  // Gmail always stamps its own authserv-id (`mx.google.com`) — checking it distinguishes Gmail's
+  // real topmost stamp from an upstream relay's (or a forged one) that reached the top. Microsoft's
+  // header carries no authserv-id, so the Graph adapter relies on the topmost-header rule alone.
+  const dmarcPass = parseAuthResults(
+    full.authenticationResults,
+    deps.provider === 'gmail' ? { authservId: GMAIL_AUTHSERV_ID } : undefined,
+  ).dmarcPass
 
   const outcome = await withOrg(deps.db, deps.orgId, async (tx): Promise<MessageOutcome> => {
     // Re-resolved INSIDE the transaction, not carried over from the pre-fetch gate above. The full
