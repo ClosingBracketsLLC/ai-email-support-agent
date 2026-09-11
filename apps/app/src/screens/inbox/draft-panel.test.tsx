@@ -12,18 +12,23 @@ const BASE: DraftView = {
   decisionReason: 'cold_start',
   confidence: 0.82,
   guardrailResult: { ok: true, findings: [] },
+  confidenceBreakdown: {},
+  decisionSource: null,
+  flaggedAt: null,
   send: null,
 }
 
 const TICKET = { id: 'ticket-1', redraftCount: 0, status: 'awaiting_review' }
 
 const mockApprove = jest.fn()
+const mockFlag = jest.fn()
 const mockHold = jest.fn()
 const mockReject = jest.fn()
 const mockResume = jest.fn()
 
 beforeEach(() => {
   mockApprove.mockReset()
+  mockFlag.mockReset()
   mockHold.mockReset()
   mockReject.mockReset()
   mockResume.mockReset()
@@ -38,6 +43,7 @@ function props(overrides: Partial<DraftPanelProps> = {}): DraftPanelProps {
     approveError: null,
     undoUntil: null,
     onApprove: mockApprove,
+    onFlag: mockFlag,
     onHold: mockHold,
     onReject: mockReject,
     onResume: mockResume,
@@ -106,9 +112,11 @@ test('Reject opens the reject sheet, and submitting it calls onReject', async ()
   expect(screen.getByTestId('reject-sheet')).toBeTruthy()
 
   await fireEvent.changeText(screen.getByTestId('reject-reason'), 'Wrong shipping date')
+  await fireEvent(screen.getByTestId('reject-add-guidance'), 'valueChange', true)
   await fireEvent.press(screen.getByTestId('reject-redraft'))
 
-  expect(mockReject).toHaveBeenCalledWith('redraft', 'Wrong shipping date')
+  // The sheet's third argument — "make this a standing rule too" — rides the same call through.
+  expect(mockReject).toHaveBeenCalledWith('redraft', 'Wrong shipping date', true)
 })
 
 test("a guardrail approveError shows the findings and opens edit mode", async () => {
@@ -298,4 +306,59 @@ describe("the web shortcuts' handle", () => {
     await act(async () => { handle.current?.approve() })
     expect(mockApprove).not.toHaveBeenCalled()
   })
+})
+
+// --- Phase 5: an auto-sent reply's own three surfaces on this panel.
+
+test('an auto-send in its hold window offers Hold, not Undo', async () => {
+  await render(<DraftPanel {...props({
+    draft: { ...BASE, status: 'approved', decisionSource: 'auto' },
+    undoUntil: new Date(Date.now() + 10_000),
+    undoTickMs: 10_000,
+  })} />)
+
+  expect(screen.getByTestId('undo-bar')).toBeTruthy()
+  expect(screen.getByText(/^Auto-sending in \d+s$/)).toBeTruthy()
+  await fireEvent.press(screen.getByTestId('undo-button'))
+  expect(mockHold).toHaveBeenCalledTimes(1)
+})
+
+test("an owner's own approval still counts down as Sending, with Undo", async () => {
+  await render(<DraftPanel {...props({
+    draft: { ...BASE, status: 'approved', decisionSource: 'app' },
+    undoUntil: new Date(Date.now() + 10_000),
+    undoTickMs: 10_000,
+  })} />)
+  expect(screen.getByText(/^Sending in \d+s$/)).toBeTruthy()
+})
+
+test('the evidence line says what the reply scored and the bar it had to clear', async () => {
+  await render(<DraftPanel {...props({ draft: { ...BASE, confidenceBreakdown: { evidence: 0.62, threshold: 0.8 } } })} />)
+  expect(screen.getByTestId('draft-evidence').props.children).toBe('Evidence 62% · auto-sends at 80%')
+})
+
+test('with no threshold (the category is not on Autopilot) the evidence stands alone', async () => {
+  await render(<DraftPanel {...props({ draft: { ...BASE, confidenceBreakdown: { evidence: 0.62, threshold: null } } })} />)
+  expect(screen.getByTestId('draft-evidence').props.children).toBe('Evidence 62%')
+})
+
+test('a breakdown with no evidence at all renders no line rather than "Evidence NaN%"', async () => {
+  await render(<DraftPanel {...props({ draft: { ...BASE, confidenceBreakdown: { threshold: 0.8 } } })} />)
+  expect(screen.queryByTestId('draft-evidence')).toBeNull()
+})
+
+test('a sent auto reply offers "Should not have sent", and says so once flagged', async () => {
+  const rendered = await render(<DraftPanel {...props({ draft: { ...BASE, status: 'sent', decisionSource: 'auto', flaggedAt: null } })} />)
+
+  await fireEvent.press(screen.getByTestId('flag-auto-sent'))
+  expect(mockFlag).toHaveBeenCalledTimes(1)
+
+  await rendered.rerender(<DraftPanel {...props({ draft: { ...BASE, status: 'sent', decisionSource: 'auto', flaggedAt: new Date() } })} />)
+  expect(screen.queryByTestId('flag-auto-sent')).toBeNull()
+  expect(screen.getByText('Flagged — should not have sent')).toBeTruthy()
+})
+
+test('a reply the owner approved themselves is never flaggable', async () => {
+  await render(<DraftPanel {...props({ draft: { ...BASE, status: 'sent', decisionSource: 'app' } })} />)
+  expect(screen.queryByTestId('flag-auto-sent')).toBeNull()
 })

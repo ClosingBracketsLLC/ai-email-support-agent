@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useLocalSearchParams } from 'expo-router'
+import { useLocalSearchParams, useRouter } from 'expo-router'
 import { useEffect, useRef, useState } from 'react'
 import { Pressable, StyleSheet, Text, View } from 'react-native'
 import type { AgentStatus, PersonaPreset } from '@aesa/contracts'
@@ -44,6 +44,7 @@ type DirtyKey = 'displayName' | 'signature' | 'personaPreset' | 'personaText' | 
  * immediate action, not part of the dirty-keys save. */
 export function AgentEditScreen() {
   const { id } = useLocalSearchParams<{ id: string }>()
+  const router = useRouter()
   const c = useColors()
   const trpc = useTRPC()
   const queryClient = useQueryClient()
@@ -239,12 +240,12 @@ export function AgentEditScreen() {
       {categoriesQuery.data ? (
         <Card testID="categories-card">
           <Heading>Categories</Heading>
-          <Muted>Autopilot per category arrives with the learning loop</Muted>
           <View style={styles.chipsRow}>
             {categoriesQuery.data.categories.map((cat) => (
               <Chip key={cat.categoryId} tone="neutral" testID={`category-${cat.categoryId}`}>{`${cat.label} · ${label(CATEGORY_MODE_LABEL, cat.mode)}`}</Chip>
             ))}
           </View>
+          <Button variant="secondary" label="Manage Autopilot" onPress={() => router.push('/settings/autopilot')} testID="manage-autopilot" />
         </Card>
       ) : null}
     </Screen>

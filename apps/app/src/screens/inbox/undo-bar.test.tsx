@@ -43,3 +43,21 @@ test('a press while the hold is already in flight is ignored', async () => {
 
   expect(mockUndo).not.toHaveBeenCalled()
 })
+
+// An AUTO-sent reply gets the same bar with different words: the owner never approved it, so there
+// is nothing to "undo" — there is a send to hold (task 10 brief).
+test('an auto-send labels the bar Hold and counts down as "Auto-sending"', async () => {
+  await render(
+    <UndoBar untilAt={new Date(Date.now() + 10_000)} onUndo={mockUndo} busy={false} tickMs={10_000} label="Hold" verb="Auto-sending" />,
+  )
+
+  expect(screen.getByText(/^Auto-sending in \d+s$/)).toBeTruthy()
+  await fireEvent.press(screen.getByTestId('undo-button'))
+  expect(mockUndo).toHaveBeenCalledTimes(1)
+})
+
+test('without the two props it stays the approve-path Undo bar', async () => {
+  await render(<UndoBar untilAt={new Date(Date.now() + 10_000)} onUndo={mockUndo} busy={false} tickMs={10_000} />)
+  expect(screen.getByText(/^Sending in \d+s$/)).toBeTruthy()
+  expect(screen.getByTestId('undo-button').props.accessibilityLabel).toBe('Undo')
+})

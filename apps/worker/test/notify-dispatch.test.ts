@@ -144,6 +144,22 @@ describe('notify.dispatch', () => {
     expect(calls[0]).toEqual({ to: [device.expoPushToken], title: 'Reconnect your mailbox', body: 'Body text', data: { kind: 'escalation', ticketId } })
   })
 
+  it("an 'auto_send' push carries its own actionable categoryId (Review + Hold)", async () => {
+    const orgId = await newOrg()
+    const device = await seedDevice(orgId)
+    const ticketId = await seedTicket(orgId)
+    const notificationId = await seedNotification(orgId, { kind: 'auto_send', payload: { ticketId, draftId: 'd2' } })
+    const { send, calls } = createStubPush({ ok: true, invalidTokens: [] })
+
+    await runNotifyDispatch(makeDeps(send), { orgId, notificationId })
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toEqual({
+      to: [device.expoPushToken], title: 'Reconnect your mailbox', body: 'Body text',
+      data: { kind: 'auto_send', ticketId, draftId: 'd2' }, categoryId: 'auto_send',
+    })
+  })
+
   it("a 'draft_review' push carries the actionable categoryId; an 'escalation' carries none", async () => {
     const orgId = await newOrg()
     const device = await seedDevice(orgId)

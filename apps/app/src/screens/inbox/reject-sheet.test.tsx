@@ -32,7 +32,7 @@ test('the re-draft button is disabled with a blank reason and enabled once one i
 
   await fireEvent.press(screen.getByTestId('reject-redraft'))
   expect(mockSubmit).toHaveBeenCalledTimes(1)
-  expect(mockSubmit).toHaveBeenCalledWith('redraft', 'Too formal — warm it up')
+  expect(mockSubmit).toHaveBeenCalledWith('redraft', 'Too formal — warm it up', false)
 })
 
 test('at the re-draft cap the button is replaced by the cap copy', async () => {
@@ -51,7 +51,7 @@ test("\"I'll handle it\" stays available at the cap and submits the typed reason
   await fireEvent.changeText(screen.getByTestId('reject-reason'), 'I know this customer')
   await fireEvent.press(screen.getByTestId('reject-handle'))
 
-  expect(mockSubmit).toHaveBeenCalledWith('handle', 'I know this customer')
+  expect(mockSubmit).toHaveBeenCalledWith('handle', 'I know this customer', false)
 })
 
 test('a second press while the rejection is in flight is ignored', async () => {
@@ -69,4 +69,31 @@ test('Cancel closes the sheet without submitting', async () => {
 
   expect(mockCancel).toHaveBeenCalledTimes(1)
   expect(mockSubmit).not.toHaveBeenCalled()
+})
+
+// Phase 5: the same sentence that re-drafts this one reply can become a standing rule.
+test('the guidance switch is dead until a reason is typed, then rides along on the submit', async () => {
+  await renderSheet()
+  expect(screen.getByTestId('reject-add-guidance').props.accessibilityState.disabled).toBe(true)
+
+  await fireEvent(screen.getByTestId('reject-add-guidance'), 'valueChange', true)
+  await fireEvent.press(screen.getByTestId('reject-handle'))
+  expect(mockSubmit).toHaveBeenCalledWith('handle', '', false)
+
+  mockSubmit.mockReset()
+  await fireEvent.changeText(screen.getByTestId('reject-reason'), 'Never promise a delivery date')
+  expect(screen.getByTestId('reject-add-guidance').props.accessibilityState.disabled).toBe(false)
+  await fireEvent(screen.getByTestId('reject-add-guidance'), 'valueChange', true)
+  await fireEvent.press(screen.getByTestId('reject-redraft'))
+  expect(mockSubmit).toHaveBeenCalledWith('redraft', 'Never promise a delivery date', true)
+})
+
+test('clearing the reason again takes the guidance flag down with it', async () => {
+  await renderSheet()
+  await fireEvent.changeText(screen.getByTestId('reject-reason'), 'Never promise a delivery date')
+  await fireEvent(screen.getByTestId('reject-add-guidance'), 'valueChange', true)
+  await fireEvent.changeText(screen.getByTestId('reject-reason'), '   ')
+
+  await fireEvent.press(screen.getByTestId('reject-handle'))
+  expect(mockSubmit).toHaveBeenCalledWith('handle', '', false)
 })

@@ -109,7 +109,7 @@ test('a ticket with no inbound message yet shows "no messages yet" instead of a 
 function draft(overrides: Partial<TicketDraftSummary> = {}): TicketDraftSummary {
   return {
     id: 'draft-1', status: 'pending', confidence: 0.82, decisionReason: 'cold_start',
-    expiresAt: new Date('2026-01-08T00:00:00Z'), version: 1, ...overrides,
+    expiresAt: new Date('2026-01-08T00:00:00Z'), version: 1, decisionSource: null, sendAfter: null, ...overrides,
   }
 }
 
@@ -151,4 +151,49 @@ test('no draft chip when the ticket has no live draft', async () => {
 test('a draft in a status with no chip of its own renders none rather than throwing', async () => {
   await render(<TicketRow ticket={ticket({ draft: draft({ status: 'sent' }) })} onPress={mockOnPress} />)
   expect(screen.queryByTestId('ticket-draft-ticket-1')).toBeNull()
+})
+
+// --- Phase 5: an auto-send counts down on the row itself, so the owner can catch it from the list.
+
+const NOW = new Date('2026-01-01T12:00:00Z')
+
+test('an auto-send in its hold window counts down on the row', async () => {
+  await render(
+    <TicketRow
+      ticket={ticket({ status: 'auto_sending', draft: draft({ status: 'approved', decisionSource: 'auto', sendAfter: new Date(NOW.getTime() + 119_000) }) })}
+      onPress={mockOnPress}
+      chipProps={{ tickMs: 60_000, now: () => NOW }}
+    />,
+  )
+  expect(screen.getByText('Auto-sending · 1:59')).toBeTruthy()
+  expect(screen.getByTestId('ticket-draft-ticket-1')).toHaveStyle({ backgroundColor: palettes.light.primaryTint })
+})
+
+test('past the instant it goes, the countdown reads Sending…', async () => {
+  await render(
+    <TicketRow
+      ticket={ticket({ draft: draft({ status: 'approved', decisionSource: 'auto', sendAfter: new Date(NOW.getTime() - 1_000) }) })}
+      onPress={mockOnPress}
+      chipProps={{ tickMs: 60_000, now: () => NOW }}
+    />,
+  )
+  expect(screen.getByText('Sending…')).toBeTruthy()
+})
+
+test("an owner's own approval says Sending… with no clock — the undo window is the ticket's business", async () => {
+  await render(
+    <TicketRow
+      ticket={ticket({ draft: draft({ status: 'approved', decisionSource: 'app', sendAfter: new Date(NOW.getTime() + 119_000) }) })}
+      onPress={mockOnPress}
+      chipProps={{ tickMs: 60_000, now: () => NOW }}
+    />,
+  )
+  expect(screen.getByText('Sending…')).toBeTruthy()
+})
+
+test('an auto-send whose send row is no longer queued (sendAfter null) just says Sending…', async () => {
+  await render(
+    <TicketRow ticket={ticket({ draft: draft({ status: 'sending', decisionSource: 'auto', sendAfter: null }) })} onPress={mockOnPress} />,
+  )
+  expect(screen.getByText('Sending…')).toBeTruthy()
 })

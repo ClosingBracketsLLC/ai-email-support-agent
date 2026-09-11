@@ -10,6 +10,8 @@ export default function SettingsLayout() {
       <Stack.Screen name="agents" options={{ title: 'Agents' }} />
       <Stack.Screen name="agents/[id]" options={{ title: 'Agent' }} />
       <Stack.Screen name="knowledge" options={{ title: 'Knowledge' }} />
+      <Stack.Screen name="autopilot" options={{ title: 'Autopilot' }} />
+      <Stack.Screen name="memory" options={{ title: 'Learned answers' }} />
       <Stack.Screen name="notifications" options={{ title: 'Notifications' }} />
     </Stack>
   )

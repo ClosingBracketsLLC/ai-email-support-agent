@@ -11,6 +11,7 @@ import { useTRPC } from '@/lib/trpc'
 import { FlaggedChunks } from './flagged-chunks'
 import { GapsCard } from './gaps-card'
 import { GuidanceEditor } from './guidance-editor'
+import { GuidanceSuggestions } from './guidance-suggestions'
 import { SourceCards } from './source-cards'
 import { SourceList } from './source-list'
 
@@ -117,6 +118,7 @@ export function KnowledgeScreen({ mode, pollMs = POLL_MS_DEFAULT }: KnowledgeScr
 
       {counts.flaggedChunks > 0 ? <FlaggedChunks canManage={canManage} /> : null}
 
+      <GuidanceSuggestions canManage={canManage} />
       <GuidanceEditor initial={ws.data.operatingGuidance} canManage={canManage} />
 
       <GapsCard />

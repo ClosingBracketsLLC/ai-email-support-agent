@@ -30,6 +30,8 @@ function defaultListData(): ListData {
 }
 
 let mockWorkspace = { websiteUrl: 'https://acme.example.com', operatingGuidance: '' }
+let mockSuggestions: { id: string; text: string; rationale: string | null; categoryLabel: string | null; agentAddress: string | null; createdAt: Date }[] = []
+const mockAcceptCalls: unknown[] = []
 let mockWorkspaceImpl: () => Promise<typeof mockWorkspace> = () => Promise.resolve(mockWorkspace)
 let mockListData: ListData = defaultListData()
 let mockListImpl: () => Promise<ListData> = () => Promise.resolve(mockListData)
@@ -51,6 +53,12 @@ jest.mock('@/lib/trpc', () => ({
         queryKey: () => ['workspace', 'get'],
       },
       updateGuidance: { mutationOptions: (o: object) => ({ mutationFn: () => Promise.resolve(mockWorkspace), ...o }) },
+      guidanceSuggestions: {
+        queryOptions: () => ({ queryKey: ['workspace', 'guidanceSuggestions'], queryFn: () => Promise.resolve({ suggestions: mockSuggestions }) }),
+        queryKey: () => ['workspace', 'guidanceSuggestions'],
+      },
+      acceptSuggestion: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => { mockAcceptCalls.push(v); return Promise.resolve({ ok: true }) }, ...o }) },
+      dismissSuggestion: { mutationOptions: (o: object) => ({ mutationFn: () => Promise.resolve({ ok: true }), ...o }) },
       advanceOnboarding: { mutationOptions: (o: object) => ({ mutationFn: () => { mockAdvanceCalls.push(true); return mockAdvanceImpl() }, ...o }) },
     },
     knowledge: {
@@ -108,6 +116,8 @@ beforeEach(() => {
   mockListQueryCalls = 0
   mockAdvanceCalls.length = 0
   mockAdvanceImpl = () => Promise.resolve({ from: 'knowledge', to: 'go_live' })
+  mockSuggestions = []
+  mockAcceptCalls.length = 0
   mockReplace.mockClear()
   mockPush.mockClear()
 })
@@ -238,4 +248,17 @@ test('canManage: false hides the add cards behind a read-only notice, but still 
   expect(screen.queryByTestId('crawl-card')).toBeNull()
   expect(screen.getByTestId('guidance-editor')).toBeTruthy()
   expect(screen.queryByTestId('save-guidance')).toBeNull()
+})
+
+test('a pending suggested rule sits above the guidance editor, and accepting it calls the mutation', async () => {
+  mockSuggestions = [{
+    id: 's1', text: 'Never promise a delivery date', rationale: 'You edited 3 replies that promised one',
+    categoryLabel: 'Shipping', agentAddress: 'support@acme.com', createdAt: new Date('2026-09-01T00:00:00Z'),
+  }]
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('guidance-suggestions')).toBeTruthy())
+
+  expect(screen.getByText('Never promise a delivery date')).toBeTruthy()
+  await fireEvent.press(screen.getByTestId('accept-s1'))
+  expect(mockAcceptCalls).toEqual([{ suggestionId: 's1' }])
 })

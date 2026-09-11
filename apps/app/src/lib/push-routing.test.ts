@@ -19,6 +19,21 @@ describe('pathForNotification', () => {
     expect(pathForNotification({ kind: 'draft_review', draftId: 'd3' })).toBe('/inbox')
   })
 
+  // Phase 5's four new kinds.
+  test('auto_send kind opens the ticket whose reply is on its way out', () => {
+    expect(pathForNotification({ kind: 'auto_send', ticketId: 't4', draftId: 'd4' })).toBe('/ticket/t4')
+  })
+  test('auto_send kind with no ticketId falls back to the inbox', () => {
+    expect(pathForNotification({ kind: 'auto_send', draftId: 'd4' })).toBe('/inbox')
+  })
+  test('graduation and demotion open the Autopilot screen', () => {
+    expect(pathForNotification({ kind: 'graduation' })).toBe('/settings/autopilot')
+    expect(pathForNotification({ kind: 'demotion' })).toBe('/settings/autopilot')
+  })
+  test('memory_sample opens the Learned answers screen', () => {
+    expect(pathForNotification({ kind: 'memory_sample' })).toBe('/settings/memory')
+  })
+
   // The worker now stamps `kind` onto every push's `data` (notify-dispatch.ts / notify-digest.ts),
   // but a push already sitting in a device's notification tray from before that change has neither
   // — these are that backward-compatibility fallback's shapes, kept so an old, undelivered
@@ -51,6 +66,10 @@ describe('actionForResponse', () => {
   test('a plain tap on the notification body holds nothing', () => {
     expect(actionForResponse({ actionIdentifier: 'expo.modules.notifications.actions.DEFAULT', ...response({ kind: 'draft_review', ticketId: 't1', draftId: 'd1' }) }))
       .toEqual({ path: '/ticket/t1', holdDraftId: null })
+  })
+  test("the auto_send push's Hold button holds the send it is about", () => {
+    expect(actionForResponse({ actionIdentifier: 'hold', ...response({ kind: 'auto_send', ticketId: 't5', draftId: 'd5' }) }))
+      .toEqual({ path: '/ticket/t5', holdDraftId: 'd5' })
   })
   test('Hold on a payload that carries no draft id holds nothing', () => {
     expect(actionForResponse({ actionIdentifier: 'hold', ...response({ kind: 'escalation', ticketId: 't1' }) }))

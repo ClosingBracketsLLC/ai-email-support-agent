@@ -199,6 +199,8 @@ export interface DraftView {
   viewedAt: Date | null
   decidedAt: Date | null
   decisionSource: string | null
+  /** Stamped by `flagAutoSent` — the owner's "this should not have gone out" about an auto-send. */
+  flaggedAt: Date | null
   rejectReason: string | null
   editDistanceRatio: number | null
   expiresAt: Date
@@ -215,7 +217,8 @@ const draftViewColumns = {
   finalBody: drafts.finalBody, decision: drafts.decision, decisionReason: drafts.decisionReason, confidence: drafts.confidence,
   confidenceBreakdown: drafts.confidenceBreakdown, guardrailResult: drafts.guardrailResult, rationale: drafts.rationale,
   unresolvedQuestions: drafts.unresolvedQuestions, customerLanguage: drafts.customerLanguage, isRedraft: drafts.isRedraft,
-  viewedAt: drafts.viewedAt, decidedAt: drafts.decidedAt, decisionSource: drafts.decisionSource, rejectReason: drafts.rejectReason,
+  viewedAt: drafts.viewedAt, decidedAt: drafts.decidedAt, decisionSource: drafts.decisionSource, flaggedAt: drafts.flaggedAt,
+  rejectReason: drafts.rejectReason,
   editDistanceRatio: drafts.editDistanceRatio, expiresAt: drafts.expiresAt, createdAt: drafts.createdAt,
   agentAddress: agents.address, categoryLabel: categories.label,
   sendId: outboundSends.id, sendStatus: outboundSends.status, sendAfter: outboundSends.sendAfter,
@@ -247,6 +250,7 @@ function toDraftView(row: DraftViewRow): DraftView {
     guardrailResult: row.guardrailResult as Record<string, unknown>,
     rationale: row.rationale, unresolvedQuestions: row.unresolvedQuestions, customerLanguage: row.customerLanguage,
     isRedraft: row.isRedraft, viewedAt: row.viewedAt, decidedAt: row.decidedAt, decisionSource: row.decisionSource,
+    flaggedAt: row.flaggedAt,
     rejectReason: row.rejectReason, editDistanceRatio: row.editDistanceRatio, expiresAt: row.expiresAt, createdAt: row.createdAt,
     agentAddress: row.agentAddress, categoryLabel: row.categoryLabel, send,
     // The undo bar's clock: only an approved draft whose send is still queued can still be pulled back.

@@ -15,6 +15,7 @@ jest.mock('expo-notifications', () => ({
 // except in the one test below that deliberately switches it to 'web'.
 
 import * as Notifications from 'expo-notifications'
+import { AUTO_SEND_PUSH_CATEGORY } from '@aesa/contracts'
 import { DRAFT_REVIEW_CATEGORY, __resetPushCategoriesForTests, registerForPush } from './push'
 
 const getPermissionsAsync = jest.mocked(Notifications.getPermissionsAsync)
@@ -33,22 +34,29 @@ beforeEach(() => {
   __resetPushCategoriesForTests()
 })
 
-test('registers the draft_review actions before asking for a token, and only once per process', async () => {
+test('registers both push categories before asking for a token, and only once per process', async () => {
   getPermissionsAsync.mockResolvedValue(permissions('granted'))
   getExpoPushTokenAsync.mockResolvedValue({ type: 'expo', data: 'ExponentPushToken[abc]' })
 
   await registerForPush({ ask: false })
+  // A draft_review push is about a PENDING draft: there is nothing to hold yet (the api answers
+  // `not_holdable`), so Review is its only button.
   expect(setNotificationCategoryAsync).toHaveBeenCalledWith(DRAFT_REVIEW_CATEGORY, [
+    { identifier: 'review', buttonTitle: 'Review', options: { opensAppToForeground: true } },
+  ])
+  // An auto_send push IS a queued send inside its hold window — Hold is the whole point of it.
+  expect(setNotificationCategoryAsync).toHaveBeenCalledWith(AUTO_SEND_PUSH_CATEGORY, [
     { identifier: 'review', buttonTitle: 'Review', options: { opensAppToForeground: true } },
     { identifier: 'hold', buttonTitle: 'Hold', options: { opensAppToForeground: true } },
   ])
   expect(DRAFT_REVIEW_CATEGORY).toBe('draft_review')
+  expect(AUTO_SEND_PUSH_CATEGORY).toBe('auto_send')
   // The push's action buttons must exist before a push can arrive, i.e. before the token this call
   // hands the server.
   expect(setNotificationCategoryAsync.mock.invocationCallOrder[0]!).toBeLessThan(getExpoPushTokenAsync.mock.invocationCallOrder[0]!)
 
   await registerForPush({ ask: false })
-  expect(setNotificationCategoryAsync).toHaveBeenCalledTimes(1)
+  expect(setNotificationCategoryAsync).toHaveBeenCalledTimes(2)
 })
 
 test('does not prompt when not asked and permission is missing', async () => {

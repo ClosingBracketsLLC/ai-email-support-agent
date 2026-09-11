@@ -1,7 +1,9 @@
+import type { ReactNode } from 'react'
 import { Pressable, StyleSheet, Text, View } from 'react-native'
 import type { DraftStatus, NeedsOwnerReason } from '@aesa/contracts'
 import { Chip, type ChipTone } from '@/components/chip'
 import { spacing, typeScale, useColors } from '@/theme'
+import { AutoSendChip, type AutoSendChipProps } from './auto-send-chip'
 
 /** The ticket's ONE live draft, as `inbox.list` joins it (apps/api/src/trpc/routers/inbox.ts) —
  * just enough for a row's chip; the review panel loads the full `DraftView`. */
@@ -12,6 +14,11 @@ export interface TicketDraftSummary {
   decisionReason: string
   expiresAt: Date
   version: number
+  /** `auto` = the agent decided this one; `app`/`email` = a human did; null = nobody has yet. */
+  decisionSource: string | null
+  /** The instant the reply goes out — non-null ONLY while its send is still `queued`, so a held or
+   * already-claimed one renders no countdown the owner can no longer act on. */
+  sendAfter: Date | null
 }
 
 /** The client-side view of `inbox.list`'s `TicketSummary` (apps/api/src/trpc/routers/inbox.ts).
@@ -73,16 +80,31 @@ const REASON_TONE: Record<NeedsOwnerReason, ChipTone> = {
   draft_expired: 'warning', send_failed: 'danger', category_off: 'neutral', no_agent: 'neutral',
 }
 function reasonTone(reason: string | null): ChipTone { return (reason && (REASON_TONE as Record<string, ChipTone>)[reason]) || 'neutral' }
-function draftTone(draft: TicketDraftSummary | null): ChipTone { return draft?.status === 'held' ? 'warning' : 'primary' }
+/** What one row lets a countdown chip read its clock from — test-only in practice (see `AutoSendChip`). */
+export type ChipTimingProps = Pick<AutoSendChipProps, 'tickMs' | 'now'>
 
-/** The draft's own word on the row: what the agent has ready, or where its reply has got to. */
-function draftChip(draft: TicketDraftSummary | null, categoryLabel: string | null): string | null {
+/**
+ * The draft's own word on the row: what the agent has ready, or where its reply has got to. It
+ * returns the chip itself rather than a string because ONE case is live — an auto-send still inside
+ * its hold window counts down, so the owner can catch it from the list without opening the ticket.
+ */
+function draftChip(ticket: TicketSummary, chipProps: ChipTimingProps | undefined): ReactNode | null {
+  const draft = ticket.draft
   if (!draft) return null
-  if (draft.status === 'approved' || draft.status === 'sending') return 'Sending…'
-  if (draft.status === 'held') return 'On hold'
+  const testID = `ticket-draft-${ticket.id}`
+  if (draft.status === 'approved' || draft.status === 'sending') {
+    return draft.decisionSource === 'auto' && draft.sendAfter !== null
+      ? <AutoSendChip sendAfter={draft.sendAfter} testID={testID} {...chipProps} />
+      : <Chip tone="primary" testID={testID}>Sending…</Chip>
+  }
+  if (draft.status === 'held') return <Chip tone="warning" testID={testID}>On hold</Chip>
   if (draft.status !== 'pending') return null
   const pct = draft.confidence === null ? null : `${Math.round(draft.confidence * 100)}%`
-  return ['Reply ready', categoryLabel ?? 'Uncategorized', ...(pct ? [pct] : [])].join(' · ')
+  return (
+    <Chip tone="primary" testID={testID}>
+      {['Reply ready', ticket.categoryLabel ?? 'Uncategorized', ...(pct ? [pct] : [])].join(' · ')}
+    </Chip>
+  )
 }
 
 function relativeTime(date: Date | null): string {
@@ -95,10 +117,10 @@ function relativeTime(date: Date | null): string {
   return `${Math.round(hours / 24)}d ago`
 }
 
-export function TicketRow({ ticket, onPress }: { ticket: TicketSummary; onPress: () => void }) {
+export function TicketRow({ ticket, onPress, chipProps }: { ticket: TicketSummary; onPress: () => void; chipProps?: ChipTimingProps }) {
   const c = useColors()
   const chip = reasonChip(ticket.needsOwnerReason)
-  const draft = draftChip(ticket.draft, ticket.categoryLabel)
+  const draft = draftChip(ticket, chipProps)
   const subject = ticket.subject || '(no subject)'
   const customer = ticket.customerName || ticket.customerEmail || 'Unknown sender'
 
@@ -121,7 +143,7 @@ export function TicketRow({ ticket, onPress }: { ticket: TicketSummary; onPress:
       </View>
       {draft || chip ? (
         <View style={styles.chips}>
-          {draft ? <Chip tone={draftTone(ticket.draft)} testID={`ticket-draft-${ticket.id}`}>{draft}</Chip> : null}
+          {draft}
           {chip ? <Chip tone={reasonTone(ticket.needsOwnerReason)} testID={`ticket-reason-${ticket.id}`}>{chip}</Chip> : null}
         </View>
       ) : null}
