@@ -457,6 +457,34 @@ describe('ticket.backstop-sweep', () => {
       expect(ticket.status).toBe('awaiting_review')
     })
 
+    it('an auto_sending ticket with no live draft is escalated orphaned too; a healthy one is left alone', async () => {
+      const orgId = await newOrg()
+      // The levered-auto-send end state: `landHeld` left the ticket in `auto_sending`, nobody
+      // resumed it, and `sweeps.daily` expired the `held` draft WITHOUT paging (only `pending` rows
+      // escalate there). Without this arm covering `auto_sending`, the customer email is dropped.
+      const stranded = await seedTicket(orgId, { status: 'auto_sending', updatedAt: minutesAgo(ORPHAN_AFTER_MINUTES + 30) })
+      await seedDraft(orgId, stranded, { status: 'expired', createdAt: minutesAgo(ORPHAN_AFTER_MINUTES + 5) })
+      // A healthy auto-send inside (or past) its hold window still holds an `approved` draft, which
+      // `LIVE_DRAFT_STATUSES` covers — the `NOT EXISTS` must keep excluding it.
+      const healthy = await seedTicket(orgId, { status: 'auto_sending', updatedAt: minutesAgo(ORPHAN_AFTER_MINUTES + 30) })
+      await seedDraft(orgId, healthy, { status: 'approved', createdAt: minutesAgo(ORPHAN_AFTER_MINUTES + 5) })
+
+      const result = await runTicketBackstopSweep(boss, makeDeps())
+
+      expect(result.orphans).toBe(1)
+      const ticket = await getTicket(orgId, stranded)
+      expect(ticket.status).toBe('needs_owner')
+      expect(ticket.needsOwnerReason).toBe('orphaned')
+      expect((await getTicket(orgId, healthy)).status).toBe('auto_sending')
+
+      const notifs = await notifyJobs()
+      const job = notifs.find((j) => (j.data as { orgId?: string }).orgId === orgId)
+      expect(job).toBeDefined()
+      const notification = await notificationById((job!.data as { notificationId: string }).notificationId)
+      expect(notification?.dedupeKey).toBe(`orphaned:${stranded}:${DAY}`)
+      expect(notification?.payload).toMatchObject({ ticketId: stranded })
+    })
+
     it('a fresh newest draft (< ORPHAN_AFTER_MINUTES old) protects the ticket even with an old updated_at', async () => {
       const orgId = await newOrg()
       const ticketId = await seedTicket(orgId, { status: 'awaiting_review', updatedAt: minutesAgo(999) })
