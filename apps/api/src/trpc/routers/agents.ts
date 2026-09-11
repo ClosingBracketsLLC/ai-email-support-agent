@@ -1,21 +1,29 @@
 /**
- * `agents.list` / `update` / `categories` — Task 19's slice. Mode editing per (agent, category)
- * arrives with Phase 5's autonomy screen; `categories` here is read-only, returning the rows
- * `mailboxes.addAddress` already seeded (one per org category, mode 'review').
+ * `agents.list` / `update` / `categories` / `setCategoryPolicy` — the agent settings screens, and
+ * (Phase 5) the Autopilot one. `categories` is the whole Autopilot payload for one agent: the policy
+ * row per category with its threshold and its graduation/demotion trail, the cold-start counter, and
+ * the 30-day stats `stats.rollup` writes. `setCategoryPolicy` is the switch itself — the ONE place an
+ * owner can put a category on `auto`, and the only gate in front of that is the cold-start lock.
  */
 import { TRPCError } from '@trpc/server'
-import { and, asc, eq, sql } from 'drizzle-orm'
-import { AgentIdInput, DRAFT_MODEL_ID, SandboxOutputView, SandboxRunInput, SandboxStartInput, UpdateAgentInput } from '@aesa/contracts'
-import { resolveSetting } from '@aesa/core'
+import { and, asc, count, eq, gte, isNotNull, sql, sum } from 'drizzle-orm'
 import {
-  agentCategoryPolicies, agentRuns, agents, audit, bumpMeter, categories, mailboxConnections,
-  SANDBOX_METERS, usageCounters,
+  AgentIdInput, DEFAULT_AUTO_SEND_THRESHOLD, DRAFT_MODEL_ID, SandboxOutputView, SandboxRunInput, SandboxStartInput,
+  SetCategoryPolicyInput, UpdateAgentInput,
+} from '@aesa/contracts'
+import { COLD_START_DECISIONS, resolveSetting } from '@aesa/core'
+import {
+  agentCategoryPolicies, agentRuns, agents, audit, bumpMeter, categories, countHumanDecisions, drafts, mailboxConnections,
+  categoryStatsDaily, SANDBOX_METERS, usageCounters,
 } from '@aesa/db'
 import { JOB_NAMES } from '@aesa/queue'
 import { loadOrgSettings } from '../../org-settings.ts'
 import { managerProcedure, orgProcedure, router } from '../init.ts'
 
 const utcDayString = (d: Date): string => d.toISOString().slice(0, 10)
+
+/** The window `agents.categories` reports over — the Autopilot screen's "last 30 days" block. */
+const STATS_WINDOW_DAYS = 30
 
 /** Owner-authored free text (personaText/guidanceExtra/signature can run to thousands of characters) —
  * the audit row logs a length, never the body. Everything else changed by this input is short and
@@ -26,7 +34,12 @@ function auditValue(key: keyof UpdateAgentInput, value: unknown): unknown {
   return FREEFORM_TEXT_KEYS.has(key) && typeof value === 'string' ? { length: value.length } : value
 }
 
-const UPDATABLE_KEYS = ['displayName', 'signature', 'personaPreset', 'personaText', 'guidanceExtra', 'priority', 'replyFromAddress', 'status'] as const
+const UPDATABLE_KEYS = [
+  'displayName', 'signature', 'personaPreset', 'personaText', 'guidanceExtra', 'priority', 'replyFromAddress', 'status',
+  // Phase 5's two agent-wide autonomy knobs: whether a category may graduate itself once the
+  // evidence is there, and how long an auto-send waits before it goes (the owner's Hold window).
+  'autoGraduate', 'autoSendDelayMin',
+] as const
 
 export const agentsRouter = router({
   /**
@@ -42,7 +55,7 @@ export const agentsRouter = router({
         connectionEmailAddress: mailboxConnections.emailAddress,
         domain: agents.domain, displayName: agents.displayName, signature: agents.signature, personaPreset: agents.personaPreset,
         personaText: agents.personaText, guidanceExtra: agents.guidanceExtra, priority: agents.priority, status: agents.status,
-        autoSendDelayMin: agents.autoSendDelayMin,
+        autoGraduate: agents.autoGraduate, autoSendDelayMin: agents.autoSendDelayMin,
       })
         .from(agents)
         .innerJoin(mailboxConnections, eq(mailboxConnections.id, agents.connectionId))
@@ -101,15 +114,151 @@ export const agentsRouter = router({
     return { ok: true as const }
   }),
 
+  /**
+   * The Autopilot screen's whole payload for one agent, in four queries: the policy rows joined to
+   * their categories, the per-category count of decisions a HUMAN made (what the cold-start lock
+   * reads — an auto-send has no `decided_by`), and the 30-day stats summed out of
+   * `category_stats_daily`. `coldStartAt` travels with it so the app never hard-codes the 10.
+   *
+   * Read-only and `orgProcedure`: seeing how the agent is doing is every teammate's business;
+   * changing it is `setCategoryPolicy`'s, which is a `managerProcedure`.
+   */
   categories: orgProcedure.input(AgentIdInput).query(async ({ ctx, input }) =>
-    ctx.deps.api.withOrg(ctx.orgId, async (tx) => ({
-      categories: await tx.select({ categoryId: categories.id, key: categories.key, label: categories.label, mode: agentCategoryPolicies.mode })
+    ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
+      const [agent] = await tx.select({ autoGraduate: agents.autoGraduate, autoSendDelayMin: agents.autoSendDelayMin })
+        .from(agents).where(and(eq(agents.orgId, ctx.orgId), eq(agents.id, input.agentId)))
+      if (!agent) throw new TRPCError({ code: 'NOT_FOUND', message: 'agent not found' })
+
+      const rows = await tx.select({
+        categoryId: categories.id, key: categories.key, label: categories.label,
+        mode: agentCategoryPolicies.mode, autoSendMinConfidence: agentCategoryPolicies.autoSendMinConfidence,
+        graduatedAt: agentCategoryPolicies.graduatedAt, demotedAt: agentCategoryPolicies.demotedAt,
+        demotedReason: agentCategoryPolicies.demotedReason,
+        suggestedAt: agentCategoryPolicies.suggestedAt, suggestedWouldSend: agentCategoryPolicies.suggestedWouldSend,
+        suggestedOf: agentCategoryPolicies.suggestedOf,
+      })
         .from(agentCategoryPolicies)
         .innerJoin(categories, eq(categories.id, agentCategoryPolicies.categoryId))
         .where(and(eq(agentCategoryPolicies.orgId, ctx.orgId), eq(agentCategoryPolicies.agentId, input.agentId)))
-        .orderBy(asc(categories.key)),
-    })),
+        .orderBy(asc(categories.key))
+
+      const decisions = await tx.select({ categoryId: drafts.categoryId, value: count() })
+        .from(drafts)
+        .where(and(eq(drafts.orgId, ctx.orgId), eq(drafts.agentId, input.agentId), isNotNull(drafts.decidedBy)))
+        .groupBy(drafts.categoryId)
+      const decisionsByCategory = new Map(decisions.map((d) => [d.categoryId, d.value]))
+
+      const since = utcDayString(new Date(Date.now() - STATS_WINDOW_DAYS * 86_400_000))
+      const stats = await tx.select({
+        categoryId: categoryStatsDaily.categoryId,
+        drafted: sum(categoryStatsDaily.drafted), approvedUnchanged: sum(categoryStatsDaily.approvedUnchanged),
+        approvedEdited: sum(categoryStatsDaily.approvedEdited), rejected: sum(categoryStatsDaily.rejected),
+        autoSent: sum(categoryStatsDaily.autoSent), autoSentFlagged: sum(categoryStatsDaily.autoSentFlagged),
+        held: sum(categoryStatsDaily.held),
+      })
+        .from(categoryStatsDaily)
+        .where(and(
+          eq(categoryStatsDaily.orgId, ctx.orgId), eq(categoryStatsDaily.agentId, input.agentId),
+          gte(categoryStatsDaily.day, since),
+        ))
+        .groupBy(categoryStatsDaily.categoryId)
+      const statsByCategory = new Map(stats.map((row) => [row.categoryId, row]))
+
+      return {
+        agent: { autoGraduate: agent.autoGraduate, autoSendDelayMin: agent.autoSendDelayMin },
+        coldStartAt: COLD_START_DECISIONS,
+        categories: rows.map((row) => {
+          const s = statsByCategory.get(row.categoryId)
+          return {
+            categoryId: row.categoryId, key: row.key, label: row.label, mode: row.mode,
+            autoSendMinConfidence: row.autoSendMinConfidence,
+            humanDecisionCount: decisionsByCategory.get(row.categoryId) ?? 0,
+            graduatedAt: row.graduatedAt, demotedAt: row.demotedAt, demotedReason: row.demotedReason,
+            // Only a complete suggestion is one: `stats.rollup` writes all three columns together.
+            suggestion: row.suggestedAt && row.suggestedWouldSend !== null && row.suggestedOf !== null
+              ? { wouldSend: row.suggestedWouldSend, of: row.suggestedOf, at: row.suggestedAt }
+              : null,
+            stats30d: {
+              drafted: Number(s?.drafted ?? 0), approvedUnchanged: Number(s?.approvedUnchanged ?? 0),
+              approvedEdited: Number(s?.approvedEdited ?? 0), rejected: Number(s?.rejected ?? 0),
+              autoSent: Number(s?.autoSent ?? 0), autoSentFlagged: Number(s?.autoSentFlagged ?? 0),
+              held: Number(s?.held ?? 0),
+            },
+          }
+        }),
+      }
+    }),
   ),
+
+  /**
+   * The Autopilot switch. Three preconditions, all of them about the ONE direction that matters —
+   * putting a category on `auto`:
+   *  - the agent must exist in this org (NOT_FOUND, by construction: RLS hides another org's row);
+   *  - it must be `active` — an agent that cannot send has no business auto-sending (`agent_inactive`);
+   *  - the cold-start lock: fewer than `COLD_START_DECISIONS` HUMAN decisions in this category and the
+   *    answer is `cold_start`. It is the same floor `decide()` enforces on every draft, so lifting it
+   *    here would only produce drafts that fall back to review anyway.
+   * `review` and `off` pass all three untested: taking autonomy AWAY is always allowed.
+   *
+   * The threshold falls back to whatever the policy already carried, then to the balanced default, so
+   * a re-graduation keeps the owner's number. `graduated_at` is cut only on the way IN to auto, and
+   * the graduation suggestion is cleared with it — it has been acted on.
+   */
+  setCategoryPolicy: managerProcedure.input(SetCategoryPolicyInput).mutation(async ({ ctx, input }) => {
+    const now = new Date()
+    await ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
+      const [agent] = await tx.select({ id: agents.id, status: agents.status })
+        .from(agents).where(and(eq(agents.orgId, ctx.orgId), eq(agents.id, input.agentId)))
+      if (!agent) throw new TRPCError({ code: 'NOT_FOUND', message: 'agent not found' })
+      if (input.mode === 'auto' && agent.status !== 'active') {
+        throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'agent_inactive' })
+      }
+
+      // Locked for the whole read-modify-write: `demoteCategory` (the worker's backstop, and the
+      // inline check the draft service runs on every reject/flag) takes this same row's lock on its
+      // guarded `auto → review` UPDATE, so without this an owner's switch could read `auto`, wait,
+      // and then write back a `graduated_at` (or a mode) over a demotion that landed in between.
+      const [policy] = await tx.select({
+        mode: agentCategoryPolicies.mode, autoSendMinConfidence: agentCategoryPolicies.autoSendMinConfidence,
+        graduatedAt: agentCategoryPolicies.graduatedAt,
+      })
+        .from(agentCategoryPolicies)
+        .where(and(
+          eq(agentCategoryPolicies.orgId, ctx.orgId), eq(agentCategoryPolicies.agentId, input.agentId),
+          eq(agentCategoryPolicies.categoryId, input.categoryId),
+        ))
+        .limit(1)
+        .for('update')
+      if (!policy) throw new TRPCError({ code: 'NOT_FOUND', message: 'category policy not found' })
+
+      if (input.mode === 'auto') {
+        const humanDecisionCount = await countHumanDecisions(tx, input.agentId, input.categoryId)
+        if (humanDecisionCount < COLD_START_DECISIONS) {
+          throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'cold_start', cause: { humanDecisionCount } })
+        }
+      }
+
+      const enteringAuto = input.mode === 'auto' && policy.mode !== 'auto'
+      const autoSendMinConfidence = input.autoSendMinConfidence ?? policy.autoSendMinConfidence ?? DEFAULT_AUTO_SEND_THRESHOLD
+      await tx.update(agentCategoryPolicies)
+        .set({
+          mode: input.mode, autoSendMinConfidence,
+          graduatedAt: enteringAuto ? now : policy.graduatedAt,
+          ...(enteringAuto ? { suggestedAt: null, suggestedWouldSend: null, suggestedOf: null } : {}),
+        })
+        .where(and(
+          eq(agentCategoryPolicies.orgId, ctx.orgId), eq(agentCategoryPolicies.agentId, input.agentId),
+          eq(agentCategoryPolicies.categoryId, input.categoryId),
+        ))
+
+      await audit(tx, {
+        actor: ctx.actor, action: 'autonomy.policy_updated', entityType: 'agent', entityId: input.agentId,
+        detail: { categoryId: input.categoryId, mode: input.mode, autoSendMinConfidence },
+        ip: ctx.ip, userAgent: ctx.userAgent,
+      })
+    })
+    return { ok: true as const }
+  }),
 
   /**
    * The owner's "Try it" — one hand-typed question through the real draft pipeline, against a

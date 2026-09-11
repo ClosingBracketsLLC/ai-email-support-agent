@@ -7,7 +7,7 @@
 import { TRPCError } from '@trpc/server'
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm'
 import { InboxListInput, ResolveTicketInput, TicketIdInput, type DraftStatus, type InboxSection } from '@aesa/contracts'
-import { agents, categories, drafts, isUuid, messages, tickets, type OrgTx } from '@aesa/db'
+import { agents, categories, drafts, isUuid, messages, outboundSends, tickets, type OrgTx } from '@aesa/db'
 import { LIVE_DRAFT_STATUSES, loadLiveDraftView, resolveTicket } from '../../drafts/service.ts'
 import { orgProcedure, router } from '../init.ts'
 
@@ -27,10 +27,13 @@ const ticketSummaryColumns = {
   agentAddress: agents.address, spamFlagged: tickets.spamFlagged, hasAttachments: tickets.hasAttachments,
 }
 
-/** Just enough of the live draft for a list row's chip; the panel loads the full `DraftView`. */
+/** Just enough of the live draft for a list row's chip; the panel loads the full `DraftView`.
+ * Phase 5 adds the two the Auto-sending countdown needs: whose decision it was, and when the reply
+ * actually goes (the send row's `send_after`, which is also the Hold deadline). */
 const draftSummaryColumns = {
   draftId: drafts.id, draftStatus: drafts.status, draftConfidence: drafts.confidence,
   draftDecisionReason: drafts.decisionReason, draftExpiresAt: drafts.expiresAt, draftVersion: drafts.version,
+  draftDecisionSource: drafts.decisionSource, draftSendAfter: outboundSends.sendAfter, draftSendStatus: outboundSends.status,
 }
 
 export interface TicketDraftSummary {
@@ -40,12 +43,20 @@ export interface TicketDraftSummary {
   decisionReason: string
   expiresAt: Date
   version: number
+  /** `auto` = the agent decided this one; `app`/`email` = a human did; null = nobody has yet. */
+  decisionSource: string | null
+  /** The instant the reply goes out — set ONLY while the send is still `queued`, so a held or
+   * already-claimed one renders no countdown the owner can no longer act on. */
+  sendAfter: Date | null
 }
 
 /** The join predicate: the ticket's own org, and only the statuses the one-live-draft unique covers. */
 const liveDraftJoin = and(
   eq(drafts.ticketId, tickets.id), eq(drafts.orgId, tickets.orgId), inArray(drafts.status, [...LIVE_DRAFT_STATUSES]),
 )!
+
+/** At most one send row per draft (the unique on `draft_id`), so this never multiplies the rows. */
+const draftSendJoin = eq(outboundSends.draftId, drafts.id)
 
 /** Typed as the nullable union on purpose — these are LEFT JOIN columns, null on a ticket with no live draft. */
 interface DraftSummaryRow {
@@ -55,6 +66,9 @@ interface DraftSummaryRow {
   draftDecisionReason: string | null
   draftExpiresAt: Date | null
   draftVersion: number | null
+  draftDecisionSource: string | null
+  draftSendAfter: Date | null
+  draftSendStatus: string | null
 }
 
 function toDraftSummary(row: DraftSummaryRow): TicketDraftSummary | null {
@@ -62,6 +76,8 @@ function toDraftSummary(row: DraftSummaryRow): TicketDraftSummary | null {
   return {
     id: row.draftId, status: row.draftStatus as DraftStatus, confidence: row.draftConfidence,
     decisionReason: row.draftDecisionReason!, expiresAt: row.draftExpiresAt!, version: row.draftVersion!,
+    decisionSource: row.draftDecisionSource,
+    sendAfter: row.draftSendStatus === 'queued' ? row.draftSendAfter : null,
   }
 }
 
@@ -159,6 +175,7 @@ export async function loadTicketSummary(tx: OrgTx, orgId: string, ticketId: stri
     .leftJoin(categories, eq(categories.id, tickets.categoryId))
     .leftJoin(agents, eq(agents.id, tickets.agentId))
     .leftJoin(drafts, liveDraftJoin)
+    .leftJoin(outboundSends, draftSendJoin)
     .where(and(eq(tickets.orgId, orgId), eq(tickets.id, ticketId)))
     .limit(1)
   return row ? toSummary(row) : null
@@ -173,6 +190,7 @@ export const inboxRouter = router({
         .leftJoin(categories, eq(categories.id, tickets.categoryId))
         .leftJoin(agents, eq(agents.id, tickets.agentId))
         .leftJoin(drafts, liveDraftJoin)
+        .leftJoin(outboundSends, draftSendJoin)
         .where(and(
           eq(tickets.orgId, ctx.orgId),
           inArray(tickets.status, SECTION_STATUSES[input.section]),
@@ -200,6 +218,7 @@ export const inboxRouter = router({
         .leftJoin(categories, eq(categories.id, tickets.categoryId))
         .leftJoin(agents, eq(agents.id, tickets.agentId))
         .leftJoin(drafts, liveDraftJoin)
+        .leftJoin(outboundSends, draftSendJoin)
         .where(and(eq(tickets.orgId, ctx.orgId), eq(tickets.id, input.ticketId)))
       if (!row) return null
 

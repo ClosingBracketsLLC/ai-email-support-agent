@@ -310,6 +310,47 @@ describe('inbox router (read-only)', () => {
     expect(bad.tickets.map((tk) => tk.id)).toEqual([ticket.id])
   })
 
+  // Phase 5: the Auto-sending section's countdown. The row needs two things the chip never had —
+  // that the decision was the agent's, and the instant the reply actually goes.
+  it('an auto_sending ticket lists with its draft decisionSource and the queued send\'s sendAfter, and a held send reports none', async () => {
+    const signed = await signInWithOtp(t.app, t.mail, 'owner-autosending@example.com', 'Owner')
+    const c = client(base, signed.cookie)
+    const { orgId } = await c.workspace.create.mutate({ businessName: 'Acme', timezone: 'UTC' })
+    const connectionId = await insertConnectedMailbox(t.api, orgId, signed.user.id, 'support@autosending.test')
+    const agentId = await insertAgent(t.api, orgId, connectionId, 'support@autosending.test')
+
+    const ticket = await insertTicket(orgId, connectionId, { status: 'auto_sending', agentId, subject: 'Where is my order?', lastInboundAt: new Date() })
+    const draft = await seedPendingDraft(t.api, orgId, ticket.id, { agentId })
+    await t.api.withOrg(orgId, (tx) => tx.update(drafts)
+      .set({ status: 'approved', decisionSource: 'auto', decidedAt: new Date(), autoDecidedAt: new Date(), finalBody: SEED_DRAFT_BODY })
+      .where(eq(drafts.id, draft.id)))
+    const sendAfter = new Date(Date.now() + 120_000)
+    const [send] = await t.api.withOrg(orgId, (tx) => tx.insert(outboundSends).values({
+      orgId, draftId: draft.id, ticketId: ticket.id, connectionId, agentId, status: 'queued', sendAfter,
+    }).returning())
+
+    const list = await c.inbox.list.query({ section: 'auto_sending' })
+    expect(list.tickets.map((tk) => tk.id)).toEqual([ticket.id])
+    expect(list.tickets[0]!.draft).toMatchObject({ id: draft.id, status: 'approved', decisionSource: 'auto' })
+    expect(list.tickets[0]!.draft!.sendAfter).toEqual(sendAfter)
+
+    const one = await c.inbox.ticket.query({ ticketId: ticket.id })
+    expect(one.ticket.draft).toMatchObject({ decisionSource: 'auto' })
+    expect(one.ticket.draft!.sendAfter).toEqual(sendAfter)
+
+    // A send that is no longer counting down (held by a kill lever, or already claimed) has no
+    // countdown to render.
+    await t.api.withOrg(orgId, (tx) => tx.update(outboundSends).set({ status: 'held' }).where(eq(outboundSends.id, send!.id)))
+    const held = await c.inbox.list.query({ section: 'auto_sending' })
+    expect(held.tickets[0]!.draft).toMatchObject({ decisionSource: 'auto', sendAfter: null })
+
+    // A pending human-review draft carries neither.
+    const reviewTicket = await insertTicket(orgId, connectionId, { status: 'awaiting_review', agentId, lastInboundAt: new Date() })
+    await seedPendingDraft(t.api, orgId, reviewTicket.id, { agentId })
+    const review = await c.inbox.list.query({ section: 'to_review' })
+    expect(review.tickets[0]!.draft).toMatchObject({ status: 'pending', decisionSource: null, sendAfter: null })
+  })
+
   it('TicketSummary is a concrete type, not a bag of unknown — drafts.get hands it straight to the app', async () => {
     // `export type TicketSummary = ReturnType<typeof toSummary>` on a GENERIC toSummary resolved every
     // field to `unknown` (review Important 3): inbox.list/ticket were fine (T inferred from the real
@@ -321,6 +362,8 @@ describe('inbox router (read-only)', () => {
     expectTypeOf<TicketSummary['lastInboundAt']>().toEqualTypeOf<Date | null>()
     expectTypeOf<TicketSummary['inboundCount']>().toEqualTypeOf<number>()
     expectTypeOf<TicketSummary['draft']>().toEqualTypeOf<TicketDraftSummary | null>()
+    expectTypeOf<TicketDraftSummary['decisionSource']>().toEqualTypeOf<string | null>()
+    expectTypeOf<TicketDraftSummary['sendAfter']>().toEqualTypeOf<Date | null>()
 
     const signed = await signInWithOtp(t.app, t.mail, 'owner-summary@example.com', 'Owner')
     const c = client(base, signed.cookie)

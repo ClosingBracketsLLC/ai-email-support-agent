@@ -2,10 +2,11 @@ import { TRPCError } from '@trpc/server'
 import { APIError } from 'better-auth/api'
 import { and, asc, count, desc, eq, inArray, sql } from 'drizzle-orm'
 import {
-  CreateWorkspaceInput, SetAgentEnabledInput, UpdateGuidanceInput, deriveAllowedHosts, isOnboardingStep, nextOnboardingStep, slugify,
+  CreateWorkspaceInput, OPERATING_GUIDANCE_MAX, SetAgentEnabledInput, SuggestionIdInput, UpdateGuidanceInput,
+  deriveAllowedHosts, isOnboardingStep, nextOnboardingStep, slugify,
   UpdateProfileInput, type OnboardingStep, type Tone,
 } from '@aesa/contracts'
-import { agents, audit, drafts, tickets, workspaces } from '@aesa/db'
+import { agents, audit, categories, drafts, guidanceSuggestions, tickets, workspaces } from '@aesa/db'
 import type { Auth } from '../../auth.ts'
 import { mapAuthError } from '../auth-errors.ts'
 import { authedProcedure, managerProcedure, orgProcedure, router } from '../init.ts'
@@ -13,6 +14,9 @@ import { authedProcedure, managerProcedure, orgProcedure, router } from '../init
 /** The "live" draft statuses — the same set `drafts_live_per_ticket_uidx` (migration 0011) enforces
  * one-per-ticket over. `goLiveStatus`'s `firstDraft` is the newest of these, org-wide. */
 const LIVE_DRAFT_STATUSES = ['pending', 'approved', 'held', 'sending'] as const
+
+/** How many pending guidance suggestions the Knowledge screen shows at once. */
+const GUIDANCE_SUGGESTIONS_LIMIT = 20
 
 // Intl.supportedValuesOf('timeZone') omits 'UTC' itself (ECMA-402 treats it as a legacy alias, not a
 // canonical named identifier), even though it is a real, commonly-sent IANA zone — add it back explicitly.
@@ -159,6 +163,91 @@ export const workspaceRouter = router({
       return row!
     })
     return { ...toWorkspaceView(updated), role: ctx.member.role }
+  }),
+
+  /**
+   * Phase 5's "one tap turns this edit into a rule": the pending suggestions `guidance.suggest` wrote
+   * after an edited approval, newest first. `orgProcedure` — reading them is every teammate's job;
+   * accepting one is management, below.
+   */
+  guidanceSuggestions: orgProcedure.query(async ({ ctx }) => ({
+    suggestions: await ctx.deps.api.withOrg(ctx.orgId, (tx) =>
+      tx.select({
+        id: guidanceSuggestions.id, text: guidanceSuggestions.text, rationale: guidanceSuggestions.rationale,
+        categoryLabel: categories.label, agentAddress: agents.address, createdAt: guidanceSuggestions.createdAt,
+      })
+        .from(guidanceSuggestions)
+        .leftJoin(categories, eq(categories.id, guidanceSuggestions.categoryId))
+        .leftJoin(agents, eq(agents.id, guidanceSuggestions.agentId))
+        .where(and(eq(guidanceSuggestions.orgId, ctx.orgId), eq(guidanceSuggestions.status, 'pending')))
+        .orderBy(desc(guidanceSuggestions.createdAt), desc(guidanceSuggestions.id))
+        .limit(GUIDANCE_SUGGESTIONS_LIMIT),
+    ),
+  })),
+
+  /**
+   * Accepting a suggestion appends it to the operating guidance — one of the four trusted texts every
+   * guardrail gate screens a reply against — and spends the suggestion, in ONE transaction: the row is
+   * locked and re-checked `pending`, so two taps (or two managers) can never append the same rule
+   * twice. Past the 8,000-character cap nothing is appended, the suggestion stays pending, and the
+   * owner is told `guidance_full` so they can make room in the guidance editor.
+   *
+   * The audit row logs a LENGTH, never the text (CLAUDE.md), exactly as `updateGuidance` does.
+   */
+  acceptSuggestion: managerProcedure.input(SuggestionIdInput).mutation(async ({ ctx, input }) => {
+    await ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
+      const [suggestion] = await tx.select({ id: guidanceSuggestions.id, text: guidanceSuggestions.text, status: guidanceSuggestions.status })
+        .from(guidanceSuggestions)
+        .where(and(eq(guidanceSuggestions.orgId, ctx.orgId), eq(guidanceSuggestions.id, input.suggestionId)))
+        .limit(1)
+        .for('update')
+      if (!suggestion) throw new TRPCError({ code: 'NOT_FOUND', message: 'suggestion not found' })
+      if (suggestion.status !== 'pending') throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'already decided' })
+
+      const [workspace] = await tx.select({ operatingGuidance: workspaces.operatingGuidance })
+        .from(workspaces).where(eq(workspaces.orgId, ctx.orgId)).limit(1)
+      if (!workspace) throw new TRPCError({ code: 'NOT_FOUND', message: 'workspace not created yet' })
+
+      const current = workspace.operatingGuidance
+      const next = `${current.trimEnd()}${current.trim() ? '\n' : ''}- ${suggestion.text.trim()}`
+      if (next.length > OPERATING_GUIDANCE_MAX) throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'guidance_full' })
+
+      await tx.update(workspaces).set({ operatingGuidance: next }).where(eq(workspaces.orgId, ctx.orgId))
+      await tx.update(guidanceSuggestions)
+        .set({ status: 'accepted', decidedAt: new Date(), decidedBy: ctx.user.id })
+        .where(and(eq(guidanceSuggestions.id, suggestion.id), eq(guidanceSuggestions.status, 'pending')))
+      await audit(tx, {
+        actor: ctx.actor, action: 'workspace.guidance.append', entityType: 'workspace', entityId: ctx.orgId,
+        detail: { length: next.length, suggestionId: suggestion.id }, ip: ctx.ip, userAgent: ctx.userAgent,
+      })
+    })
+    return { ok: true as const }
+  }),
+
+  /** "No thanks" — the suggestion is spent without touching the guidance. */
+  dismissSuggestion: managerProcedure.input(SuggestionIdInput).mutation(async ({ ctx, input }) => {
+    await ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
+      const dismissed = await tx.update(guidanceSuggestions)
+        .set({ status: 'dismissed', decidedAt: new Date(), decidedBy: ctx.user.id })
+        .where(and(
+          eq(guidanceSuggestions.orgId, ctx.orgId), eq(guidanceSuggestions.id, input.suggestionId),
+          eq(guidanceSuggestions.status, 'pending'),
+        ))
+        .returning({ id: guidanceSuggestions.id })
+      if (dismissed.length === 0) {
+        // Same two-code split as accept: a row that exists but is already decided is a precondition,
+        // an id this workspace has never seen is a NOT_FOUND.
+        const [exists] = await tx.select({ id: guidanceSuggestions.id }).from(guidanceSuggestions)
+          .where(and(eq(guidanceSuggestions.orgId, ctx.orgId), eq(guidanceSuggestions.id, input.suggestionId)))
+        if (!exists) throw new TRPCError({ code: 'NOT_FOUND', message: 'suggestion not found' })
+        throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'already decided' })
+      }
+      await audit(tx, {
+        actor: ctx.actor, action: 'workspace.guidance.dismissed', entityType: 'workspace', entityId: ctx.orgId,
+        detail: { suggestionId: input.suggestionId }, ip: ctx.ip, userAgent: ctx.userAgent,
+      })
+    })
+    return { ok: true as const }
   }),
 
   /** The go-live screen's poll target: whether the switch is on, the addresses it can flip live, and
