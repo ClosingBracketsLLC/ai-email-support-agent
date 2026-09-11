@@ -19,9 +19,10 @@ describe('createVoyageEmbedder', () => {
     expect(out.vectors[0]![0]).toBe(1); expect(out.vectors[1]![1]).toBe(1); expect(out.tokens).toBe(12)
     expect(embedder.model).toBe('voyage-4'); expect(embedder.dimensions).toBe(1024)
   })
-  it('maps 401 → auth, 429 → rate_limit with Retry-After, 5xx → transient, 400 → permanent', async () => {
+  it('maps 401 → auth, 403 → auth, 429 → rate_limit with Retry-After, 5xx → transient, 400 → permanent', async () => {
     const mk = (status: number, headers?: Record<string, string>) => createVoyageEmbedder({ apiKey: new Secret('k'), fetch: fakeFetch(() => new Response('{"detail":"x"}', { status, headers })) })
     await expect(mk(401).embed(['a'], 'query')).rejects.toMatchObject({ code: 'auth', retryable: false })
+    await expect(mk(403).embed(['a'], 'query')).rejects.toMatchObject({ code: 'auth', retryable: false })
     await expect(mk(429, { 'retry-after': '7' }).embed(['a'], 'query')).rejects.toMatchObject({ code: 'rate_limit', retryable: true, retryAfterMs: 7000 })
     await expect(mk(503).embed(['a'], 'query')).rejects.toMatchObject({ code: 'transient', retryable: true })
     await expect(mk(400).embed(['a'], 'query')).rejects.toMatchObject({ code: 'permanent', retryable: false })
@@ -31,6 +32,14 @@ describe('createVoyageEmbedder', () => {
     const embedder = createVoyageEmbedder({ apiKey: new Secret('vk-secret'), fetch: fakeFetch(() => new Response('{}', { status: 500 })) })
     await expect(embedder.embed(Array.from({ length: 129 }, () => 'x'), 'document')).rejects.toThrow(/128/)
     await expect(embedder.embed(['x'], 'document')).rejects.not.toThrow(/vk-secret/)
+  })
+  it('a 200 with a malformed (non-JSON) body becomes a permanent EmbedError, not a raw SyntaxError', async () => {
+    const embedder = createVoyageEmbedder({ apiKey: new Secret('k'), fetch: fakeFetch(() => new Response('not json', { status: 200 })) })
+    await expect(embedder.embed(['a'], 'document')).rejects.toMatchObject({ code: 'permanent', retryable: false })
+  })
+  it('a 200 whose data array answers fewer texts than requested is a permanent EmbedError', async () => {
+    const embedder = createVoyageEmbedder({ apiKey: new Secret('k'), fetch: fakeFetch(() => new Response(JSON.stringify({ object: 'list', data: [{ object: 'embedding', embedding: vec(0), index: 0 }], model: 'voyage-4', usage: { total_tokens: 3 } }), { status: 200 })) })
+    await expect(embedder.embed(['a', 'b'], 'document')).rejects.toMatchObject({ code: 'permanent', retryable: false })
   })
 })
 

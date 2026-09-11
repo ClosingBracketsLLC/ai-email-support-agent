@@ -42,7 +42,7 @@ jobs:
         run: psql -h localhost -p 5434 -U aesa -d aesa_dev -v ON_ERROR_STOP=1 -f scripts/db-init/001-roles.sql
       - name: Start minio (GitHub service containers can't take a custom command, so run it directly)
         run: |
-          docker run -d --name minio -p 9000:9000 -e MINIO_ROOT_USER=aesa -e MINIO_ROOT_PASSWORD=aesaaesa minio/minio:latest server /data
+          docker run -d --name minio -p 9000:9000 -e MINIO_ROOT_USER=aesa -e MINIO_ROOT_PASSWORD=aesaaesa -e MINIO_API_CORS_ALLOW_ORIGIN=http://localhost:8081 minio/minio:latest server /data
           for i in $(seq 1 30); do
             if curl -sf http://localhost:9000/minio/health/live; then break; fi
             sleep 1

@@ -63,6 +63,9 @@ async function readErrorBodySlice(res: Response): Promise<string> {
 
 function mapStatusToError(status: number, bodySlice: string, retryAfterHeader: string | null): EmbedError {
   const message = `voyage: ${status} ${bodySlice}`
+  // 403 Forbidden is folded into `auth` alongside 401 Unauthorized — both mean the caller's
+  // credentials (missing, revoked, or lacking the needed scope) are the problem, not something a
+  // retry fixes.
   if (status === 401 || status === 403) return new EmbedError('auth', message)
   if (status === 429) return new EmbedError('rate_limit', message, parseRetryAfterMs(retryAfterHeader))
   if (status >= 500) return new EmbedError('transient', message)
@@ -100,7 +103,24 @@ export function createVoyageEmbedder(opts: CreateVoyageEmbedderOptions): Embedde
         throw mapStatusToError(res.status, await readErrorBodySlice(res), res.headers.get('retry-after'))
       }
 
-      const json = (await res.json()) as VoyageEmbeddingsResponse
+      // A 200 with a malformed body (invalid JSON, or valid JSON missing the documented shape) is
+      // a provider fault, not a bug in this adapter — never let `res.json()`'s raw `SyntaxError`
+      // (or a bare property-access crash on an unexpected shape) escape uncaught.
+      let json: VoyageEmbeddingsResponse
+      try {
+        const parsed = (await res.json()) as VoyageEmbeddingsResponse
+        if (!Array.isArray(parsed.data)) throw new Error('missing data array')
+        json = parsed
+      } catch {
+        throw new EmbedError('permanent', 'voyage: malformed response')
+      }
+
+      // The response is valid JSON in the documented shape, but doesn't actually answer every
+      // input text — a distinct, more specific fault than "malformed".
+      if (json.data.length !== texts.length) {
+        throw new EmbedError('permanent', 'voyage: response count mismatch')
+      }
+
       const vectors: number[][] = new Array(texts.length)
       for (const item of json.data) {
         if (item.embedding.length !== EMBEDDING_DIMENSIONS) {
@@ -108,6 +128,12 @@ export function createVoyageEmbedder(opts: CreateVoyageEmbedderOptions): Embedde
         }
         vectors[item.index] = item.embedding
       }
+      // `data.length === texts.length` alone doesn't guarantee every index 0..texts.length-1 was
+      // actually used (a duplicated or out-of-range `index` in the response would leave a hole).
+      for (const vector of vectors) {
+        if (!vector) throw new EmbedError('permanent', 'voyage: response count mismatch')
+      }
+
       return { vectors, tokens: json.usage.total_tokens }
     },
   }
@@ -129,7 +155,15 @@ export function createVoyageReranker(opts: CreateVoyageRerankerOptions): Reranke
         throw mapStatusToError(res.status, await readErrorBodySlice(res), res.headers.get('retry-after'))
       }
 
-      const json = (await res.json()) as VoyageRerankResponse
+      let json: VoyageRerankResponse
+      try {
+        const parsed = (await res.json()) as VoyageRerankResponse
+        if (!Array.isArray(parsed.data)) throw new Error('missing data array')
+        json = parsed
+      } catch {
+        throw new EmbedError('permanent', 'voyage: malformed response')
+      }
+
       return json.data
         .map((item) => ({ index: item.index, score: item.relevance_score }))
         .sort((a, b) => b.score - a.score)

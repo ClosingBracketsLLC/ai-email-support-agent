@@ -1,9 +1,17 @@
 #!/usr/bin/env tsx
 /**
- * Idempotent bootstrap for the local/CI object store (minio): creates the dev bucket and sets its
- * CORS policy so a browser can PUT a presigned upload from the Expo web origin. Safe to run
- * repeatedly — `BucketAlreadyOwnedByYou` on an existing bucket is swallowed, and `PutBucketCors`
+ * Idempotent bootstrap for the local/CI object store (minio): creates the dev bucket and attempts
+ * to set its CORS policy so a browser can PUT a presigned upload from the Expo web origin. Safe to
+ * run repeatedly — `BucketAlreadyOwnedByYou` on an existing bucket is swallowed, and `PutBucketCors`
  * always overwrites rather than appends.
+ *
+ * MinIO has no per-bucket CORS API — `PutBucketCors` always returns `501 NotImplemented` against it
+ * (confirmed against the raw SDK, the AWS CLI, and minio's own `mc cors set`; see task-5-report.md).
+ * CORS on minio is configured server-wide instead, via the `MINIO_API_CORS_ALLOW_ORIGIN` env var on
+ * the minio container itself (`compose.yaml`'s `minio` service, and the CI `docker run` step) — this
+ * script still issues the standard `PutBucketCors` call (a real S3 bucket in production DOES support
+ * it), but tolerates ONLY minio's known 501 response and rethrows anything else, the same discipline
+ * `CreateBucketCommand` above uses for `BucketAlreadyOwnedByYou`.
  *
  * Reads `S3_*` from the environment with the same dev defaults `compose.yaml`'s `minio` service
  * and `packages/db-init` use, so a bare `pnpm db:up && pnpm s3:init` works with no `.env` file.
@@ -19,8 +27,8 @@ const forcePathStyle = (process.env.S3_FORCE_PATH_STYLE ?? 'true') === 'true'
 const corsOrigin = process.env.S3_CORS_ORIGIN ?? 'http://localhost:8081'
 
 // `requestChecksumCalculation: 'WHEN_REQUIRED'` avoids an unnecessary flexible-checksum header on
-// operations that don't need one (e.g. `CreateBucket`) — harmless here, though it does NOT change
-// the `PutBucketCors` behaviour below (see that comment).
+// operations that don't need one (e.g. `CreateBucket`) — harmless here, though it has no effect on
+// `PutBucketCors` below, which minio always 501s regardless of request headers (see module doc).
 const client = new S3Client({
   endpoint,
   region,
@@ -55,17 +63,10 @@ async function main() {
     )
     console.log(`s3:init — bucket "${bucket}" ready at ${endpoint}, CORS allows ${corsOrigin}`)
   } catch (err) {
-    // `PutBucketCors` returns 501 NotImplemented against the current `minio/minio:latest`
-    // (RELEASE.2025-09-07T16-13-09Z) — reproduced identically with the AWS CLI and with minio's
-    // OWN `mc cors set` client talking to its own server, so this is a server-side gap in this
-    // minio build, not a header/SDK-version mismatch on our end (ruled out: stripping every
-    // checksum/MD5 header before signing made no difference). The dev bucket itself is still
-    // created and fully usable — `createS3Store`'s presign/PUT/head/get/delete round-trip works
-    // against this same minio — a real browser upload just won't clear CORS preflight until minio
-    // fixes this or the image is pinned to a release where it works. Warn, don't fail the script:
-    // failing here would also block the object-store round-trip tests that DO work.
-    console.warn(`s3:init — WARNING: bucket "${bucket}" is ready, but setting its CORS policy failed (browser uploads will fail CORS preflight until this is fixed):`)
-    console.warn(err instanceof Error ? err.message : String(err))
+    const isMinioNotImplemented =
+      err instanceof Error && (err.name === 'NotImplemented' || (err as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode === 501)
+    if (!isMinioNotImplemented) throw err
+    console.warn('s3:init — this endpoint has no per-bucket CORS API (MinIO): CORS is server-wide, set MINIO_API_CORS_ALLOW_ORIGIN to the web origin')
   }
 }
 

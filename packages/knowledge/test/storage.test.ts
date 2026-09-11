@@ -38,4 +38,22 @@ describe.skipIf(!s3)('createS3Store against minio', () => {
     expect(new TextDecoder().decode(await store.get(key))).toBe('hello')
     await store.delete(key); expect(await store.head(key)).toBeNull()
   })
+
+  it('clears a real cross-origin preflight and PUT — minio\'s server-wide MINIO_API_CORS_ALLOW_ORIGIN, not a per-bucket policy', async () => {
+    const store = createS3Store({ ...s3!, secretAccessKey: new Secret(s3!.secretAccessKey) })
+    const key = uploadKey('org-test', `src-cors-${Date.now()}`, 'hello.txt')
+    const { url, headers } = await store.presignPut(key, { contentType: 'text/plain', expiresSeconds: 60 })
+
+    const preflight = await fetch(url, {
+      method: 'OPTIONS',
+      headers: { origin: 'http://localhost:8081', 'access-control-request-method': 'PUT', 'access-control-request-headers': 'content-type' },
+    })
+    const allowOrigin = preflight.headers.get('access-control-allow-origin')
+    expect(allowOrigin === 'http://localhost:8081' || allowOrigin === '*').toBe(true)
+
+    const res = await fetch(url, { method: 'PUT', body: 'hello', headers: { ...headers, origin: 'http://localhost:8081' } })
+    expect(res.ok).toBe(true)
+
+    await store.delete(key)
+  })
 })
