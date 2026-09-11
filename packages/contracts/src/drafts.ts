@@ -80,6 +80,9 @@ export const SandboxOutputView = z.object({
     })),
   }).nullable(),
   confidence: z.number().nullable(),
+  /** `max(memory, grounding) × model` — what a real draft's auto gate would compare against the
+   * category threshold; null for every outcome but `reply`. */
+  evidence: z.number().nullable(),
   decision: z.enum(DECISION_ACTIONS),
   decisionReason: z.enum(DECISION_REASONS),
   reason: z.string().nullable(),

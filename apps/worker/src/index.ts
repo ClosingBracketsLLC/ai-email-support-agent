@@ -14,6 +14,7 @@ import { registerMailboxSync } from './jobs/mailbox-sync.ts'
 import { registerNotifyDigest } from './jobs/notify-digest.ts'
 import { enqueueNotifyDispatch, registerNotifyDispatch } from './jobs/notify-dispatch.ts'
 import { registerPlatformHeartbeat } from './jobs/platform-heartbeat.ts'
+import { enqueueSendExecute } from './jobs/send-execute.ts'
 import { registerSweepsDaily } from './jobs/sweeps-daily.ts'
 import { registerTicketBackstopSweep } from './jobs/ticket-backstop-sweep.ts'
 import { enqueueTicketDraft } from './jobs/ticket-draft.ts'
@@ -83,6 +84,9 @@ await maybeRegisterAgentRole({
   boss, db, logger, config,
   enqueueNotify: (orgId, notificationId) => enqueueNotifyDispatch(boss, orgId, notificationId),
   enqueueDraft: (orgId, ticketId, opts) => enqueueTicketDraft(boss, orgId, ticketId, opts),
+  // The auto landing's send. `enqueueSendExecute` resolves the pg-boss job id (or null when the
+  // `short` queue collapsed a duplicate); the draft job only needs "it was handed over".
+  enqueueSend: (orgId, sendId, opts) => enqueueSendExecute(boss, orgId, sendId, opts).then(() => undefined),
 })
 
 await maybeRegisterKnowledgeRole({

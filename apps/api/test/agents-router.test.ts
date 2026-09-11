@@ -235,7 +235,8 @@ describe('agents router — sandbox', () => {
 
     const output = {
       outcome: 'reply' as const, body: 'Yes we do.', normalizedBody: 'Yes we do.', guardrail: { ok: true, findings: [] },
-      confidence: 0.9, decision: 'send' as const, decisionReason: 'ok' as const, reason: null, rationale: 'r', unresolvedQuestions: [],
+      confidence: 0.9, evidence: 0.85, decision: 'send' as const, decisionReason: 'ok' as const, reason: null, rationale: 'r',
+      unresolvedQuestions: [],
       usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, apiCalls: 1, costMicros: 5 },
     }
     await t.api.withOrg(org.orgId, (tx) => tx.update(agentRuns).set({ status: 'succeeded', output, finishedAt: new Date() }).where(eq(agentRuns.id, res.runId)))

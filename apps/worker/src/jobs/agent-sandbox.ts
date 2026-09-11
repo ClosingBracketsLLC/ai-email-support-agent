@@ -27,8 +27,11 @@ import {
   type DraftCallResult, type DraftDecision, type DraftPromptInput, type RetrievedAnswer,
   type RetrievedChunk, type Retriever, type ThreadMessage, type UsageTotals,
 } from '@aesa/agent'
-import type { DecisionAction, DecisionReason } from '@aesa/contracts'
-import { collectGroundedNumbers, decide, INVARIANTS, validateReplyBody, type GuardrailFinding, type GuardrailResult } from '@aesa/core'
+import { DEFAULT_AUTO_SEND_THRESHOLD, type DecisionAction, type DecisionReason } from '@aesa/contracts'
+import {
+  collectGroundedNumbers, decide, evidenceScore, INVARIANTS, memoryScore, validateReplyBody,
+  type GuardrailFinding, type GuardrailResult,
+} from '@aesa/core'
 import { agentCategoryPolicies, agentRuns, agents, drafts, mailboxConnections, platformState, withOrg, type Db } from '@aesa/db'
 import { computeCostMicros, findPricing, LlmError, type ChatMeta, type LlmProvider } from '@aesa/llm'
 import { defineJob, JOB_NAMES, registerJob, type JobDefinition } from '@aesa/queue'
@@ -71,6 +74,9 @@ export interface SandboxOutput {
   normalizedBody: string | null
   guardrail: { ok: boolean; findings: GuardrailFinding[] } | null
   confidence: number | null
+  /** `max(memory, grounding) × model` — the number a REAL draft's auto gate would compare against
+   *  the category's threshold. Null for every outcome but `reply` (deviation 12: informational). */
+  evidence: number | null
   /** `decide()`'s verdict — informational only; a sandbox run never acts on it. */
   decision: DecisionAction
   decisionReason: DecisionReason
@@ -385,19 +391,46 @@ async function runAgentSandboxUnsafe(
       ? await screenSandboxReply(deps, orgId, runId, decision, shared, agent, knowledge, thread.map((m) => m.body))
       : null
 
+  // Parity with `ticket.draft`'s evidence maths (deviation 12), computed on the SAME inputs: the
+  // answers the model actually used, banded by cosine and scaled by human approvals. A sandbox run
+  // never acts on any of it — it exists so the owner sees the number a real draft would be judged on.
+  const replyDecision = decision.outcome === 'reply' ? decision : null
+  const retrievedChunkIds = knowledge.chunks.map((c) => c.id)
+  const retrievedAnswerIds = knowledge.answers.map((a) => a.id)
+  const citedChunkIds = replyDecision ? replyDecision.citedChunkIds.filter((id) => retrievedChunkIds.includes(id)) : []
+  const usedAnswerIds = replyDecision ? replyDecision.usedAnswerIds.filter((id) => retrievedAnswerIds.includes(id)) : []
+  const memoryConflictIds = replyDecision
+    ? replyDecision.memoryConflictIds.filter((id) => retrievedChunkIds.includes(id) || retrievedAnswerIds.includes(id))
+    : []
+  const citedScores = knowledge.chunks.filter((c) => citedChunkIds.includes(c.id)).map((c) => c.score)
+  const groundingScore = citedScores.length > 0 ? Math.max(...citedScores) : null
+  const memoryBest = knowledge.answers
+    .filter((a) => usedAnswerIds.includes(a.id))
+    .reduce<number | null>((best, a) => {
+      const score = memoryScore(a.score, a.approvals)
+      return best === null || score > best ? score : best
+    }, null)
+  const evidence = replyDecision
+    ? evidenceScore({ memory: memoryBest ?? 0, grounding: groundingScore, model: replyDecision.confidence })
+    : null
+
   const finishedAt = deps.now?.() ?? new Date()
   await withOrg(deps.db, orgId, async (tx) => {
     let categoryMode: 'off' | 'review' | 'auto' = 'review'
+    let autoSendMinConfidence: number | null = null
     let humanDecisionCount = 0
 
     if (decision.outcome === 'reply') {
       const category = resolveCategory(shared.cats, decision.categoryKey)
       if (category) {
         const [policy] = await tx
-          .select({ mode: agentCategoryPolicies.mode })
+          .select({ mode: agentCategoryPolicies.mode, autoSendMinConfidence: agentCategoryPolicies.autoSendMinConfidence })
           .from(agentCategoryPolicies)
           .where(and(eq(agentCategoryPolicies.agentId, agent.id), eq(agentCategoryPolicies.categoryId, category.id)))
-        if (policy) categoryMode = policy.mode as 'off' | 'review' | 'auto'
+        if (policy) {
+          categoryMode = policy.mode as 'off' | 'review' | 'auto'
+          autoSendMinConfidence = policy.autoSendMinConfidence
+        }
 
         const [decided] = await tx
           .select({ value: count() })
@@ -406,6 +439,8 @@ async function runAgentSandboxUnsafe(
         humanDecisionCount = decided?.value ?? 0
       }
     }
+    const threshold =
+      replyDecision && categoryMode === 'auto' ? (autoSendMinConfidence ?? DEFAULT_AUTO_SEND_THRESHOLD) / 100 : null
 
     const verdict = decide({
       platformKillSwitch: pre.platformKillSwitch,
@@ -420,14 +455,16 @@ async function runAgentSandboxUnsafe(
       dmarcPass: true,
       categoryMode,
       isRedraft: false,
-      memoryConflict: false, // Task 6 wires this
-      unresolvedQuestions: false,
+      memoryConflict: memoryConflictIds.length > 0,
+      unresolvedQuestions: replyDecision !== null && replyDecision.unresolvedQuestions.length > 0,
+      // The sandbox's synthetic thread is one message, so this blocker can never fire here.
       threadTooLong: false,
       humanDecisionCount,
-      evidence: null,
-      threshold: null,
+      evidence,
+      threshold,
       hasAttachments: false,
       allowanceExhausted: false,
+      // A "Try it" run never sends, so it never consumes — let alone exhausts — the daily cap.
       autoSendCapReached: false,
       mailboxHealthy: pre.mailboxHealthy,
     })
@@ -435,6 +472,7 @@ async function runAgentSandboxUnsafe(
     await appendRunEvent(tx, runId, 'decision', {
       outcome: decision.outcome, action: verdict.action, reason: verdict.reason, quiet: verdict.quiet === true,
       guardrailOk: guardrail?.ok ?? null, warningCount: guardrail?.warningCount ?? null,
+      evidence, threshold,
     })
 
     const output: SandboxOutput =
@@ -445,6 +483,7 @@ async function runAgentSandboxUnsafe(
             normalizedBody: guardrail!.normalizedBody,
             guardrail: { ok: guardrail!.ok, findings: guardrail!.findings },
             confidence: decision.confidence,
+            evidence,
             decision: verdict.action,
             decisionReason: verdict.reason,
             reason: null,
@@ -458,6 +497,7 @@ async function runAgentSandboxUnsafe(
             normalizedBody: null,
             guardrail: null,
             confidence: null,
+            evidence: null,
             decision: verdict.action,
             decisionReason: verdict.reason,
             reason: contentFiltered ? 'content_filtered' : decision.reason,

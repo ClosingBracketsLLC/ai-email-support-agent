@@ -39,6 +39,8 @@ export interface AgentRoleDeps {
   enqueueNotify: TicketTriageDeps['enqueueNotify']
   /** index.ts wires this to `enqueueTicketDraft` — triage's hand-off and the job's own `org_busy` retry. */
   enqueueDraft: TicketDraftDeps['enqueueDraft']
+  /** index.ts wires this to `enqueueSendExecute` — the auto landing's queued send (Phase 5). */
+  enqueueSend: TicketDraftDeps['enqueueSend']
 }
 
 /** The three registrars, as one injectable seam. */
@@ -89,7 +91,7 @@ export async function maybeRegisterAgentRole(deps: AgentRoleDeps, register: Agen
   })
   await register.registerDraft(deps.boss, {
     db: deps.db, provider, retriever, logger: deps.logger,
-    enqueueNotify: deps.enqueueNotify, enqueueDraft: deps.enqueueDraft,
+    enqueueNotify: deps.enqueueNotify, enqueueDraft: deps.enqueueDraft, enqueueSend: deps.enqueueSend,
   })
   await register.registerSandbox(deps.boss, { db: deps.db, provider, retriever, logger: deps.logger })
 }

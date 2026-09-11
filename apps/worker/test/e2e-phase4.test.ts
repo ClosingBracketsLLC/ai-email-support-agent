@@ -341,6 +341,8 @@ describe('Phase 4 close-out E2E (real pg-boss knowledge jobs + the real api know
       db: app.db, provider, retriever, logger,
       enqueueNotify: async () => {},
       enqueueDraft: (orgId, ticketId, opts) => enqueueTicketDraft(boss, orgId, ticketId, opts),
+      // Phase 4's scenarios never reach the auto landing (every category is `review`).
+      enqueueSend: async () => {},
     })
 
     service = { api: createApiFacade({ db: app.db, pool: app.pool }), enqueue: createEnqueue(boss), store, logger }

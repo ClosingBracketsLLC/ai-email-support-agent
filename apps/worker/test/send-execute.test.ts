@@ -257,6 +257,22 @@ async function seedApprovedDraft(opts: SeedOpts = {}): Promise<Seeded> {
   })
 }
 
+/**
+ * The auto-send shape (Phase 5): the SAME approved draft + queued send, but decided by the agent —
+ * `decision_source: 'auto'`, an `auto_decided_at` stamp, no `decided_by` — on a ticket parked in
+ * `auto_sending` for the hold window rather than in the review queue.
+ */
+async function seedAutoSend(opts: SeedOpts = {}): Promise<Seeded> {
+  return seedApprovedDraft({
+    ...opts,
+    ticket: { status: 'auto_sending', redraftCount: 0, ownerRedraftFeedback: null, ...opts.ticket },
+    draft: {
+      decision: 'send', decisionReason: 'ok', decisionSource: 'auto', decidedBy: null,
+      autoDecidedAt: new Date(NOW.getTime() - 120_000), ...opts.draft,
+    },
+  })
+}
+
 interface Harness {
   deps: SendExecuteDeps
   notified: { orgId: string; notificationId: string }[]
@@ -1297,6 +1313,106 @@ describe('send.execute', () => {
 
     expect(fx.mailbox.sentMessages()).toHaveLength(0)
     expect((await getSend(s.sendId)).attempts).toBe(0)
+  })
+  // --- Phase 5: the auto-send path ------------------------------------------------------------
+
+  it('P5 an auto-send completes: auto_sending → waiting_on_customer, decision_source stays auto, auto_sends metered', async () => {
+    const s = await seedAutoSend()
+    const { deps, sentEvents, draftEnqueues } = makeDeps()
+
+    await run(deps, s.sendId)
+
+    expect(fx.mailbox.sentMessages()).toHaveLength(1)
+    const send = await getSend(s.sendId)
+    expect(send.status).toBe('sent')
+    expect(send.sentAt).not.toBeNull()
+
+    const draft = await getDraft(s.draftId)
+    expect(draft.status).toBe('sent')
+    // The agent decided this one and nobody overrode it — the learning loop keys off both stamps.
+    expect(draft.decisionSource).toBe('auto')
+    expect(draft.autoDecidedAt).not.toBeNull()
+
+    const ticket = await getTicket(s.ticketId)
+    expect(ticket.status).toBe('waiting_on_customer')
+    expect(ticket.aiHandledMonth).toBe(THIS_MONTH)
+    expect(draftEnqueues).toHaveLength(0)
+
+    const m = await meters()
+    expect(m[SEND_METERS.autoSends]).toBe(1)
+    expect(m[SEND_METERS.reviewSends]).toBeUndefined()
+    expect(m[SEND_METERS.aiHandledConversations]).toBe(1)
+    // `memory.capture`'s seam (Task 7) fires for an auto-send exactly as it does for a review send.
+    expect(sentEvents).toEqual([{ orgId: fx.orgId, ticketId: s.ticketId, draftId: s.draftId }])
+  })
+
+  it('P5 an auto-send that finds a newer inbound is stale: auto_sending → triaged and the re-draft is enqueued', async () => {
+    const s = await seedAutoSend()
+    const newerAt = await addNewerInbound(s, 'never mind, it arrived')
+    const { deps, draftEnqueues } = makeDeps()
+
+    await run(deps, s.sendId)
+
+    expect(fx.mailbox.sentMessages()).toHaveLength(0)
+    expect((await getSend(s.sendId)).lastError).toBe(STALE_ERROR)
+    expect((await getDraft(s.draftId)).status).toBe('failed')
+    const ticket = await getTicket(s.ticketId)
+    expect(ticket.status).toBe('triaged')
+    expect(ticket.lastAgentRunAt).toBeNull()
+    expect(draftEnqueues).toEqual([{ orgId: fx.orgId, ticketId: s.ticketId }])
+    const [staleAudit] = await auditRows('send.stale')
+    expect(staleAudit!.detail).toMatchObject({ newerInboundAt: newerAt.toISOString() })
+  })
+
+  it('P5 an auto-send whose third-pass guardrail fails escalates from auto_sending to needs_owner/send_failed', async () => {
+    const s = await seedAutoSend({ finalBody: `${CLEAN_BODY} See https://evil.com/deal for more.` })
+    const { deps, notified } = makeDeps()
+
+    await run(deps, s.sendId)
+
+    expect(fx.mailbox.sentMessages()).toHaveLength(0)
+    const send = await getSend(s.sendId)
+    expect(send.status).toBe('failed')
+    expect(send.lastError).toBe('guardrail:url_not_allowed')
+    expect((await getDraft(s.draftId)).status).toBe('failed')
+    const ticket = await getTicket(s.ticketId)
+    expect(ticket.status).toBe('needs_owner')
+    expect(ticket.needsOwnerReason).toBe('send_failed')
+    expect(notified).toHaveLength(1)
+  })
+
+  it('P5 a kill lever during the hold window holds the auto-send, leaving the ticket in auto_sending', async () => {
+    const s = await seedAutoSend()
+    await withOrg(app.db, fx.orgId, (tx) => tx.update(workspaces).set({ killSwitch: true }).where(eq(workspaces.orgId, fx.orgId)))
+    const { deps, notified } = makeDeps()
+
+    await run(deps, s.sendId)
+
+    expect(fx.mailbox.sentMessages()).toHaveLength(0)
+    const send = await getSend(s.sendId)
+    expect(send.status).toBe('held')
+    expect(send.lastError).toBe('held:workspace_kill_switch')
+    expect((await getDraft(s.draftId)).status).toBe('held')
+    // The ticket stays in the hold window: the owner's Resume is what puts the reply back in flight.
+    expect((await getTicket(s.ticketId)).status).toBe('auto_sending')
+    expect(notified).toHaveLength(1)
+  })
+
+  it('P5 the last attempt dead-letters an auto-send out of auto_sending, not out of awaiting_review', async () => {
+    const s = await seedAutoSend()
+    const { deps, notified } = makeDeps({
+      clientFactory: () => ({ ...fx.mailbox, sendReply: async () => { throw new MailApiError('boom', 500) } }) as MailboxClient,
+    })
+
+    await expect(run(deps, s.sendId, { attempt: 6, lastAttempt: true })).rejects.toThrow(/boom/)
+
+    const send = await getSend(s.sendId)
+    expect(send.status).toBe('failed')
+    expect((await getDraft(s.draftId)).status).toBe('failed')
+    const ticket = await getTicket(s.ticketId)
+    expect(ticket.status).toBe('needs_owner')
+    expect(ticket.needsOwnerReason).toBe('send_failed')
+    expect(notified).toHaveLength(1)
   })
 })
 

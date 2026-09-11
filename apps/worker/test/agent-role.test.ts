@@ -52,7 +52,7 @@ describe('maybeRegisterAgentRole', () => {
     const { logger, lines } = testLogger()
     let registered = false
     await maybeRegisterAgentRole(
-      { boss: fakeBoss, db: fakeDb, logger, config: baseConfig({ roles: new Set(['sync']) }), enqueueNotify: async () => {}, enqueueDraft: async () => {} },
+      { boss: fakeBoss, db: fakeDb, logger, config: baseConfig({ roles: new Set(['sync']) }), enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {} },
       spyRegistrars(() => { registered = true }),
     )
     expect(registered).toBe(false)
@@ -64,7 +64,7 @@ describe('maybeRegisterAgentRole', () => {
     let registered = false
     await expect(
       maybeRegisterAgentRole(
-        { boss: fakeBoss, db: fakeDb, logger, config: baseConfig({ env: 'production' }), enqueueNotify: async () => {}, enqueueDraft: async () => {} },
+        { boss: fakeBoss, db: fakeDb, logger, config: baseConfig({ env: 'production' }), enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {} },
         spyRegistrars(() => { registered = true }),
       ),
     ).rejects.toThrow(/ANTHROPIC_API_KEY/)
@@ -75,7 +75,7 @@ describe('maybeRegisterAgentRole', () => {
     const { logger, lines } = testLogger()
     let registered = false
     await maybeRegisterAgentRole(
-      { boss: fakeBoss, db: fakeDb, logger, config: baseConfig({ env: 'development' }), enqueueNotify: async () => {}, enqueueDraft: async () => {} },
+      { boss: fakeBoss, db: fakeDb, logger, config: baseConfig({ env: 'development' }), enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {} },
       spyRegistrars(() => { registered = true }),
     )
     expect(registered).toBe(false)
@@ -87,7 +87,7 @@ describe('maybeRegisterAgentRole', () => {
     const { logger } = testLogger()
     let registered = false
     await maybeRegisterAgentRole(
-      { boss: fakeBoss, db: fakeDb, logger, config: baseConfig({ env: 'test' }), enqueueNotify: async () => {}, enqueueDraft: async () => {} },
+      { boss: fakeBoss, db: fakeDb, logger, config: baseConfig({ env: 'test' }), enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {} },
       spyRegistrars(() => { registered = true }),
     )
     expect(registered).toBe(false)
@@ -98,6 +98,7 @@ describe('maybeRegisterAgentRole', () => {
     let triageDeps: TicketTriageDeps | undefined
     let draftDeps: TicketDraftDeps | undefined
     let sandboxDeps: AgentSandboxDeps | undefined
+    const enqueueSend: TicketDraftDeps['enqueueSend'] = async () => {}
     await maybeRegisterAgentRole(
       {
         boss: fakeBoss, db: fakeDb, logger,
@@ -106,6 +107,7 @@ describe('maybeRegisterAgentRole', () => {
         config: baseConfig({ env: 'production', anthropicApiKey: new Secret('sk-ant-test'), voyageApiKey: new Secret('pa-voyage') }),
         enqueueNotify: async () => {},
         enqueueDraft: async () => {},
+        enqueueSend,
       },
       {
         registerTriage: async (_boss, jobDeps) => { triageDeps = jobDeps },
@@ -124,6 +126,9 @@ describe('maybeRegisterAgentRole', () => {
     expect(draftDeps?.retriever).toBeDefined()
     expect(sandboxDeps?.retriever).toBeDefined()
     expect(triageDeps?.enqueueDraft).toBeDefined()
+    // Phase 5: without this seam the auto landing's send row would sit `queued` until the backstop
+    // sweep's due-send arm noticed it, a minute or more after the hold window elapsed.
+    expect(draftDeps?.enqueueSend).toBe(enqueueSend)
   })
 
   it('hands draft AND sandbox the REAL retriever — one instance, with retrieveDetailed (not emptyRetriever)', async () => {
@@ -136,6 +141,7 @@ describe('maybeRegisterAgentRole', () => {
         config: baseConfig({ anthropicApiKey: new Secret('sk-ant-test') }),
         enqueueNotify: async () => {},
         enqueueDraft: async () => {},
+        enqueueSend: async () => {},
       },
       {
         registerTriage: async () => {},
@@ -159,6 +165,7 @@ describe('maybeRegisterAgentRole', () => {
         config: baseConfig({ roles: new Set(['agent', 'knowledge']), anthropicApiKey: new Secret('sk-ant-test') }),
         enqueueNotify: async () => {},
         enqueueDraft: async () => {},
+        enqueueSend: async () => {},
       },
       spyRegistrars(() => {}),
     )

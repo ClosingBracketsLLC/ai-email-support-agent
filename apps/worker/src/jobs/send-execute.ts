@@ -48,12 +48,12 @@
  * killed connection). The claim (step 1) and the pre-send flip (step 8) are each ONE statement set in
  * ONE transaction. The api never runs any of this: sending is worker-only.
  */
-import { and, asc, eq, gt, lte, ne, or, sql } from 'drizzle-orm'
+import { and, asc, eq, gt, inArray, lte, ne, or, sql } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import { z } from 'zod'
 import {
-  appendSignature, clearRedraftCycle, INVARIANTS, validateReplyBody,
+  appendSignature, clearRedraftCycle, INVARIANTS, ticketTransitions, validateReplyBody,
 } from '@aesa/core'
 import type { KekRing } from '@aesa/crypto'
 import {
@@ -102,6 +102,20 @@ export const STALE_ERROR = 'stale: newer customer message'
 const RELEASE_RETRY_SECONDS = INVARIANTS.SEND_RELEASE_RETRY_SECONDS
 
 const SEND_ACTOR = `system:${JOB_NAMES.sendExecute}` as const
+
+/**
+ * The two ticket statuses a live send can be delivering from. An owner-approved reply waits in
+ * `awaiting_review`; an agent-approved one waits out its hold window in `auto_sending` (Phase 5).
+ * Every guarded ticket write below accepts BOTH — a flip that named only the review status silently
+ * matched nothing on an auto-send, which is how a delivered auto reply would have fallen into the
+ * mid-send hand-back and a failed one would have stranded the ticket with nobody paged.
+ */
+const SENDING_TICKET_STATUSES = ['awaiting_review', 'auto_sending'] as const
+
+/** Which of the two THIS send is walking back from — the status the claim read, never a fresh one. */
+function ticketFrom(status: string): 'awaiting_review' | 'auto_sending' {
+  return status === 'auto_sending' ? 'auto_sending' : 'awaiting_review'
+}
 
 /** Owner-facing copy for the kill levers, in the order step 1 evaluates them. */
 const LEVER_WORDS = {
@@ -200,7 +214,12 @@ export async function enqueueSendExecute(
 interface ClaimedSend {
   claimToken: string
   send: { id: string; draftId: string; ticketId: string; connectionId: string; agentId: string | null; providerDraftId: string | null }
-  draft: { id: string; status: string; finalBody: string | null; threadSnapshotAt: Date; customerLanguage: string | null; categoryId: string | null }
+  draft: {
+    id: string; status: string; finalBody: string | null; threadSnapshotAt: Date
+    customerLanguage: string | null; categoryId: string | null
+    /** `auto` means the agent approved this one: it meters `auto_sends`, not `review_sends`. */
+    decisionSource: string | null
+  }
   ticket: {
     id: string; status: string; subject: string | null; customerEmail: string | null
     providerThreadId: string; language: string | null; aiHandledMonth: string | null
@@ -261,7 +280,7 @@ async function claimSend(deps: SendExecuteDeps, orgId: string, sendId: string, n
     const [draft] = await tx
       .select({
         id: drafts.id, status: drafts.status, finalBody: drafts.finalBody, threadSnapshotAt: drafts.threadSnapshotAt,
-        customerLanguage: drafts.customerLanguage, categoryId: drafts.categoryId,
+        customerLanguage: drafts.customerLanguage, categoryId: drafts.categoryId, decisionSource: drafts.decisionSource,
       })
       .from(drafts)
       .where(eq(drafts.id, send.draftId))
@@ -352,6 +371,9 @@ interface Landing {
   draftId: string
   ticketId: string
   connectionId: string
+  /** The ticket status the CLAIM read — `awaiting_review` or `auto_sending`. The terminal landings
+   *  guard their walk-back on it, so a ticket someone moved meanwhile is left alone. */
+  ticketStatus: string
   now: Date
   day: string
 }
@@ -424,7 +446,7 @@ async function landTerminal(l: Landing, reason: string, opts: { escalate: boolea
     })
     if (!opts.escalate) return undefined
     const { notificationId } = await escalateTicket(tx, {
-      orgId: l.orgId, ticketId: l.ticketId, fromStatus: 'awaiting_review', reason: 'send_failed',
+      orgId: l.orgId, ticketId: l.ticketId, fromStatus: ticketFrom(l.ticketStatus), reason: 'send_failed',
       day: l.day, now: l.now, draftId: l.draftId, actor: SEND_ACTOR, auditAction: 'ticket.escalated',
       // Reason-scoped, like `ticket.draft`'s cap key: a ticket that already paged today for a
       // different reason (a blocked draft the owner then fixed and re-approved) must still page for
@@ -452,6 +474,7 @@ async function landTerminal(l: Landing, reason: string, opts: { escalate: boolea
  * DOES clear it precisely because the reply already went out.)
  */
 async function landStale(l: Landing, threadSnapshotAt: Date, newerInboundAt: Date | null): Promise<void> {
+  for (const from of SENDING_TICKET_STATUSES) ticketTransitions.assert(from, 'triaged')
   const { landed, notificationId } = await withOrg(l.deps.db, l.orgId, async (tx) => {
     if (!(await setSendStatus(tx, l.sendId, 'failed', { lastError: STALE_ERROR, now: l.now }))) {
       l.deps.logger.warn({ sendId: l.sendId }, 'send.landing_skipped_already_sent')
@@ -471,7 +494,7 @@ async function landStale(l: Landing, threadSnapshotAt: Date, newerInboundAt: Dat
       // stranded with no draft and no page. The other two hand-back writers (`reopenIfEligible`,
       // the api's redraft path) already reset it; these two were the only ones that did not.
       .set({ status: 'triaged', lastAgentRunAt: null, agentFailureCount: 0 })
-      .where(and(eq(tickets.id, l.ticketId), eq(tickets.status, 'awaiting_review')))
+      .where(and(eq(tickets.id, l.ticketId), inArray(tickets.status, [...SENDING_TICKET_STATUSES])))
     await audit(tx, {
       actor: SEND_ACTOR, action: 'send.stale', entityType: 'outbound_send', entityId: l.sendId,
       detail: {
@@ -528,8 +551,12 @@ async function landDeadLetter(deps: SendExecuteDeps, orgId: string, sendId: stri
       actor: SEND_ACTOR, action: 'send.dead_letter', entityType: 'outbound_send', entityId: sendId,
       detail: { reason, ticketId: send.ticketId, draftId: send.draftId },
     })
+    // Read live rather than carried: this path has no `Landing` (it runs off the payload alone), and
+    // an auto-send dead-lettering out of `auto_sending` with a hard-coded `awaiting_review` guard
+    // would match nothing — the ticket stranded mid-send with nobody paged.
+    const [ticket] = await tx.select({ status: tickets.status }).from(tickets).where(eq(tickets.id, send.ticketId))
     const { notificationId } = await escalateTicket(tx, {
-      orgId, ticketId: send.ticketId, fromStatus: 'awaiting_review', reason: 'send_failed',
+      orgId, ticketId: send.ticketId, fromStatus: ticketFrom(ticket?.status ?? 'awaiting_review'), reason: 'send_failed',
       day, now, draftId: send.draftId, actor: SEND_ACTOR, auditAction: 'ticket.escalated',
       dedupeKey: `send_failed:${send.ticketId}:${day}`,
       detail: { sendId, error: reason },
@@ -605,6 +632,8 @@ interface CompleteSendInput {
   bodyText: string
   threadSnapshotAt: Date
   aiHandledMonth: string | null
+  /** `drafts.decision_source` — `auto` meters `auto_sends`, anything else `review_sends`. */
+  decisionSource: string | null
   /** Present only on the fresh-send path; a recovery has no threading context to record. */
   threading?: { to: string[]; inReplyTo: string; refs: string[] }
 }
@@ -615,6 +644,10 @@ interface CompleteSendInput {
  */
 async function completeSend(l: Landing, input: CompleteSendInput): Promise<void> {
   const month = l.now.toISOString().slice(0, 7)
+  for (const from of SENDING_TICKET_STATUSES) {
+    ticketTransitions.assert(from, 'waiting_on_customer')
+    ticketTransitions.assert(from, 'triaged')
+  }
   const { completed, handBack } = await withOrg(l.deps.db, l.orgId, async (tx) => {
     // The mailbox poll will see this same SENT message and run its own insert; whichever writer gets
     // there first wins and exactly ONE outbound row survives. `draft_id` is force-written (the poll
@@ -679,7 +712,9 @@ async function completeSend(l: Landing, input: CompleteSendInput): Promise<void>
       .where(
         and(
           eq(tickets.id, l.ticketId),
-          eq(tickets.status, 'awaiting_review'),
+          // BOTH live send statuses: an auto-send is delivering from `auto_sending`, not from the
+          // review queue, and naming only the latter would drop it into the hand-back below.
+          inArray(tickets.status, [...SENDING_TICKET_STATUSES]),
           // `COALESCE(..., 'epoch')` (fix wave W7 / final-A2 M-4): `last_inbound_at` is nullable,
           // and SQL's three-valued logic made `NULL <= snapshot` neither true nor false — the flip
           // matched 0 rows and a SUCCESSFUL send fell into the hand-back below, parking the ticket
@@ -700,7 +735,7 @@ async function completeSend(l: Landing, input: CompleteSendInput): Promise<void>
         .update(tickets)
         // `agentFailureCount: 0` for the same reason `landStale` clears it — see there (fix wave W1).
         .set({ status: 'triaged', lastAgentRunAt: null, agentFailureCount: 0, ...clearRedraftCycle() })
-        .where(and(eq(tickets.id, l.ticketId), eq(tickets.status, 'awaiting_review')))
+        .where(and(eq(tickets.id, l.ticketId), inArray(tickets.status, [...SENDING_TICKET_STATUSES])))
         .returning({ id: tickets.id })
       handBack = rows.length > 0
     }
@@ -710,7 +745,10 @@ async function completeSend(l: Landing, input: CompleteSendInput): Promise<void>
       return { completed: false, handBack: false }
     }
 
-    await bumpMeter(tx, l.orgId, l.day, SEND_METERS.reviewSends, 1)
+    // The billing meter, split by who decided: the owner (`review_sends`) or the agent
+    // (`auto_sends`). `decision_source` is the draft's own column, so a Hold + re-approve inside the
+    // window correctly bills the re-approved reply as a review send.
+    await bumpMeter(tx, l.orgId, l.day, input.decisionSource === 'auto' ? SEND_METERS.autoSends : SEND_METERS.reviewSends, 1)
     // At most once per ticket per calendar month — the stamp IS the dedupe, so a second send in the
     // same month matches nothing and the meter stays put.
     if (input.aiHandledMonth !== month) {
@@ -784,7 +822,7 @@ async function execute(deps: SendExecuteDeps, payload: SendExecutePayload, ctx: 
   }
   const l: Landing = {
     deps, orgId, sendId, draftId: claimed.draft.id, ticketId: claimed.ticket.id,
-    connectionId: claimed.send.connectionId, now, day,
+    connectionId: claimed.send.connectionId, ticketStatus: claimed.ticket.status, now, day,
   }
 
   try {
@@ -945,6 +983,7 @@ async function afterClaim(deps: SendExecuteDeps, ctx: SendExecuteContext, claime
       await completeSend(l, {
         recovered: true, providerMessageId: recoveredId, providerThreadId: ticket.providerThreadId, rfcMessageId,
         fromAddress, subject, bodyText, threadSnapshotAt: draft.threadSnapshotAt, aiHandledMonth: ticket.aiHandledMonth,
+        decisionSource: draft.decisionSource,
       })
       return
     }
@@ -1106,6 +1145,7 @@ async function afterClaim(deps: SendExecuteDeps, ctx: SendExecuteContext, claime
       bodyText,
       threadSnapshotAt: draft.threadSnapshotAt,
       aiHandledMonth: ticket.aiHandledMonth,
+      decisionSource: draft.decisionSource,
       threading: { to: [ticket.customerEmail], inReplyTo, refs: references },
     })
   } finally {

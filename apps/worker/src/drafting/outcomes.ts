@@ -24,9 +24,9 @@ import type pino from 'pino'
 import type { UsageTotals } from '@aesa/agent'
 import type { DecisionReason, DraftStatus, NeedsOwnerReason } from '@aesa/contracts'
 import { DRAFT_EXPIRE_DAYS } from '@aesa/contracts'
-import { draftTransitions, outboundSendTransitions } from '@aesa/core'
+import { draftTransitions, outboundSendTransitions, ticketTransitions } from '@aesa/core'
 import {
-  audit, drafts, escalateTicket, notifications, outboundSends, tickets, withOrg,
+  audit, drafts, escalateTicket, notifications, outboundSends, resolvedAnswers, tickets, withOrg,
   type AuditActor, type Db, type OrgTx,
 } from '@aesa/db'
 import { stampFinished } from './claim.ts'
@@ -183,11 +183,26 @@ export async function applyNoReplyOutcome(
   })
 }
 
-/** Where a written draft leaves the ticket: the review queue, or an owner's hands with the body attached. */
+/**
+ * Where a written draft leaves the ticket: the review queue, an owner's hands with the body
+ * attached, or — Phase 5 — straight out to the customer after the agent's hold window.
+ */
 export type DraftLanding =
   | { kind: 'review'; decisionReason: DecisionReason }
   /** `guardrail_failed` (the body is stored so the owner can edit it) and `category_off` (quiet). */
   | { kind: 'escalate'; reason: NeedsOwnerReason; decisionReason: DecisionReason; quiet: boolean }
+  /**
+   * `decide()` answered `send`. The draft is stored ALREADY approved (`final_body` = the screened
+   * model body, `decision_source: 'auto'`, no `decided_by`) beside a `queued` send row due
+   * `delayMin` minutes out, and the ticket goes to `auto_sending` — the window in which the owner
+   * can still Hold it. `pushAutoSends` is the org's `notifications.push_auto_sends` setting.
+   */
+  | { kind: 'auto'; decisionReason: DecisionReason; sendAfter: Date; delayMin: number; pushAutoSends: boolean }
+
+/** The `drafts.decision` value (and the audit/run-output word) each landing writes. */
+function decisionWord(landing: DraftLanding): 'send' | 'review' | 'escalate' {
+  return landing.kind === 'auto' ? 'send' : landing.kind === 'review' ? 'review' : 'escalate'
+}
 
 /** Everything the `drafts` row carries that the model or the guardrails produced. */
 export interface DraftRowInput {
@@ -218,10 +233,15 @@ export function draftReviewCopy(categoryLabel: string, confidence: number, body:
  * Rules 13/14 — a draft exists and is being stored. ONE transaction, in the reference's pinned
  * order: guarded transition → supersede → insert → notify → audit → settle → watermarks.
  *
- * The transition comes FIRST on the review path so a lost race throws before anything else is
- * written. On the escalate paths the draft has to exist before `escalateTicket` can put its id in
- * the notification payload, so the order there is insert → escalate; the `LostRaceError` rolls the
- * insert back either way, which is what makes the two orders equivalent.
+ * The transition comes FIRST on the review AND the auto path so a lost race throws before anything
+ * else is written. On the escalate paths the draft has to exist before `escalateTicket` can put its
+ * id in the notification payload, so the order there is insert → escalate; the `LostRaceError` rolls
+ * the insert back either way, which is what makes the two orders equivalent.
+ *
+ * The auto landing writes one more row than the other two: the `outbound_sends` ledger row the
+ * `send.execute` job will claim once the hold window elapses. It goes in AFTER the draft insert,
+ * matching the api's `approveDraft` — it is a brand-new row, so the global lock order
+ * (`outbound_sends → drafts → tickets`) cannot be inverted by it.
  *
  * Superseding covers every live status except `sending` (`DRAFT_RETIREMENT`). `pending` is the
  * ordinary case; `approved` became reachable when `drafts.resume` gave a `failed` draft a way back
@@ -233,7 +253,7 @@ export async function applyDraftOutcome(
   ctx: OutcomeContext,
   landing: DraftLanding,
   row: DraftRowInput,
-): Promise<{ draftId: string; notificationId?: string }> {
+): Promise<{ draftId: string; notificationId?: string; sendId?: string }> {
   return withOrg(ctx.db, ctx.orgId, async (tx) => {
     // Global lock order (task 17 review ruling): `outbound_sends` → `drafts` → `tickets`, one order
     // across the worker and the api. The ticket's live drafts are locked BEFORE the ticket — by BOTH
@@ -265,10 +285,15 @@ export async function applyDraftOutcome(
       ))
       .for('update')
 
-    if (landing.kind === 'review') {
+    if (landing.kind === 'review' || landing.kind === 'auto') {
+      // The auto landing parks the ticket on `auto_sending` — the hold window, in which the owner
+      // can still pull the reply back — instead of the review queue. Both edges are guarded on
+      // `triaged`, so an owner action during the model call still wins the race.
+      const to = landing.kind === 'auto' ? 'auto_sending' : 'awaiting_review'
+      ticketTransitions.assert('triaged', to)
       const flipped = await tx
         .update(tickets)
-        .set({ status: 'awaiting_review' })
+        .set({ status: to })
         .where(and(eq(tickets.id, ctx.ticketId), eq(tickets.status, 'triaged')))
         .returning({ id: tickets.id })
       if (flipped.length === 0) throw new LostRaceError('draft.propose_lost_race')
@@ -322,9 +347,18 @@ export async function applyDraftOutcome(
         version, body: row.body, categoryId: row.categoryId,
         modelConfidence: row.confidence, confidence: row.confidence,
         confidenceBreakdown: row.confidenceBreakdown, guardrailResult: row.guardrailResult,
-        decision: landing.kind === 'review' ? 'review' : 'escalate',
+        decision: decisionWord(landing),
         decisionReason: landing.decisionReason,
-        status: 'pending',
+        // The auto landing IS the decision: the draft is stored already approved, with the screened
+        // body as its `final_body` (nobody will edit it) and no `decided_by`/`viewed_at` — nobody
+        // looked. `auto_decided_at` is the durable mark that survives a Hold + re-approve, which
+        // rewrites `decision_source` to `app`.
+        ...(landing.kind === 'auto'
+          ? {
+              status: 'approved' as const, finalBody: row.body, decisionSource: 'auto',
+              decidedAt: ctx.finishedAt, autoDecidedAt: ctx.finishedAt,
+            }
+          : { status: 'pending' as const }),
         retrievedChunkIds: row.retrievedChunkIds, citedChunkIds: row.citedChunkIds,
         retrievedAnswerIds: row.retrievedAnswerIds, usedAnswerIds: row.usedAnswerIds,
         memoryConflictIds: row.memoryConflictIds,
@@ -340,8 +374,54 @@ export async function applyDraftOutcome(
       .returning({ id: drafts.id })
     const draftId = inserted!.id
 
+    // Deviation 8: an answer the model says contradicts the guidance goes to the owner's Verify list
+    // NOW, on every landing kind — even one that is then rejected. The ids were already filtered
+    // against what retrieval returned; a chunk id in that list simply matches no answer row, and the
+    // `status = 'active'` guard makes a second run's repeat flag a no-op.
+    if (row.memoryConflictIds.length > 0) {
+      await tx
+        .update(resolvedAnswers)
+        .set({ status: 'needs_review', reviewReason: 'model_conflict' })
+        .where(and(
+          eq(resolvedAnswers.orgId, ctx.orgId),
+          inArray(resolvedAnswers.id, row.memoryConflictIds),
+          eq(resolvedAnswers.status, 'active'),
+        ))
+    }
+
     let notificationId: string | undefined
-    if (landing.kind === 'review') {
+    let sendId: string | undefined
+    if (landing.kind === 'auto') {
+      // The ticket row is already locked by this transaction's own flip, so this read cannot race;
+      // the send row is NEW, so inserting it after the draft cannot invert the global lock order.
+      const [connection] = await tx
+        .select({ connectionId: tickets.connectionId })
+        .from(tickets)
+        .where(eq(tickets.id, ctx.ticketId))
+      const [send] = await tx
+        .insert(outboundSends)
+        .values({
+          orgId: ctx.orgId, draftId, ticketId: ctx.ticketId, connectionId: connection!.connectionId,
+          agentId: ctx.agentId, status: 'queued', sendAfter: landing.sendAfter,
+        })
+        .returning({ id: outboundSends.id })
+      sendId = send!.id
+      // Off by default (`notifications.push_auto_sends`): an owner who trusts Autopilot does not
+      // want a push per reply. When it IS on, the page is the Hold button's only doorway.
+      if (landing.pushAutoSends) {
+        const [push] = await tx
+          .insert(notifications)
+          .values({
+            orgId: ctx.orgId, kind: 'auto_send',
+            title: `Auto-sending in ${landing.delayMin} min · ${row.categoryLabel} · ${Math.round(row.confidence * 100)}%`,
+            body: row.body.slice(0, 140),
+            dedupeKey: `auto_send:${draftId}`, payload: { ticketId: ctx.ticketId, draftId },
+          })
+          .onConflictDoNothing({ target: notifications.dedupeKey })
+          .returning({ id: notifications.id })
+        notificationId = push?.id
+      }
+    } else if (landing.kind === 'review') {
       const copy = draftReviewCopy(row.categoryLabel, row.confidence, row.body)
       const [push] = await tx
         .insert(notifications)
@@ -368,15 +448,19 @@ export async function applyDraftOutcome(
     await audit(tx, {
       actor: `agent:${ctx.runId}`, action: 'draft.created', entityType: 'ticket', entityId: ctx.ticketId,
       detail: {
-        draftId, version, decision: landing.kind === 'review' ? 'review' : 'escalate',
+        draftId, version, decision: decisionWord(landing),
         reason: landing.decisionReason, confidence: row.confidence, warnings: row.warnings,
         isRedraft: row.isRedraft, usage: { ...ctx.usage },
       },
     })
-    await settleRun(tx, ctx, { outcome: 'reply', draftId, decision: landing.kind === 'review' ? 'review' : 'escalate' })
+    await settleRun(tx, ctx, { outcome: 'reply', draftId, decision: decisionWord(landing) })
     await stampFinished(tx, ctx.ticketId, ctx.threadSnapshotAt, ctx.finishedAt)
 
-    return notificationId === undefined ? { draftId } : { draftId, notificationId }
+    return {
+      draftId,
+      ...(notificationId === undefined ? {} : { notificationId }),
+      ...(sendId === undefined ? {} : { sendId }),
+    }
   })
 }
 

@@ -229,6 +229,9 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
       db: app.db, provider, retriever: emptyRetriever, logger,
       enqueueNotify: (orgId, notificationId) => enqueueNotifyDispatch(boss, orgId, notificationId),
       enqueueDraft: (orgId, ticketId, opts) => enqueueTicketDraft(boss, orgId, ticketId, opts),
+      // Phase 3's scenarios never reach the auto landing (every category is `review`), so this seam
+      // is only here to satisfy the deps contract — Phase 5's own E2E is what exercises it.
+      enqueueSend: async () => {},
     })
     await registerAgentSandbox(boss, { db: app.db, provider, retriever: emptyRetriever, logger })
     await registerNotifyDispatch(boss, { db: app.db, push, logger })
