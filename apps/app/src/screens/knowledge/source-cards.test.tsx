@@ -26,6 +26,7 @@ jest.mock('@/lib/trpc', () => ({
       paste: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => mockPasteImpl(v), ...o }) },
       startUpload: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => mockStartUploadImpl(v), ...o }) },
       completeUpload: { mutationOptions: (o: object) => ({ mutationFn: () => Promise.resolve({ ok: true }), ...o }) },
+      deleteSource: { mutationOptions: (o: object) => ({ mutationFn: () => Promise.resolve({ ok: true }), ...o }) },
     },
   }),
 }))
@@ -104,11 +105,46 @@ test('a plan cap under every fixed option collapses to a single fixed cap line, 
   await waitFor(() => expect(mockStartCrawlCalls).toEqual([{ url: 'https://acme.example.com', maxPages: 10 }]))
 })
 
-test('a BAD_REQUEST from startCrawl shows its message under the crawl field, not as a banner', async () => {
-  mockStartCrawlImpl = () => Promise.reject({ data: { code: 'BAD_REQUEST' }, message: 'Crawls need an https:// address' })
+test('a non-https URL is refused client-side, under the field, and never reaches startCrawl', async () => {
   await setup('http://acme.example.com')
   await fireEvent.press(screen.getByTestId('start-crawl'))
-  await waitFor(() => expect(screen.getByText('Crawls need an https:// address')).toBeTruthy())
+  await waitFor(() => expect(screen.getByText('Enter a full https:// address')).toBeTruthy())
+  expect(mockStartCrawlCalls).toHaveLength(0)
+  expect(screen.queryByTestId('knowledge-cap-error')).toBeNull()
+})
+
+test('a BAD_REQUEST from the server shows the same fixed copy under the field — never the server message', async () => {
+  // zod 4 stringifies its issue array into `message`, and tRPC keeps a BAD_REQUEST's message
+  // verbatim: rendering `err.message` would put raw JSON under the owner's URL field.
+  mockStartCrawlImpl = () => Promise.reject({
+    data: { code: 'BAD_REQUEST' },
+    message: '[\n  {\n    "code": "invalid_format",\n    "path": ["url"]\n  }\n]',
+  })
+  await setup('https://acme.example.com')
+  await fireEvent.press(screen.getByTestId('start-crawl'))
+  await waitFor(() => expect(screen.getByText('Enter a full https:// address')).toBeTruthy())
+  expect(screen.queryByText(/invalid_format/)).toBeNull()
+  expect(screen.queryByTestId('knowledge-cap-error')).toBeNull()
+})
+
+test('a non-FORBIDDEN failure on startCrawl shows a plain retry line, never the cap banner', async () => {
+  mockStartCrawlImpl = () => Promise.reject({ data: { code: 'INTERNAL_SERVER_ERROR' }, message: 'boom' })
+  await setup('https://acme.example.com', { maxSources: 7, maxCrawlPages: 200 })
+  await fireEvent.press(screen.getByTestId('start-crawl'))
+  await waitFor(() => expect(screen.getByTestId('crawl-error')).toBeTruthy())
+  expect(screen.getByText('Could not start the crawl. Try again.')).toBeTruthy()
+  expect(screen.queryByTestId('knowledge-cap-error')).toBeNull()
+  expect(screen.queryByText('boom')).toBeNull()
+})
+
+test('a non-FORBIDDEN failure on paste shows a plain retry line, never the cap banner', async () => {
+  mockPasteImpl = () => Promise.reject({ data: { code: 'INTERNAL_SERVER_ERROR' }, message: 'boom' })
+  await setup('https://acme.example.com', { maxSources: 7, maxCrawlPages: 200 })
+  await fireEvent.changeText(screen.getByTestId('paste-title'), 'FAQ')
+  await fireEvent.changeText(screen.getByTestId('paste-text'), 'Some text')
+  await fireEvent.press(screen.getByTestId('add-paste'))
+  await waitFor(() => expect(screen.getByTestId('paste-error')).toBeTruthy())
+  expect(screen.getByText('Could not add the text. Try again.')).toBeTruthy()
   expect(screen.queryByTestId('knowledge-cap-error')).toBeNull()
 })
 

@@ -24,7 +24,7 @@ jest.mock('@/lib/trpc', () => ({
 function source(overrides: Partial<SourceRow> = {}): SourceRow {
   return {
     id: 's1', kind: 'upload', status: 'ready', title: 'policies.pdf', url: null,
-    documentCount: 1, chunkCount: 12, failureReason: null, failureDetail: null, crawlProgress: null,
+    documentCount: 1, chunkCount: 12, failureReason: null, crawlProgress: null,
     ...overrides,
   }
 }
@@ -103,14 +103,20 @@ test('a crawl source shows its progress line; an upload does not', async () => {
   expect(screen.queryByTestId('crawl-progress-u1')).toBeNull()
 })
 
-test('Refresh appears only on a ready or failed crawl, never on an upload or paste source', async () => {
+test('Refresh appears on every crawl except a processing one, and never on an upload or paste source', async () => {
   const sources = [
     source({ id: 'c1', kind: 'crawl', status: 'ready', url: 'https://acme.example.com' }),
     source({ id: 'c2', kind: 'crawl', status: 'processing', url: 'https://acme.example.com' }),
+    // A crawl whose job exhausted its retries lands back on `queued` with nothing coming for it —
+    // Refresh is the owner's only way out until the Phase 7 stranded-source sweep ships.
+    source({ id: 'c3', kind: 'crawl', status: 'queued', url: 'https://acme.example.com' }),
+    source({ id: 'c4', kind: 'crawl', status: 'failed', url: 'https://acme.example.com', failureReason: 'crawl_failed' }),
     source({ id: 'u1', kind: 'upload', status: 'ready' }),
   ]
   await setup(sources)
   await waitFor(() => expect(screen.getByTestId('refresh-c1')).toBeTruthy())
+  expect(screen.getByTestId('refresh-c3')).toBeTruthy()
+  expect(screen.getByTestId('refresh-c4')).toBeTruthy()
   expect(screen.queryByTestId('refresh-c2')).toBeNull()
   expect(screen.queryByTestId('refresh-u1')).toBeNull()
 

@@ -266,14 +266,21 @@ export async function runKnowledgeCrawl(deps: KnowledgeDeps, payload: KnowledgeC
     if (err instanceof CrawlError) {
       // The site was fine and our OWN persistence failed: the owner must not be told their site is
       // broken, and the detail (a driver message) must never reach `failure_detail`. Re-queue and
-      // rethrow the underlying error so pg-boss retries after the lease lapses.
+      // rethrow so pg-boss retries after the lease lapses.
+      //
+      // The rethrow is a WRAPPER, not the underlying error: pg-boss stores whatever is thrown in
+      // `pgboss.job.output` through serialize-error, which walks own ENUMERABLE properties — a raw
+      // `DrizzleQueryError` lands its `query` and `params` (the crawled page's text) there, and its
+      // `message` embeds them too. `cause` passed through the options bag is non-enumerable, so it
+      // is dropped from the stored output while staying available locally for a debugger. Same
+      // shape `knowledge.ingest`'s persist path uses.
       if (err.origin === 'consumer') {
         deps.logger.warn(
           { sourceId, error: errorMessage(err), driver: driverSummary(err.cause) },
           'knowledge.crawl: batch persistence failed; re-queueing the source',
         )
         await handBack()
-        throw err.cause ?? err
+        throw new Error('knowledge.crawl: batch persistence failed', { cause: err.cause ?? err })
       }
       // Terminal: the crawl itself could not run (a refused start URL, a dead site).
       await failSource(deps.db, { orgId, sourceId, actor: ACTOR, reason: err.code, detail: err.message, now: nowAt(), claimToken: claimed.token })

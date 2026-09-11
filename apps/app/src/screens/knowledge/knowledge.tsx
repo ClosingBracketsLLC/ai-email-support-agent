@@ -15,11 +15,17 @@ import { SourceCards } from './source-cards'
 import { SourceList } from './source-list'
 
 const POLL_MS_DEFAULT = 5000
+/** How long a `queued` source keeps the screen polling. A `queued` upload only becomes `processing`
+ * once its object has actually landed and `completeUpload` has enqueued the ingest job; if the
+ * browser's PUT never finished, no job is coming and the row would otherwise poll forever. Ten
+ * minutes is the presigned URL's own TTL (`UPLOAD_URL_TTL_SECONDS`, 600 s) — past it the upload can
+ * no longer land at all. A `processing` source always keeps polling: a job IS running. */
+const QUEUED_POLL_WINDOW_MS = 10 * 60 * 1000
 
-/** `list`'s own busy statuses (task brief) — the polling predicate, distinct from `canContinue`'s
- * narrower "processing only" gate below. */
-function anyBusy(data: { sources: { status: string }[] } | undefined): boolean {
-  return Boolean(data?.sources.some((s) => s.status === 'queued' || s.status === 'processing'))
+/** The polling predicate, distinct from `canContinue`'s narrower "processing only" gate below. */
+function anyBusy(data: { sources: { status: string; createdAt: Date }[] } | undefined, now: number): boolean {
+  return Boolean(data?.sources.some((s) =>
+    s.status === 'processing' || (s.status === 'queued' && now - s.createdAt.getTime() < QUEUED_POLL_WINDOW_MS)))
 }
 
 export interface KnowledgeScreenProps {
@@ -31,8 +37,8 @@ export interface KnowledgeScreenProps {
 /**
  * The Knowledge screen (spec §Product step 4), one body for both routes: Settings
  * (`app/(app)/settings/knowledge.tsx`) and onboarding step 3 (`screens/onboarding/knowledge.tsx`'s
- * `KnowledgeStep`). Three "add knowledge" cards, a live counter that polls while anything is still
- * queued or processing, the source list, flagged content (only while any exists), the guidance
+ * `KnowledgeStep`). Three "add knowledge" cards, a live counter that polls while a job is still
+ * running (`anyBusy`), the source list, flagged content (only while any exists), the guidance
  * editor, and the gaps report — plus, in onboarding mode only, Continue/Skip. `knowledge.list`'s
  * `canManage` (the caller's own role, resolved server-side) gates the three add cards, every
  * Delete/Refresh/Allow, and the guidance editor's Save: a plain member gets a read-only view of the
@@ -45,7 +51,7 @@ export function KnowledgeScreen({ mode, pollMs = POLL_MS_DEFAULT }: KnowledgeScr
 
   const ws = useQuery(trpc.workspace.get.queryOptions())
   const list = useQuery(trpc.knowledge.list.queryOptions(undefined, {
-    refetchInterval: (query) => (anyBusy(query.state.data) ? pollMs : false),
+    refetchInterval: (query) => (anyBusy(query.state.data, Date.now()) ? pollMs : false),
   }))
 
   const refreshList = () => { void list.refetch() }
@@ -76,7 +82,7 @@ export function KnowledgeScreen({ mode, pollMs = POLL_MS_DEFAULT }: KnowledgeScr
             <Button label="Try again" onPress={retry} testID="knowledge-retry" />
             {mode === 'onboarding' ? (
               <>
-                {skipConfirming ? <Banner tone="info">Without knowledge the agent answers from your profile and guidance only</Banner> : null}
+                {skipConfirming ? <Banner tone="warning">Without knowledge the agent answers from your profile and guidance only</Banner> : null}
                 <Button
                   variant={skipConfirming ? 'danger' : 'secondary'}
                   label={skipConfirming ? 'Confirm skip' : 'Skip for now'}
@@ -106,7 +112,7 @@ export function KnowledgeScreen({ mode, pollMs = POLL_MS_DEFAULT }: KnowledgeScr
         <Muted testID="knowledge-readonly">Only owners and admins can change knowledge.</Muted>
       )}
 
-      <Muted testID="knowledge-counter">{`Ready: ${counts.sources} of ${caps.maxSources} sources · ${counts.readyChunks} chunks`}</Muted>
+      <Muted testID="knowledge-counter">{`${counts.sources} of ${caps.maxSources} sources · ${counts.readyChunks} chunks ready`}</Muted>
       <SourceList sources={sources} onChanged={refreshList} canManage={canManage} />
 
       {counts.flaggedChunks > 0 ? <FlaggedChunks canManage={canManage} /> : null}
@@ -118,7 +124,7 @@ export function KnowledgeScreen({ mode, pollMs = POLL_MS_DEFAULT }: KnowledgeScr
       {mode === 'onboarding' ? (
         <>
           {advance.isError ? <Banner tone="error">Could not save your progress. Try again.</Banner> : null}
-          {skipConfirming ? <Banner tone="info">Without knowledge the agent answers from your profile and guidance only</Banner> : null}
+          {skipConfirming ? <Banner tone="warning">Without knowledge the agent answers from your profile and guidance only</Banner> : null}
           <Button label="Continue" onPress={() => advance.mutate()} loading={advance.isPending} disabled={!canContinue || advance.isPending} testID="continue" />
           <Button
             variant={skipConfirming ? 'danger' : 'secondary'}

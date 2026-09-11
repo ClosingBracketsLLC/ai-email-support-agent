@@ -1,7 +1,7 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useCallback, useRef, useState } from 'react'
 import { Pressable, StyleSheet, View } from 'react-native'
-import { KNOWLEDGE_DEFAULT_CRAWL_PAGES, KNOWLEDGE_MAX_PASTE_CHARS, KNOWLEDGE_MAX_UPLOAD_BYTES, KNOWLEDGE_UPLOAD_MIMES, type KnowledgeUploadMime } from '@aesa/contracts'
+import { KNOWLEDGE_DEFAULT_CRAWL_PAGES, KNOWLEDGE_MAX_PASTE_CHARS, KNOWLEDGE_MAX_UPLOAD_BYTES, KNOWLEDGE_UPLOAD_MIMES, StartCrawlInput, type KnowledgeUploadMime } from '@aesa/contracts'
 import { Banner } from '@/components/banner'
 import { Button } from '@/components/button'
 import { Card } from '@/components/card'
@@ -56,9 +56,12 @@ const UPLOAD_MAX_MB = Math.round(KNOWLEDGE_MAX_UPLOAD_BYTES / 1024 / 1024)
 function errorCode(err: unknown): string | undefined {
   return (err as { data?: { code?: string } } | null)?.data?.code
 }
-function errorMessage(err: unknown, fallback: string): string {
-  return (err as { message?: string } | null)?.message ?? fallback
-}
+
+/** The ONE thing a `BAD_REQUEST` on the crawl field can mean, in the owner's words. A tRPC
+ * `BAD_REQUEST` carries either zod 4's stringified issue array (an input-schema refusal — unreadable
+ * JSON) or the service's own sentence; neither is ever rendered. The client-side `safeParse` below
+ * catches the same case first, so this is only reached when the two disagree. */
+const CRAWL_URL_MESSAGE = 'Enter a full https:// address'
 
 function PageCapControl({ value, onChange, maxCrawlPages }: { value: number; onChange: (v: number) => void; maxCrawlPages: number }) {
   const c = useColors()
@@ -85,10 +88,12 @@ function PageCapControl({ value, onChange, maxCrawlPages }: { value: number; onC
  * The three "add knowledge" cards (spec §Product step 4): Crawl, Paste, Upload. Self-contained — it
  * owns its own crawl/paste/upload mutations and error surfacing, and invalidates `knowledge.list`
  * itself on a crawl/paste success (the upload pipeline's own `use-upload.ts` already does that for
- * uploads). `startCrawl`'s `BAD_REQUEST` (a non-https URL) surfaces under the URL field; a
- * `FORBIDDEN` from any of the three (the plan's source cap) surfaces as one shared error banner
- * whose text is always composed from `caps.maxSources` — never the server's own message, which can
- * change wording without this screen following along.
+ * uploads). A non-https URL is caught by `StartCrawlInput.safeParse` BEFORE the mutate (the
+ * `profile-form.tsx` idiom) and surfaces under the URL field; a `FORBIDDEN` from any of the three
+ * (the plan's source cap) — and ONLY a `FORBIDDEN` — surfaces as the shared cap banner, whose text
+ * is always composed from `caps.maxSources`. Every other failure (a timeout, a 500, a dropped
+ * connection) gets its own plain "try again" line: telling an owner their plan is full when the
+ * server merely hiccuped sends them off to delete sources they still need.
  */
 export function SourceCards({ websiteUrl, caps }: { websiteUrl: string | null; caps: KnowledgeCaps }) {
   const trpc = useTRPC()
@@ -103,6 +108,8 @@ export function SourceCards({ websiteUrl, caps }: { websiteUrl: string | null; c
   const [pasteTitle, setPasteTitle] = useState('')
   const [pasteText, setPasteText] = useState('')
   const [capReached, setCapReached] = useState(false)
+  const [crawlFailed, setCrawlFailed] = useState(false)
+  const [pasteFailed, setPasteFailed] = useState(false)
 
   const refresh = () => queryClient.invalidateQueries({ queryKey: trpc.knowledge.list.queryKey() })
   const capBannerText = `Your plan allows ${caps.maxSources} sources. Delete one to add another.`
@@ -110,13 +117,15 @@ export function SourceCards({ websiteUrl, caps }: { websiteUrl: string | null; c
   const startCrawl = useMutation(trpc.knowledge.startCrawl.mutationOptions({
     onSuccess: () => { setCrawlUrlError(null); void refresh() },
     onError: (err) => {
-      if (errorCode(err) === 'BAD_REQUEST') setCrawlUrlError(errorMessage(err, 'Enter a valid https:// address.'))
-      else setCapReached(true)
+      const code = errorCode(err)
+      if (code === 'BAD_REQUEST') setCrawlUrlError(CRAWL_URL_MESSAGE)
+      else if (code === 'FORBIDDEN') setCapReached(true)
+      else setCrawlFailed(true)
     },
   }))
   const paste = useMutation(trpc.knowledge.paste.mutationOptions({
     onSuccess: () => { setPasteTitle(''); setPasteText(''); void refresh() },
-    onError: () => setCapReached(true),
+    onError: (err) => { if (errorCode(err) === 'FORBIDDEN') setCapReached(true); else setPasteFailed(true) },
   }))
 
   // The effective page cap actually sent: the segmented value once one is offered, otherwise the
@@ -126,17 +135,29 @@ export function SourceCards({ websiteUrl, caps }: { websiteUrl: string | null; c
   function submitCrawl() {
     setCrawlUrlError(null)
     setCapReached(false)
-    startCrawl.mutate({ url: crawlUrl.trim(), maxPages: effectiveMaxPages })
+    setCrawlFailed(false)
+    // The contract itself is the validator (`StartCrawlInput.url` is `HttpsUrl`) — parse before the
+    // mutate so a typo never makes a round trip and never renders zod's own issue JSON.
+    const parsed = StartCrawlInput.safeParse({ url: crawlUrl.trim(), maxPages: effectiveMaxPages })
+    if (!parsed.success) { setCrawlUrlError(CRAWL_URL_MESSAGE); return }
+    startCrawl.mutate(parsed.data)
   }
   function submitPaste() {
     setCapReached(false)
+    setPasteFailed(false)
     paste.mutate({ title: pasteTitle.trim(), text: pasteText })
   }
-  async function handleFiles(files: PickedFile[]) {
+  // Stable across renders: `DropZone`'s web sibling binds its four DOM listeners in an effect keyed
+  // on this callback, so a fresh identity every render would unbind and rebind them on every render
+  // — including every `pending` update DURING an upload. `useUpload`'s `start` is itself a fresh
+  // closure each render, hence the ref rather than a dependency on it.
+  const startRef = useRef(upload.start)
+  startRef.current = upload.start
+  const handleFiles = useCallback(async (files: PickedFile[]) => {
     setCapReached(false)
-    const outcome = await upload.start(files)
+    const outcome = await startRef.current(files)
     if (outcome.stoppedBy === 'cap') setCapReached(true)
-  }
+  }, [])
 
   const uploadBusy = upload.pending.some((p) => p.progress === 'signing' || p.progress === 'uploading')
 
@@ -175,6 +196,8 @@ export function SourceCards({ websiteUrl, caps }: { websiteUrl: string | null; c
       </Card>
 
       {capReached ? <Banner tone="error" testID="knowledge-cap-error">{capBannerText}</Banner> : null}
+      {crawlFailed ? <Banner tone="error" testID="crawl-error">Could not start the crawl. Try again.</Banner> : null}
+      {pasteFailed ? <Banner tone="error" testID="paste-error">Could not add the text. Try again.</Banner> : null}
     </View>
   )
 }

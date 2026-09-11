@@ -44,12 +44,16 @@ function errorCode(err: unknown): string | undefined {
  * stops the WHOLE batch immediately — every file still waiting its turn is marked `failed`/`cap`
  * without ever being signed — and `start` resolves `{ stoppedBy: 'cap' }` so `SourceCards` can raise
  * the shared cap banner instead of a generic per-file failure.
+ *
+ * A failure AFTER `startUpload` has minted its row deletes that row (best effort) on the way out, so
+ * the only `queued` sources the owner ever sees are ones an ingest job is actually coming for.
  */
 export function useUpload() {
   const trpc = useTRPC()
   const queryClient = useQueryClient()
   const startUpload = useMutation(trpc.knowledge.startUpload.mutationOptions())
   const completeUpload = useMutation(trpc.knowledge.completeUpload.mutationOptions())
+  const deleteSource = useMutation(trpc.knowledge.deleteSource.mutationOptions())
   const [pending, setPending] = useState<PendingUpload[]>([])
 
   function setProgress(id: string, progress: UploadProgress, reason: UploadFailureReason | null) {
@@ -72,14 +76,28 @@ export function useUpload() {
       const size = file.size
       if (size === null) continue // unreachable — `refusalReason` already filtered this — keeps TS honest
 
+      // The row `startUpload` minted, remembered so a failure AFTER it can take the row back down
+      // with it. A `queued` upload whose PUT or `completeUpload` never landed enqueues no ingest
+      // job, so it would otherwise read "Queued for processing" forever, hold a `max_sources` slot
+      // nothing will ever free, and keep the screen polling. Null while nothing has been minted —
+      // a `FORBIDDEN` from `startUpload` itself leaves no row to delete.
+      let mintedSourceId: string | null = null
       try {
         const mime = inferMime(file.name, file.mime) as KnowledgeUploadMime
         const signed = await startUpload.mutateAsync({ fileName: file.name, mime, byteSize: size })
+        mintedSourceId = signed.sourceId
         setProgress(id, 'uploading', null)
         await uploadToPresignedUrl({ url: signed.url, headers: signed.headers, file })
         await completeUpload.mutateAsync({ sourceId: signed.sourceId })
+        mintedSourceId = null
         setProgress(id, 'queued', null)
       } catch (err) {
+        if (mintedSourceId !== null) {
+          // Best effort, and never allowed to change what the owner is told: the upload already
+          // failed, and a failed cleanup only leaves the same stranded row the owner can delete by
+          // hand from the source list.
+          try { await deleteSource.mutateAsync({ sourceId: mintedSourceId }) } catch { /* the row stays; the list's Delete is the fallback */ }
+        }
         if (errorCode(err) === 'FORBIDDEN') {
           stoppedByCap = true
           setProgress(id, 'failed', 'cap')

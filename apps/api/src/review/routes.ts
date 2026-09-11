@@ -237,13 +237,16 @@ async function safeRender(req: FastifyRequest, work: () => Promise<string>): Pro
  * carries a live single-use action token, so: `content-security-policy` — `style-src 'unsafe-inline'`
  * because the brand branch put the review pages' CSS in an inline `<style>` (`src/brand/css.ts`), and
  * `default-src 'none'` blocks everything else since the pages have no script and load no external
- * resource; `x-frame-options: DENY` stops the approve/hold form from being framed for a clickjack;
+ * resource, and `base-uri 'none'` refuses any `<base>` element outright — `form-action 'self'` is
+ * resolved against the document base, so an injected `<base href>` would otherwise be a way to aim
+ * the approve/hold form somewhere else; `x-frame-options: DENY` stops the form from being framed
+ * for a clickjack;
  * `x-content-type-options: nosniff` stops a browser from ever second-guessing the `text/html` type.
  */
 function reviewReply(reply: FastifyReply, body: string): FastifyReply {
   return reply.code(200)
     .header('cache-control', 'no-store')
-    .header('content-security-policy', "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'")
+    .header('content-security-policy', "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'")
     .header('x-frame-options', 'DENY')
     .header('x-content-type-options', 'nosniff')
     .type('text/html; charset=utf-8').send(body)

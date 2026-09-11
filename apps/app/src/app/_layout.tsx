@@ -2,6 +2,7 @@ import { Stack } from 'expo-router/stack'
 import * as SplashScreen from 'expo-splash-screen'
 import { useEffect } from 'react'
 import { Providers } from '@/components/providers'
+import { useWindowDropGuard } from '@/lib/drop-guard'
 import { useBrandFonts } from '@/lib/fonts'
 
 // Hold the native splash until the brand faces are registered (or have failed to): the first frame the
@@ -14,6 +15,9 @@ SplashScreen.preventAutoHideAsync().catch(() => {})
 
 export default function RootLayout() {
   const { ready } = useBrandFonts()
+  // Web only, and above the `!ready` early return so the guard is bound for the whole life of the
+  // app: a file dropped anywhere OUTSIDE a drop zone must never navigate the tab away from it.
+  useWindowDropGuard()
   useEffect(() => { if (ready) SplashScreen.hideAsync().catch(() => {}) }, [ready])
   if (!ready) return null
   return (

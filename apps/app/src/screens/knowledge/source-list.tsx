@@ -23,7 +23,6 @@ export interface SourceRow {
   documentCount: number
   chunkCount: number
   failureReason: KnowledgeFailureReason | null
-  failureDetail: string | null
   crawlProgress: { fetched: number; ingested: number; skipped: number } | null
 }
 
@@ -54,8 +53,11 @@ function subtitleFor(s: SourceRow): string {
 
 /**
  * The source list (spec §Product step 4): one `Card` per source, its status `Chip`, a crawl's
- * progress line, "Refresh" for a crawl sitting `ready`/`failed` (the only statuses `refreshCrawl`
- * actually accepts server-side — `apps/api/src/knowledge/service.ts`), and a two-tap "Delete" (the
+ * progress line, "Refresh" for any crawl that is not `processing` — `ready`, `failed` and `queued`,
+ * exactly what `refreshCrawl` accepts server-side (`apps/api/src/knowledge/service.ts`). `queued` is
+ * offered because a crawl whose job exhausted its retries sits there with nothing coming for it, and
+ * this is the owner's only way out; a `queued` crawl that IS still live just gets a second job whose
+ * claim no-ops. Plus a two-tap "Delete" (the
  * same idiom `agent-edit.tsx`'s disable button and `mailboxes.tsx`'s disconnect use). `canManage`
  * false (a plain member) hides both actions entirely — read-only knowledge for members.
  */
@@ -110,7 +112,7 @@ export function SourceList({ sources, onChanged, canManage }: { sources: SourceR
             ) : null}
             {canManage ? (
               <View style={styles.actions}>
-                {s.kind === 'crawl' && (s.status === 'ready' || s.status === 'failed') ? (
+                {s.kind === 'crawl' && s.status !== 'processing' ? (
                   <Button variant="secondary" label="Refresh" onPress={() => handleRefresh(s.id)} loading={refreshingThis} testID={`refresh-${s.id}`} />
                 ) : null}
                 <Button

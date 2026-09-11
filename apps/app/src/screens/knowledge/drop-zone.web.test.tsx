@@ -75,3 +75,31 @@ test('the returned unbind removes all four listeners', () => {
   unbind()
   for (const type of DRAG_EVENTS) expect(node.countFor(type)).toBe(0)
 })
+
+test('disabled still prevents default on every event and never calls onFiles', () => {
+  const node = new FakeNode()
+  const onFiles = jest.fn()
+  // The real component passes `() => disabledRef.current`, read at event time — the listeners
+  // themselves are bound for the life of the zone so a second drop mid-upload can never fall
+  // through to the browser's own "navigate to the dropped file" default.
+  bindDropZone(node, { onFiles, isDisabled: () => true })
+  const file = { name: 'notes.pdf', type: 'application/pdf', size: 42 } as unknown as File
+  for (const type of DRAG_EVENTS) {
+    const event = fakeDragEvent({ files: [file] })
+    node.dispatch(type, event)
+    expect(event.preventDefault).toHaveBeenCalledTimes(1)
+  }
+  expect(onFiles).not.toHaveBeenCalled()
+})
+
+test('isDisabled is read per event, so a zone that becomes enabled again accepts the next drop', () => {
+  const node = new FakeNode()
+  const onFiles = jest.fn()
+  let disabled = true
+  bindDropZone(node, { onFiles, isDisabled: () => disabled })
+  node.dispatch('drop', fakeDragEvent({ files: [] }))
+  expect(onFiles).not.toHaveBeenCalled()
+  disabled = false
+  node.dispatch('drop', fakeDragEvent({ files: [] }))
+  expect(onFiles).toHaveBeenCalledTimes(1)
+})

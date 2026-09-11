@@ -17,6 +17,9 @@ export interface DropZoneNode {
 export interface DropZoneHandlers {
   onFiles: (files: File[]) => void
   onDragState?: (active: boolean) => void
+  /** Read at EVENT time, never at bind time (the component reads a ref) — see `bindDropZone`'s
+   * doc comment for why the binding itself must never come and go. */
+  isDisabled?: () => boolean
 }
 
 /**
@@ -28,6 +31,12 @@ export interface DropZoneHandlers {
  * replaces). Every one of the four events gets its own `preventDefault()`: the browser's default
  * handling of `dragenter`/`dragover`/`dragleave` is exactly what has to be suppressed for `drop` to
  * ever fire as a drop instead of a navigation.
+ *
+ * `isDisabled` suppresses only `onFiles` — never `preventDefault`. The listeners stay bound for the
+ * whole life of the zone: unbinding them while an upload is in flight is what let a SECOND drop
+ * navigate the tab away, killing the in-flight `completeUpload` calls and stranding their `queued`
+ * rows. A disabled zone still has to swallow the browser's default handling; it just does nothing
+ * with the files.
  */
 export function bindDropZone(node: DropZoneNode, handlers: DropZoneHandlers): () => void {
   const onDragEnter = (event: DragEvent) => { event.preventDefault(); handlers.onDragState?.(true) }
@@ -36,6 +45,7 @@ export function bindDropZone(node: DropZoneNode, handlers: DropZoneHandlers): ()
   const onDrop = (event: DragEvent) => {
     event.preventDefault()
     handlers.onDragState?.(false)
+    if (handlers.isDisabled?.()) return
     const files = event.dataTransfer?.files
     handlers.onFiles(files ? Array.from(files) : [])
   }
@@ -73,20 +83,32 @@ export function DropZone({ onFiles, disabled }: DropZoneProps) {
   const c = useColors()
   const ref = useRef<View>(null)
 
+  // `disabled` is read through a ref so the binding never churns: an effect that re-ran on every
+  // `disabled` flip would tear the four listeners down for the whole duration of an upload, and a
+  // second drop during that window navigates the tab to the dropped file.
+  const disabledRef = useRef(disabled)
+  disabledRef.current = disabled
+
   useEffect(() => {
-    if (disabled) return
     const node = ref.current as unknown as DropZoneNode | null
     if (!node) return
-    return bindDropZone(node, { onFiles: (files) => onFiles(toPickedFiles(files)) })
-  }, [disabled, onFiles])
+    return bindDropZone(node, { onFiles: (files) => onFiles(toPickedFiles(files)), isDisabled: () => Boolean(disabledRef.current) })
+  }, [onFiles])
 
   function openPicker() {
     if (disabled) return
     const input = document.createElement('input')
     input.type = 'file'
     input.multiple = true
-    input.accept = KNOWLEDGE_UPLOAD_MIMES.join(',')
+    // Both the MIME types and the extensions: a `.md` (and, on some systems, a `.txt`) has no
+    // registered type in every browser's file dialog, so a MIME-only `accept` greys it out.
+    input.accept = `${KNOWLEDGE_UPLOAD_MIMES.join(',')},.pdf,.docx,.md,.txt`
+    // Never rendered — `hidden` keeps the throwaway input out of the layout while it is parented,
+    // and BOTH terminal events remove it, so dismissing the dialog leaves no orphan behind
+    // (`cancel` fires on dismissal in every browser that supports it; `change` on a pick).
+    input.hidden = true
     input.onchange = () => { onFiles(toPickedFiles(input.files ? Array.from(input.files) : [])); input.remove() }
+    input.oncancel = () => { input.remove() }
     document.body.appendChild(input)
     input.click()
   }

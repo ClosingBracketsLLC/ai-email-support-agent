@@ -7,8 +7,8 @@
  * `{ api, enqueue, store, logger }` — no logic may live only in the router.
  *
  * Discipline every function here keeps (CLAUDE.md):
- *  - one `withOrg` transaction per call, holding no network I/O — the presign call (`startUpload`)
- *    and the object delete (`deleteSource`) both happen AFTER the transaction has returned;
+ *  - one `withOrg` transaction per call, holding no network I/O — the presign (`startUpload`) runs
+ *    BEFORE the transaction opens and the object delete (`deleteSource`) AFTER it has returned;
  *  - every write guarded on what it was read at (a status IN list, `injection_flagged = true`), so
  *    zero rows is a soft outcome, never an error;
  *  - `enqueue` only after the transaction commits, and a collapsed duplicate (`null`) is logged at
@@ -20,7 +20,7 @@ import { and, count, desc, eq, inArray, ne, sql } from 'drizzle-orm'
 import type pino from 'pino'
 import {
   KNOWLEDGE_DEFAULT_CRAWL_PAGES,
-  type KnowledgeFailureReason, type KnowledgeSourceKind, type KnowledgeSourceStatus,
+  type KnowledgeFailureReason, type KnowledgeInjectionReason, type KnowledgeSourceKind, type KnowledgeSourceStatus,
   type PasteInput, type StartCrawlInput, type StartUploadInput,
 } from '@aesa/contracts'
 import { resolveSetting } from '@aesa/core'
@@ -63,8 +63,11 @@ const FLAGGED_CHUNKS_LIMIT = 200
 type SoftCode = 'not_found' | 'forbidden_cap' | 'bad_request'
 interface SoftFailure { ok: false; code: SoftCode; message?: string }
 
-function capFailure(setting: string, cap: number): SoftFailure {
-  return { ok: false, code: 'forbidden_cap', message: `${setting} reached (${cap})` }
+/** The FORBIDDEN's message. A settings key (`knowledge.max_sources`) is an implementation detail;
+ * the app composes its own banner from `list`'s `caps` anyway, so this only has to be intelligible
+ * wherever a raw tRPC message surfaces (a log, a script, a curl). */
+function capFailure(cap: number): SoftFailure {
+  return { ok: false, code: 'forbidden_cap', message: `Source limit reached (${cap})` }
 }
 
 // ---------------------------------------------------------------------------
@@ -84,7 +87,6 @@ export interface KnowledgeSourceView {
   documentCount: number
   chunkCount: number
   failureReason: KnowledgeFailureReason | null
-  failureDetail: string | null
   crawlProgress: KnowledgeCrawlProgress | null
   createdAt: Date
   completedAt: Date | null
@@ -92,7 +94,7 @@ export interface KnowledgeSourceView {
 
 interface SourceRow {
   id: string; kind: string; status: string; title: string; url: string | null; mime: string | null; byteSize: number | null
-  documentCount: number; chunkCount: number; failureReason: string | null; failureDetail: string | null
+  documentCount: number; chunkCount: number; failureReason: string | null
   crawlConfig: unknown; createdAt: Date; completedAt: Date | null
 }
 
@@ -112,7 +114,7 @@ function toSourceView(row: SourceRow): KnowledgeSourceView {
   return {
     id: row.id, kind: row.kind as KnowledgeSourceKind, status: row.status as KnowledgeSourceStatus, title: row.title,
     url: row.url, mime: row.mime, byteSize: row.byteSize, documentCount: row.documentCount, chunkCount: row.chunkCount,
-    failureReason: row.failureReason as KnowledgeFailureReason | null, failureDetail: row.failureDetail,
+    failureReason: row.failureReason as KnowledgeFailureReason | null,
     crawlProgress: crawlProgressOf(row.kind, row.crawlConfig), createdAt: row.createdAt, completedAt: row.completedAt,
   }
 }
@@ -121,7 +123,7 @@ const SOURCE_LIST_COLUMNS = {
   id: knowledgeSources.id, kind: knowledgeSources.kind, status: knowledgeSources.status, title: knowledgeSources.title,
   url: knowledgeSources.url, mime: knowledgeSources.mime, byteSize: knowledgeSources.byteSize,
   documentCount: knowledgeSources.documentCount, chunkCount: knowledgeSources.chunkCount,
-  failureReason: knowledgeSources.failureReason, failureDetail: knowledgeSources.failureDetail,
+  failureReason: knowledgeSources.failureReason,
   crawlConfig: knowledgeSources.crawlConfig, createdAt: knowledgeSources.createdAt, completedAt: knowledgeSources.completedAt,
 }
 
@@ -133,9 +135,9 @@ export interface KnowledgeListResult {
   knowledgeVersion: number
   counts: { sources: number; readyChunks: number; flaggedChunks: number }
   sources: KnowledgeSourceView[]
-  /** The SAME org-resolved values `checkSourceCap`/`startCrawl` clamp against (org override > plan
-   * default > code default) — the app's own page-cap control and cap-reached copy read these rather
-   * than hard-coding a number the api could silently outgrow. */
+  /** The SAME org-resolved values `checkSourceCap`/`startCrawl` clamp against — the app's own
+   * page-cap control and cap-reached copy read these rather than hard-coding a number the api could
+   * silently outgrow. See `checkSourceCap`'s note on what "resolved" means today. */
   caps: { maxSources: number; maxCrawlPages: number }
   /** Echoes the caller's own role check (`canManageWorkspace`) — the router resolves it, since role
    * belongs to `ctx.member`, not to anything this service otherwise reads. */
@@ -174,6 +176,13 @@ export async function listSources(deps: KnowledgeServiceDeps, orgId: string, can
  * "Non-failed sources" (controller ruling): `status <> 'failed'` — a failed source doesn't hold a
  * slot, so an owner can always retry after cleaning up.
  *
+ * What the cap resolves to TODAY: `resolveSetting` is called with `{ org }` only, so it is the org's
+ * own `org_settings` override if it has one and the settings-catalog default otherwise
+ * (`knowledge.max_sources` 100, `knowledge.max_crawl_pages` 200). `@aesa/core`'s `planSettingDefaults`
+ * exists but has no caller — plan-tier resolution arrives with Phase 7's billing, which owns both the
+ * org's `plan` column and the `{ plan }` argument at every `resolveSetting` site. Nothing here claims
+ * a plan layer that is not live.
+ *
  * Read-then-insert, with no lock: two concurrent calls that both read `cap − 1` both pass, so the
  * org can land one row over its cap. Deliberately unlike `agents.ts`'s sandbox cap (an
  * `pg_advisory_xact_lock`-serialized gate) — that cap guards a real-money model call per run; this
@@ -187,7 +196,7 @@ async function checkSourceCap(tx: OrgTx, orgId: string): Promise<{ ok: true } | 
   const [row] = await tx.select({ value: count() })
     .from(knowledgeSources)
     .where(and(eq(knowledgeSources.orgId, orgId), ne(knowledgeSources.status, 'failed')))
-  if ((row?.value ?? 0) >= cap) return capFailure('knowledge.max_sources', cap)
+  if ((row?.value ?? 0) >= cap) return capFailure(cap)
   return { ok: true }
 }
 
@@ -209,12 +218,19 @@ export async function startUpload(
   deps: KnowledgeServiceDeps, orgId: string, actor: KnowledgeActor, input: StartUploadInput,
 ): Promise<StartUploadResult> {
   const now = clock(deps)
+  // BEFORE the transaction, and deliberately: presigning a PUT is a local SigV4 signature over a
+  // key and an expiry — no request leaves the process — but it CAN still throw (a missing bucket
+  // config, a store that has to mint a session token). Doing it first means a presign failure
+  // strands no `queued` row: nothing has been written yet. `sourceId` is minted here because the
+  // object key embeds it, and it is the row's own id a moment later.
+  const sourceId = randomUUID()
+  const storageKey = uploadKey(orgId, sourceId, input.fileName)
+  const presigned = await deps.store.presignPut(storageKey, { contentType: input.mime, expiresSeconds: UPLOAD_URL_TTL_SECONDS })
+
   const outcome = await deps.api.withOrg(orgId, async (tx) => {
     const capCheck = await checkSourceCap(tx, orgId)
     if (!capCheck.ok) return capCheck
 
-    const sourceId = randomUUID()
-    const storageKey = uploadKey(orgId, sourceId, input.fileName)
     await tx.insert(knowledgeSources).values({
       id: sourceId, orgId, kind: 'upload', status: 'queued', title: input.fileName,
       storageKey, mime: input.mime, byteSize: input.byteSize, createdBy: actor.userId,
@@ -224,14 +240,11 @@ export async function startUpload(
       detail: { kind: 'upload', title: input.fileName, mime: input.mime, byteSize: input.byteSize },
       ip: actor.ip, userAgent: actor.userAgent,
     })
-    return { ok: true as const, sourceId, storageKey }
+    return { ok: true as const }
   })
   if (!outcome.ok) return outcome
 
-  // Outside the transaction: the presign call is network I/O the app role's 5 s idle-in-transaction
-  // timeout would otherwise race.
-  const presigned = await deps.store.presignPut(outcome.storageKey, { contentType: input.mime, expiresSeconds: UPLOAD_URL_TTL_SECONDS })
-  return { ok: true, sourceId: outcome.sourceId, url: presigned.url, headers: presigned.headers, expiresAt: new Date(now.getTime() + UPLOAD_URL_TTL_SECONDS * 1000) }
+  return { ok: true, sourceId, url: presigned.url, headers: presigned.headers, expiresAt: new Date(now.getTime() + UPLOAD_URL_TTL_SECONDS * 1000) }
 }
 
 export type CompleteUploadResult = { ok: true } | SoftFailure
@@ -402,6 +415,16 @@ export async function startCrawl(
 
 export type RefreshCrawlResult = { ok: true } | SoftFailure
 
+/**
+ * `ready`, `failed` — and `queued` too (final-review ruling). A `queued` crawl normally has a job
+ * coming, so re-queuing it enqueues a SECOND one; that is harmless, because the two jobs race for
+ * the same `queued → processing` claim and the loser's guarded write matches zero rows and returns.
+ * What it buys is the one case with no other way out: a crawl whose job exhausted its retries
+ * (`knowledge.crawl` hands the source back to `queued` before it rethrows) sits `queued` with
+ * nothing coming for it, and `startCrawl` on the same URL just finds the row and reports it pending.
+ * Until the Phase 7 stranded-source sweep ships, "Refresh" is the owner's way out of that.
+ * `processing` stays refused: that source holds a live claim token.
+ */
 export async function refreshCrawl(
   deps: KnowledgeServiceDeps, orgId: string, actor: KnowledgeActor, input: { sourceId: string },
 ): Promise<RefreshCrawlResult> {
@@ -410,8 +433,8 @@ export async function refreshCrawl(
       .from(knowledgeSources).where(and(eq(knowledgeSources.orgId, orgId), eq(knowledgeSources.id, input.sourceId))).limit(1)
     if (!source) return { ok: false as const, code: 'not_found' as const }
     if (source.kind !== 'crawl') return { ok: false as const, code: 'bad_request' as const, message: 'source is not a crawl' }
-    if (source.status !== 'ready' && source.status !== 'failed') {
-      return { ok: false as const, code: 'bad_request' as const, message: `source is ${source.status}, not ready or failed` }
+    if (source.status === 'processing') {
+      return { ok: false as const, code: 'bad_request' as const, message: 'source is processing, not ready, failed or queued' }
     }
 
     const settings = await loadOrgSettings(tx, ['knowledge.max_crawl_pages'])
@@ -419,7 +442,7 @@ export async function refreshCrawl(
     // The row's OWN stored budget, only reclamped — `refreshCrawl` takes no `maxPages` input, so
     // there is no caller value to prefer (see `requeueCrawlSource`'s doc comment).
     const maxPages = Math.min(existingMaxPagesOf(source.crawlConfig), pageCap)
-    const requeued = await requeueCrawlSource(tx, orgId, source, ['ready', 'failed'], maxPages, actor)
+    const requeued = await requeueCrawlSource(tx, orgId, source, ['ready', 'failed', 'queued'], maxPages, actor)
     if (!requeued) return { ok: false as const, code: 'bad_request' as const, message: 'source changed status before it could be requeued' }
     return { ok: true as const, sourceId: source.id }
   })
@@ -480,11 +503,14 @@ export interface FlaggedChunkView {
   documentUri: string
   headingPath: string[]
   content: string
-  reason: string | null
+  /** The code `screenChunk` wrote (`knowledge_chunks.injection_reason`, a plain text column), typed
+   * as the contracts enum the app has a label for. The app falls back to generic copy for anything
+   * it does not recognise, so a row written before the enum existed still renders. */
+  reason: KnowledgeInjectionReason | null
 }
 
 export async function flaggedChunks(deps: KnowledgeServiceDeps, orgId: string): Promise<{ chunks: FlaggedChunkView[] }> {
-  const chunks = await deps.api.withOrg(orgId, (tx) =>
+  const rows = await deps.api.withOrg(orgId, (tx) =>
     tx.select({
       id: knowledgeChunks.id, sourceId: knowledgeSources.id, sourceTitle: knowledgeSources.title,
       documentUri: knowledgeDocuments.uri, headingPath: knowledgeChunks.headingPath, content: knowledgeChunks.content,
@@ -497,7 +523,7 @@ export async function flaggedChunks(deps: KnowledgeServiceDeps, orgId: string): 
       .orderBy(desc(knowledgeChunks.createdAt))
       .limit(FLAGGED_CHUNKS_LIMIT),
   )
-  return { chunks }
+  return { chunks: rows.map((row) => ({ ...row, reason: row.reason as KnowledgeInjectionReason | null })) }
 }
 
 export type UnflagChunkResult = { ok: true } | { ok: false; code: 'not_found' }
@@ -509,7 +535,10 @@ export async function unflagChunk(
     const rows = await tx.update(knowledgeChunks)
       .set({ injectionFlagged: false, injectionReason: null })
       .where(and(eq(knowledgeChunks.orgId, orgId), eq(knowledgeChunks.id, input.chunkId), eq(knowledgeChunks.injectionFlagged, true)))
-      .returning({ id: knowledgeChunks.id, documentId: knowledgeChunks.documentId, embedding: knowledgeChunks.embedding })
+      // `needsEmbed` is computed in the database rather than `.returning` the vector itself: a
+      // 1024-dimension embedding is ~20 KB of text over the wire per row, read only to compare it
+      // against null.
+      .returning({ id: knowledgeChunks.id, documentId: knowledgeChunks.documentId, needsEmbed: sql<boolean>`${knowledgeChunks.embedding} IS NULL` })
     const row = rows[0]
     if (!row) return { ok: false as const, code: 'not_found' as const }
 
@@ -518,7 +547,7 @@ export async function unflagChunk(
       actor: actor.actor, action: 'knowledge.chunk.unflagged', entityType: 'knowledge_chunk', entityId: row.id,
       detail: { chunkId: row.id, documentId: row.documentId }, ip: actor.ip, userAgent: actor.userAgent,
     })
-    return { ok: true as const, documentId: row.documentId, needsEmbed: row.embedding === null }
+    return { ok: true as const, documentId: row.documentId, needsEmbed: row.needsEmbed }
   })
   if (!outcome.ok) return outcome
 

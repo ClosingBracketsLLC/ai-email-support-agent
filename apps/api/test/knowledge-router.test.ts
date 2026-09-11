@@ -113,8 +113,12 @@ describe('knowledge router', () => {
   it('list returns caps resolved the SAME way the mutations clamp with (org override wins over the plan default), and canManage false for a plain member', async () => {
     const org = await seedOrg()
     const defaults = await org.c.knowledge.list.query()
-    // Core settings-catalog defaults (packages/core/src/settings-catalog.ts): a brand-new org with no
-    // org_settings override and no plan override sits on the code defaults.
+    // 100 / 200 are the settings-catalog defaults (packages/core/src/settings-catalog.ts), and they
+    // are what EVERY org gets today: `resolveSetting` is called with `{ org }` only at every
+    // knowledge site, so the org's own `org_settings` row is the sole override layer.
+    // `planSettingDefaults` (packages/core/src/plans.ts) exists but has no caller — plan-tier
+    // resolution arrives with Phase 7's billing, which owns the org's `plan` column and the
+    // `{ plan }` argument. Until then this is a pin on the defaults, NOT on a trial tier.
     expect(defaults.caps).toEqual({ maxSources: 100, maxCrawlPages: 200 })
     expect(defaults.canManage).toBe(true)
 
@@ -192,13 +196,28 @@ describe('knowledge router', () => {
     }
   })
 
-  it('startUpload over knowledge.max_sources is FORBIDDEN with a clear message', async () => {
+  it('startUpload over knowledge.max_sources is FORBIDDEN, and the message names the limit rather than the settings key', async () => {
     const org = await seedOrg()
     await setCap(org.orgId, 'knowledge.max_sources', 1)
     await org.c.knowledge.startUpload.mutate({ fileName: 'first.txt', mime: 'text/plain', byteSize: 10 })
 
     await expect(org.c.knowledge.startUpload.mutate({ fileName: 'second.txt', mime: 'text/plain', byteSize: 10 }))
-      .rejects.toMatchObject({ data: { code: 'FORBIDDEN' }, message: expect.stringContaining('knowledge.max_sources') })
+      .rejects.toMatchObject({ data: { code: 'FORBIDDEN' }, message: 'Source limit reached (1)' })
+  })
+
+  it('a presign failure strands no source row — the presign runs before the transaction opens', async () => {
+    const org = await seedOrg()
+    // The suite's own memory store, swapped for one call and restored — the service looks
+    // `presignPut` up on `deps.store` per call, so this is enough to make the presign throw.
+    const store = t.store as { presignPut: ObjectStore['presignPut'] }
+    const original = store.presignPut
+    store.presignPut = () => Promise.reject(new Error('no bucket'))
+    try {
+      await expect(org.c.knowledge.startUpload.mutate({ fileName: 'doomed.txt', mime: 'text/plain', byteSize: 10 })).rejects.toBeDefined()
+    } finally {
+      store.presignPut = original
+    }
+    expect((await org.c.knowledge.list.query()).sources).toEqual([])
   })
 
   // ── paste ────────────────────────────────────────────────────────────────
@@ -289,7 +308,7 @@ describe('knowledge router', () => {
       .rejects.toMatchObject({ data: { code: 'FORBIDDEN' } })
   })
 
-  it('refreshCrawl re-queues a ready or failed crawl source, KEEPING its own stored maxPages budget (only reclamped to a shrunk cap), and enqueues knowledge.crawl; a queued source is BAD_REQUEST', async () => {
+  it('refreshCrawl re-queues a ready or failed crawl source, KEEPING its own stored maxPages budget (only reclamped to a shrunk cap), and enqueues knowledge.crawl', async () => {
     const org = await seedOrg()
     const failed = await insertSource(org.orgId, {
       kind: 'crawl', status: 'failed', title: 'https://example.com/x', url: 'https://example.com/x',
@@ -315,8 +334,33 @@ describe('knowledge router', () => {
     const [reclamped] = await t.api.withOrg(org.orgId, (tx) => tx.select().from(knowledgeSources).where(eq(knowledgeSources.id, overCap.id)))
     expect((reclamped!.crawlConfig as { maxPages: number }).maxPages).toBe(3)
 
-    const queued = await insertSource(org.orgId, { kind: 'crawl', status: 'queued', title: 'https://example.com/y', url: 'https://example.com/y' })
-    await expect(org.c.knowledge.refreshCrawl.mutate({ sourceId: queued.id })).rejects.toMatchObject({ data: { code: 'BAD_REQUEST' } })
+  })
+
+  it('refreshCrawl ALSO accepts a `queued` crawl (the stranded-crawl escape) and refuses only `processing`', async () => {
+    const org = await seedOrg()
+    // The shape a crawl whose job exhausted its retries is left in: `knowledge.crawl` hands the
+    // source back to `queued` before it rethrows, so the row sits there with nothing coming for it
+    // and `startCrawl` on the same URL only reports it pending. Re-queuing enqueues a second job,
+    // which is harmless: the two race for the same `queued → processing` claim and the loser's
+    // guarded write matches zero rows.
+    const queued = await insertSource(org.orgId, {
+      kind: 'crawl', status: 'queued', title: 'https://example.com/y', url: 'https://example.com/y', crawlConfig: { maxPages: 9 },
+    })
+    sent.length = 0
+    expect(await org.c.knowledge.refreshCrawl.mutate({ sourceId: queued.id })).toEqual({ ok: true })
+    expect(sent).toEqual([{ name: 'knowledge.crawl', data: { orgId: org.orgId, sourceId: queued.id }, opts: { entityId: queued.id } }])
+    const [row] = await t.api.withOrg(org.orgId, (tx) => tx.select().from(knowledgeSources).where(eq(knowledgeSources.id, queued.id)))
+    expect(row).toMatchObject({ status: 'queued', claimToken: null })
+    expect((row!.crawlConfig as { maxPages: number }).maxPages).toBe(9)
+    expect(await auditRows(org.orgId, 'knowledge.source.crawl_requeued', queued.id)).toHaveLength(1)
+
+    // `processing` still refused: that source holds a live claim token.
+    const processing = await insertSource(org.orgId, { kind: 'crawl', status: 'processing', title: 'https://example.com/z', url: 'https://example.com/z' })
+    await expect(org.c.knowledge.refreshCrawl.mutate({ sourceId: processing.id })).rejects.toMatchObject({ data: { code: 'BAD_REQUEST' } })
+
+    // And a non-crawl source is still BAD_REQUEST whatever its status.
+    const upload = await insertSource(org.orgId, { kind: 'upload', status: 'ready', title: 'f.txt' })
+    await expect(org.c.knowledge.refreshCrawl.mutate({ sourceId: upload.id })).rejects.toMatchObject({ data: { code: 'BAD_REQUEST' } })
   })
 
   // ── deleteSource ─────────────────────────────────────────────────────────
@@ -454,5 +498,37 @@ describe('knowledge router', () => {
 
     const [stillThere] = await t.api.withOrg(org.orgId, (tx) => tx.select().from(knowledgeSources).where(eq(knowledgeSources.id, mine!.id)))
     expect(stillThere).toBeDefined()
+  })
+
+  // Every id-taking mutation, not just `deleteSource`: each one's read is scoped with an explicit
+  // `org_id` predicate on top of RLS, and a hit on another org's row must be indistinguishable from
+  // a row that does not exist — never a BAD_REQUEST that leaks the row's kind or status.
+  it.each([
+    ['completeUpload', (c: Awaited<ReturnType<typeof seedOrg>>['c'], ids: { sourceId: string; chunkId: string }) => c.knowledge.completeUpload.mutate({ sourceId: ids.sourceId })],
+    ['refreshCrawl', (c: Awaited<ReturnType<typeof seedOrg>>['c'], ids: { sourceId: string; chunkId: string }) => c.knowledge.refreshCrawl.mutate({ sourceId: ids.sourceId })],
+    ['unflagChunk', (c: Awaited<ReturnType<typeof seedOrg>>['c'], ids: { sourceId: string; chunkId: string }) => c.knowledge.unflagChunk.mutate({ chunkId: ids.chunkId })],
+    ['deleteChunk', (c: Awaited<ReturnType<typeof seedOrg>>['c'], ids: { sourceId: string; chunkId: string }) => c.knowledge.deleteChunk.mutate({ chunkId: ids.chunkId })],
+  ] as const)("%s with another org's id is NOT_FOUND", async (_name, call) => {
+    const org = await seedOrg()
+    const other = await seedOrg()
+    // A source and a chunk in org A that WOULD satisfy each mutation's own preconditions if the
+    // caller were org A: a `queued` crawl (completeUpload's "not an upload" and refreshCrawl's
+    // status checks both come AFTER the row is found) and a flagged chunk.
+    const source = await insertSource(org.orgId, { kind: 'crawl', status: 'queued', title: 'https://example.com/p', url: 'https://example.com/p' })
+    const doc = await insertDocument(org.orgId, source.id)
+    const chunk = await insertChunk(org.orgId, doc.id, { injectionFlagged: true, injectionReason: 'override_instructions' })
+
+    await expect(call(other.c, { sourceId: source.id, chunkId: chunk.id })).rejects.toMatchObject({ data: { code: 'NOT_FOUND' } })
+  })
+
+  it("flaggedChunks never returns another org's flagged chunk", async () => {
+    const org = await seedOrg()
+    const other = await seedOrg()
+    const source = await insertSource(org.orgId)
+    const doc = await insertDocument(org.orgId, source.id)
+    const mine = await insertChunk(org.orgId, doc.id, { injectionFlagged: true, injectionReason: 'role_marker' })
+
+    expect((await other.c.knowledge.flaggedChunks.query()).chunks).toEqual([])
+    expect((await org.c.knowledge.flaggedChunks.query()).chunks.map((c) => c.id)).toEqual([mine.id])
   })
 })

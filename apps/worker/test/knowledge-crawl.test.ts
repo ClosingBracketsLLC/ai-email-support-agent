@@ -288,12 +288,23 @@ describe('knowledge.crawl', () => {
     } finally {
       await owner.pool.query('GRANT INSERT ON knowledge_chunks TO aesa_app')
     }
-    // The ORIGINAL error reaches pg-boss, not the CrawlError wrapper: drizzle's own
-    // `DrizzleQueryError` ("Failed query: insert into knowledge_chunks …") with pg's
-    // "permission denied" on its `cause`.
+    // What reaches pg-boss is a FIXED-message wrapper, never the drizzle error itself. pg-boss
+    // stores the thrown value in `pgboss.job.output` through serialize-error, which copies `name`,
+    // `message`, `stack` and every own ENUMERABLE property — a raw `DrizzleQueryError` would land
+    // its `query` and `params` (the crawled page's own text) there, and its message
+    // ("Failed query: insert into "knowledge_chunks" … params: …") embeds them as well.
     expect(thrown).toBeInstanceOf(Error)
-    expect((thrown as Error).message).toMatch(/insert into "knowledge_chunks"/)
-    expect(String(((thrown as { cause?: { message?: string } }).cause)?.message)).toMatch(/permission denied/)
+    expect((thrown as Error).message).toBe('knowledge.crawl: batch persistence failed')
+    expect(Object.keys(thrown as object)).toEqual([])      // nothing serialize-error would copy
+    // No page text, no SQL, no bound parameters anywhere the job's output would reach.
+    const serialized = `${(thrown as Error).message}\n${(thrown as Error).stack ?? ''}`
+    expect(serialized).not.toContain('Acme Dog Supplies sells beds')
+    expect(serialized).not.toMatch(/insert into "knowledge_chunks"/)
+    expect(serialized).not.toMatch(/params:/)
+    // The real error is still reachable locally, on the non-enumerable `cause` chain.
+    const cause = (thrown as { cause?: { message?: string; cause?: { message?: string } } }).cause
+    expect(String(cause?.message)).toMatch(/insert into "knowledge_chunks"/)
+    expect(String(cause?.cause?.message)).toMatch(/permission denied/)
 
     // Nor does the page text reach the LOG: a `DrizzleQueryError`'s message is
     // `Failed query: … params: <the page's own text>`, and pino's `err` serializer would copy its

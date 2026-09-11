@@ -71,7 +71,7 @@ export const knowledgeRouter = router({
   refreshCrawl: managerProcedure.input(SourceIdInput).mutation(async ({ ctx, input }) => {
     const res = await refreshCrawl(serviceDeps(ctx), ctx.orgId, appActor(ctx), input)
     if (res.ok) return { ok: true as const }
-    throw knowledgeError(res.code, res.message, res.code === 'not_found' ? 'knowledge source not found' : 'source is not a ready or failed crawl')
+    throw knowledgeError(res.code, res.message, res.code === 'not_found' ? 'knowledge source not found' : 'source is not a crawl that can be requeued')
   }),
 
   deleteSource: managerProcedure.input(SourceIdInput).mutation(async ({ ctx, input }) => {

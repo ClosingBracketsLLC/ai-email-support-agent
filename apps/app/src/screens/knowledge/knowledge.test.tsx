@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider, notifyManager } from '@tanstack/react-query'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react-native'
 import type { ReactNode } from 'react'
+import { palettes } from '@/theme'
 import { KnowledgeScreen } from './knowledge'
 
 // See inbox.test.tsx: TanStack's default scheduler defers notifications through a real setTimeout(0),
@@ -10,7 +11,9 @@ notifyManager.setScheduler((callback) => callback())
 interface Source {
   id: string; kind: 'upload' | 'paste' | 'crawl'; status: 'queued' | 'processing' | 'ready' | 'failed'
   title: string; url: string | null; documentCount: number; chunkCount: number
-  failureReason: string | null; failureDetail: string | null; crawlProgress: unknown
+  failureReason: string | null; crawlProgress: unknown
+  /** Real `Date` over the wire — the tRPC link transforms with superjson. `anyBusy` compares it. */
+  createdAt: Date
 }
 interface ListData {
   knowledgeVersion: number
@@ -87,7 +90,7 @@ async function setup(mode: 'settings' | 'onboarding' = 'settings', pollMs?: numb
 }
 
 function sourceRow(overrides: Partial<Source> = {}): Source {
-  return { id: 's1', kind: 'crawl', status: 'processing', title: 'https://acme.example.com', url: 'https://acme.example.com', documentCount: 0, chunkCount: 0, failureReason: null, failureDetail: null, crawlProgress: null, ...overrides }
+  return { id: 's1', kind: 'crawl', status: 'processing', title: 'https://acme.example.com', url: 'https://acme.example.com', documentCount: 0, chunkCount: 0, failureReason: null, crawlProgress: null, createdAt: new Date(), ...overrides }
 }
 
 /** A promise this test resolves by hand — same idiom `use-gate.test.tsx` uses. */
@@ -110,14 +113,14 @@ beforeEach(() => {
 })
 afterEach(async () => { for (const teardown of teardowns.splice(0)) await teardown() })
 
-test('shows the live "Ready: N of M sources · P chunks" counter', async () => {
+test('shows the live "N of M sources · K chunks ready" counter', async () => {
   mockListData = { knowledgeVersion: 1, counts: { sources: 3, readyChunks: 212, flaggedChunks: 0 }, sources: [], caps: DEFAULT_CAPS, canManage: true }
   await setup()
   await waitFor(() => expect(screen.getByTestId('knowledge-counter')).toBeTruthy())
-  expect(screen.getByText('Ready: 3 of 100 sources · 212 chunks')).toBeTruthy()
+  expect(screen.getByText('3 of 100 sources · 212 chunks ready')).toBeTruthy()
 })
 
-test('polls knowledge.list while a source is queued or processing, and stops once it turns ready', async () => {
+test('polls knowledge.list while a source is processing, and stops once it turns ready', async () => {
   let call = 0
   mockListImpl = () => {
     call += 1
@@ -132,6 +135,36 @@ test('polls knowledge.list while a source is queued or processing, and stops onc
   // The interval stopped: waiting well past several poll periods doesn't add more calls.
   await new Promise((resolve) => setTimeout(resolve, 100))
   expect(mockListQueryCalls).toBeLessThanOrEqual(callsOnceReady + 1)
+})
+
+test('a freshly queued source keeps the poll running', async () => {
+  mockListImpl = () => {
+    mockListData = {
+      knowledgeVersion: 1, counts: { sources: 1, readyChunks: 0, flaggedChunks: 0 },
+      sources: [sourceRow({ status: 'queued', createdAt: new Date() })], caps: DEFAULT_CAPS, canManage: true,
+    }
+    return Promise.resolve(mockListData)
+  }
+  await setup('settings', 5)
+  await waitFor(() => expect(mockListQueryCalls).toBeGreaterThanOrEqual(3), { timeout: 2000 })
+})
+
+test('a `queued` source older than the upload URL\'s own lifetime stops the poll — a PUT that never landed enqueues no job', async () => {
+  mockListImpl = () => {
+    mockListData = {
+      knowledgeVersion: 1, counts: { sources: 1, readyChunks: 0, flaggedChunks: 0 },
+      // 11 minutes old: past the 600 s presigned-URL TTL, so the object can no longer arrive and
+      // nothing will ever move this row off `queued`.
+      sources: [sourceRow({ status: 'queued', createdAt: new Date(Date.now() - 11 * 60 * 1000) })],
+      caps: DEFAULT_CAPS, canManage: true,
+    }
+    return Promise.resolve(mockListData)
+  }
+  await setup('settings', 5)
+  await waitFor(() => expect(screen.getByTestId('knowledge-counter')).toBeTruthy())
+  const callsAfterFirstLoad = mockListQueryCalls
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  expect(mockListQueryCalls).toBeLessThanOrEqual(callsAfterFirstLoad + 1)
 })
 
 test('onboarding: Continue is disabled with zero sources', async () => {
@@ -151,7 +184,11 @@ test('onboarding: Skip shows a warning banner, and a second tap advances', async
   await waitFor(() => expect(screen.getByTestId('skip')).toBeTruthy())
 
   await fireEvent.press(screen.getByTestId('skip'))
-  expect(screen.getByText('Without knowledge the agent answers from your profile and guidance only')).toBeTruthy()
+  const confirmation = screen.getByText('Without knowledge the agent answers from your profile and guidance only')
+  expect(confirmation).toBeTruthy()
+  // The `warning` tone, not `info`: skipping has a consequence worth a second look, and
+  // `primaryTint` reads as neutral chrome.
+  expect(confirmation).toHaveStyle({ color: palettes.light.warningText })
   expect(mockAdvanceCalls).toHaveLength(0)
 
   await fireEvent.press(screen.getByTestId('skip'))
