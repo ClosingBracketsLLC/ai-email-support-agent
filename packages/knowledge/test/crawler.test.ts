@@ -435,6 +435,93 @@ describe('crawlSite', () => {
     expect(site.hits).not.toContain('https://acme.example:8080/x')
     expect(summary.refused).toContainEqual({ url: 'https://acme.example:8080/x', reason: 'invalid_url' })
   })
+
+  it('24. a slow onBatch under concurrent workers neither loses nor duplicates pages (review finding 4 regression, test 1: deterministic, no wall-clock)', async () => {
+    // The start URL is ingested ALONE in wave 1 (its links aren't discovered until it's parsed),
+    // leaving `buffer` at length 1 before wave 2's two concurrent workers each push their own page —
+    // the first push alone crosses the firstBatch: 2 threshold and triggers a flush; the SECOND
+    // worker's push, landing while that flush is still awaiting the gated onBatch below, is exactly
+    // what the old aliased-buffer bug mishandled (as either a lost page or a re-delivered batch).
+    const extra = [0, 1, 2, 3, 4]
+    const site = fakeSite({
+      '/': { body: `<h1>Home</h1><p>Welcome.</p>${extra.map((i) => `<a href="/p${i}">p${i}</a>`).join('')}` },
+      ...Object.fromEntries(extra.map((i) => [`/p${i}`, page(`P${i}`, `Content ${i}.`)])),
+    })
+
+    let releaseFirstBatch: () => void = () => {}
+    const firstBatchGate = new Promise<void>((resolve) => { releaseFirstBatch = resolve })
+    let firstBatchStarted: () => void = () => {}
+    const firstBatchStartedSignal = new Promise<void>((resolve) => { firstBatchStarted = resolve })
+
+    const delivered: string[][] = []
+    let batchIndex = 0
+    const crawlPromise = crawlSite({
+      startUrl: `${SITE}/`, maxPages: 6, firstBatch: 2, concurrency: 2, delayMs: 0, fetch: site.fetch, resolver: site.resolver, signal: signal(),
+      onBatch: async (pages) => {
+        const isFirst = batchIndex === 0
+        batchIndex++
+        if (isFirst) {
+          firstBatchStarted()
+          await firstBatchGate // hold the first flush open — a concurrent worker's push must land safely
+        }
+        delivered.push(pages.map((p) => p.url))
+      },
+    })
+
+    await firstBatchStartedSignal // deterministic: resolves exactly when the first flush begins, no timers
+    releaseFirstBatch()
+    const summary = await crawlPromise
+
+    const deliveredUrls = delivered.flat()
+    expect(new Set(deliveredUrls).size).toBe(deliveredUrls.length) // no page delivered twice
+    expect(summary.ingested).toBe(deliveredUrls.length) // no page lost
+    expect(new Set(deliveredUrls)).toEqual(new Set([`${SITE}/`, `${SITE}/p0`, `${SITE}/p1`, `${SITE}/p2`, `${SITE}/p3`, `${SITE}/p4`]))
+    // The precise regression: the buggy aliased buffer let wave 2's second worker's push land
+    // INSIDE the array already handed to the gated onBatch call, silently growing the "first" batch
+    // from 2 pages to 3 instead of leaving the extra page for a later batch. Confirmed by reverting
+    // to the pre-fix `flush()` and observing exactly this — `delivered[0]` came back as
+    // `[start, p0, p1]` (3 pages) instead of the 2 the threshold actually called for.
+    expect(delivered[0]).toHaveLength(2)
+  })
+
+  it('25. a slow onBatch under sustained load neither loses nor duplicates pages, and never delivers an oversized batch (review finding 4 regression, test 2: 44 pages)', async () => {
+    // A deliberate one-page offset (review finding 4 investigation): with an EVEN page count and
+    // concurrency: 2, `firstBatch`/the fixed batch size (both 20, also even) always lands the
+    // threshold-crossing push on the SECOND member of its wave — by then both of that wave's
+    // workers have already pushed, so there's no third worker left to race in during the stuck
+    // flush, and the bug can't actually manifest (confirmed empirically: without this offset, the
+    // buggy code produces the fully correct [20, 20, 4] here too). `/dup1` + `/dup2` (identical
+    // content, so `/dup2` is skipped as a duplicate) shift the ingested-push count by exactly one
+    // relative to the fetch-wave count, so the 20th push instead lands on the FIRST member of a
+    // wave, leaving its wave-mate to push (and race) while that flush is in flight. Reverting to
+    // the pre-fix `flush()` against this exact fixture reproduces the review's own symptom almost
+    // exactly: batches `[21, 21, 20, 3]`, 65 pages delivered for only 44 unique ones (21 duplicates).
+    const n = 44
+    const uniqueUrls = Array.from({ length: 43 }, (_, i) => `${SITE}/p${i}`)
+    const urls = [`${SITE}/dup1`, `${SITE}/dup2`, ...uniqueUrls]
+    const pages: Record<string, FakePage> = {
+      '/sitemap.xml': { body: sitemapXml(urls) },
+      '/': { body: '<nav></nav>' },
+      '/dup1': page('Dup', 'Identical duplicate content.'),
+      '/dup2': page('Dup', 'Identical duplicate content.'),
+    }
+    for (let i = 0; i < 43; i++) pages[`/p${i}`] = page(`P${i}`, `Content ${i}.`)
+    const site = fakeSite(pages)
+    const delivered: string[][] = []
+    const summary = await crawlSite({
+      startUrl: `${SITE}/`, maxPages: n, firstBatch: 20, concurrency: 2, delayMs: 0, fetch: site.fetch, resolver: site.resolver, signal: signal(),
+      onBatch: async (batchPages) => {
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        delivered.push(batchPages.map((p) => p.url))
+      },
+    })
+    const deliveredUrls = delivered.flat()
+    expect(new Set(deliveredUrls).size).toBe(deliveredUrls.length) // no page delivered twice
+    expect(deliveredUrls).toHaveLength(n) // no page lost
+    expect(summary.ingested).toBe(n)
+    expect(summary.skipped).toBe(1) // /dup2, the content duplicate
+    for (const batch of delivered.slice(1)) expect(batch.length).toBeLessThanOrEqual(20)
+  })
 })
 
 describe('normalizeUrl (review finding 3: https only)', () => {

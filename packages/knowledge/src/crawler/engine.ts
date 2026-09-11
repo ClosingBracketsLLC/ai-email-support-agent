@@ -185,7 +185,8 @@ type FetchOutcome =
  * is normalized, same-site-checked and re-resolved through `resolvePublic` BEFORE it is fetched —
  * `pageFetch` never sees a redirect target the caller hasn't re-validated. `isAllowed` (robots) is
  * re-checked on EVERY hop, not just the first (review finding 9) — a same-site redirect into a
- * disallowed path must never be fetched either. */
+ * disallowed path must never be fetched either — and checked BEFORE `validateHop` (review re-check
+ * minor finding): a disallowed URL costs no DNS resolution (`validateHop`'s `resolvePublic` call). */
 async function fetchResolved(
   pageFetch: (url: URL) => Promise<{ status: number; headers: Record<string, string>; body: string }>,
   initialUrl: string,
@@ -195,10 +196,10 @@ async function fetchResolved(
 ): Promise<FetchOutcome> {
   let currentUrl = initialUrl
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    if (!isAllowed(currentUrl)) return { kind: 'disallowed', url: currentUrl }
+
     const gate = await validateHop(currentUrl, siteUrl, resolver)
     if (!gate.ok) return { kind: 'refused', url: currentUrl, reason: gate.reason }
-
-    if (!isAllowed(gate.url.toString())) return { kind: 'disallowed', url: currentUrl }
 
     const res = await pageFetch(gate.url)
     if (!REDIRECT_STATUSES.has(res.status)) {
@@ -315,32 +316,56 @@ export async function crawlSite(opts: CrawlOptions): Promise<CrawlSummary> {
   const seenHashes = new Set<string>()
   let buffer: CrawledPage[] = []
   let firstBatchDone = false
+  // Guards against two overlapping `onBatch` calls (review finding 4's regression — see
+  // `flushSome` below): while one flush is in flight, `maybeFlush` calls from OTHER concurrent
+  // workers are no-ops; `buffer` just keeps growing until the in-flight flush finishes.
+  let flushing = false
 
-  // Rule 8 + review finding 4: `onBatch` must fully succeed before its pages are considered
-  // delivered — `buffer` keeps holding them until then, so a rejection never silently drops up to
-  // 20 pages while still counting them ingested. A failure is re-thrown as `BatchFlushError`,
-  // which `processUrl` (below) is careful NOT to swallow like every other page-level failure, and
-  // which `crawlSite`'s own try/catch (further below) turns into a `CrawlError('crawl_failed')`
-  // that aborts the whole crawl — including from this function's LAST call, after the main loop,
-  // which used to propagate raw and uncaught while a mid-crawl failure was silently swallowed.
-  const flush = async (): Promise<void> => {
-    if (buffer.length === 0) return
-    const pages = buffer
+  const currentThreshold = (): number => (firstBatchDone ? SUBSEQUENT_BATCH_SIZE : firstBatch)
+
+  // Rule 8 + review finding 4 (and finding 4's OWN regression, fixed here): `onBatch` must fully
+  // succeed before its pages are considered delivered, and a concurrent worker's `buffer.push()`
+  // during the `await` must neither land inside the in-flight batch nor be discarded by it.
+  //
+  // The first attempt at finding 4's fix aliased the live array — `const pages = buffer` — so a
+  // push during `await onBatch(pages)` mutated `pages` too (`buffer` and `pages` were the SAME
+  // array), and the trailing `buffer = []` then discarded whatever had landed in it: a page
+  // counted `ingested` could vanish, or — since `buffer.length` kept climbing past the threshold on
+  // that SAME still-aliased array — a second `maybeFlush()` racing in from another worker would see
+  // the threshold crossed again and flush (a version of) the SAME array a second time, redelivering it.
+  //
+  // Fixed here with a SYNCHRONOUS swap: `buffer.splice(0, cap)` takes the batch out and shortens
+  // `buffer` to whatever's left in the SAME synchronous tick, with no `await` in between — a
+  // concurrent push can only ever land in what's left of `buffer`, never in `pages`. `flushing`
+  // stops two flushes from running at once (the second-worker-races-in scenario above): while one
+  // is in flight, `buffer` just keeps growing behind it, and `cap` (always `≤ SUBSEQUENT_BATCH_SIZE`
+  // after the very first flush) ensures a pile-up that happens anyway delivers as several ≤cap
+  // batches afterward, never one oversized one. On failure the pages are spliced back onto the
+  // FRONT of `buffer` (ahead of whatever queued up during the attempt) before re-throwing as
+  // `BatchFlushError` — nothing is lost either way.
+  const flushSome = async (cap: number): Promise<void> => {
+    if (buffer.length === 0 || flushing) return
+    const pages = buffer.splice(0, cap)
+    flushing = true
     try {
       await opts.onBatch(pages)
     } catch (err) {
+      buffer = pages.concat(buffer)
       throw new BatchFlushError(err)
+    } finally {
+      flushing = false
     }
-    buffer = []
   }
   // Rule 8: the first `firstBatch` (20) ingested pages flush immediately; every flush after that
   // carries up to the fixed 20, not `firstBatch` again. Whatever's left flushes once at the end
-  // (the final `await flush()` after the loop below).
+  // (the final drain loop after the main loop below, which — unlike a single `flush()` call — keeps
+  // going as long as `buffer` has anything left, in case a pile-up during a slow flush left more
+  // than one `cap`'s worth behind).
   const maybeFlush = async (): Promise<void> => {
-    const threshold = firstBatchDone ? SUBSEQUENT_BATCH_SIZE : firstBatch
+    const threshold = currentThreshold()
     if (buffer.length >= threshold) {
       firstBatchDone = true
-      await flush()
+      await flushSome(threshold)
     }
   }
   const reportProgress = async (): Promise<void> => {
@@ -469,7 +494,13 @@ export async function crawlSite(opts: CrawlOptions): Promise<CrawlSummary> {
       if (batch.length === 0) break
       await Promise.all(batch.map((url) => processUrl(url)))
     }
-    await flush()
+    // Drains everything left, in ≤cap-sized pieces — a single call isn't enough if a pile-up during
+    // a slow mid-crawl flush left more than one `cap`'s worth of pages behind.
+    while (buffer.length > 0) {
+      const cap = currentThreshold()
+      firstBatchDone = true
+      await flushSome(cap)
+    }
   } catch (err) {
     if (err instanceof BatchFlushError) {
       throw new CrawlError('crawl_failed', err.cause instanceof Error ? err.cause.message : String(err.cause))
