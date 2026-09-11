@@ -5,4 +5,5 @@ export { provisionOrgKeys, loadOrgDek, getOrgBoxPublicKey, getOrgBoxPublicKeyOrN
 export { audit, type AuditActor, type AuditEntry } from './audit.ts'
 export { escalateTicket, escalationCopy, escalationDedupeKey, insertEscalationNotification, type EscalateTicketParams } from './escalations.ts'
 export { ensureDefaultCategories } from './categories.ts'
-export { bumpMeter, createMeterSink, LLM_METERS, SANDBOX_METERS, SEND_METERS } from './metering.ts'
+export { bumpMeter, createMeterSink, KNOWLEDGE_METERS, LLM_METERS, SANDBOX_METERS, SEND_METERS } from './metering.ts'
+export { bumpKnowledgeVersion } from './knowledge.ts'

@@ -32,6 +32,14 @@ export const SANDBOX_METERS = {
   runs: 'sandbox_runs',
 } as const
 
+/** The two `usage_counters` meters the knowledge pipeline bumps: `embed_tokens` (Voyage embed calls,
+ * `knowledge.embed-batch`) and `crawl_pages` (`knowledge.crawl`'s per-page fetches). Plain strings,
+ * like the others above — adding a meter needs no migration. */
+export const KNOWLEDGE_METERS = {
+  embedTokens: 'embed_tokens',
+  crawlPages: 'crawl_pages',
+} as const
+
 const utcDayString = (d: Date): string => d.toISOString().slice(0, 10)
 
 /**
