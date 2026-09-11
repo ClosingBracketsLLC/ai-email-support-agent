@@ -109,7 +109,13 @@ instruction from him in the session.
   second embeds the query and filters the vector leg by it, so a drifted replica retrieves nothing
   from the vector leg at all and silently degrades every draft to the lexical one. Nothing refuses
   it at boot; the retriever warns once per process per org when the vector leg comes back empty and
-  a different `embedding_model` is stored.
+  a different `embedding_model` is stored. **Phase 5 added NO environment variable to either app.**
+  Its two new knobs are per-workspace `org_settings` rows, resolved through `resolveSetting`:
+  `notifications.push_auto_sends` (boolean, **default false** — the Hold-button push on every
+  auto-send) and `guidance.daily_suggest_cap` (number, default 50 — the per-org daily ceiling on
+  `guidance.suggest`'s Haiku call). Learned answers are embedded with the SAME
+  `KNOWLEDGE_EMBED_MODEL` as chunks and filtered by it on the answers leg too, so the paragraph
+  above now also governs whether a workspace can retrieve anything it has learned.
 
 ## Layout
 
@@ -118,8 +124,12 @@ instruction from him in the session.
   libpq startup options), `withOrg` / `withPlatform` / `withOrgIdentity` (lending a platform sweep's
   per-row SAVEPOINT tx one org's identity), per-org data keys, `escalateTicket` (the single entry
   into `needs_owner` — see the Escalation rule below), the meter sink (`createMeterSink`,
-  `bumpMeter`, `LLM_METERS` / `SEND_METERS` / `SANDBOX_METERS` / `KNOWLEDGE_METERS`),
-  `bumpKnowledgeVersion`, and `createTestDatabase`.
+  `bumpMeter`, `LLM_METERS` / `SEND_METERS` (incl. Phase 5's `autoSends`) / `SANDBOX_METERS` /
+  `KNOWLEDGE_METERS` / `GUIDANCE_METERS`), `bumpKnowledgeVersion`, Phase 5's `resolved_answers` /
+  `category_stats_daily` / `guidance_suggestions` tables, `customerHash` /
+  `ensureCustomerHashSalt` (`memory.ts`) and the autonomy helpers (`autonomy.ts`:
+  `countHumanDecisions`, `readDemotionSignals`, `demoteCategory`, `graduateCategory` — the single
+  entries into a mode change, see the Autonomy rule below), and `createTestDatabase`.
 - `packages/crypto` — `Secret`, domain-separated token hashing, AES-256-GCM envelope with a KEK ring,
   libsodium sealed boxes, the SSRF guard (`validateOutboundUrl`, `resolvePublic`, `pinnedFetch`).
 - `packages/core` — tripwire, state-transition matrices, settings catalog, plans, startup
@@ -127,8 +137,14 @@ instruction from him in the session.
   screens (`guardrails/{validator,screens,policy,shingles}.ts` — one implementation run at all three
   gates, over a per-tenant `WorkspacePolicy` built in one place, `@aesa/agent/policy`, so the draft,
   approve and send gates screen against the SAME four trusted texts and the same allowed hosts),
-  `decide()` (`autonomy.ts`), the redraft policy
-  (`redraft.ts`: `resolveRejectAction`, `clearRedraftCycle`, `REDRAFT_MAX`) and `appendSignature`.
+  `decide()` (`autonomy.ts` — Phase 5 added its `memory_conflict` / `unresolved_questions` /
+  `thread_too_long` blockers), the redraft policy
+  (`redraft.ts`: `resolveRejectAction`, `clearRedraftCycle`, `REDRAFT_MAX`), `appendSignature`, and
+  Phase 5's `evidence.ts` — the evidence maths (`memoryBand`, `memoryScore`,
+  `evidenceScore = max(memory, grounding) × model`) plus the graduation and demotion rules
+  (`DEMOTION_RULES`, `evaluateDemotion`, `GRADUATION_RULES`, `evaluateGraduation`) and the memory
+  constants (`MEMORY_RETRIEVE_MIN_COSINE`, `MEMORY_EXPIRY_DAYS`, `MEMORY_STRIKES_TO_RETIRE`,
+  `THREAD_MAX_MESSAGES_FOR_AUTO`).
 - `packages/queue` — pg-boss wrappers (`startBoss`, `registerCron`), `defineJob` / `registerJob`,
   `enqueue`, `fairSelectSql`.
 - `packages/mail` — the provider-agnostic mailbox port: Gmail + Microsoft Graph adapters, credential
@@ -149,7 +165,9 @@ instruction from him in the session.
   gates including the api's approve gate. It is deliberately pure: `@aesa/core` plus this package's
   own prompt-text modules and nothing else, so the api can build the identical policy without the
   Anthropic SDK entering its module graph (held by `packages/agent/test/policy.test.ts` and
-  `apps/api/test/error-surface.test.ts`, which both walk the real module graph).
+  `apps/api/test/error-surface.test.ts`, which both walk the real module graph). Phase 5 added
+  `guidance/suggest.ts` — the small Haiku call that turns ONE edited approval into ONE suggested
+  operating rule, or `null`.
 - `packages/knowledge` — Phase 4's knowledge pipeline, with no job and no queue of its own:
   the HTML/Markdown/text/PDF/DOCX block parsers and the bounded parser child
   (`parsers/`, `bounds.ts`), the heading-aware chunker, the prompt-injection screen,
@@ -157,7 +175,10 @@ instruction from him in the session.
   deterministic-hash adapters, the `ObjectStore` port with its S3 and in-memory adapters
   (`storage/`), the SSRF-safe crawler (robots, sitemap-first, re-validated redirects, first-20
   batches) and hybrid per-org retrieval (`createRetriever`, `assertSameOrg`, the relaxed tsquery,
-  RRF fusion). Two PURE sub-paths the api imports and nothing else — `@aesa/knowledge/storage` and
+  RRF fusion) — plus Phase 5's `memory/scrub.ts` (`scrubForMemory`, the structural PII scrub every
+  stored answer passes through) and the retriever's **answers leg** (`answerSearchSql`: vector-only,
+  `status = 'active'`, cosine ≥ `MEMORY_RETRIEVE_MIN_COSINE`, top 3, never fused with the chunk
+  ranking). Two PURE sub-paths the api imports and nothing else — `@aesa/knowledge/storage` and
   `@aesa/knowledge/url` — keep the parsers and the LLM client out of the api's module graph
   (`apps/api/test/error-surface.test.ts` walks it); `./testing` exports `fakeSite`. `@aesa/agent` is
   a type-only devDependency (`RetrievedChunk`/`Retriever` erase at runtime).
@@ -183,7 +204,13 @@ instruction from him in the session.
   that reads its own aggregates and touches no draft service, and Phase 4's `knowledge` router
   (presigned uploads, paste, crawl, list, delete, flagged chunks, gaps), which is likewise a thin
   code-to-`TRPCError` wrapper over ONE service module (`src/knowledge/service.ts`, exported as
-  `@aesa/api/knowledge`). The approve gate screens the owner's
+  `@aesa/api/knowledge`). Phase 5 adds the same shape again: a `memory` router over
+  `src/memory/service.ts` (`@aesa/api/memory` — the sampling verdicts, keep/retire, and
+  delete-by-customer), `drafts.flagAutoSent` plus the Hold that cancels an auto-send in the SAME
+  `src/drafts/service.ts`, `agents.setCategoryPolicy` with the cold-start lock, and the guidance
+  suggestions. Every owner correction (reject, flag, an edited approve of a held auto-send) runs the
+  demotion check INLINE in its own transaction — a category that has earned a demotion never waits
+  for the nightly rollup. The approve gate screens the owner's
   body through the SAME policy the draft and send gates use — the api depends on `@aesa/agent`, but
   only through the pure `@aesa/agent/policy` sub-path, never the package root. The api never holds
   the KEK, never calls a model, never
@@ -204,13 +231,26 @@ instruction from him in the session.
   one document's missing vectors are filled in ≤ 128-text embed calls — `knowledge/sources.ts`
   holds `guardedSourceWrite`/`failSource` and `knowledge-deps.ts` is the ONE place the store,
   embedder and reranker are chosen from `WorkerConfig`, shared with the `agent` role's retriever so
-  a worker can never write vectors with one model and query with another), `send.execute` (`send`
-  role — the only process that ever sends a customer reply), `notify.dispatch` / `notify.digest` (escalation and
+  a worker can never write vectors with one model and query with another),
+  `memory.capture` / `guidance.suggest` (Phase 5, `agent` role — the first turns one DELIVERED reply
+  into a new resolved answer or a reinforcement of the one it reused, the second turns one edited
+  approval into a suggested guidance rule; both are enqueued from elsewhere, `memory.capture` by
+  `send.execute`'s post-commit `onSent` seam and `guidance.suggest` by the api's approve),
+  `send.execute` (`send`
+  role — the only process that ever sends a customer reply; it now delivers from `auto_sending` as
+  well as `awaiting_review` and meters `auto_sends` vs `review_sends` off `drafts.decision_source`),
+  `notify.dispatch` / `notify.digest` (escalation and
   collapsed-overflow push, plus the daily digest EMAIL via `digest-email.ts`), and the crons
   `ticket.backstop-sweep` (every minute, five arms: (a) missed/stuck draft runs, (a2) tickets
-  stranded at the agent failure ceiling, (b) stuck run rows, (c) orphaned tickets, (d) due sends —
+  stranded at the agent failure ceiling, (b) stuck run rows, (c) orphaned tickets — `auto_sending`
+  included, so a levered auto-send whose held draft expired still pages, (d) due sends —
   the pass reads `platform_state['killswitch.global']` once and skips (a), and only (a), while it
-  is set) and `sweeps.daily` (draft expiry and run-event/action-token retention).
+  is set), `sweeps.daily` (draft expiry, run-event/action-token retention, and Phase 5's three
+  memory arms: expired answers, unsampled candidates past 30 days, and answers whose source chunks
+  changed → `needs_review`; each writes one audit row per org per arm) and `stats.rollup`
+  (02:15 UTC — the SOLE writer of `category_stats_daily`, recomputed for the trailing 30 days from
+  `drafts`, plus the Autopilot suggestion / `auto_graduate` graduation, the demotion backstop and
+  the Monday `memory_sample` nudge).
 - `apps/app` — the Expo universal app (`@aesa/app`, SDK 57, Expo Router, `web.output` server):
   `src/app` routes only, `src/screens` bodies, `src/lib` clients and the session gate, `src/components`
   primitives; jest-expo + RNTL for units, Playwright for the signup smoke.
@@ -238,9 +278,12 @@ instruction from him in the session.
   `registerJob` hands the handler an `AbortSignal` that fires at `expireInSeconds` minus
   `JOB_SIGNAL_MARGIN_SECONDS` (owned by `@aesa/core`). **`singletonKey` only does something on a
   queue whose `policy` says so.** pg-boss 10 gates its singleton indexes on the queue's policy, and
-  `defineJob` defaults to `standard`, on which no index applies and the key is inert. The seven
-  `short` queues — Phase 3's `ticket.draft`, `send.execute`, `agent.sandbox`, `notify.dispatch` and
-  Phase 4's `knowledge.ingest`, `knowledge.crawl`, `knowledge.embed-batch` — declare
+  `defineJob` defaults to `standard`, on which no index applies and the key is inert. The nine
+  `short` queues — Phase 3's `ticket.draft`, `send.execute`, `agent.sandbox`, `notify.dispatch`,
+  Phase 4's `knowledge.ingest`, `knowledge.crawl`, `knowledge.embed-batch` and Phase 5's
+  `memory.capture` (produced by the WORKER alone, from `send.execute`'s post-commit `onSent` seam)
+  and `guidance.suggest` (produced by the API alone, from `approveDraft` after an edited
+  approval) — declare
   `policy: 'short'` in `defineJob`'s `queue` options, which collapses a duplicate only while the
   first job is still `created` (a job that has gone `active`, or that is sitting in `retry`, never
   swallows a newer event; `enqueue` returns `null` when a duplicate was collapsed).
@@ -259,7 +302,11 @@ instruction from him in the session.
   a job that never runs and never errors; the preflight test is what catches it. **Both pre-create
   lists carry the queue's `policy`** — `createQueue` ignores a second call, so whichever process
   boots first decides, and a `short` queue first created by an api-only boot with no options would
-  stay `standard` until a worker replica ran `updateQueue`.
+  stay `standard` until a worker replica ran `updateQueue`. The rule is LITERAL about "both
+  pre-create lists": `memory.capture` is in the api's list though the api never sends it, and
+  `guidance.suggest` is in the worker's though the worker never sends it. A cron is NOT a queue in
+  this sense — `stats.rollup`, like `sweeps.daily` and `ticket.backstop-sweep`, is registered with
+  `registerCron` and belongs in none of the four places.
 - **Escalation.** Every entry into `needs_owner` from the drafting, send and api paths goes through
   `escalateTicket` (`@aesa/db`) — it owns the guarded transition, the `escalation_notified_at` reset,
   the audit row and the deduped notification, and its `dedupeKey` is reason-scoped where a second
@@ -283,6 +330,18 @@ instruction from him in the session.
   cleared. The approve gate differs from the send gate in exactly one deliberate way — it passes no
   `groundedNumbers` (the owner is the grounding for their own edit, and `unbacked_number` is a
   `warn` that flips no outcome).
+- **Autonomy.** `decide()`'s evaluation order IS the spec's — do not reorder a branch without
+  changing the spec and `packages/core/test/autonomy.test.ts`'s table. The auto branch compares
+  `confidence_breakdown.evidence` (`max(memory, grounding) × model`) against the category policy's
+  `auto_send_min_confidence / 100`, **never `drafts.confidence`**, which still means the model's own
+  self-assessment (plan deviation 1). A `send` verdict lands exactly one shape — an `approved` draft
+  with `decision_source = 'auto'` and no `decided_by`, a `queued` `outbound_sends` row due the
+  agent's `auto_send_delay_min` out, and the ticket on `auto_sending` — and **nothing else in the
+  codebase may write `decision_source = 'auto'`**; `auto_decided_at` is stamped once there and never
+  cleared, so a Hold + re-approve still reads as "the agent proposed it, the human sent it". Every
+  demotion goes through `demoteCategory` and every graduation through `graduateCategory`
+  (`@aesa/db`), both guarded on the mode they were read at; the cold-start count is
+  `countHumanDecisions` (`decided_by IS NOT NULL`), never a draft count.
 - **Retrieval.** Every retrieval leg filters `org_id` in SQL (`retrieval/sql.ts`) AND runs inside
   `withOrg`, and `assertSameOrg` re-checks every row again before any of it can reach a prompt — it
   throws rather than filtering, because a foreign row in that set is evidence the filter is broken.
@@ -295,6 +354,17 @@ instruction from him in the session.
   grounding quality, not replies. `apps/worker`'s `ticket.draft` records the provenance
   (`score`, `mode`, `knowledgeVersion`, `retrieved`, `cited`) in `confidence_breakdown.grounding`
   and re-filters every id the model cites against what retrieval actually returned.
+- **Memory.** A resolved answer reaches a prompt ONLY through the retriever's answers leg —
+  `status = 'active'`, `org_id` in the SQL, `assertSameOrg` on the re-read, cosine ≥
+  `MEMORY_RETRIEVE_MIN_COSINE`, vector-only (the degraded/lexical path returns no answers at all).
+  A `candidate` (every auto-send produces one) is therefore invisible until a human samples it.
+  `memory.capture` is the ONLY writer of a new `resolved_answers` row, and it is idempotent on
+  `drafts.memory_captured_at`; `scrubForMemory` runs on every stored question and answer, and an
+  empty result is a skip (`memory.skipped`, `empty_after_scrub`), never a stored empty string.
+  `expires_at` is a FIXED 365 days from the human decision that set it — capture, a reinforcing
+  approval, or `confirmCandidate` — and **nothing else moves it**: being retrieved into a prompt,
+  or cited by a draft nobody approved, buys an answer no extra life. The api's
+  memory service and `flagAutoSent`/`rejectDraft` are the strike/retire paths; two strikes retire.
 - **Knowledge bounds.** PDF and DOCX are parsed in a **forked child** (`runParserInChild`) under
   `--max-old-space-size=512` and a 60 s clock, never in the worker process; uploads are capped at
   `KNOWLEDGE_MAX_UPLOAD_BYTES` (20 MiB) declared to the api AND re-checked by `knowledge.ingest`'s

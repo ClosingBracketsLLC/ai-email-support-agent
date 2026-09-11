@@ -38,10 +38,14 @@ already set in the process environment.
 
 - `WORKER_ROLES` — comma-separated subset of `sync,agent,send,knowledge,cron`; it is what partitions
   the job registrations across replicas. `sync` runs the mailbox lifecycle, `agent` runs
-  `ticket.triage`/`ticket.draft`/`agent.sandbox`, `send` runs `send.execute` (the only process that
+  `ticket.triage`/`ticket.draft`/`agent.sandbox` plus Phase 5's `memory.capture` and
+  `guidance.suggest` (both of them embed or call a model, which is why they live here rather than
+  with the producer that enqueues them), `send` runs `send.execute` (the only process that
   sends a customer reply), `knowledge` runs
   `knowledge.ingest`/`knowledge.crawl`/`knowledge.embed-batch` (the only process that reads an
-  uploaded file's bytes), `cron` runs the sweeps and the digest.
+  uploaded file's bytes), `cron` runs the sweeps, the digest and the nightly `stats.rollup`.
+  **A deployment with a `send` role and no `agent` role anywhere delivers replies and learns
+  nothing** — `send.execute` enqueues `memory.capture`, but only an `agent` replica runs it.
 - `AESA_KEK_V<n>` / `AESA_KEK_ACTIVE` — the KEK ring. Required in production when `WORKER_ROLES`
   includes `sync` or `send`: mailbox credentials are sealed under it and there is no other way to
   reach a provider.
@@ -49,9 +53,10 @@ already set in the process environment.
 - `VOYAGE_API_KEY` — embeddings. Required in production when `WORKER_ROLES` includes `knowledge`
   (every chunk's vector) or `agent` (every retrieval query); outside production a missing key falls
   back to a deterministic hash embedder whose vectors are NOT comparable with Voyage's.
-  `KNOWLEDGE_EMBED_MODEL` (default `voyage-4`) is stored on every chunk and is part of the vector
-  leg's filter, so it **must be identical on every `knowledge` and `agent` replica** — a drifted
-  one retrieves nothing from the vector leg and silently degrades to lexical grounding, with no
+  `KNOWLEDGE_EMBED_MODEL` (default `voyage-4`) is stored on every chunk **and on every learned
+  answer**, and is part of both vector legs' filters, so it **must be identical on every `knowledge`
+  and `agent` replica** — a drifted one retrieves nothing from either vector leg and silently
+  degrades to lexical grounding with no memory at all, with no
   boot-time refusal; `KNOWLEDGE_RERANK` (default `off`) adds Voyage's cross-encoder pass.
 - `S3_ENDPOINT` / `S3_REGION` / `S3_BUCKET` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` /
   `S3_FORCE_PATH_STYLE` — object storage for knowledge uploads: minio locally (`pnpm db:up` starts
