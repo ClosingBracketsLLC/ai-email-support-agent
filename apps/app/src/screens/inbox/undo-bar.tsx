@@ -3,6 +3,7 @@ import { StyleSheet, View } from 'react-native'
 import { Button } from '@/components/button'
 import { Body } from '@/components/typography'
 import { radius, spacing, useColors } from '@/theme'
+import { formatCountdown } from './format-countdown'
 import { useCountdown } from './use-countdown'
 
 /**
@@ -14,11 +15,13 @@ import { useCountdown } from './use-countdown'
  * agent's `autoSendDelayMin` hold window on a reply nobody approved — there is nothing to undo
  * there, only a send to `Hold`. Both call the same `drafts.hold`.
  */
-export function UndoBar({ untilAt, onUndo, busy, tickMs, onExpired, label = 'Undo', verb = 'Sending', testID = 'undo-bar' }: {
+export function UndoBar({ untilAt, onUndo, busy, tickMs, now, onExpired, label = 'Undo', verb = 'Sending', testID = 'undo-bar' }: {
   untilAt: Date
   onUndo: () => void
   busy: boolean
   tickMs?: number
+  /** Test seam, the same one `AutoSendChip` takes — this codebase never uses fake timers. */
+  now?: () => Date
   onExpired?: () => void
   /** The button's word: 'Undo' for the owner's own approval, 'Hold' for an auto-send. */
   label?: string
@@ -27,7 +30,7 @@ export function UndoBar({ untilAt, onUndo, busy, tickMs, onExpired, label = 'Und
   testID?: string
 }) {
   const c = useColors()
-  const { secondsLeft, done } = useCountdown(untilAt, { tickMs })
+  const { secondsLeft, done } = useCountdown(untilAt, { tickMs, now })
   const [fired, setFired] = useState(false)
 
   // Held in a ref so an inline `onExpired={() => …}` cannot re-fire this on every render.
@@ -45,7 +48,7 @@ export function UndoBar({ untilAt, onUndo, busy, tickMs, onExpired, label = 'Und
 
   return (
     <View style={[styles.bar, { borderColor: c.border, backgroundColor: c.primaryTint }]} testID={testID}>
-      <Body style={styles.label}>{`${verb} in ${secondsLeft}s`}</Body>
+      <Body style={styles.label}>{`${verb} in ${formatCountdown(secondsLeft)}`}</Body>
       <Button label={label} variant="secondary" onPress={undo} loading={busy} disabled={fired} testID="undo-button" />
     </View>
   )

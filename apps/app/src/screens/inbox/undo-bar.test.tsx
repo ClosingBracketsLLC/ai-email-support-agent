@@ -61,3 +61,23 @@ test('without the two props it stays the approve-path Undo bar', async () => {
   expect(screen.getByText(/^Sending in \d+s$/)).toBeTruthy()
   expect(screen.getByTestId('undo-button').props.accessibilityLabel).toBe('Undo')
 })
+
+// The bar is the Hold surface for a 2/5/15-minute auto-send window now, not just the 15-second undo
+// — "Auto-sending in 899s" is not a time anyone reads. Same `m:ss` clock as the inbox row's chip
+// (`formatCountdown`), so one window never reads two different ways on two screens.
+test('a multi-minute hold window counts down in m:ss', async () => {
+  const now = new Date('2026-01-01T12:00:00Z')
+  await render(
+    <UndoBar
+      untilAt={new Date(now.getTime() + 899_000)} onUndo={mockUndo} busy={false}
+      tickMs={60_000} now={() => now} label="Hold" verb="Auto-sending"
+    />,
+  )
+  expect(screen.getByText('Auto-sending in 14:59')).toBeTruthy()
+})
+
+test('the 15-second undo window still counts down in bare seconds', async () => {
+  const now = new Date('2026-01-01T12:00:00Z')
+  await render(<UndoBar untilAt={new Date(now.getTime() + 12_000)} onUndo={mockUndo} busy={false} tickMs={60_000} now={() => now} />)
+  expect(screen.getByText('Sending in 12s')).toBeTruthy()
+})
