@@ -162,7 +162,10 @@ export function createRetriever(deps: RetrieverDeps): DetailedRetriever {
           for (const entry of list) vectorBest.set(entry.id, Math.max(vectorBest.get(entry.id) ?? 0, entry.score))
           if (list.length > 0) lists.push(list)
         }
-        const { rows } = await tx.execute(lexicalSearchSql(orgId, query, limits.perQuery))
+        // `null` when the question is all stop words and short tokens: there is no tsquery to run.
+        const lexical = lexicalSearchSql(orgId, query, limits.perQuery)
+        if (!lexical) continue
+        const { rows } = await tx.execute(lexical)
         // `ts_rank_cd` has no fixed range, so the leg's own best row normalizes it — and the 0.5
         // ceiling keeps a lexical-only hit below any vector hit, which is what lets one score
         // field carry both legs honestly.

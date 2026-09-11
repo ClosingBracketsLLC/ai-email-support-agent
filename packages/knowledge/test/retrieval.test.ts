@@ -107,18 +107,32 @@ describe('createRetriever', () => {
     expect(plan).not.toMatch(/Seq Scan on knowledge_chunks/)
   })
 
-  it('falls back to lexical-only when the embedder throws, and says so', async () => {
+  it('falls back to lexical-only when the embedder throws, and the tsvector leg still answers the golden set', async () => {
     const warns: string[] = []
     const broken = createRetriever({
       db: handle.db,
       embedder: { model: 'hash-v1', version: 1, dimensions: 1024, embed: async () => { throw new EmbedError('transient', 'voyage down') } },
       logger: { warn: (_obj, msg) => { warns.push(msg) } },
     })
+
     const r = await broken.retrieveDetailed({ orgId: orgs[1]!, questions: ['gift cards expire'], text: '', signal })
     expect(r).toMatchObject({ mode: 'lexical', degraded: true })
     expect(r.chunks.some((c) => c.heading === 'Gift cards')).toBe(true)
-    expect(r.chunks.every((c) => c.score <= 0.5)).toBe(true)
+    expect(r.chunks.every((c) => c.score <= 0.5)).toBe(true)   // a lexical-only hit never outranks a cosine
     expect(warns).toHaveLength(1)
+
+    // A Voyage outage must cost grounding QUALITY, not grounding (spec §Launch risks): the same
+    // natural-language questions the hybrid path answers have to survive the degraded path too.
+    // `websearch_to_tsquery('simple', …)` answered 0 of these 20 — see `relaxedTsQuery`.
+    let hits = 0
+    const misses: string[] = []
+    for (const g of GOLDEN) {
+      const degraded = await broken.retrieveDetailed({ orgId: orgs[7]!, questions: [g.question], text: '', signal })
+      expect(degraded.mode).toBe('lexical')
+      if (degraded.chunks.some((c) => c.heading === g.heading)) hits++
+      else misses.push(`${g.question} → ${headings(degraded).join(' | ')}`)
+    }
+    expect(hits / GOLDEN.length, `lexical-only hit rate ${hits}/${GOLDEN.length}; misses: ${misses.join(' ;; ')}`).toBeGreaterThanOrEqual(0.75)
   })
 
   it('excludes injection-flagged chunks', async () => {
@@ -140,23 +154,30 @@ describe('createRetriever', () => {
     expect(headings(neighbour)).toContain('Gift cards')
   })
 
-  it('excludes chunks written by another embedding model', async () => {
+  it('excludes chunks written by another embedding model from the vector leg', async () => {
     const orgId = orgs[42]!
-    // A natural-language question: `websearch_to_tsquery('simple', …)` ANDs every token (the simple
-    // config strips no stop words), so the lexical leg matches nothing here and the case isolates
-    // the vector leg — which is the only leg that filters on `embedding_model` (a lexical hit needs
-    // no embedding at all).
     const question = 'Do gift cards expire?'
+    const { vectors } = await embedder.embed([question], 'query')
+    const vectorLegIds = async () => withOrg(handle.db, orgId, async (tx) =>
+      (await tx.execute(vectorSearchSql(orgId, vectors[0]!, embedder.model, 50))).rows.map((row) => String(row.id)))
+
     const before = await retriever.retrieveDetailed({ orgId, questions: [question], text: '', signal })
-    expect(headings(before)).toContain('Gift cards')
+    const gift = before.chunks.find((c) => c.heading === 'Gift cards')!
+    expect(gift.score).toBeGreaterThan(0.5)                 // a cosine: it came from the vector leg
+    expect(await vectorLegIds()).toContain(gift.id)
 
     await withOrg(handle.db, orgId, (tx) => tx.update(knowledgeChunks)
       .set({ embeddingModel: 'other-v9' })
       .where(and(eq(knowledgeChunks.orgId, orgId), eq(knowledgeChunks.ordinal, 6))))
 
+    // The vector leg drops it outright. The LEXICAL leg deliberately has no `embedding_model`
+    // filter — a lexical hit needs no embedding — so the chunk can still surface there, now capped
+    // at the lexical ceiling. That score drop is the observable proof the vector leg excluded it.
+    expect(await vectorLegIds()).not.toContain(gift.id)
     const after = await retriever.retrieveDetailed({ orgId, questions: [question], text: '', signal })
     expect(after.mode).toBe('hybrid')
-    expect(headings(after)).not.toContain('Gift cards')
+    const giftAfter = after.chunks.find((c) => c.id === gift.id)
+    expect(giftAfter === undefined || giftAfter.score <= 0.5).toBe(true)
   })
 
   it('uses the inbound text when there are no questions', async () => {

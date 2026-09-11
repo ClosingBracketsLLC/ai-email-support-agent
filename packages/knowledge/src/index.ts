@@ -18,6 +18,7 @@ export {
   type CreateVoyageRerankerOptions,
 } from './embed/voyage.ts'
 export { fuseRanked, RRF_K } from './retrieval/fuse.ts'
+export { relaxedTsQuery } from './retrieval/lexical-query.ts'
 export { rerankChunks } from './retrieval/rerank.ts'
 export {
   assertSameOrg,

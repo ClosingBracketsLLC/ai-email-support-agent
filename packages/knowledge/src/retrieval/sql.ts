@@ -1,4 +1,5 @@
 import { sql, type SQL } from 'drizzle-orm'
+import { relaxedTsQuery } from './lexical-query.ts'
 
 /**
  * The two retrieval legs, as drizzle fragments so the EXPLAIN test can plan the very SQL the
@@ -53,12 +54,17 @@ export function vectorSearchSql(orgId: string, vector: number[], model: string, 
  * `embedding_model` or `embedding IS NOT NULL`: a lexical hit needs no vector, which is what keeps
  * retrieval useful while an embedding provider is down or a workspace is mid-re-embed.
  *
- * `websearch_to_tsquery('simple', …)` ANDs every token and the `simple` configuration strips no
- * stop words, so this leg answers keyword-shaped queries; a whole natural-language question is
- * usually answered by the vector leg alone.
+ * The query side is `relaxedTsQuery` — the question's content words, OR-ed, each a prefix match —
+ * bound as one parameter into `to_tsquery('simple', $q)`. See `lexical-query.ts` for why
+ * `websearch_to_tsquery` cannot be used here. `null` means the question had no content word left
+ * and the caller skips the leg.
+ *
+ * `id` is a deterministic tiebreak, for the same reason as the vector leg.
  */
-export function lexicalSearchSql(orgId: string, query: string, limit: number): SQL {
-  const tsquery = sql`websearch_to_tsquery('simple', ${query})`
+export function lexicalSearchSql(orgId: string, question: string, limit: number): SQL | null {
+  const relaxed = relaxedTsQuery(question)
+  if (relaxed === null) return null
+  const tsquery = sql`to_tsquery('simple', ${relaxed})`
   return sql`
     SELECT id, org_id, ts_rank_cd(tsv, ${tsquery}) AS rank
     FROM knowledge_chunks
