@@ -8,14 +8,15 @@ import { relaxedTsQuery } from './lexical-query.ts'
  * Both carry `org_id = <caller>` in their WHERE — the tenancy boundary is the SQL predicate, and
  * `assertSameOrg` in `retriever.ts` is the second, belt-and-braces check (spec §Tenancy).
  *
- * Everything that is not a number is a BOUND PARAMETER. The one interpolation is the pgvector
- * literal, and `vectorLiteral` proves every element is a finite number before building it.
+ * Everything that is not a number is a BOUND PARAMETER — the pgvector probe included.
  */
 
 /**
- * A pgvector literal built ONLY from numbers. This is the single place in retrieval where a value
- * is interpolated into SQL text instead of bound, so it refuses anything that is not a finite
- * number rather than trusting its caller.
+ * A pgvector probe: the `'[…]'` text bound as an ordinary parameter and cast `::vector` in SQL, so
+ * nothing built from an embedding is ever interpolated into query TEXT. The finite-number check
+ * stays regardless of the binding — a NaN or an Infinity would reach Postgres as an unparsable
+ * vector literal, and a non-number as whatever its `toString` produced — so the caller is refused
+ * here rather than trusted.
  */
 export function vectorLiteral(vector: number[]): SQL {
   for (const value of vector) {
@@ -23,7 +24,7 @@ export function vectorLiteral(vector: number[]): SQL {
       throw new TypeError('vectorLiteral: every element of an embedding must be a finite number')
     }
   }
-  return sql.raw(`'[${vector.join(',')}]'::vector`)
+  return sql`${`[${vector.join(',')}]`}::vector`
 }
 
 /**

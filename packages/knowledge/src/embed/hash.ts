@@ -29,7 +29,9 @@ function stem(token: string): string {
 
 function tokenize(text: string): string[] {
   const normalized = text.normalize('NFKC').toLowerCase()
-  const matches = normalized.match(/[\p{L}\p{N}]+/gu) ?? []
+  // `\p{M}` (combining marks) keeps a Devanagari/Thai/Arabic word whole — without it "नमस्ते"
+  // splits into four fragments and hashes into four unrelated bins.
+  const matches = normalized.match(/[\p{L}\p{M}\p{N}]+/gu) ?? []
   return matches.filter((token) => token.length > 2)
 }
 

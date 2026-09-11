@@ -112,9 +112,9 @@ async function parseUpload(deps: KnowledgeDeps, source: ClaimedSource): Promise<
     await writeFile(path, bytes)
     switch (source.mime) {
       case 'application/pdf':
-        return { blocks: await parseInChild({ kind: 'pdf', path, limits: DEFAULT_PARSE_LIMITS }), uri }
+        return { blocks: (await parseInChild({ kind: 'pdf', path, limits: DEFAULT_PARSE_LIMITS })).blocks, uri }
       case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
-        return { blocks: await parseInChild({ kind: 'docx', path, limits: DEFAULT_PARSE_LIMITS }), uri }
+        return { blocks: (await parseInChild({ kind: 'docx', path, limits: DEFAULT_PARSE_LIMITS })).blocks, uri }
       case 'text/markdown':
         return { blocks: parseMarkdown(Buffer.from(bytes).toString('utf8')), uri }
       case 'text/plain':

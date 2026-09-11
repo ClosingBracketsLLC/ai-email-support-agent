@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { HttpUrl } from './workspace.ts'
+import { HttpsUrl } from './workspace.ts'
 
 export const KNOWLEDGE_SOURCE_KINDS = ['upload', 'paste', 'crawl'] as const
 export type KnowledgeSourceKind = (typeof KNOWLEDGE_SOURCE_KINDS)[number]
@@ -13,6 +13,17 @@ export const KNOWLEDGE_FAILURE_REASONS = [
   'too_large', 'wrong_type', 'parse_failed', 'parse_timeout', 'no_text', 'embed_failed', 'crawl_failed', 'crawl_no_pages', 'cap_reached',
 ] as const
 export type KnowledgeFailureReason = (typeof KNOWLEDGE_FAILURE_REASONS)[number]
+
+/** Why a chunk was quarantined by `screenChunk` (`packages/knowledge/src/injection.ts`), in the
+ * rule table's own order (plus `invisible_text`, screened by the format-character count BEFORE the
+ * table) — the FIRST matching rule wins, so the order is part of the meaning.
+ * Lives here, not in `@aesa/knowledge`, because the app renders a label per code and never
+ * value-imports a server package (`packages/contracts/test/knowledge.test.ts` pins the list;
+ * `injection.ts`'s table is typed against it). */
+export const KNOWLEDGE_INJECTION_REASONS = [
+  'override_instructions', 'role_reassignment', 'system_prompt', 'concealment', 'role_marker', 'forced_output', 'exfiltration', 'invisible_text',
+] as const
+export type KnowledgeInjectionReason = (typeof KNOWLEDGE_INJECTION_REASONS)[number]
 
 export const KNOWLEDGE_MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 export const KNOWLEDGE_MAX_PASTE_CHARS = 50_000
@@ -32,7 +43,7 @@ export type StartUploadInput = z.infer<typeof StartUploadInput>
 export const CompleteUploadInput = z.object({ sourceId: z.uuid() })
 export const PasteInput = z.object({ title: z.string().trim().min(1).max(120), text: z.string().min(1).max(KNOWLEDGE_MAX_PASTE_CHARS) })
 export type PasteInput = z.infer<typeof PasteInput>
-export const StartCrawlInput = z.object({ url: HttpUrl, maxPages: z.number().int().min(1).max(1000) })
+export const StartCrawlInput = z.object({ url: HttpsUrl, maxPages: z.number().int().min(1).max(1000) })
 export type StartCrawlInput = z.infer<typeof StartCrawlInput>
 export const SourceIdInput = z.object({ sourceId: z.uuid() })
 export const ChunkIdInput = z.object({ chunkId: z.uuid() })

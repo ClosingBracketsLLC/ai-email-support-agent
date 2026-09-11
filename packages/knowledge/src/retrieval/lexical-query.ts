@@ -48,19 +48,24 @@ const MAX_TERMS = 24
  * `null` when the question has no content word left — the caller skips the leg entirely rather
  * than sending Postgres an empty `to_tsquery`. At most `MAX_TERMS` terms come back.
  *
- * The output is safe to bind into `to_tsquery('simple', $1)`: every token is stripped to letters
- * and digits, so no tsquery operator, quote or parenthesis can survive from the customer's text.
+ * The output is safe to bind into `to_tsquery('simple', $1)`: every token is stripped to letters,
+ * combining marks and digits, so no tsquery operator, quote or parenthesis can survive from the
+ * customer's text.
  */
 export function relaxedTsQuery(question: string): string | null {
-  const tokens = question.normalize('NFKC').toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []
+  // `\p{M}` (combining marks) belongs in the class: Devanagari, Thai, Arabic and Hebrew write
+  // vowels and diacritics as separate marks, so without it "नमस्ते" splits into four fragments
+  // that match nothing and a Hindi question reaches Postgres as noise.
+  const tokens = question.normalize('NFKC').toLowerCase().match(/[\p{L}\p{M}\p{N}]+/gu) ?? []
   const terms: string[] = []
   const seen = new Set<string>()
   for (const token of tokens) {
     if (terms.length >= MAX_TERMS) break
     if (token.length < MIN_TOKEN_LENGTH || STOP_WORDS.has(token)) continue
-    // Belt and braces: the split above already yields letters and digits only, but the result of
-    // this function is interpolated by Postgres into a tsquery, so nothing else may leave here.
-    const term = token.replace(/[^\p{L}\p{N}]/gu, '')
+    // Belt and braces: the split above already yields letters, marks and digits only, but the
+    // result of this function is interpolated by Postgres into a tsquery, so nothing else may
+    // leave here.
+    const term = token.replace(/[^\p{L}\p{M}\p{N}]/gu, '')
     if (term.length < MIN_TOKEN_LENGTH || seen.has(term)) continue
     seen.add(term)
     terms.push(`${term}:*`)

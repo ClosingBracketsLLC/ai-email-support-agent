@@ -44,11 +44,23 @@ describe('createVoyageEmbedder', () => {
 })
 
 describe('batchTexts', () => {
-  it('packs in order under both the count and the estimated-token ceilings', () => {
+  it('packs in order under the count and the estimated-token ceilings', () => {
     const texts = [...Array.from({ length: 130 }, (_, i) => `t${i}`), 'y'.repeat(400_004), 'z']
-    const batches = batchTexts(texts, { maxTexts: 128, maxTokens: 100_000 })
+    const batches = batchTexts(texts, { maxTexts: 128, maxTokens: 100_000, maxChars: 10_000_000 })
     expect(batches.map((b) => b.length)).toEqual([128, 2, 1, 1])   // 128 · the last two short ones · the 100,001-token text alone · z
     expect(batches.flat()).toEqual(texts)
+  })
+
+  it('packs under the CHARACTER ceiling too, which is what binds for CJK (≈ 1 token per character)', () => {
+    // Each text estimates at 250 tokens but is 1,000 characters: under the token ceiling alone all
+    // ten would ride in one call, which for Chinese content is ~10,000 real tokens, not 2,500.
+    const texts = Array.from({ length: 10 }, () => '据'.repeat(1_000))
+    const batches = batchTexts(texts, { maxTexts: 128, maxTokens: 100_000, maxChars: 3_000 })
+    expect(batches.map((b) => b.length)).toEqual([3, 3, 3, 1])
+    expect(batches.flat()).toEqual(texts)
+    // A single text over the character ceiling still reaches the provider, alone.
+    const oversized = batchTexts(['a', '据'.repeat(5_000), 'b'], { maxTexts: 128, maxTokens: 100_000, maxChars: 3_000 })
+    expect(oversized.map((b) => b.length)).toEqual([1, 1, 1])
   })
 })
 

@@ -12,6 +12,14 @@ describe('createHashEmbedder', () => {
     expect(a.tokens).toBe(Math.ceil('returns within 30 days'.length / 4))
     expect(e.model).toBe('hash-v1')
   })
+  it('keeps a word with combining marks whole: "नमस्ते" is one term, not the fragment "नमस"', async () => {
+    // Without `\p{M}` in the tokenizer class the word split into "नमस" + "त" and the second was
+    // dropped by the 3-character floor, so the greeting hashed to exactly the same vector as its
+    // own first fragment.
+    const [whole, fragment] = (await e.embed(['नमस्ते', 'नमस'], 'document')).vectors
+    expect(cosine(whole!, fragment!)).toBeLessThan(1)
+  })
+
   it('scores lexical overlap: a paraphrase with shared nouns beats an unrelated sentence', async () => {
     const [q, near, far] = (await e.embed(['how long do I have to return an item', 'returns are accepted within 30 days of delivery', 'we ship worldwide with tracked parcels'], 'document')).vectors
     expect(cosine(q!, near!)).toBeGreaterThan(cosine(q!, far!))

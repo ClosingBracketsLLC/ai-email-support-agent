@@ -302,7 +302,7 @@ describe('knowledge.ingest', () => {
     const key = uploadKey(orgId, sourceId, 'faq.md')
     await withOrg(app.db, orgId, (tx) => tx.update(knowledgeSources).set({ storageKey: key }).where(eq(knowledgeSources.id, sourceId)))
     let childCalls = 0
-    const { deps, store } = makeDeps({ parseInChild: async (): Promise<Block[]> => { childCalls++; return [] } })
+    const { deps, store } = makeDeps({ parseInChild: async () => { childCalls++; return { blocks: [] as Block[], truncated: false } } })
     store.put(key, Buffer.from(`## Shipping\n\n${FAQ}`, 'utf8'), 'text/markdown')
 
     await run(deps, sourceId)

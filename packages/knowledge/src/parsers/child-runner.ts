@@ -3,6 +3,14 @@ import { fileURLToPath } from 'node:url'
 import { ParseError, type ParseLimits } from '../bounds.ts'
 import type { Block } from './blocks.ts'
 
+/** What one child parse hands back. `truncated` means the document held more text than
+ * `limits.maxTextChars` and the block list stops there (final review A3) — the caller may log it;
+ * nothing here does. */
+export interface ParserChildResult {
+  blocks: Block[]
+  truncated: boolean
+}
+
 const CHILD = fileURLToPath(new URL('./child-main.ts', import.meta.url))
 
 /** The loader flag the child needs to run a .ts entry: inherited when the parent already runs under tsx, added otherwise (vitest transforms in-process, so its execArgv carries none). */
@@ -12,8 +20,8 @@ function childExecArgv(maxHeapMb: number): string[] {
   return [...inherited, ...(hasTsx ? [] : ['--import', 'tsx']), `--max-old-space-size=${maxHeapMb}`]
 }
 
-export function runParserInChild(input: { kind: 'pdf' | 'docx'; path: string; limits: ParseLimits }): Promise<Block[]> {
-  return new Promise((resolve, reject) => {
+export function runParserInChild(input: { kind: 'pdf' | 'docx'; path: string; limits: ParseLimits }): Promise<ParserChildResult> {
+  return new Promise<ParserChildResult>((resolve, reject) => {
     // stderr is 'ignore', not 'pipe': an unread stderr pipe fills its OS buffer once the child
     // writes enough to it and blocks the child on the next write — a hang vector for no benefit,
     // since nothing here ever reads child.stderr.
@@ -21,8 +29,8 @@ export function runParserInChild(input: { kind: 'pdf' | 'docx'; path: string; li
     let settled = false
     const settle = (fn: () => void) => { if (!settled) { settled = true; clearTimeout(timer); fn() } }
     const timer = setTimeout(() => { child.kill('SIGKILL'); settle(() => reject(new ParseError('parse_timeout', `parser exceeded ${input.limits.timeoutMs} ms`))) }, input.limits.timeoutMs)
-    child.once('message', (msg: { blocks?: Block[]; error?: string; message?: string }) => {
-      settle(() => msg.blocks ? resolve(msg.blocks) : reject(new ParseError((msg.error ?? 'parse_failed') as ParseError['code'], msg.message)))
+    child.once('message', (msg: { blocks?: Block[]; truncated?: boolean; error?: string; message?: string }) => {
+      settle(() => msg.blocks ? resolve({ blocks: msg.blocks, truncated: msg.truncated === true }) : reject(new ParseError((msg.error ?? 'parse_failed') as ParseError['code'], msg.message)))
       child.kill()
     })
     child.once('error', (err) => settle(() => reject(new ParseError('parse_failed', err.message))))

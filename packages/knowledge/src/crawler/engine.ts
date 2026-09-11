@@ -29,6 +29,10 @@ const MAX_SITEMAP_SEED_URLS = 5_000
 /** The exact User-Agent every request carries (rule 12) — also usable by robots.txt reporting/runbooks. */
 export const CRAWL_USER_AGENT = 'aesa-crawler/1.0 (+https://aesa.app)'
 const FETCH_HEADERS: Record<string, string> = { 'user-agent': CRAWL_USER_AGENT, accept: 'text/html' }
+/** robots.txt is `text/plain`, not html: asking for `text/html` invites a content-negotiating
+ * server to hand back an HTML error page (which the caller then refuses for its content-type, so
+ * the site crawls with NO rules at all). */
+const ROBOTS_FETCH_HEADERS: Record<string, string> = { 'user-agent': CRAWL_USER_AGENT, accept: 'text/plain, */*' }
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
 
 export class CrawlError extends Error {
@@ -185,6 +189,20 @@ export async function validateHop(rawUrl: string, siteUrl: URL, resolver: Resolv
   return { ok: true, url }
 }
 
+/** The SYNTACTIC half of `validateHop`'s same-site check, for a URL `normalizeUrl` already
+ * accepted (so `new URL` cannot throw; the catch is belt and braces). Used at DISCOVERY — where a
+ * page or a sitemap, not the crawl, chose the hostname — so an off-site link costs neither a
+ * frontier slot nor a DNS lookup (final review A4). `validateHop` keeps its DNS-classifying order
+ * for the hops it still gates: the start URL and every redirect target. */
+function isSameSiteUrl(normalized: string, siteUrl: URL): boolean {
+  try {
+    return sameSite(new URL(normalized), siteUrl)
+  } catch {
+    /* c8 ignore next */
+    return false
+  }
+}
+
 type FetchOutcome =
   | { kind: 'ok'; url: string; status: number; headers: Record<string, string>; body: string }
   | { kind: 'refused'; url: string; reason: RefusalReason }
@@ -235,20 +253,26 @@ async function fetchResolved(
  * 6) and stops early — returning whatever was collected so far — once aborted. A sitemap file
  * itself refused by `validateHop` (off-site, private, or an invalid URL) contributes no seeds and
  * is silently skipped, same as a non-2xx or unparsable one; none of that is reported anywhere
- * (`collectSitemapSeeds` returns only the seed list) — reporting IS done for pages and redirect
+ * (`collectSitemapSeeds` returns seeds and off-site seeds, never a file-level refusal) — reporting IS done for pages and redirect
  * hops dequeued from the frontier (`crawlSite`'s `refused`), which sitemap-file-level problems are
  * deliberately not conflated with. Exported so this can be tested directly: proving either cap by
- * running a full crawl through thousands of dummy seeded pages would be far too slow. */
+ * running a full crawl through thousands of dummy seeded pages would be far too slow.
+ *
+ * A seeded page URL for ANOTHER site is dropped here, syntactically (final review A4), and comes
+ * back in `offSite` for the caller to report: it never takes a frontier slot and never costs a DNS
+ * lookup on a host the sitemap chose. The sitemap FILES themselves still go through `validateHop`
+ * — there are at most five of them, so the classifying order costs nothing there. */
 export async function collectSitemapSeeds(
   initialSitemapUrls: string[],
   siteUrl: URL,
   pageFetch: (url: URL) => Promise<{ status: number; headers: Record<string, string>; body: string }>,
   resolver: Resolver | undefined,
   signal: AbortSignal,
-): Promise<string[]> {
+): Promise<{ seeds: string[]; offSite: string[] }> {
   const toFetch = [...initialSitemapUrls]
   const fetchedSitemaps = new Set<string>()
   const seeds: string[] = []
+  const offSite: string[] = []
   while (toFetch.length > 0 && fetchedSitemaps.size < MAX_SITEMAP_FETCHES && seeds.length < MAX_SITEMAP_SEED_URLS) {
     if (signal.aborted) break
     const nextSitemapUrl = toFetch.shift()!
@@ -264,14 +288,16 @@ export async function collectSitemapSeeds(
       for (const u of parsed.urls) {
         if (seeds.length >= MAX_SITEMAP_SEED_URLS) break
         const n = normalizeUrl(u, gate.url.toString())
-        if (n) seeds.push(n)
+        if (!n) continue
+        if (isSameSiteUrl(n, siteUrl)) seeds.push(n)
+        else offSite.push(n)
       }
       toFetch.push(...parsed.sitemaps)
     } catch {
       // One bad sitemap fetch doesn't fail the crawl — just contributes no urls.
     }
   }
-  return seeds
+  return { seeds, offSite }
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
@@ -282,7 +308,10 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 export async function crawlSite(opts: CrawlOptions): Promise<CrawlSummary> {
   const concurrency = opts.concurrency ?? DEFAULT_CONCURRENCY
   const delayMs = opts.delayMs ?? DEFAULT_DELAY_MS
-  const firstBatch = opts.firstBatch ?? DEFAULT_FIRST_BATCH
+  // Clamped to ≥ 1: a caller-supplied 0 (or a negative) would make `currentThreshold()` 0, and
+  // `maybeFlush` would then flush an EMPTY buffer on every page — `flushSome` returns early on an
+  // empty buffer, so nothing would ever be delivered until the final drain.
+  const firstBatch = Math.max(1, Math.floor(opts.firstBatch ?? DEFAULT_FIRST_BATCH))
   const resolver = opts.resolver
 
   // Rule 11: an already-aborted signal returns immediately, before any network activity at all —
@@ -306,7 +335,7 @@ export async function crawlSite(opts: CrawlOptions): Promise<CrawlSummary> {
    * for the same host in one concurrent wave could both read the same stale `last` and fire
    * together. Rule 10's concurrency half lives in the wave loop below, which never has more than
    * `concurrency` of these in flight at once. */
-  const pageFetch = async (url: URL): Promise<{ status: number; headers: Record<string, string>; body: string }> => {
+  const pageFetch = async (url: URL, headers: Record<string, string> = FETCH_HEADERS): Promise<{ status: number; headers: Record<string, string>; body: string }> => {
     const host = url.hostname
     const now = Date.now()
     const last = lastRequestAtByHost.get(host)
@@ -314,7 +343,7 @@ export async function crawlSite(opts: CrawlOptions): Promise<CrawlSummary> {
     lastRequestAtByHost.set(host, wake)
     const wait = wake - now
     if (wait > 0) await sleep(wait)
-    return opts.fetch(url.toString(), { timeoutMs: TIMEOUT_MS, maxBodyBytes: MAX_BODY_BYTES, headers: FETCH_HEADERS, signal: opts.signal })
+    return opts.fetch(url.toString(), { timeoutMs: TIMEOUT_MS, maxBodyBytes: MAX_BODY_BYTES, headers, signal: opts.signal })
   }
 
   const frontier = new Frontier({ maxSeen: opts.maxPages * FRONTIER_CAP_MULTIPLIER })
@@ -322,6 +351,16 @@ export async function crawlSite(opts: CrawlOptions): Promise<CrawlSummary> {
   let ingestedCount = 0
   let skippedCount = 0
   const refused: { url: string; reason: RefusalReason }[] = []
+  /** Off-site URLs seen at discovery, deduped and bounded by the very cap the frontier used to
+   * impose on them (`maxPages × FRONTIER_CAP_MULTIPLIER` distinct URLs): they no longer pass
+   * through the frontier, so the summary needs its own ceiling or one page of outbound links per
+   * crawled page could grow `refused` without limit. */
+  const offSiteSeen = new Set<string>()
+  const recordOffSite = (url: string): void => {
+    if (offSiteSeen.size >= opts.maxPages * FRONTIER_CAP_MULTIPLIER || offSiteSeen.has(url)) return
+    offSiteSeen.add(url)
+    refused.push({ url, reason: 'off_site' })
+  }
   const seenHashes = new Set<string>()
   let buffer: CrawledPage[] = []
   let firstBatchDone = false
@@ -329,6 +368,11 @@ export async function crawlSite(opts: CrawlOptions): Promise<CrawlSummary> {
   // `flushSome` below): while one flush is in flight, `maybeFlush` calls from OTHER concurrent
   // workers are no-ops; `buffer` just keeps growing until the in-flight flush finishes.
   let flushing = false
+  // A5: latched the moment one `onBatch` call fails. Nothing after that may call `onBatch` again
+  // (a sibling worker mid-wave would otherwise deliver a batch the caller has already failed on)
+  // and nothing may call `onProgress` again: `crawlSite` is about to reject, and the engine's
+  // contract is that nothing fires after it settles.
+  let failed = false
 
   const currentThreshold = (): number => (firstBatchDone ? SUBSEQUENT_BATCH_SIZE : firstBatch)
 
@@ -353,12 +397,13 @@ export async function crawlSite(opts: CrawlOptions): Promise<CrawlSummary> {
   // FRONT of `buffer` (ahead of whatever queued up during the attempt) before re-throwing as
   // `BatchFlushError` — nothing is lost either way.
   const flushSome = async (cap: number): Promise<void> => {
-    if (buffer.length === 0 || flushing) return
+    if (buffer.length === 0 || flushing || failed) return
     const pages = buffer.splice(0, cap)
     flushing = true
     try {
       await opts.onBatch(pages)
     } catch (err) {
+      failed = true
       buffer = pages.concat(buffer)
       throw new BatchFlushError(err)
     } finally {
@@ -378,6 +423,7 @@ export async function crawlSite(opts: CrawlOptions): Promise<CrawlSummary> {
     }
   }
   const reportProgress = async (): Promise<void> => {
+    if (failed) return
     if (opts.onProgress) {
       await opts.onProgress({ fetched: fetchedCount, ingested: ingestedCount, skipped: skippedCount, frontier: frontier.size })
     }
@@ -392,7 +438,7 @@ export async function crawlSite(opts: CrawlOptions): Promise<CrawlSummary> {
   let robots: { isAllowed(url: string): boolean; sitemaps: string[] } = { isAllowed: () => true, sitemaps: [] }
   try {
     const robotsUrl = new URL('/robots.txt', siteUrl)
-    const res = await pageFetch(robotsUrl)
+    const res = await pageFetch(robotsUrl, ROBOTS_FETCH_HEADERS)
     const contentType = (res.headers['content-type'] ?? res.headers['Content-Type'] ?? '').toLowerCase()
     if (res.status >= 200 && res.status < 300 && (contentType === '' || contentType.startsWith('text/'))) {
       robots = parseRobots(res.body, robotsUrl.toString())
@@ -406,7 +452,7 @@ export async function crawlSite(opts: CrawlOptions): Promise<CrawlSummary> {
   // Rule 3: sitemap-first. Robots' own `Sitemap:` lines win; otherwise fall back to `/sitemap.xml`
   // at the site root.
   const sitemapUrlsToFetch = robots.sitemaps.length > 0 ? [...robots.sitemaps] : [new URL('/sitemap.xml', siteUrl).toString()]
-  const sitemapSeeds = await collectSitemapSeeds(sitemapUrlsToFetch, siteUrl, pageFetch, resolver, opts.signal)
+  const { seeds: sitemapSeeds, offSite: offSiteSeeds } = await collectSitemapSeeds(sitemapUrlsToFetch, siteUrl, pageFetch, resolver, opts.signal)
 
   // The start URL is queued FIRST (review finding 5): a large sitemap can otherwise fill the
   // frontier's `maxSeen` cap entirely before the start URL ever gets a slot, silently dropping the
@@ -417,12 +463,21 @@ export async function crawlSite(opts: CrawlOptions): Promise<CrawlSummary> {
   if (normalizedStart) frontier.add([normalizedStart], 'link')
 
   frontier.add(sitemapSeeds, 'sitemap')
+  for (const url of offSiteSeeds) recordOffSite(url)
 
+  /** Queues the same-site links a page declared, and records the rest as `off_site` WITHOUT
+   * enqueuing or resolving them (final review A4). Before this, every outbound link on a page took
+   * a frontier slot (capped at `maxPages × 10`) and cost a `resolvePublic` DNS lookup on a
+   * page-chosen hostname before `validateHop` refused it — so a site with hundreds of outbound
+   * links starved same-site discovery on a small plan and turned the crawler into a DNS amplifier
+   * for whatever hostnames the page felt like listing. */
   const addDiscoveredLinks = (hrefs: string[], baseUrl: string): void => {
     const normalized: string[] = []
     for (const href of hrefs) {
       const n = normalizeUrl(href, baseUrl)
-      if (n) normalized.push(n)
+      if (!n) continue
+      if (isSameSiteUrl(n, siteUrl)) normalized.push(n)
+      else recordOffSite(n)
     }
     frontier.add(normalized, 'link')
   }
@@ -501,11 +556,20 @@ export async function crawlSite(opts: CrawlOptions): Promise<CrawlSummary> {
         batch.push(next)
       }
       if (batch.length === 0) break
-      await Promise.all(batch.map((url) => processUrl(url)))
+      // `allSettled`, not `all`: `all` rejects the moment the FIRST worker's flush fails while its
+      // siblings are still in flight, so the wave's own pages kept landing after `crawlSite` had
+      // already settled. Settling the wave first (the `failed` latch above keeps any sibling from
+      // calling `onBatch` or `onProgress` in the meantime) and only then re-throwing gives the
+      // engine's "nothing fires after settlement" contract real teeth (final review A5).
+      const settled = await Promise.allSettled(batch.map((url) => processUrl(url)))
+      // Nothing but a BatchFlushError ever escapes `processUrl` — every page-level failure is
+      // swallowed there — so the first rejection is the flush failure to report.
+      const firstRejection = settled.find((r) => r.status === 'rejected')
+      if (firstRejection) throw firstRejection.reason
     }
     // Drains everything left, in ≤cap-sized pieces — a single call isn't enough if a pile-up during
     // a slow mid-crawl flush left more than one `cap`'s worth of pages behind.
-    while (buffer.length > 0) {
+    while (buffer.length > 0 && !failed) {
       const cap = currentThreshold()
       firstBatchDone = true
       await flushSome(cap)

@@ -1,4 +1,4 @@
-export { DEFAULT_PARSE_LIMITS, ParseError, type ParseLimits } from './bounds.ts'
+export { DEFAULT_PARSE_LIMITS, MAX_PARSED_TEXT_CHARS, ParseError, type ParseLimits } from './bounds.ts'
 export { chunkBlocks, type Chunk } from './chunker.ts'
 export {
   collectSitemapSeeds,
@@ -21,8 +21,8 @@ export { parseSitemap } from './crawler/sitemap.ts'
 export { normalizeUrl, sameSite } from './crawler/url.ts'
 export { contentHashOf, prepareDocument, type PreparedDocument } from './ingest.ts'
 export { screenChunk } from './injection.ts'
-export { type Block } from './parsers/blocks.ts'
-export { runParserInChild } from './parsers/child-runner.ts'
+export { capBlockText, type Block } from './parsers/blocks.ts'
+export { runParserInChild, type ParserChildResult } from './parsers/child-runner.ts'
 export { parseDocx } from './parsers/docx.ts'
 export { parseHtml } from './parsers/html.ts'
 export { parseMarkdown } from './parsers/markdown.ts'

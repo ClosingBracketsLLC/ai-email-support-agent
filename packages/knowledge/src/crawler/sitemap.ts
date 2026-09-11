@@ -1,7 +1,10 @@
 import { Parser } from 'htmlparser2'
 
 /** The sitemap protocol's own per-file cap (https://www.sitemaps.org/protocol.html): a `<urlset>`
- * past this many `<loc>` entries is truncated rather than trusted whole. */
+ * — or a `<sitemapindex>` — past this many `<loc>` entries is truncated rather than trusted whole.
+ * The index side is capped for the same reason as the url side: a hostile 50,000-entry
+ * `<sitemapindex>` would otherwise build a 50,000-string array in memory, of which the engine
+ * fetches at most `MAX_SITEMAP_FETCHES` (5) anyway. */
 const MAX_SITEMAP_URLS = 5_000
 
 /** Parse a sitemap XML document: a `<urlset>` yields page `<loc>`s in `urls`, a `<sitemapindex>`
@@ -32,7 +35,7 @@ export function parseSitemap(xml: string): { urls: string[]; sitemaps: string[] 
           const loc = locText.trim()
           if (loc.length > 0) {
             if (context === 'url') { if (urls.length < MAX_SITEMAP_URLS) urls.push(loc) }
-            else if (context === 'sitemap') sitemaps.push(loc)
+            else if (context === 'sitemap') { if (sitemaps.length < MAX_SITEMAP_URLS) sitemaps.push(loc) }
           }
         } else if (name === 'url' || name === 'sitemap') {
           context = null

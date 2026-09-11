@@ -1,7 +1,7 @@
 import { readFileSync, statSync } from 'node:fs'
 import type { ParseLimits } from '../bounds.ts'
 import { ParseError } from '../bounds.ts'
-import type { Block } from './blocks.ts'
+import { capBlockText, type Block } from './blocks.ts'
 import { parseDocx } from './docx.ts'
 import { parsePdf } from './pdf.ts'
 
@@ -11,7 +11,7 @@ import { parsePdf } from './pdf.ts'
  * nothing written to either would ever reach the parent anyway, but a bounded, single-purpose
  * process that talks only over IPC should stay silent regardless. */
 type ChildInput = { kind: 'pdf' | 'docx'; path: string; limits: ParseLimits }
-type ChildReply = { blocks: Block[] } | { error: string; message?: string }
+type ChildReply = { blocks: Block[]; truncated: boolean } | { error: string; message?: string }
 
 function toReply(err: unknown): ChildReply {
   if (err instanceof ParseError) return { error: err.code, message: err.message }
@@ -30,8 +30,13 @@ async function run(input: ChildInput): Promise<void> {
       reply = { error: 'too_large', message: `file is ${size} bytes, over the ${input.limits.maxBytes}-byte limit` }
     } else {
       const bytes = new Uint8Array(readFileSync(input.path))
-      const blocks = input.kind === 'pdf' ? await parsePdf(bytes, input.limits) : await parseDocx(bytes, input.limits)
-      reply = { blocks }
+      const parsed = input.kind === 'pdf' ? await parsePdf(bytes, input.limits) : await parseDocx(bytes, input.limits)
+      // The reply is bounded BEFORE `process.send` (final review A3): past `maxTextChars` the
+      // parent would have to buffer and JSON.parse a string the child's heap alone allowed — a
+      // 20 MiB PDF of dense text can inflate well past it. Blocks past the ceiling can never
+      // become chunks anyway (the chunker stops at `maxChunks`), so dropping them here costs
+      // nothing a later stage would have kept.
+      reply = capBlockText(parsed, input.limits.maxTextChars)
     }
   } catch (err) {
     reply = toReply(err)

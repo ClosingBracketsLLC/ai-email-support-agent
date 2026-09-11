@@ -12,6 +12,7 @@
  * Voyage's quality.
  */
 import { and, eq, sql } from 'drizzle-orm'
+import { PgDialect } from 'drizzle-orm/pg-core'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { knowledgeChunks, knowledgeDocuments, knowledgeSources, withOrg, workspaces } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
@@ -156,8 +157,11 @@ describe('createRetriever', () => {
     // A text whose only lexical match in the corpus IS the flagged chunk ('balances' appears in no
     // other golden or decoy content), through the lexical-only path so the vector leg — which
     // always returns its `perQuery` nearest rows whatever their distance — cannot pad the result.
-    // Nothing comes back: the flag is enforced by the leg AND re-applied by the re-read that builds
-    // the prompt text, not merely by whichever query produced the id.
+    // Nothing comes back. Note what this does and does NOT prove: the LEG's own
+    // `injection_flagged = false` predicate drops the id first, so the re-read's identical filter
+    // (defence in depth, for a chunk flagged between the legs and the re-read) is never the thing
+    // under test here — no test exercises that window, which would need a write racing the two
+    // transactions.
     const lexicalOnly = createRetriever({
       db: handle.db,
       embedder: { model: 'hash-v1', version: 1, dimensions: 1024, embed: async () => { throw new EmbedError('transient', 'voyage down') } },
@@ -193,6 +197,34 @@ describe('createRetriever', () => {
     expect(after.mode).toBe('hybrid')
     const giftAfter = after.chunks.find((c) => c.id === gift.id)
     expect(giftAfter === undefined || giftAfter.score <= 0.5).toBe(true)
+  })
+
+  it('warns ONCE per process per org when the vector leg is empty and the corpus is embedded under another model (seam review D4)', async () => {
+    // The failure this catches: `KNOWLEDGE_EMBED_MODEL` set differently on a `knowledge` replica
+    // and an `agent` replica. Every chunk is embedded, the vector leg's `embedding_model` filter
+    // matches none of them, and retrieval quietly runs lexical-only forever with no error anywhere.
+    const orgId = orgs[70]!
+    await withOrg(handle.db, orgId, (tx) => tx.update(knowledgeChunks)
+      .set({ embeddingModel: 'voyage-4' })
+      .where(eq(knowledgeChunks.orgId, orgId)))
+
+    const warns: { obj: object; msg: string }[] = []
+    const capture = () => createRetriever({ db: handle.db, embedder, logger: { warn: (obj, msg) => { warns.push({ obj, msg }) } } })
+
+    const r = await capture().retrieveDetailed({ orgId, questions: ['Do gift cards expire?'], text: '', signal })
+    expect(r.mode).toBe('hybrid')                                  // the embedder worked; the leg matched nothing
+    expect(r.chunks.every((c) => c.score <= 0.5)).toBe(true)       // every hit is lexical-only
+    expect(warns).toHaveLength(1)
+    expect(warns[0]!.msg).toContain('KNOWLEDGE_EMBED_MODEL')
+    expect(warns[0]!.obj).toMatchObject({ orgId, queryModel: 'hash-v1', storedModels: ['voyage-4'] })
+
+    // Once per PROCESS per org — a fresh retriever instance for the same org stays silent.
+    await capture().retrieveDetailed({ orgId, questions: ['Do gift cards expire?'], text: '', signal })
+    expect(warns).toHaveLength(1)
+
+    // ...and an org whose corpus matches the embedder never triggers the probe's warn at all.
+    await capture().retrieveDetailed({ orgId: orgs[71]!, questions: ['a phrase no chunk contains anywhere'], text: '', signal })
+    expect(warns).toHaveLength(1)
   })
 
   it('uses the inbound text when there are no questions', async () => {
@@ -272,7 +304,16 @@ describe('createRetriever', () => {
     expect(plain.chunks.map((c) => c.id)).toEqual(detailed.chunks.map((c) => c.id))
   })
 
-  it('the vector leg refuses a literal that is not all numbers', async () => {
+  it('the vector probe is a BOUND parameter, and the leg still refuses a literal that is not all numbers', async () => {
+    // The probe rides as `$n::vector`, not as interpolated query text: nothing built from an
+    // embedding reaches the SQL string at all (final review A-minor).
+    const query = new PgDialect().sqlToQuery(vectorSearchSql(orgs[0]!, [0.5, 0.25], 'hash-v1', 12))
+    expect(query.sql).toContain('::vector')
+    expect(query.sql).not.toContain('[0.5,0.25]')
+    expect(query.params).toContain('[0.5,0.25]')
+
+    // The finite-number guard stays regardless of the binding: a non-number would otherwise reach
+    // Postgres as whatever its `toString` produced, inside a parameter it cannot parse as a vector.
     expect(() => vectorSearchSql(orgs[0]!, [1, Number.NaN], 'hash-v1', 12)).toThrow(/finite number/)
     expect(() => vectorSearchSql(orgs[0]!, ["0'); DROP TABLE knowledge_chunks; --" as unknown as number], 'hash-v1', 12)).toThrow(/finite number/)
   })

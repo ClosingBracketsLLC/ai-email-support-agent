@@ -46,6 +46,14 @@ describe('chunkBlocks', () => {
     expect(chunks).toHaveLength(2)
     expect(chunks.every((c) => c.content.length <= 3000)).toBe(true)
   })
+  it('a heading immediately followed by an over-max block rides on its first piece instead of becoming a chunk of its own (final review A-minor)', () => {
+    const long = Array.from({ length: 60 }, (_, i) => `Sentence number ${i} explains one more detail of the shipping policy for our customers. `).join('')
+    const chunks = chunkBlocks([b('heading', ['Shipping'], 'Shipping'), b('paragraph', ['Shipping'], long)], { target: 1600, max: 3000, overlap: 200 })
+    expect(chunks.length).toBeGreaterThan(1)
+    expect(chunks[0]!.content.startsWith('Shipping\n\nSentence number 0')).toBe(true)
+    expect(chunks.some((c) => c.content === 'Shipping')).toBe(false)   // never a lone heading chunk
+    for (const c of chunks) expect(c.content.length).toBeLessThanOrEqual(3000)
+  })
   it('a heading block always starts a new chunk, even a sibling heading with identical text/path (fix review #6)', () => {
     const chunks = chunkBlocks([b('heading', ['FAQ'], 'FAQ'), b('paragraph', ['FAQ'], 'one'), b('heading', ['FAQ'], 'FAQ'), b('paragraph', ['FAQ'], 'two')])
     expect(chunks).toHaveLength(2)

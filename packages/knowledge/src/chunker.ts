@@ -95,16 +95,26 @@ export function chunkBlocks(
     return true
   }
 
-  let current: { headingPath: string[]; content: string } | null = null
+  // `headingOnly` marks a `current` that is still just the heading block that opened it — nothing
+  // has merged into it yet.
+  let current: { headingPath: string[]; content: string; headingOnly: boolean } | null = null
   const flushCurrent = () => { if (current) push(current.headingPath, current.content); current = null }
 
   outer: for (const block of blocks) {
     if (chunks.length >= maxChunks) break
 
     if (block.text.length > max) {
-      flushCurrent()
-      for (const piece of packBlockText(block.text, target, max, overlap)) {
-        if (!push(block.headingPath, piece)) break outer
+      // A heading immediately followed by an over-max block rides ON its first piece instead of
+      // becoming a chunk of its own: a lone "Shipping" chunk retrieves on nothing and, worse, the
+      // piece that carries the actual answer then starts with no statement of what it is about.
+      // Only when the two genuinely do not fit within `max` does the heading flush alone.
+      const prefix = current?.headingOnly === true ? current.content : null
+      const pieces = packBlockText(block.text, target, max, overlap)
+      const prefixFits = prefix !== null && pieces.length > 0 && prefix.length + 2 + pieces[0]!.length <= max
+      if (prefixFits) current = null
+      else flushCurrent()
+      for (const [index, piece] of pieces.entries()) {
+        if (!push(block.headingPath, index === 0 && prefixFits ? `${prefix}\n\n${piece}` : piece)) break outer
       }
       continue
     }
@@ -113,16 +123,18 @@ export function chunkBlocks(
     // (and so an identical headingPath) never merge into one chunk.
     if (block.kind === 'heading' || current === null || !sameHeadingPath(current.headingPath, block.headingPath)) {
       flushCurrent()
-      current = { headingPath: block.headingPath, content: block.text }
+      current = { headingPath: block.headingPath, content: block.text, headingOnly: block.kind === 'heading' }
       continue
     }
 
     const joined = `${current.content}\n\n${block.text}`
     if (joined.length <= target) {
       current.content = joined
+      current.headingOnly = false
     } else {
       flushCurrent()
-      current = { headingPath: block.headingPath, content: block.text }
+      // Never a heading: a heading block took the branch above.
+      current = { headingPath: block.headingPath, content: block.text, headingOnly: false }
     }
   }
   if (chunks.length < maxChunks) flushCurrent()

@@ -20,6 +20,10 @@ describe('relaxedTsQuery', () => {
     expect(relaxedTsQuery("Where's my T-shirt (size XXL)?")).toBe('shirt:* | size:* | xxl:*')
     expect(relaxedTsQuery("invoice' | pg_sleep(10) --")).toBe('invoice:* | sleep:*')   // the operator, quote, parens and digits are gone
     expect(relaxedTsQuery('CAFÉ café')).toBe('café:*')   // lowercased and deduped, accents kept
+    // Combining marks stay INSIDE the term (`\p{M}`): without it the Devanagari "नमस्ते" split
+    // into "नमस" + "त", the second below the 3-character floor — a Hindi question reached
+    // Postgres as a fragment that matches nothing.
+    expect(relaxedTsQuery('नमस्ते')).toBe('नमस्ते:*')
   })
 
   it('caps the term list at 24, keeping the first in order of appearance', () => {

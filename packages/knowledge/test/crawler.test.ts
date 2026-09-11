@@ -66,7 +66,7 @@ describe('crawlSite', () => {
     expect(summary.skipped).toBe(1)
   })
 
-  it('4. a link to a private address is refused private_address; a link to another site is refused off_site — neither is ever fetched', async () => {
+  it('4. a discovered link to another site — private-address bait included — is refused off_site without a DNS lookup, and never fetched', async () => {
     const site = fakeSite({
       // No /robots.txt entry at all: a missing robots.txt (404) means no rules, and the crawl
       // still proceeds — robots.txt is still fetched FIRST, though (rule 2's ordering half).
@@ -76,8 +76,14 @@ describe('crawlSite', () => {
     expect(site.hits[0]).toBe(`${SITE}/robots.txt`)
     expect(site.hits).not.toContain('https://api.internal/x')
     expect(site.hits).not.toContain('https://other.example/')
-    expect(summary.refused).toContainEqual({ url: 'https://api.internal/x', reason: 'private_address' })
+    // Both are `off_site`, not one of each: at DISCOVERY the same-site test is syntactic and runs
+    // FIRST (final review A4), so `api.internal` — a hostname this site does not own — is refused
+    // before anything resolves it. `validateHop`'s DNS-first ordering, which is what labels a
+    // private address as such, still gates the start URL and every redirect target (test 5b).
+    expect(summary.refused).toContainEqual({ url: 'https://api.internal/x', reason: 'off_site' })
     expect(summary.refused).toContainEqual({ url: 'https://other.example/', reason: 'off_site' })
+    expect(site.resolved).not.toContain('api.internal')
+    expect(site.resolved).not.toContain('other.example')
     expect(summary.ingested).toBe(1)
   })
 
@@ -192,23 +198,27 @@ describe('crawlSite', () => {
     expect(site.hits).toHaveLength(0)
   })
 
-  it('10. every request carries the crawler User-Agent and an html Accept header', async () => {
+  it('10. every request carries the crawler User-Agent; robots.txt asks for text/plain and every other request for html', async () => {
     const site = fakeSite({
       '/robots.txt': { body: `Sitemap: ${SITE}/sitemap.xml` },
       '/sitemap.xml': { body: sitemapXml([`${SITE}/p1`]) },
       '/p1': page('P1', 'Content.'),
     })
-    const seenHeaders: Record<string, string>[] = []
+    const seen: { url: string; headers: Record<string, string> }[] = []
     const wrappedFetch: CrawlFetch = async (url, init) => {
-      seenHeaders.push(init.headers)
+      seen.push({ url, headers: init.headers })
       return site.fetch(url, init)
     }
     await crawlSite({ startUrl: `${SITE}/`, maxPages: 2, delayMs: 0, fetch: wrappedFetch, resolver: site.resolver, signal: signal(), onBatch: async () => {} })
-    expect(seenHeaders.length).toBeGreaterThan(0)
-    for (const h of seenHeaders) {
-      expect(h['user-agent']).toBe('aesa-crawler/1.0 (+https://aesa.app)')
-      expect(h['accept']).toBe('text/html')
+    expect(seen.length).toBeGreaterThan(0)
+    for (const { url, headers } of seen) {
+      expect(headers['user-agent']).toBe('aesa-crawler/1.0 (+https://aesa.app)')
+      // robots.txt is text/plain: asking a content-negotiating server for html invites an HTML
+      // error page, which the caller then refuses for its content-type — and the site would crawl
+      // with no rules at all.
+      expect(headers['accept']).toBe(url.endsWith('/robots.txt') ? 'text/plain, */*' : 'text/html')
     }
+    expect(seen.some((r) => r.url.endsWith('/robots.txt'))).toBe(true)
   })
 
   it('11. a sitemap URL for a different site is refused off_site and never fetched', async () => {
@@ -544,6 +554,65 @@ describe('crawlSite', () => {
     expect(summary.skipped).toBe(1) // /dup2, the content duplicate
     for (const batch of delivered.slice(1)) expect(batch.length).toBeLessThanOrEqual(20)
   })
+
+  it('26. 500 off-site links on maxPages 5 still fetch all 5 same-site pages, and no off-site host is ever resolved (final review A4)', async () => {
+    const offSiteLinks = Array.from({ length: 500 }, (_, i) => `https://out${i}.example/page`)
+    const sameSitePaths = Array.from({ length: 5 }, (_, i) => `/s${i}`)
+    const site = fakeSite({
+      // The off-site links come FIRST, which is exactly what used to starve discovery: they took
+      // the frontier's `maxSeen` slots (maxPages × 10 = 50) before a single same-site link was
+      // seen, and each one cost a `resolvePublic` lookup on a hostname the PAGE chose.
+      '/': { body: `<nav>${[...offSiteLinks, ...sameSitePaths.map((path) => `${SITE}${path}`)].map((u) => `<a href="${u}">l</a>`).join('')}</nav>` },
+      ...Object.fromEntries(sameSitePaths.map((path, i) => [path, page(`S${i}`, `Content ${i}.`)])),
+    })
+    const summary = await crawlSite({ startUrl: `${SITE}/`, maxPages: 5, delayMs: 0, fetch: site.fetch, resolver: site.resolver, signal: signal(), onBatch: async () => {} })
+
+    expect(summary.ingested).toBe(5)
+    for (const path of sameSitePaths) expect(site.hits).toContain(`${SITE}${path}`)
+    // Not one fetch and — the point of the fix — not one DNS lookup for any of the 500.
+    expect(site.hits.some((u) => u.includes('out'))).toBe(false)
+    expect(site.resolved.some((h) => h.startsWith('out'))).toBe(false)
+    // Reported, deduped, and bounded by the very cap the frontier used to impose on them.
+    expect(summary.refused.every((r) => r.reason === 'off_site')).toBe(true)
+    expect(summary.refused).toHaveLength(5 * 10)
+  })
+
+  it('27. one failed flush latches the crawl: no sibling flush, and neither onBatch nor onProgress fires after crawlSite rejects (final review A5)', async () => {
+    const site = fakeSite({
+      '/': { body: '<nav><a href="/p0">p0</a><a href="/p1">p1</a></nav>' },   // nav-only: ingests nothing, so wave 1 flushes nothing
+      '/p0': page('P0', 'Content 0.'),
+      '/p1': page('P1', 'Content 1.'),
+    })
+    // p1 is still in flight when p0's flush fails. Under `Promise.all` the wave's rejection
+    // settled `crawlSite` immediately and p1 went on to push, flush and report progress AFTER it.
+    const slowP1: CrawlFetch = async (url, init) => {
+      if (url.endsWith('/p1')) await new Promise((resolve) => setTimeout(resolve, 30))
+      return site.fetch(url, init)
+    }
+
+    const events: string[] = []
+    let firstBatchStarted: () => void = () => {}
+    const firstBatchStartedSignal = new Promise<void>((resolve) => { firstBatchStarted = resolve })
+
+    const crawlPromise = crawlSite({
+      startUrl: `${SITE}/`, maxPages: 6, firstBatch: 1, concurrency: 2, delayMs: 0, fetch: slowP1, resolver: site.resolver, signal: signal(),
+      onBatch: async () => {
+        events.push('batch')
+        firstBatchStarted()
+        throw new Error('the database went away')
+      },
+      onProgress: async () => { events.push('progress') },
+    })
+    await firstBatchStartedSignal
+    await expect(crawlPromise).rejects.toMatchObject({ name: 'CrawlError', code: 'crawl_failed', origin: 'consumer' })
+
+    const atRejection = events.length
+    await new Promise((resolve) => setTimeout(resolve, 60))   // well past p1's own 30 ms fetch
+    expect(events.length).toBe(atRejection)
+    // Wave 1's progress for the nav-only home, then the one flush that failed — and nothing else:
+    // the latch suppressed p0's own trailing progress report, p1's flush, and p1's progress.
+    expect(events).toEqual(['progress', 'batch'])
+  })
 })
 
 describe('normalizeUrl (review finding 3: https only)', () => {
@@ -582,13 +651,13 @@ describe('collectSitemapSeeds (review findings 2, 6, 12 — tested directly: a f
     const urlsA = Array.from({ length: 3000 }, (_, i) => `${SITE}/a${i}`)
     const urlsB = Array.from({ length: 3000 }, (_, i) => `${SITE}/b${i}`)
     const site = fakeSite({ '/sitemapA.xml': { body: sitemapXml(urlsA) }, '/sitemapB.xml': { body: sitemapXml(urlsB) } })
-    const seeds = await collectSitemapSeeds([`${SITE}/sitemapA.xml`, `${SITE}/sitemapB.xml`], siteUrl, rawPageFetch(site), site.resolver, neverAborted)
+    const { seeds } = await collectSitemapSeeds([`${SITE}/sitemapA.xml`, `${SITE}/sitemapB.xml`], siteUrl, rawPageFetch(site), site.resolver, neverAborted)
     expect(seeds).toHaveLength(5000)
   })
 
   it('a sitemap file at a private address is silently skipped, contributing no seeds', async () => {
     const site = fakeSite({ '/sitemap.xml': { body: sitemapXml([`${SITE}/x`]) } })
-    const seeds = await collectSitemapSeeds(['https://sitemap-host.internal/sitemap.xml'], siteUrl, rawPageFetch(site), site.resolver, neverAborted)
+    const { seeds } = await collectSitemapSeeds(['https://sitemap-host.internal/sitemap.xml'], siteUrl, rawPageFetch(site), site.resolver, neverAborted)
     expect(seeds).toEqual([])
     expect(site.hits).toEqual([])
   })
@@ -597,7 +666,7 @@ describe('collectSitemapSeeds (review findings 2, 6, 12 — tested directly: a f
     const site = fakeSite({ '/sitemapA.xml': { body: sitemapXml([`${SITE}/a`]) }, '/sitemapB.xml': { body: sitemapXml([`${SITE}/b`]) } })
     const controller = new AbortController()
     controller.abort()
-    const seeds = await collectSitemapSeeds([`${SITE}/sitemapA.xml`, `${SITE}/sitemapB.xml`], siteUrl, rawPageFetch(site), site.resolver, controller.signal)
+    const { seeds } = await collectSitemapSeeds([`${SITE}/sitemapA.xml`, `${SITE}/sitemapB.xml`], siteUrl, rawPageFetch(site), site.resolver, controller.signal)
     expect(seeds).toEqual([])
     expect(site.hits).toEqual([])
   })

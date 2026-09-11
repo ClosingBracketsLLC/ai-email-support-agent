@@ -1,4 +1,4 @@
-import { and, eq, inArray } from 'drizzle-orm'
+import { and, eq, inArray, sql } from 'drizzle-orm'
 import { knowledgeChunks, withOrg, workspaces, type Db, type OrgTx } from '@aesa/db'
 // type-only — erases at runtime; `@aesa/agent` is a devDependency on purpose (every consumer already depends on it)
 import type { RetrievedChunk, Retriever } from '@aesa/agent'
@@ -25,6 +25,16 @@ export const RERANK_CANDIDATES = 20
 
 /** The first 1,000 characters of the inbound body stand in for the questions when triage produced none. */
 const TEXT_QUERY_CHARS = 1_000
+
+/**
+ * Orgs already warned about an embedding-model mismatch, for the life of the process (seam review
+ * D4). `KNOWLEDGE_EMBED_MODEL` must be identical on every `knowledge` and `agent` replica: the
+ * vector leg filters `embedding_model = <this embedder's>`, so a replica configured with a
+ * different model retrieves NOTHING from the vector leg while the source rows sit there fully
+ * embedded, and the only symptom is quieter grounding. One warn per org per process is enough to
+ * name it in the logs without turning a real empty corpus into a log flood.
+ */
+const modelMismatchWarned = new Set<string>()
 
 export interface RetrievalResult {
   chunks: RetrievedChunk[]
@@ -154,6 +164,9 @@ export function createRetriever(deps: RetrieverDeps): DetailedRetriever {
     const lists: { id: string; score: number }[][] = []
     const vectorBest = new Map<string, number>()
     const lexicalBest = new Map<string, number>()
+    /** Set when the vector leg ran for a query and came back with nothing — the symptom a model
+     * mismatch produces, checked for once (below) rather than diagnosed per query. */
+    let vectorLegEmpty = false
 
     await withOrg(deps.db, orgId, async (tx) => {
       for (const [index, query] of queries.entries()) {
@@ -161,6 +174,7 @@ export function createRetriever(deps: RetrieverDeps): DetailedRetriever {
         const vector = vectors?.[index]
         if (vector) {
           const { rows } = await tx.execute(vectorSearchSql(orgId, vector, deps.embedder.model, limits.perQuery))
+          if (rows.length === 0) vectorLegEmpty = true
           const list = rows.map((row) => ({ id: String(row.id), score: clamp01(1 - Number(row.distance)) }))
           for (const entry of list) vectorBest.set(entry.id, Math.max(vectorBest.get(entry.id) ?? 0, entry.score))
           if (list.length > 0) lists.push(list)
@@ -187,7 +201,11 @@ export function createRetriever(deps: RetrieverDeps): DetailedRetriever {
     const ids = ordered.map(([id]) => id)
 
     // ── the re-read (content + heading + org_id) and the version, one short transaction ───────
-    const { rows, knowledgeVersion } = await withOrg(deps.db, orgId, async (tx) => {
+    // The mismatch probe rides along inside this SAME transaction (seam review D4) — no extra
+    // round trip of its own, and only when the vector leg came back empty for a query and this
+    // process has not already warned about this org.
+    const probeForModelMismatch = vectorLegEmpty && !modelMismatchWarned.has(orgId)
+    const { rows, models, knowledgeVersion } = await withOrg(deps.db, orgId, async (tx) => {
       const rows = ids.length === 0
         ? []
         : await tx
@@ -198,9 +216,27 @@ export function createRetriever(deps: RetrieverDeps): DetailedRetriever {
             // model because one leg's filter was wrong or an owner flagged it mid-run. Same
             // defense-in-depth rationale as `assertSameOrg` below.
             .where(and(eq(knowledgeChunks.orgId, orgId), eq(knowledgeChunks.injectionFlagged, false), inArray(knowledgeChunks.id, ids)))
-      return { rows, knowledgeVersion: await readKnowledgeVersion(tx, orgId) }
+      const models = probeForModelMismatch
+        ? (await tx.execute<{ embedding_model: string | null }>(
+            sql`SELECT DISTINCT embedding_model FROM knowledge_chunks WHERE org_id = ${orgId}::uuid AND embedding IS NOT NULL`,
+          )).rows.map((row) => row.embedding_model)
+        : []
+      return { rows, models, knowledgeVersion: await readKnowledgeVersion(tx, orgId) }
     })
     assertSameOrg(orgId, rows)
+
+    // A query's vector leg came back empty AND the org holds vectors under a model this replica
+    // does not query with — the signature of a replica whose `KNOWLEDGE_EMBED_MODEL` differs from
+    // the one that wrote the corpus. A workspace caught mid-re-embed can trip it once too, which
+    // is harmless: it is a warn, once per org per process, not a behaviour change.
+    const otherModels = models.filter((model) => model !== null && model !== deps.embedder.model)
+    if (otherModels.length > 0 && !modelMismatchWarned.has(orgId)) {
+      modelMismatchWarned.add(orgId)
+      deps.logger?.warn(
+        { orgId, queryModel: deps.embedder.model, storedModels: otherModels },
+        'knowledge vector leg returned nothing and the org has chunks embedded under a different model: KNOWLEDGE_EMBED_MODEL differs across replicas',
+      )
+    }
 
     const byId = new Map(rows.map((row) => [row.id, row]))
     let chunks: RetrievedChunk[] = []
