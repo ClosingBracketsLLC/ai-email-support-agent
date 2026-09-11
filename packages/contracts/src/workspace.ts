@@ -35,6 +35,9 @@ export function deriveAllowedHosts(websiteUrl: string | null, contactUrls: reado
   return [...hosts]
 }
 
+export const UpdateGuidanceInput = z.object({ operatingGuidance: z.string().trim().max(8000) })
+export type UpdateGuidanceInput = z.infer<typeof UpdateGuidanceInput>
+
 /** Base for the Better Auth organization slug; the api appends a random suffix and retries on collision. */
 export function slugify(name: string): string {
   const base = name

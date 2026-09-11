@@ -10,6 +10,9 @@ export const SETTINGS_CATALOG = {
   'support.spam_shortcircuit.always': { kind: 'boolean', default: false },
   'notifications.digest_email': { kind: 'boolean', default: true },
   'notifications.digest_email_hour': { kind: 'number', default: 8 }, // local hour in the workspace timezone
+  'knowledge.max_sources': { kind: 'number', default: 100 },
+  'knowledge.max_crawl_pages': { kind: 'number', default: 200 },
+  'knowledge.daily_embed_tokens_cap': { kind: 'number', default: 5_000_000 },
 } as const satisfies Record<string, { kind: 'number' | 'boolean' | 'string'; default: number | boolean | string }>
 
 export type SettingKey = keyof typeof SETTINGS_CATALOG

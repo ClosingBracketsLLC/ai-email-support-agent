@@ -24,3 +24,13 @@ describe('digest email settings', () => {
     expect(() => resolveSetting('notifications.digest_email_hour', { org: { 'notifications.digest_email_hour': '8' } })).toThrow(/expected number/)
   })
 })
+
+describe('knowledge settings', () => {
+  it('knows the knowledge caps and their plan defaults', () => {
+    expect(resolveSetting('knowledge.max_sources', {})).toBe(100)
+    expect(resolveSetting('knowledge.max_crawl_pages', {})).toBe(200)
+    expect(resolveSetting('knowledge.daily_embed_tokens_cap', {})).toBe(5_000_000)
+    expect(planSettingDefaults('trial')).toMatchObject({ 'knowledge.max_sources': 10, 'knowledge.max_crawl_pages': 20, 'knowledge.daily_embed_tokens_cap': 200_000 })
+    expect(planSettingDefaults('standard')).toMatchObject({ 'knowledge.max_sources': 100, 'knowledge.max_crawl_pages': 200, 'knowledge.daily_embed_tokens_cap': 5_000_000 })
+  })
+})
