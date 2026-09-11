@@ -1,11 +1,12 @@
 import { and, eq, inArray, sql } from 'drizzle-orm'
-import { knowledgeChunks, withOrg, workspaces, type Db, type OrgTx } from '@aesa/db'
+import { MEMORY_RETRIEVE_MIN_COSINE } from '@aesa/core'
+import { knowledgeChunks, resolvedAnswers, withOrg, workspaces, type Db, type OrgTx } from '@aesa/db'
 // type-only — erases at runtime; `@aesa/agent` is a devDependency on purpose (every consumer already depends on it)
-import type { RetrievedChunk, Retriever } from '@aesa/agent'
+import type { RetrievedAnswer, RetrievedChunk, Retriever } from '@aesa/agent'
 import type { Embedder, Reranker } from '../embed/types.ts'
 import { fuseRanked } from './fuse.ts'
 import { rerankChunks } from './rerank.ts'
-import { lexicalSearchSql, vectorSearchSql } from './sql.ts'
+import { answerSearchSql, lexicalSearchSql, vectorSearchSql } from './sql.ts'
 
 export interface RetrievalLimits {
   /** rows each leg returns for each query */
@@ -16,9 +17,11 @@ export interface RetrievalLimits {
   maxContentChars: number
   /** triage questions embedded for one ticket */
   maxQueries: number
+  /** past resolved answers handed to the prompt, best cosine first (spec §Learning loop) */
+  answersTopK: number
 }
 
-export const DEFAULT_RETRIEVAL_LIMITS: RetrievalLimits = { perQuery: 12, topK: 6, maxContentChars: 12_000, maxQueries: 6 }
+export const DEFAULT_RETRIEVAL_LIMITS: RetrievalLimits = { perQuery: 12, topK: 6, maxContentChars: 12_000, maxQueries: 6, answersTopK: 3 }
 
 /** How many fused candidates the optional cross-encoder re-scores before `topK` survive. */
 export const RERANK_CANDIDATES = 20
@@ -38,8 +41,10 @@ const modelMismatchWarned = new Set<string>()
 
 export interface RetrievalResult {
   chunks: RetrievedChunk[]
-  /** Always `[]`: resolved answers are Phase 5; the shape carries the slot (plan deviation 12). */
-  answers: []
+  /** ACTIVE resolved answers only, org-scoped, cosine >= `MEMORY_RETRIEVE_MIN_COSINE`, best first,
+   * capped at `answersTopK` (spec §Learning loop). Vector-only: the degraded/lexical path always
+   * returns `[]` — memory is retrieved by cosine or not at all. */
+  answers: RetrievedAnswer[]
   knowledgeVersion: number
   mode: 'hybrid' | 'lexical'
   degraded: boolean
@@ -164,6 +169,10 @@ export function createRetriever(deps: RetrieverDeps): DetailedRetriever {
     const lists: { id: string; score: number }[][] = []
     const vectorBest = new Map<string, number>()
     const lexicalBest = new Map<string, number>()
+    /** The answers leg's own best cosine per resolved-answer id, across every query — never mixed
+     * into `lists`/`fuseRanked`: chunks and past answers are two separate prompt sections, never
+     * one fused ranking (spec §Learning loop). */
+    const answerBest = new Map<string, number>()
     /** Set when the vector leg ran for a query and came back with nothing — the symptom a model
      * mismatch produces, checked for once (below) rather than diagnosed per query. */
     let vectorLegEmpty = false
@@ -178,6 +187,13 @@ export function createRetriever(deps: RetrieverDeps): DetailedRetriever {
           const list = rows.map((row) => ({ id: String(row.id), score: clamp01(1 - Number(row.distance)) }))
           for (const entry of list) vectorBest.set(entry.id, Math.max(vectorBest.get(entry.id) ?? 0, entry.score))
           if (list.length > 0) lists.push(list)
+
+          // The answers leg: same probe, its own table, its own (unfused) best-score map.
+          const { rows: answerRows } = await tx.execute(answerSearchSql(orgId, vector, deps.embedder.model, limits.answersTopK))
+          for (const row of answerRows) {
+            const score = clamp01(1 - Number(row.distance))
+            answerBest.set(String(row.id), Math.max(answerBest.get(String(row.id)) ?? 0, score))
+          }
         }
         // `null` when the question is all stop words and short tokens: there is no tsquery to run.
         const lexical = lexicalSearchSql(orgId, query, limits.perQuery)
@@ -205,7 +221,8 @@ export function createRetriever(deps: RetrieverDeps): DetailedRetriever {
     // round trip of its own, and only when the vector leg came back empty for a query and this
     // process has not already warned about this org.
     const probeForModelMismatch = vectorLegEmpty && !modelMismatchWarned.has(orgId)
-    const { rows, models, knowledgeVersion } = await withOrg(deps.db, orgId, async (tx) => {
+    const answerIds = [...answerBest.keys()]
+    const { rows, models, knowledgeVersion, answerRows } = await withOrg(deps.db, orgId, async (tx) => {
       const rows = ids.length === 0
         ? []
         : await tx
@@ -221,9 +238,19 @@ export function createRetriever(deps: RetrieverDeps): DetailedRetriever {
             sql`SELECT DISTINCT embedding_model FROM knowledge_chunks WHERE org_id = ${orgId}::uuid AND embedding IS NOT NULL`,
           )).rows.map((row) => row.embedding_model)
         : []
-      return { rows, models, knowledgeVersion: await readKnowledgeVersion(tx, orgId) }
+      // Re-read + re-guard, same rationale as the chunks re-read above: `status = 'active'` is
+      // re-applied here, not just on the leg that produced these ids, so an answer demoted between
+      // the leg and the re-read can never reach a prompt.
+      const answerRows = answerIds.length === 0
+        ? []
+        : await tx
+            .select({ id: resolvedAnswers.id, orgId: resolvedAnswers.orgId, questionText: resolvedAnswers.questionText, answerBody: resolvedAnswers.answerBody, approvals: resolvedAnswers.approvals })
+            .from(resolvedAnswers)
+            .where(and(eq(resolvedAnswers.orgId, orgId), eq(resolvedAnswers.status, 'active'), inArray(resolvedAnswers.id, answerIds)))
+      return { rows, models, knowledgeVersion: await readKnowledgeVersion(tx, orgId), answerRows }
     })
     assertSameOrg(orgId, rows)
+    assertSameOrg(orgId, answerRows)
 
     // A query's vector leg came back empty AND the org holds vectors under a model this replica
     // does not query with — the signature of a replica whose `KNOWLEDGE_EMBED_MODEL` differs from
@@ -253,6 +280,16 @@ export function createRetriever(deps: RetrieverDeps): DetailedRetriever {
       })
     }
 
+    // Vector-only, gated at `MEMORY_RETRIEVE_MIN_COSINE`, best cosine first, capped at
+    // `answersTopK` — the degraded/lexical path never reaches here (`answerBest` stays empty when
+    // no query embedded), so a Voyage outage costs memory the same way it costs grounding: quality,
+    // never a wrong or stale reuse (spec §Learning loop).
+    const answers: RetrievedAnswer[] = answerRows
+      .map((row) => ({ id: row.id, question: row.questionText, answer: row.answerBody, score: answerBest.get(row.id) ?? 0, approvals: row.approvals }))
+      .filter((answer) => answer.score >= MEMORY_RETRIEVE_MIN_COSINE)
+      .sort((a, b) => b.score - a.score || (a.id < b.id ? -1 : 1))
+      .slice(0, limits.answersTopK)
+
     // ── the optional rerank: network again, and again outside every transaction ──────────────
     if (deps.reranker && chunks.length > 0) {
       try {
@@ -266,14 +303,14 @@ export function createRetriever(deps: RetrieverDeps): DetailedRetriever {
       chunks = chunks.slice(0, limits.topK)
     }
 
-    return { chunks: capContent(chunks, limits.maxContentChars), answers: [], knowledgeVersion, mode, degraded }
+    return { chunks: capContent(chunks, limits.maxContentChars), answers, knowledgeVersion, mode, degraded }
   }
 
   return {
     retrieveDetailed,
     async retrieve(input) {
-      const { chunks } = await retrieveDetailed(input)
-      return { chunks, answers: [] }
+      const { chunks, answers } = await retrieveDetailed(input)
+      return { chunks, answers }
     },
   }
 }

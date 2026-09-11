@@ -255,7 +255,7 @@ describe('knowledgeBlock (f)', () => {
   it('renders every chunk and answer with its id so the model can cite it', () => {
     const block = knowledgeBlock({
       chunks: [{ id: 'chunk-1', heading: 'Shipping', content: 'We ship in 2 business days.', score: 0.9 }],
-      answers: [{ id: 'answer-7', question: 'Do you ship to Canada?', answer: 'Yes, in 5 days.', score: 0.8 }],
+      answers: [{ id: 'answer-7', question: 'Do you ship to Canada?', answer: 'Yes, in 5 days.', score: 0.8, approvals: 2 }],
     })
     expect(block.text).toContain('chunk-1')
     expect(block.text).toContain('We ship in 2 business days.')

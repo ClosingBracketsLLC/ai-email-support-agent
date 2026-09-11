@@ -51,6 +51,24 @@ export function vectorSearchSql(orgId: string, vector: number[], model: string, 
 }
 
 /**
+ * The answers leg (spec §Learning loop): exact cosine over the org's ACTIVE resolved answers — the
+ * same no-global-index, org-predicate-first shape as `vectorSearchSql`. `candidate` (unsampled
+ * auto-sends), `needs_review` and `retired` rows are excluded HERE, and the re-read re-applies it.
+ */
+export function answerSearchSql(orgId: string, vector: number[], model: string, limit: number): SQL {
+  const probe = vectorLiteral(vector)
+  return sql`
+    SELECT id, org_id, (question_embedding <=> ${probe}) AS distance
+    FROM resolved_answers
+    WHERE org_id = ${orgId}::uuid
+      AND status = 'active'
+      AND question_embedding IS NOT NULL
+      AND embedding_model = ${model}
+    ORDER BY question_embedding <=> ${probe}, id
+    LIMIT ${limit}`
+}
+
+/**
  * The full-text leg, over the generated `tsv` (GIN). It deliberately does NOT filter
  * `embedding_model` or `embedding IS NOT NULL`: a lexical hit needs no vector, which is what keeps
  * retrieval useful while an embedding provider is down or a workspace is mid-re-embed.

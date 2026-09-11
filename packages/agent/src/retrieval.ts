@@ -19,6 +19,9 @@ export interface RetrievedAnswer {
   question: string
   answer: string
   score: number
+  /** Human approvals so far (0 for an unsampled auto-send — which is never retrieved anyway);
+   * `memoryScore(score, approvals)` is what the draft job computes from it. */
+  approvals: number
 }
 
 export interface Retriever {
