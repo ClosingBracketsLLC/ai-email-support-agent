@@ -49,7 +49,7 @@ dev volume created before Phase 4 needs `pnpm db:down && pnpm db:up` once.
    process per org when its vector leg comes back empty and the org has chunks stored under a
    different `embedding_model` — worth an alert on:
 
-       knowledge retrieval: the vector leg is empty and stored chunks use a different embedding model
+       knowledge vector leg returned nothing and the org has chunks embedded under a different model: KNOWLEDGE_EMBED_MODEL differs across replicas
 4. **`KNOWLEDGE_RERANK`** — leave it `off`. `on` adds a Voyage `rerank-2.5` cross-encoder pass over
    the fused top-20 candidates: one extra API call per retrieval, for a better top-6 order. It is
    inert without `VOYAGE_API_KEY`. Turn it on only with a measurement to compare against.

@@ -1037,11 +1037,17 @@ the record)</summary>
 - **Whole-branch final review (2026-09-11).** Reviewed at **`8ee8da3`** by four reviewers reading in
   parallel — `@aesa/knowledge` (A), `apps/worker` + `packages/db` (B), `apps/api` + `apps/app` (C),
   and the cross-cutting seams (D). Verdict **approve with fixes**: **0 Critical, 21 Important**
-  across the four, overlapping into **17 distinct fixes**, plus two whole classes of minor. All 12
+  across the four, overlapping into **18 distinct fixes** (three overlaps between reports; one of the eighteen is record-only — the plan-tier statement), plus two whole classes of minor. All 12
   seams held and no execution-time ruling was found to contradict the spec. The fix wave ran as ONE
   wave with THREE implementers in sequence on a shared index — **`97357bb`** (knowledge +
   contracts), **`cfb4fd2`** (worker), **`bdf5767`** (api + app + eslint + the one remaining worker
   line) — and this docs commit, which records the wave.
+  The scoped re-review (most capable model, over `8ee8da3..d7e29f8`) verdicted every wave item addressed and
+  found two Important items the wave itself introduced — the imperative anchor on the injection
+  verb rules dropped "Please / You must / Now / Then / Always + verb" attack phrasings, and the
+  runbook quoted an alert string that did not match the retriever's warn — plus three doc nits; all
+  five were fixed by the controller in the adjudication commit that carries the review record,
+  `docs/superpowers/reviews/2026-09-11-phase-4-final-review.md`.
   - **`@aesa/knowledge`.** The injection screen was quarantining ordinary support prose: "We will
     never email you your password", "we send a one-time token to the address on file" and two more
     probed sentences all flagged. The `override_instructions` and `exfiltration` verbs now have to
@@ -1174,7 +1180,7 @@ a merge commit on Robert's go-ahead (the standing flow from his 2026-09-09 instr
 `phase-3` (PR #3, which carries `brand`). Once it is merged, check out `main`, pull, and branch
 `phase-5` off it. Start with `superpowers:writing-plans` against the spec's *Build phases → Phase 5*
 section. Run the local setup from `CLAUDE.md` — including `pnpm db:up && pnpm s3:init` and the
-`S3_*` exports, so the minio-gated storage suite actually runs — and confirm the 2,077-test baseline
+`S3_*` exports, so the minio-gated storage suite actually runs — and confirm the 2,134-test baseline (2,132 + 2 minio-gated skips without `S3_*` exported)
 above before writing the plan. A dev Postgres volume created before Phase 4 predates
 `scripts/db-init/001-roles.sql`'s pgvector install and needs `pnpm db:down && pnpm db:up` to pick it
 up. In production, install the `vector` extension once, as the cluster superuser, before deploying
@@ -1373,7 +1379,7 @@ these 18 carry:
 
 - Phase 5 — autonomy and learning (resolved-answer memory, evidence score, graduation).
 - Phase 6 — provider choice (BYOK adapters, probes, per-agent model config).
-- Phase 7 — billing, caps, launch hardening.
+- Phase 7 — billing, caps, launch hardening. Owes the `plan` column and the `{ plan }` argument at every `resolveSetting` site: until then every org sits on the catalog defaults (100 sources, 200 crawl pages, 5,000,000 daily embed tokens) and `PLANS.trial` is inert (Phase 4 final review, seams D1).
 
 ## Open items for Robert
 

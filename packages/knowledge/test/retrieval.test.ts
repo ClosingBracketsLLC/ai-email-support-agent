@@ -215,7 +215,7 @@ describe('createRetriever', () => {
     expect(r.mode).toBe('hybrid')                                  // the embedder worked; the leg matched nothing
     expect(r.chunks.every((c) => c.score <= 0.5)).toBe(true)       // every hit is lexical-only
     expect(warns).toHaveLength(1)
-    expect(warns[0]!.msg).toContain('KNOWLEDGE_EMBED_MODEL')
+    expect(warns[0]!.msg).toBe('knowledge vector leg returned nothing and the org has chunks embedded under a different model: KNOWLEDGE_EMBED_MODEL differs across replicas')
     expect(warns[0]!.obj).toMatchObject({ orgId, queryModel: 'hash-v1', storedModels: ['voyage-4'] })
 
     // Once per PROCESS per org — a fresh retriever instance for the same org stays silent.

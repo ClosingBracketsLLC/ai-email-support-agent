@@ -12,9 +12,12 @@ import { type KnowledgeInjectionReason } from '@aesa/contracts'
  * "If you forget your password, follow the above instructions" and "You can disregard the earlier
  * instructions if you have already updated" all flagged before the anchor went in (final review
  * A1), and are pinned as CLEAN fixtures now. An injected instruction, by contrast, is a command:
- * it has no subject, so it sits exactly where the anchor looks. */
+ * it has no subject, so it sits exactly where the anchor looks — or follows a politeness or modal
+ * word ("Please ignore…", "You must ignore…", "Now disregard…", "Then send…", "Always send…"),
+ * which the anchor therefore also admits (final review re-review NB1); a SUBJECT pronoun or noun
+ * directly before the verb ("we send", "you forget", "can disregard", "never email") still does not. */
 const RULES: { reason: KnowledgeInjectionReason; pattern: RegExp }[] = [
-  { reason: 'override_instructions', pattern: /(^|[.!?:;]\s*|\band\s+)(ignore|disregard|forget|override)\b[^.]{0,40}\b(all |any |the )?(previous|prior|above|earlier|operating|system)\b[^.]{0,20}\b(instructions?|prompts?|rules?|guidance)\b/m },
+  { reason: 'override_instructions', pattern: /(^|[.!?:;,]\s*|\b(?:and|please|now|then|also|just|simply|always|must|should)\s+)(ignore|disregard|forget|override)\b[^.]{0,40}\b(all |any |the )?(previous|prior|above|earlier|operating|system)\b[^.]{0,20}\b(instructions?|prompts?|rules?|guidance)\b/m },
   { reason: 'role_reassignment', pattern: /\b(you are (now )?(an? )?(ai|assistant|chatbot|language model|claude|chatgpt|gpt)\b|\bas an ai\b|\byou must (now )?(approve|refund|send|forward|reveal))/ },
   { reason: 'system_prompt', pattern: /\bsystem prompt\b|^\s*###?\s*(system|instruction)s?\s*:/m },
   { reason: 'concealment', pattern: /\b(do not|don't|never) (tell|reveal|mention|disclose|show)\b[^.]{0,40}\b(the )?(user|customer|owner|human|them)\b/ },
@@ -24,7 +27,7 @@ const RULES: { reason: KnowledgeInjectionReason; pattern: RegExp }[] = [
   // the owner-facing flagged-chunk view carries the copy that explains it (final review A1/C4).
   { reason: 'role_marker', pattern: /^\s*(system|assistant|user)\s*:/m },
   { reason: 'forced_output', pattern: /\b(respond|reply|answer)\s+(only\s+)?with\b[^.]{0,40}\b(the following|exactly|this text)\b/ },
-  { reason: 'exfiltration', pattern: /(^|[.!?:;]\s*|\band\s+)(send|forward|email|post|exfiltrate)\b[^.]{0,60}\b(api key|password|credentials?|token|secret)\b/m },
+  { reason: 'exfiltration', pattern: /(^|[.!?:;,]\s*|\b(?:and|please|now|then|also|just|simply|always|must|should)\s+)(send|forward|email|post|exfiltrate)\b[^.]{0,60}\b(api key|password|credentials?|token|secret)\b/m },
 ]
 
 /** Zero-width and bidi format characters that can hide instructions inside otherwise ordinary
