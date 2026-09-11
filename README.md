@@ -9,7 +9,8 @@ Requires Node >= 22, pnpm 10, Docker.
 
     corepack enable
     pnpm install
-    pnpm db:up                                   # Postgres 17 + pgvector on :5434
+    pnpm db:up                                   # Postgres 17 + pgvector on :5434, minio on :9000/:9001
+    pnpm s3:init                                 # creates the dev bucket + CORS policy in minio
     DATABASE_URL=postgres://aesa:aesa@localhost:5434/aesa_dev pnpm --filter @aesa/db migrate
     cp apps/api/.env.example apps/api/.env      # set BETTER_AUTH_SECRET (openssl rand -base64 48)
     pnpm --filter @aesa/api dev                  # http://localhost:3001 — codes: /__dev/mail/latest?to=<email>

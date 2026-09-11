@@ -32,7 +32,8 @@ instruction from him in the session.
 ## Commands
 
     corepack enable && pnpm install
-    pnpm db:up                                    # Postgres 17 + pgvector on :5434 (aesa/aesa/aesa_dev) (pgvector is installed by db-init; a volume from before Phase 4 needs `pnpm db:down && pnpm db:up`)
+    pnpm db:up                                    # Postgres 17 + pgvector on :5434 (aesa/aesa/aesa_dev) (pgvector is installed by db-init; a volume from before Phase 4 needs `pnpm db:down && pnpm db:up`); also brings up minio on :9000/:9001
+    pnpm s3:init                                  # creates the dev bucket + CORS policy in minio (idempotent; safe to re-run)
     DATABASE_URL=postgres://aesa:aesa@localhost:5434/aesa_dev pnpm --filter @aesa/db migrate
     pnpm typecheck && pnpm lint && pnpm test && pnpm db:check    # the CI gate; run before every commit
     pnpm --filter @aesa/db test test/rls.test.ts  # one package, one file
