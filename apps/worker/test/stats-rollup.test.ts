@@ -226,6 +226,48 @@ describe('stats.rollup', () => {
     expect(await statsRow(orgId, agentId, categoryId, dayString(40))).toBeUndefined()
   })
 
+  it('never overwrites a day outside the trailing window with a partial recompute: a draft created 33 days ago but decided 2 days ago leaves that old, already-complete day untouched', async () => {
+    const { orgId, connectionId, agentId, categoryId } = await seedOrg()
+
+    // A complete, previously-computed row for a day that is genuinely outside the 30-day window.
+    await withOrg(app.db, orgId, (tx) =>
+      tx.insert(categoryStatsDaily).values({
+        orgId, agentId, categoryId, day: dayString(33),
+        drafted: 120, approvedUnchanged: 95, approvedEdited: 10, rejected: 5,
+        autoSent: 30, autoSentConfirmed: 25, autoSentFlagged: 1, held: 2,
+      }))
+
+    // Created 33 days ago (outside the window — this draft is loaded ONLY via its decidedAt leg).
+    await seedDraft(orgId, connectionId, agentId, categoryId, {
+      createdAt: daysAgo(33), decidedAt: daysAgo(2), decisionSource: 'app', status: 'approved', editDistanceRatio: 0,
+    })
+
+    await runStatsRollup(boss, makeDeps())
+
+    // The old day's row is untouched — the buggy version wrote drafted:1 and zeroed every other
+    // counter here, destroying a day this pass had no business touching at all.
+    expect(await statsRow(orgId, agentId, categoryId, dayString(33))).toMatchObject({
+      drafted: 120, approvedUnchanged: 95, approvedEdited: 10, rejected: 5,
+      autoSent: 30, autoSentConfirmed: 25, autoSentFlagged: 1, held: 2,
+    })
+    // The decision itself still lands correctly, on its OWN day.
+    expect(await statsRow(orgId, agentId, categoryId, dayString(2))).toMatchObject({ approvedUnchanged: 1 })
+  })
+
+  it("the trailing window is day-aligned, not instant-aligned: a draft on the cutoff's own calendar day counts in full even before the cron's own run time that day", async () => {
+    const { orgId, connectionId, agentId, categoryId } = await seedOrg()
+    const runAt = new Date('2026-09-11T02:15:00Z') // stats.rollup's own schedule (15 2 * * *)
+    const onCutoffDay = new Date('2026-08-12T01:00:00Z') // the cutoff calendar day, before 02:15Z
+
+    await seedDraft(orgId, connectionId, agentId, categoryId, {
+      createdAt: onCutoffDay, decidedAt: onCutoffDay, decisionSource: 'app', status: 'approved', editDistanceRatio: 0,
+    })
+
+    await runStatsRollup(boss, makeDeps({ now: () => runAt }))
+
+    expect(await statsRow(orgId, agentId, categoryId, utcDayString(onCutoffDay))).toMatchObject({ drafted: 1, approvedUnchanged: 1 })
+  })
+
   it("suggests Autopilot for a review category that earns it (≥20 decisions, ≥90% unchanged, no rejection in 14 d): suggested_* set from the last 20 unchanged approvals' evidence ≥ 0.80, one graduation notification, mode unchanged", async () => {
     const { orgId, connectionId, agentId, categoryId } = await seedOrg({ mode: 'review', autoGraduate: false })
 

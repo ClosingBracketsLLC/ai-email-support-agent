@@ -23,6 +23,7 @@ import {
 } from '@aesa/db'
 import { registerCron } from '@aesa/queue'
 import { utcDayString, utcWeekString } from '../date-utils.ts'
+import { utcMidnight } from '../drafting/caps.ts'
 import { errorMessage } from '../err-message.ts'
 import { enqueueNotifyDispatch } from './notify-dispatch.ts'
 
@@ -137,7 +138,12 @@ function aggregateDrafts(rows: LoadedDraft[], now: Date, cutoff: Date): { daily:
 
   for (const row of rows) {
     const { agentId, categoryId } = row
-    bump(agentId, categoryId, utcDayString(row.createdAt), 'drafted')
+    // Guarded on `cutoff`, same as the decision and auto legs below: a row loaded ONLY because its
+    // `decidedAt`/`autoDecidedAt` falls inside the window (its `createdAt` can be arbitrarily older)
+    // must never bump `drafted` for a day this pass has no business touching — that would write a
+    // partial row (`drafted: 1`, every other counter zero) over what may already be a complete,
+    // fully-aged-out day, and nothing else ever writes this table to repair it.
+    if (row.createdAt >= cutoff) bump(agentId, categoryId, utcDayString(row.createdAt), 'drafted')
 
     if (row.decisionSource && HUMAN_SOURCES.has(row.decisionSource) && row.decidedAt && row.decidedAt >= cutoff) {
       const day = utcDayString(row.decidedAt)
@@ -291,7 +297,11 @@ export async function runStatsRollup(
 ): Promise<{ orgs: number; rows: number; suggested: number; graduated: number; demoted: number; nudged: number }> {
   const now = deps.now?.() ?? new Date()
   const day = utcDayString(now)
-  const cutoff = new Date(now.getTime() - ROLLUP_WINDOW_DAYS * 86_400_000)
+  // The UTC MIDNIGHT of `now - 30d`, not the raw instant: the pass runs at a fixed time of day
+  // (02:15 UTC), so an instant cutoff would load the cutoff's own calendar day only from 02:15
+  // onward and rewrite that day's row from a partial set every night until it aged out truncated.
+  // Day-aligning makes the boundary the calendar day, exactly what "trailing 30 days" means.
+  const cutoff = utcMidnight(new Date(now.getTime() - ROLLUP_WINDOW_DAYS * 86_400_000))
   const pending: PendingNotify[] = []
   let rows = 0
   let suggested = 0
