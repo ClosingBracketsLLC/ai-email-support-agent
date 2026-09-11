@@ -1,3 +1,4 @@
+import { KNOWLEDGE_CHUNK_MAX_CHARS } from '@aesa/contracts'
 import { estimateTokens } from '@aesa/llm'
 import type { Block } from './parsers/blocks.ts'
 
@@ -22,17 +23,20 @@ function hardSplit(text: string, max: number): string[] {
   return pieces
 }
 
-/** Cut the tail of a finished piece down to whole sentences: drop the (likely partial) fragment
- * at the start so the overlap carried into the next piece always begins at a sentence boundary. */
-function sentenceAlignedOverlap(tail: string): string {
-  const sentences = splitSentences(tail)
-  if (sentences.length <= 1) return ''
-  return sentences.slice(1).join(' ')
+/** The single last complete sentence of a finished piece, truncated to `overlap` characters if
+ * it's longer — the sentence-aligned context carried into the next piece, so a chunk boundary
+ * never drops the thread a retrieval match would otherwise need (fix review #7: this must be
+ * exactly ONE sentence, not as many trailing sentences as fit in `overlap` characters, so the
+ * next piece's content literally starts with it). */
+function lastSentenceOverlap(text: string, overlap: number): string {
+  const sentences = splitSentences(text)
+  const last = sentences.length > 0 ? sentences[sentences.length - 1]! : ''
+  return last.length > overlap ? last.slice(0, overlap) : last
 }
 
 /** Pack one oversized block's text into pieces no larger than `max`, targeting `target`: sentences
  * accumulate until the next one would cross `target`, then the piece is finalized and the next one
- * opens with up to `overlap` characters of sentence-aligned context from the piece just closed. */
+ * opens with the single last sentence of the piece just closed (capped at `overlap` characters). */
 function packBlockText(text: string, target: number, max: number, overlap: number): string[] {
   const pieces: string[] = []
   let current = ''
@@ -46,7 +50,7 @@ function packBlockText(text: string, target: number, max: number, overlap: numbe
       const joined = `${current} ${sentence}`
       if (joined.length <= target) { current = joined; continue }
 
-      const overlapText = sentenceAlignedOverlap(current.slice(-overlap))
+      const overlapText = lastSentenceOverlap(current, overlap)
       finalize()
       current = overlapText.length > 0 ? `${overlapText} ${sentence}` : sentence
       // A hard-cut fragment carries no sentence boundary to overlap from; guard the hard bound
@@ -63,15 +67,17 @@ function sameHeadingPath(a: string[], b: string[]): boolean {
 }
 
 /** Group blocks into retrieval-sized chunks: consecutive blocks under the same heading path merge
- * up to `target` characters; a heading path change or a block that would cross `target` starts a
- * new chunk; a single block longer than `max` is sentence-split with overlap. Never exceeds `max`
- * characters per chunk or `maxChunks` chunks per document. */
+ * up to `target` characters; a heading block, a heading path change, or a block that would cross
+ * `target` starts a new chunk; a single block longer than `max` is sentence-split with overlap.
+ * Never exceeds `max` characters per chunk or `maxChunks` chunks per document. */
 export function chunkBlocks(
   blocks: Block[],
   opts?: { target?: number; max?: number; overlap?: number; maxChunks?: number },
 ): Chunk[] {
-  const target = opts?.target ?? 1600
-  const max = opts?.max ?? 3000
+  const max = opts?.max ?? KNOWLEDGE_CHUNK_MAX_CHARS
+  // Clamped so a caller-supplied target above max can never make the merge/split thresholds
+  // disagree with the hard per-chunk cap.
+  const target = Math.min(opts?.target ?? 1600, max)
   const overlap = opts?.overlap ?? 200
   const maxChunks = opts?.maxChunks ?? 2000
 
@@ -96,7 +102,9 @@ export function chunkBlocks(
       continue
     }
 
-    if (current === null || !sameHeadingPath(current.headingPath, block.headingPath)) {
+    // A heading block ALWAYS starts a new chunk — even two sibling headings with identical text
+    // (and so an identical headingPath) never merge into one chunk.
+    if (block.kind === 'heading' || current === null || !sameHeadingPath(current.headingPath, block.headingPath)) {
       flushCurrent()
       current = { headingPath: block.headingPath, content: block.text }
       continue

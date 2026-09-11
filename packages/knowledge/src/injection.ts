@@ -11,9 +11,13 @@ const RULES: { reason: string; pattern: RegExp }[] = [
   { reason: 'exfiltration', pattern: /\b(send|forward|email|post|exfiltrate)\b[^.]{0,60}\b(api key|password|credentials?|token|secret)\b/ },
 ]
 
-/** `\p{Cf}` — Unicode "format" characters: zero-width spaces/joiners, bidi controls, and similar
- * invisible-in-rendering characters that can hide instructions inside otherwise ordinary text. */
-const FORMAT_CHAR_RE = /\p{Cf}/gu
+/** Zero-width and bidi format characters that can hide instructions inside otherwise ordinary
+ * text: ZWSP/ZWNJ/ZWJ/LRM/RLM (U+200B-200F), bidi embedding/override controls (U+202A-202E),
+ * word joiner and invisible math operators (U+2060-2064), bidi isolates (U+2066-2069), and
+ * ZWNBSP/BOM (U+FEFF). Deliberately narrower than `\p{Cf}` (fix review #4): that broader class
+ * also matches U+00AD SOFT HYPHEN, which Word/LaTeX PDF exports and `&shy;` produce routinely in
+ * ordinary hyphenation and is never a concealment vector on its own. */
+const FORMAT_CHAR_RE = /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]/g
 
 /** NFKC-normalize and lowercase for pattern matching; collapse whitespace WITHIN each line (not
  * across lines) so the `^...` line-start rules stay meaningful for multi-line chunk content. */

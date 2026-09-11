@@ -35,6 +35,10 @@ async function run(input: ChildInput): Promise<void> {
   } catch (err) {
     reply = toReply(err)
   }
-  if (process.send) process.send(reply)
-  process.exit(0)
+  // `process.send` is asynchronous — a reply that doesn't fit the IPC socket's buffer in one write
+  // is still draining when a bare `process.exit(0)` on the next line tears the process down, and
+  // the parent sees an `exit` with no `message` ever having arrived. Exit only once the callback
+  // confirms the write landed.
+  if (process.send) process.send(reply, () => process.exit(0))
+  else process.exit(0)
 }

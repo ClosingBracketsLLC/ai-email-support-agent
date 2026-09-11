@@ -15,16 +15,27 @@ describe('chunkBlocks', () => {
     const chunks = chunkBlocks([b('paragraph', ['A'], 'a'), b('paragraph', ['B'], 'b')])
     expect(chunks.map((c) => c.headingPath)).toEqual([['A'], ['B']])
   })
-  it('splits a long block at sentence boundaries with a 200-character overlap and never exceeds max', () => {
-    const sentence = 'The quick brown fox jumps over the lazy dog near the river bank today. '
-    const chunks = chunkBlocks([b('paragraph', ['Long'], sentence.repeat(60))], { target: 1600, max: 3000, overlap: 200 })
+  it('splits a long block at sentence boundaries with a real (distinct-sentence) overlap and never exceeds max', () => {
+    // Distinct sentences (fix review #7): with the original fixture's IDENTICAL repeated sentence,
+    // `startsWith` passed even at zero real overlap. Each sentence is unique here, so the
+    // assertion only passes if chunks[1] genuinely opens with chunks[0]'s actual last sentence.
+    const sentences = Array.from({ length: 60 }, (_, i) => `Sentence number ${i} talks about topic ${i} in a fairly detailed and thorough way for our customers. `).join('')
+    const chunks = chunkBlocks([b('paragraph', ['Long'], sentences)], { target: 1600, max: 3000, overlap: 200 })
     expect(chunks.length).toBeGreaterThan(1)
     for (const c of chunks) expect(c.content.length).toBeLessThanOrEqual(3000)
-    expect(chunks[1]!.content.startsWith(chunks[0]!.content.slice(-200).trimStart().split('. ').slice(-1)[0]!.slice(0, 20))).toBe(true)
+    const chunk0Parts = chunks[0]!.content.split('. ')
+    const lastSentenceOfChunk0 = chunk0Parts[chunk0Parts.length - 1]!
+    expect(chunks[1]!.content.startsWith(lastSentenceOfChunk0)).toBe(true)
   })
   it('hard-splits a sentence longer than max and caps the chunk count', () => {
     const chunks = chunkBlocks([b('paragraph', [], 'x'.repeat(10_000))], { max: 3000, maxChunks: 2 })
     expect(chunks).toHaveLength(2)
     expect(chunks.every((c) => c.content.length <= 3000)).toBe(true)
+  })
+  it('a heading block always starts a new chunk, even a sibling heading with identical text/path (fix review #6)', () => {
+    const chunks = chunkBlocks([b('heading', ['FAQ'], 'FAQ'), b('paragraph', ['FAQ'], 'one'), b('heading', ['FAQ'], 'FAQ'), b('paragraph', ['FAQ'], 'two')])
+    expect(chunks).toHaveLength(2)
+    expect(chunks[0]!.content).toBe('FAQ\n\none')
+    expect(chunks[1]!.content).toBe('FAQ\n\ntwo')
   })
 })

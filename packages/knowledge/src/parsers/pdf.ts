@@ -20,6 +20,9 @@ async function extractPageText(doc: PDFDocumentProxy, pageNumber: number): Promi
     currentY = y
   }
   if (currentLine.length > 0) lines.push(currentLine)
+  // Release the page's cached resources (fonts, operator lists) now that its text is read — a
+  // multi-hundred-page document would otherwise hold every page's resources for the whole parse.
+  page.cleanup()
   return lines.join('\n')
 }
 
@@ -44,6 +47,12 @@ export async function parsePdf(bytes: Uint8Array, limits: ParseLimits): Promise<
     if (err instanceof ParseError) throw err
     throw new ParseError('parse_failed', err instanceof Error ? err.message : String(err))
   } finally {
-    await loadingTask.destroy()
+    // A destroy failure is a cleanup-only concern — never let it override (or, thrown bare, mask
+    // the code of) whatever real result or ParseError is already propagating out of the try block.
+    try {
+      await loadingTask.destroy()
+    } catch {
+      /* ignored: cleanup only */
+    }
   }
 }

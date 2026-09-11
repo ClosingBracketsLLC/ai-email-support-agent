@@ -1,4 +1,4 @@
-import type { KnowledgeFailureReason } from '@aesa/contracts'
+import { KNOWLEDGE_MAX_UPLOAD_BYTES, type KnowledgeFailureReason } from '@aesa/contracts'
 
 /** Bounds applied to a single parse — either in-process (small text/markdown) or inside the parser child (PDF/DOCX). */
 export interface ParseLimits {
@@ -13,7 +13,7 @@ export interface ParseLimits {
 }
 
 export const DEFAULT_PARSE_LIMITS: ParseLimits = {
-  maxBytes: 20 * 1024 * 1024,
+  maxBytes: KNOWLEDGE_MAX_UPLOAD_BYTES,
   maxPages: 500,
   timeoutMs: 60_000,
   maxHeapMb: 512,

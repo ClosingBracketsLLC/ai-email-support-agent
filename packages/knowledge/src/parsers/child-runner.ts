@@ -14,7 +14,10 @@ function childExecArgv(maxHeapMb: number): string[] {
 
 export function runParserInChild(input: { kind: 'pdf' | 'docx'; path: string; limits: ParseLimits }): Promise<Block[]> {
   return new Promise((resolve, reject) => {
-    const child = fork(CHILD, [], { execArgv: childExecArgv(input.limits.maxHeapMb), stdio: ['ignore', 'ignore', 'pipe', 'ipc'], serialization: 'json' })
+    // stderr is 'ignore', not 'pipe': an unread stderr pipe fills its OS buffer once the child
+    // writes enough to it and blocks the child on the next write — a hang vector for no benefit,
+    // since nothing here ever reads child.stderr.
+    const child = fork(CHILD, [], { execArgv: childExecArgv(input.limits.maxHeapMb), stdio: ['ignore', 'ignore', 'ignore', 'ipc'], serialization: 'json' })
     let settled = false
     const settle = (fn: () => void) => { if (!settled) { settled = true; clearTimeout(timer); fn() } }
     const timer = setTimeout(() => { child.kill('SIGKILL'); settle(() => reject(new ParseError('parse_timeout', `parser exceeded ${input.limits.timeoutMs} ms`))) }, input.limits.timeoutMs)

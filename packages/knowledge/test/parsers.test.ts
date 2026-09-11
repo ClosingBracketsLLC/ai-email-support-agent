@@ -24,6 +24,31 @@ describe('parseHtml', () => {
   it('collects http(s) links only, unresolved (the crawler resolves against the page URL)', () => {
     expect(parsed.links).toEqual(['/', '/shipping', 'https://other.example/x'])
   })
+  it('concatenates a second <title> rather than losing the first (fix review #10)', () => {
+    const two = parseHtml('<html><head><title>First</title><title>Second</title></head><body></body></html>')
+    expect(two.title).toBe('First Second')
+  })
+})
+
+describe('parseHtml: nested lists and loose (unwrapped) text', () => {
+  it('keeps a parent <li>\'s own text when a nested list opens inside it (flat list, fix review #2)', () => {
+    const nested = parseHtml('<ul><li>Domestic orders<ul><li>Within 30 days</li></ul></li><li>International orders</li></ul>')
+    expect(nested.blocks).toEqual([
+      { kind: 'list', headingPath: [], text: '• Domestic orders\n• Within 30 days\n• International orders' },
+    ])
+  })
+  it('captures text with no wrapping content tag as its own paragraph (fix review #3)', () => {
+    const loose = parseHtml('<div>Plain text with no block tag at all.</div>')
+    expect(loose.blocks).toEqual([{ kind: 'paragraph', headingPath: [], text: 'Plain text with no block tag at all.' }])
+  })
+  it('splits loose text into separate paragraphs at block-level boundaries', () => {
+    const two = parseHtml('<div>A</div><div>B</div>')
+    expect(two.blocks.map((b) => [b.kind, b.text])).toEqual([['paragraph', 'A'], ['paragraph', 'B']])
+  })
+  it('still yields one paragraph for inline tags inside a <p> (existing behaviour unchanged)', () => {
+    const inline = parseHtml('<p>See our <span>full</span> <b>policy</b> for details.</p>')
+    expect(inline.blocks).toEqual([{ kind: 'paragraph', headingPath: [], text: 'See our full policy for details.' }])
+  })
 })
 
 describe('parseMarkdown / parseText', () => {
