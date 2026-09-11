@@ -14,6 +14,8 @@ A multi-tenant SaaS: an AI agent that answers a business's customer-support emai
   whole-branch review of each finished phase.
 - Reference implementation: `~/Desktop/code/ClosingBrackets/doge-buddy`, a live business. It is
   read-only: port code from it, never modify it, never share packages with it.
+- `brand/brand.md` — the brand guide (identity, the mark's derivation, colour, type, icons, where
+  things live, licences) for anything visual: a new screen, a review page, an asset.
 
 ## How a phase is built
 
@@ -41,6 +43,7 @@ instruction from him in the session.
     pnpm --filter @aesa/app export:web            # Expo web export (server output)
     pnpm --filter @aesa/app test                  # jest, no database
     pnpm e2e                                      # Playwright signup smoke against the api and the served web export
+    pnpm brand:build   # after changing brand/tokens.json, mark.svg, wordmark.svg or icons/*.svg; commit the outputs
 
 - The database must be running for every suite except `@aesa/core` and `@aesa/crypto`. Tests read
   `DATABASE_URL` from the real environment (default `postgres://aesa:aesa@localhost:5434/aesa_dev`)
@@ -125,6 +128,14 @@ instruction from him in the session.
   and a devsink, plus the templates. Shared by `apps/api` and `apps/worker`; no database dependency.
 - `packages/test-kit` — `MockMailbox` re-export, the scrubbed fixture recorder (`MAIL_RECORD=1`),
   and the provider conformance suite run against both the mock and recorded fixtures.
+- `brand/` — the `@aesa/brand` workspace package, root-level (listed in `pnpm-workspace.yaml`, not
+  under `packages/`): the four sources (`tokens.json`, `mark.svg`, `wordmark.svg`, `icons/*.svg`),
+  the Python derivation (`scripts/derive/`, not part of the CI gate), `scripts/build.ts`
+  (`pnpm brand:build`), and `test/` (sources, compose, build-drift, tokens, contrast,
+  app-typography). Generates the other mark colourways/lockups/OG SVG under `brand/`,
+  `apps/app/assets/{icon,adaptive-icon,splash-icon,notification-icon,favicon}.png`,
+  `apps/api/public/{favicon.svg,favicon-16.png,favicon-32.png,favicon.ico,apple-touch-icon.png,og.png}`,
+  and `packages/contracts/src/brand.ts` (`BRAND`). See `brand/brand.md` for the guide.
 - `apps/api` — Fastify + Better Auth + tRPC: `/healthz`, config, scrubbed error handler, log
   redaction; the mailbox connect flow and provider webhooks; the `inbox`/`agents`/`workspace`/`team`
   routers, and Phase 3's `drafts` router (approve with the 15-second undo, hold, resume, reject with
@@ -229,6 +240,18 @@ instruction from him in the session.
   `@aesa/test-kit`, `@aesa/api`, `drizzle-orm`, `fastify`, `better-auth/node` or `node:*` — nor any of their sub-paths
   (`@aesa/db/*`, `@aesa/api/*`, `@aesa/agent/*`, `drizzle-orm/*`); `import type` is allowed
   throughout (ESLint block for `apps/app/**`). Share types through `@aesa/contracts`.
+- **Brand files are generated.** `brand/mark-{ink,paper,lifted}.svg`, `brand/lockup-{horizontal,
+  stacked}.svg`, `brand/og-image.svg`,
+  `apps/app/assets/{icon,adaptive-icon,splash-icon,notification-icon,favicon}.png`,
+  `apps/api/public/{favicon.svg,favicon-16.png,favicon-32.png,favicon.ico,apple-touch-icon.png,og.png}`
+  and `packages/contracts/src/brand.ts` (`BRAND`) are all written by `pnpm brand:build` from
+  `brand/tokens.json` + `mark.svg` + `wordmark.svg` + `icons/*.svg` — never hand-edit one;
+  `brand/test/build.test.ts` rebuilds into memory and fails on any byte of drift.
+- **App typography and colour.** `apps/app` never sets `fontWeight` — one registered family per
+  weight, named by `theme.ts`'s `font` — and never writes a literal colour outside `theme.ts`,
+  whose palettes are token-only (`BRAND.light`/`BRAND.dark`); `brand/test/app-typography.test.ts`
+  and `apps/app/src/theme.test.ts` enforce both. Icons come from `components/icon.tsx`'s `<Icon>`,
+  never an icon font.
 - **Auth tables.** Better Auth's `user`/`session`/`account`/`verification`/`organization`/`member`/
   `invitation` are `RLS_EXEMPT` with uuid ids minted by Postgres (`generateId: false`); the api
   reaches them only through Better Auth; tRPC's `orgProcedure` derives `orgId` from the session's

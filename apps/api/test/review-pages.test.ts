@@ -142,6 +142,14 @@ describe('review pages (/a/:draftId)', () => {
     // never a Referer when the reader clicks through to the app.
     expect(res.headers['cache-control']).toBe('no-store')
     expect(res.body).toContain('<meta name="referrer" content="no-referrer">')
+    // Task 4 (brand): the review page carries the favicons, the token CSS and the SVG wordmark header — no web font, no script.
+    expect(res.body).toContain('<link rel="icon" href="/favicon.svg" type="image/svg+xml">')
+    expect(res.body).toContain('<link rel="apple-touch-icon" href="/apple-touch-icon.png">')
+    expect(res.body).toContain('--primary:#2563EB')
+    expect(res.body).toContain('prefers-color-scheme:dark')
+    expect(res.body).toContain('<svg viewBox="42 100 3383 920" role="img" aria-label="aesa">')
+    expect(res.body).not.toContain('fonts.googleapis')
+    expect(res.body).not.toContain('@font-face')
     expect(res.body).toContain('Reply ready')
     expect(res.body).toContain('Where is my order?')
     expect(res.body).toContain('Casey &lt;Q&amp;A&gt;')
@@ -185,6 +193,13 @@ describe('review pages (/a/:draftId)', () => {
     }
     expect(new Set([unknown.body, wrong.body, used.body, stale.body]).size).toBe(1)
     expect(unknown.body).not.toContain('Where is my order?')
+  })
+
+  it('the friendly page carries the same header and styles as every other page (still one constant)', async () => {
+    const a = await t.app.inject({ method: 'GET', url: `/a/${randomUUID()}?t=${'x'.repeat(43)}` })
+    expect(a.body).toContain('aria-label="aesa"')
+    expect(a.body).toContain('<style>')
+    expect(a.body).toContain(FRIENDLY_COPY)
   })
 
   it('GET with a valid token on a sent draft renders the status page, not the review page', async () => {

@@ -8,7 +8,7 @@ import { Loading } from '@/components/loading'
 import { Screen } from '@/components/screen'
 import { Heading, Muted } from '@/components/typography'
 import { useTRPC } from '@/lib/trpc'
-import { radius, spacing, typeScale, useColors } from '@/theme'
+import { font, radius, spacing, typeScale, useColors } from '@/theme'
 import { StatTile } from './stat-tile'
 
 type ActivityDays = 7 | 30
@@ -109,6 +109,6 @@ export function ActivityScreen() {
 const styles = StyleSheet.create({
   segmented: { flexDirection: 'row', gap: spacing.xs },
   tab: { flex: 1, borderWidth: 1, borderRadius: radius.md, paddingVertical: spacing.sm, alignItems: 'center' },
-  tabLabel: { fontWeight: '600' },
+  tabLabel: { fontFamily: font.uiStrong },
   grid: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
 })

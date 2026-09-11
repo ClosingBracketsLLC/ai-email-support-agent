@@ -1,4 +1,5 @@
 import { fireEvent, render, screen } from '@testing-library/react-native'
+import { palettes } from '@/theme'
 import { TicketRow, type TicketDraftSummary, type TicketSummary } from './ticket-row'
 
 const BASE: TicketSummary = {
@@ -73,6 +74,9 @@ it.each([
   await render(<TicketRow ticket={ticket({ needsOwnerReason: reason })} onPress={mockOnPress} />)
   expect(screen.getByTestId('ticket-reason-ticket-1')).toBeTruthy()
   expect(screen.getByText(chip)).toBeTruthy()
+  if (reason === 'guardrail_failed') {
+    expect(screen.getByTestId('ticket-reason-ticket-1')).toHaveStyle({ backgroundColor: palettes.light.dangerTint })
+  }
 })
 
 test('no reason chip when needsOwnerReason is null', async () => {
@@ -113,6 +117,7 @@ test('a pending draft renders the "Reply ready" chip with the category and the c
   await render(<TicketRow ticket={ticket({ status: 'awaiting_review', draft: draft() })} onPress={mockOnPress} />)
   expect(screen.getByTestId('ticket-draft-ticket-1')).toBeTruthy()
   expect(screen.getByText('Reply ready · Shipping · 82%')).toBeTruthy()
+  expect(screen.getByTestId('ticket-draft-ticket-1')).toHaveStyle({ backgroundColor: palettes.light.primaryTint })
 })
 
 test('an uncategorised pending draft says "Uncategorized"', async () => {
@@ -133,6 +138,9 @@ it.each([
   await render(<TicketRow ticket={ticket({ draft: draft({ status }) })} onPress={mockOnPress} />)
   expect(screen.getByTestId('ticket-draft-ticket-1')).toBeTruthy()
   expect(screen.getByText(chip)).toBeTruthy()
+  if (status === 'held') {
+    expect(screen.getByTestId('ticket-draft-ticket-1')).toHaveStyle({ backgroundColor: palettes.light.warningTint })
+  }
 })
 
 test('no draft chip when the ticket has no live draft', async () => {

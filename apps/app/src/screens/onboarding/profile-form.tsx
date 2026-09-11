@@ -87,7 +87,7 @@ export function ProfileForm({ initial, submitLabel, onSaved }: { initial: Profil
         <View style={styles.toneRow}>
           {TONES.map((t) => (
             <Pressable key={t} role="radio" accessibilityState={{ checked: tone === t }} onPress={() => onToneChange(t)} testID={`tone-${t}`}
-              style={[styles.tone, { borderColor: tone === t ? c.primary : c.border, backgroundColor: tone === t ? c.info : c.bg }]}>
+              style={[styles.tone, { borderColor: tone === t ? c.primary : c.border, backgroundColor: tone === t ? c.primaryTint : c.bg }]}>
               <Text style={[typeScale.body, { color: c.text }]}>{TONE_LABEL[t]}</Text>
             </Pressable>
           ))}

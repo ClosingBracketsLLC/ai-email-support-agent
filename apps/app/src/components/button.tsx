@@ -7,18 +7,17 @@ export function Button({ label, onPress, variant = 'primary', loading = false, d
   const c = useColors()
   const inactive = disabled || loading
   const bg = variant === 'primary' ? c.primary : variant === 'danger' ? c.danger : c.surface
-  const fg = variant === 'secondary' ? c.text : c.onPrimary
+  const fg = variant === 'secondary' ? c.text : variant === 'danger' ? c.onDanger : c.onPrimary
   return (
     <Pressable
       role="button" accessibilityLabel={label} accessibilityState={{ disabled: inactive, busy: loading }} disabled={inactive} onPress={onPress} testID={testID}
       style={({ pressed }) => [styles.base, { backgroundColor: bg, borderColor: variant === 'secondary' ? c.border : bg, opacity: inactive ? 0.6 : pressed ? 0.85 : 1 }]}
     >
-      {loading ? <ActivityIndicator color={fg} /> : <Text style={[typeScale.body, styles.label, { color: fg }]}>{label}</Text>}
+      {loading ? <ActivityIndicator color={fg} /> : <Text style={[typeScale.bodyStrong, { color: fg }]}>{label}</Text>}
     </Pressable>
   )
 }
 
 const styles = StyleSheet.create({
   base: { minHeight: 48, paddingHorizontal: spacing.lg, borderRadius: radius.md, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
-  label: { fontWeight: '600' },
 })

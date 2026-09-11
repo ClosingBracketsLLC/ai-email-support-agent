@@ -35,7 +35,7 @@ export function UndoBar({ untilAt, onUndo, busy, tickMs, onExpired, testID = 'un
   }
 
   return (
-    <View style={[styles.bar, { borderColor: c.border, backgroundColor: c.info }]} testID={testID}>
+    <View style={[styles.bar, { borderColor: c.border, backgroundColor: c.primaryTint }]} testID={testID}>
       <Body style={styles.label}>{`Sending in ${secondsLeft}s`}</Body>
       <Button label="Undo" variant="secondary" onPress={undo} loading={busy} disabled={fired} testID="undo-button" />
     </View>
