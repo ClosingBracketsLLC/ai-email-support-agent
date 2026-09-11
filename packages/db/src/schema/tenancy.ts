@@ -32,6 +32,9 @@ export const workspaces = pgTable('workspaces', {
   knowledgeVersion: integer('knowledge_version').notNull().default(0),
   /** X25519 public key the api seals new secrets to (Task 7); the private key lives in org_data_keys. */
   boxPublicKey: bytea('box_public_key'),
+  /** Random 32 bytes minted lazily by `ensureCustomerHashSalt`; keys `resolved_answers.source_customer_hash`;
+   * never returned by an API. */
+  customerHashSalt: bytea('customer_hash_salt'),
   createdAt: createdAt(),
   updatedAt: updatedAt(),
 }, (t) => [

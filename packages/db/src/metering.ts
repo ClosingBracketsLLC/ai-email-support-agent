@@ -13,17 +13,19 @@ export const LLM_METERS = {
 } as const
 
 /**
- * The two `usage_counters` meters the SEND path writes (worker `send.execute` writes them; the api's
+ * The `usage_counters` meters the SEND path writes (worker `send.execute` writes them; the api's
  * usage endpoint reads them through this same constant, so the literals can never drift between the
  * writer and the reader). Plain strings, like `LLM_METERS` — adding a meter needs no migration.
  *
  * `review_sends` counts every reply that actually went out after an owner review;
  * `ai_handled_conversations` counts each TICKET at most once per calendar month (the
- * `tickets.ai_handled_month` stamp is what makes the second send of the same month a no-op).
+ * `tickets.ai_handled_month` stamp is what makes the second send of the same month a no-op);
+ * `auto_sends` counts every reply sent without an owner review (Phase 5 autonomy).
  */
 export const SEND_METERS = {
   reviewSends: 'review_sends',
   aiHandledConversations: 'ai_handled_conversations',
+  autoSends: 'auto_sends',
 } as const
 
 /** The one `usage_counters` meter `agents.sandboxStart` (Task 18) bumps under `sandbox.daily_cap` —
@@ -38,6 +40,12 @@ export const SANDBOX_METERS = {
 export const KNOWLEDGE_METERS = {
   embedTokens: 'embed_tokens',
   crawlPages: 'crawl_pages',
+} as const
+
+/** The one `usage_counters` meter the guidance-suggestion LLM call bumps (Phase 5). Plain string,
+ * like the others above — adding a meter needs no migration. */
+export const GUIDANCE_METERS = {
+  suggestCalls: 'guidance_suggest_calls',
 } as const
 
 const utcDayString = (d: Date): string => d.toISOString().slice(0, 10)

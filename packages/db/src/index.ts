@@ -5,5 +5,10 @@ export { provisionOrgKeys, loadOrgDek, getOrgBoxPublicKey, getOrgBoxPublicKeyOrN
 export { audit, type AuditActor, type AuditEntry } from './audit.ts'
 export { escalateTicket, escalationCopy, escalationDedupeKey, insertEscalationNotification, type EscalateTicketParams } from './escalations.ts'
 export { ensureDefaultCategories } from './categories.ts'
-export { bumpMeter, createMeterSink, KNOWLEDGE_METERS, LLM_METERS, SANDBOX_METERS, SEND_METERS } from './metering.ts'
+export { bumpMeter, createMeterSink, GUIDANCE_METERS, KNOWLEDGE_METERS, LLM_METERS, SANDBOX_METERS, SEND_METERS } from './metering.ts'
 export { bumpKnowledgeVersion } from './knowledge.ts'
+export { customerHash, ensureCustomerHashSalt } from './memory.ts'
+export {
+  countHumanDecisions, demoteCategory, graduateCategory, readDemotionSignals,
+  type DemotionSignals, type DemotionWindows,
+} from './autonomy.ts'

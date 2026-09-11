@@ -47,6 +47,9 @@ export const agentCategoryPolicies = pgTable('agent_category_policies', {
   graduatedAt: timestamp('graduated_at', { withTimezone: true }),
   demotedAt: timestamp('demoted_at', { withTimezone: true }),
   demotedReason: text('demoted_reason'),
+  suggestedAt: timestamp('suggested_at', { withTimezone: true }),
+  suggestedWouldSend: integer('suggested_would_send'),
+  suggestedOf: integer('suggested_of'),
   updatedAt: updatedAt(),
 }, (t) => [
   primaryKey({ columns: [t.agentId, t.categoryId] }),
