@@ -7,9 +7,12 @@ export interface Block {
   kind: 'heading' | 'paragraph' | 'list' | 'table' | 'code'
 }
 
-/** Collapse all whitespace runs to a single space and trim the ends. No Unicode normalization. */
+/** Collapse all whitespace runs to a single space, drop a space landing immediately before a
+ * punctuation mark (an artifact of html.ts's `<a>` word-boundary spacing landing right next to
+ * source punctuation — "policy , then" should read "policy, then"), and trim the ends. No Unicode
+ * normalization. */
 export function collapse(text: string): string {
-  return text.replace(/\s+/g, ' ').trim()
+  return text.replace(/\s+/g, ' ').replace(/\s+([,.;:!?])/g, '$1').trim()
 }
 
 /** Push a new heading onto the path at `level` (1-6): ancestors deeper than `level - 1` are

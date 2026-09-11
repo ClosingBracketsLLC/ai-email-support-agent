@@ -73,6 +73,21 @@ export function parseHtml(html: string): { title: string | null; canonical: stri
     looseBuffer = ''
   }
 
+  /** Inserts a single space, into whichever text sink is currently active, at an `<a>` tag's open
+   * or close boundary — unless that sink already ends in whitespace. Anchor text otherwise
+   * concatenates straight through the tag boundary with whatever precedes/follows it in the
+   * source (`the<a href=...>policy</a>,` -> "thepolicy,"); `collapse` above squashes a run of
+   * whitespace to one space and strips a space landing right before punctuation, so this can never
+   * leave a stray gap like "policy ,". Deliberately only for `<a>` — inline formatting tags
+   * (`<b>`/`<i>`/`<span>`/...) are untouched, matching their existing (unchanged) behavior. */
+  const appendAnchorBoundarySpace = () => {
+    if (inListItem || bufferKind !== null) {
+      if (!/\s$/.test(buffer)) buffer += ' '
+    } else if (!/\s$/.test(looseBuffer)) {
+      looseBuffer += ' '
+    }
+  }
+
   const parser = new Parser(
     {
       onopentag(name, attribs) {
@@ -86,7 +101,10 @@ export function parseHtml(html: string): { title: string | null; canonical: stri
         if (name === 'title') { inTitle = true; titleBuffer = '' }
         if (name === 'link' && (attribs.rel ?? '').toLowerCase() === 'canonical' && attribs.href) canonical = attribs.href
         if (name === 'meta' && (attribs.name ?? '').toLowerCase() === 'robots' && /noindex/i.test(attribs.content ?? '')) noindex = true
-        if (name === 'a' && attribs.href && linkSkipDepth === 0 && isHttpOrRootLink(attribs.href)) links.push(attribs.href)
+        if (name === 'a') {
+          appendAnchorBoundarySpace()
+          if (attribs.href && linkSkipDepth === 0 && isHttpOrRootLink(attribs.href)) links.push(attribs.href)
+        }
 
         if (HEADING_TAGS.has(name)) {
           flush()
@@ -153,6 +171,7 @@ export function parseHtml(html: string): { title: string | null; canonical: stri
           // fix review #10's "concatenate" rule).
           title = titleBuffer
         }
+        if (name === 'a') appendAnchorBoundarySpace()
 
         if (HEADING_TAGS.has(name)) {
           const text = collapse(buffer)

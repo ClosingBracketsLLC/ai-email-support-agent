@@ -13,7 +13,7 @@ describe('parseHtml', () => {
   it('extracts the title, canonical and noindex', () => {
     expect(parsed.title).toBe('Acme · Returns'); expect(parsed.canonical).toBe('https://acme.example/returns'); expect(parsed.noindex).toBe(true)
   })
-  it('drops nav/script/style/footer text, keeps headings as path and text — and (phase-4 controller ruling) the three trailing top-level anchors\' labels now survive as loose prose, back-to-back with no source whitespace between them', () => {
+  it('drops nav/script/style/footer text, keeps headings as path and text — and (phase-4 controller ruling) the three trailing top-level anchors\' labels now survive as loose prose, word-boundary-separated even though the source has no whitespace between them', () => {
     expect(parsed.blocks.map((b) => [b.kind, b.headingPath.join(' › '), b.text])).toEqual([
       ['heading', 'Returns', 'Returns'],
       ['paragraph', 'Returns', 'Items can be returned within 30 days.'],
@@ -21,8 +21,10 @@ describe('parseHtml', () => {
       ['list', 'Returns › Exceptions', '• Sale items\n• Gift cards'],
       // "Shipping", "Other" and "mail" — the three anchors sitting directly in <body>, with no
       // wrapping tag and no whitespace between them in the source — join into one loose-prose
-      // block once anchor text is no longer dropped outside nav/header/footer (carry-over (a)).
-      ['paragraph', 'Returns › Exceptions', 'ShippingOthermail'],
+      // block once anchor text is no longer dropped outside nav/header/footer (carry-over (a)); an
+      // <a> open/close boundary now also inserts a word-separating space, so they read as three
+      // separate words rather than one run-on "ShippingOthermail".
+      ['paragraph', 'Returns › Exceptions', 'Shipping Other mail'],
     ])
   })
   it('collects http(s) links only, unresolved (the crawler resolves against the page URL)', () => {
@@ -44,6 +46,16 @@ describe('parseHtml: anchor text is TEXT everywhere (phase-4 controller ruling, 
     const navOnly = parseHtml('<nav><a href="/home">Home</a></nav>')
     expect(navOnly.blocks).toEqual([])
     expect(navOnly.links).toEqual(['/home'])
+  })
+  it('an <a> boundary is a word boundary, not a run-on, even with NO source whitespace on either side — and a space landing before punctuation is trimmed rather than left dangling', () => {
+    // No space before <a> ("the<a...") and none after it (the comma sits right against </a>): the
+    // old behaviour concatenated straight through the tag boundary ("...thepolicy, then...").
+    const parsed = parseHtml('<p>See the<a href="/x">policy</a>, then reply.</p>')
+    expect(parsed.blocks).toEqual([{ kind: 'paragraph', headingPath: [], text: 'See the policy, then reply.' }])
+  })
+  it('inline formatting tags (b/i/span) are NOT given the anchor\'s word-boundary treatment (existing behaviour unchanged)', () => {
+    const parsed = parseHtml('<p>See our <span>full</span><b>policy</b> for details.</p>')
+    expect(parsed.blocks).toEqual([{ kind: 'paragraph', headingPath: [], text: 'See our fullpolicy for details.' }])
   })
 })
 

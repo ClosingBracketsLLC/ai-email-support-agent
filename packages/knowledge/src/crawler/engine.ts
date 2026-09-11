@@ -85,16 +85,12 @@ export interface CrawlOptions {
  * Returns `null` for anything else (including a non-`PinnedFetchError` failure), which the caller
  * re-throws.
  *
- * `redirect_not_followed`: `PinnedFetchError` carries only a message of the form "... (301)" —
- * `@aesa/crypto`'s pinned-fetch transport reads the underlying undici `Response` (status AND the
- * `location` header) before throwing, but neither is attached to the error, and the package's
- * public surface (`packages/crypto/src/index.ts`) does not re-export the lower-level transport
- * that would let this adapter read them directly. This recovers the status from the message text
- * (the one piece `@aesa/crypto` does expose, even if only informally); `location` has no way out
- * of the current API and so is reported empty. The engine's redirect-hop logic (rule 4) treats a
- * 3xx with no `location` as a dead end, so a production redirect cannot currently be followed
- * through `createPinnedCrawlFetch` end-to-end — every crawler-engine test drives `crawlSite` with
- * the fake `CrawlFetch` instead, which returns `location` directly and is unaffected by this gap. */
+ * `redirect_not_followed` can no longer actually be thrown by the call this function guards
+ * (`createPinnedCrawlFetch` below passes `redirect: 'manual'`, so `pinnedFetch` RETURNS a 3xx
+ * response instead of throwing for it) — this branch stays as a defensive fallback matching
+ * `PinnedFetchError`'s full contract, and its status-from-message recovery is still exercised
+ * directly in `test/pinned-crawl-fetch.test.ts`. `body_too_large` remains live: a body over the
+ * cap throws regardless of redirect mode. */
 export function translatePinnedFetchError(err: unknown): { status: number; headers: Record<string, string>; body: string } | null {
   if (!(err instanceof PinnedFetchError)) return null
   if (err.code === 'body_too_large') return { status: 0, headers: {}, body: '' }
@@ -102,14 +98,17 @@ export function translatePinnedFetchError(err: unknown): { status: number; heade
   return { status: match ? Number(match[1]) : 302, headers: {}, body: '' }
 }
 
-/** Production `CrawlFetch`: pins every request to a pre-resolved public address (`pinnedFetch`)
- * and translates a `PinnedFetchError` (via `translatePinnedFetchError`) into the plain
- * `{ status, headers, body }` shape the engine expects instead of a thrown error, so a refused
- * redirect or an oversized body ends the ONE fetch attempt, not the whole crawl. */
+/** Production `CrawlFetch`: pins every request to a pre-resolved public address (`pinnedFetch`),
+ * requesting `redirect: 'manual'` so a 3xx comes back as an ordinary `{ status, headers, body }`
+ * result (its `location` header included) instead of throwing — the engine's own hop validation
+ * (`fetchResolved`: normalize → same-site → `resolvePublic` → fetch) is what actually follows it,
+ * exactly as it already does against the fake `CrawlFetch` in tests. `translatePinnedFetchError`
+ * still catches an oversized body (`body_too_large`, still thrown regardless of redirect mode) so
+ * that ends the ONE fetch attempt, not the whole crawl. */
 export function createPinnedCrawlFetch(): CrawlFetch {
   return async (url, init) => {
     try {
-      const res = await pinnedFetch(url, { timeoutMs: init.timeoutMs, maxBodyBytes: init.maxBodyBytes, headers: init.headers })
+      const res = await pinnedFetch(url, { timeoutMs: init.timeoutMs, maxBodyBytes: init.maxBodyBytes, headers: init.headers, redirect: 'manual' })
       const body = await res.text()
       const headers: Record<string, string> = {}
       res.headers.forEach((value, key) => { headers[key] = value })

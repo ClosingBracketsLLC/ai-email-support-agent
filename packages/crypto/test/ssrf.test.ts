@@ -107,6 +107,16 @@ describe('pinnedFetch transport (real sockets)', () => {
     expect(Date.now() - started).toBeLessThan(2_000)
   })
 
+  it('redirect defaults to "error": still throws PinnedFetchError(redirect_not_followed) on a 3xx', async () => {
+    await expect(get('/redirect')).rejects.toMatchObject({ name: 'PinnedFetchError', code: 'redirect_not_followed' })
+  })
+
+  it('redirect: "manual" returns the 3xx response itself (status + location), instead of throwing, so the caller re-validates the hop', async () => {
+    const res = await get('/redirect', { redirect: 'manual' })
+    expect(res.status).toBe(302)
+    expect(res.headers.get('location')).toBe('https://elsewhere.example/')
+  })
+
   it('rejects a body over maxBodyBytes with code body_too_large', async () => {
     await expect(get('/large', { maxBodyBytes: 1024 })).rejects.toMatchObject({ code: 'body_too_large' })
   })
