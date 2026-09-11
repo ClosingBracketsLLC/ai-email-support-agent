@@ -2,7 +2,7 @@ import { TRPCError } from '@trpc/server'
 import { APIError } from 'better-auth/api'
 import { and, asc, count, desc, eq, inArray, sql } from 'drizzle-orm'
 import {
-  CreateWorkspaceInput, SetAgentEnabledInput, deriveAllowedHosts, isOnboardingStep, nextOnboardingStep, slugify,
+  CreateWorkspaceInput, SetAgentEnabledInput, UpdateGuidanceInput, deriveAllowedHosts, isOnboardingStep, nextOnboardingStep, slugify,
   UpdateProfileInput, type OnboardingStep, type Tone,
 } from '@aesa/contracts'
 import { agents, audit, drafts, tickets, workspaces } from '@aesa/db'
@@ -100,6 +100,23 @@ export const workspaceRouter = router({
         .where(eq(workspaces.orgId, ctx.orgId)).returning()
       await audit(tx, { actor: ctx.actor, action: 'workspace.profile.update', entityType: 'workspace', entityId: ctx.orgId, detail: { tone: input.tone, allowedUrlHosts, onboardingStep }, ip: ctx.ip, userAgent: ctx.userAgent })
       return row!
+    })
+    return toWorkspaceView(updated)
+  }),
+
+  /** The Knowledge screen's free-text "operating guidance" block — one of the four trusted texts
+   * every guardrail gate (`@aesa/agent/policy`'s `buildReplyPolicy`) screens a reply against. The
+   * audit row logs only its length, never the text (CLAUDE.md — owner-authored free text is
+   * logged as a length, same rule `agents.ts`'s `auditValue` follows for persona/guidance text). */
+  updateGuidance: managerProcedure.input(UpdateGuidanceInput).mutation(async ({ ctx, input }) => {
+    const updated = await ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
+      const [row] = await tx.update(workspaces).set({ operatingGuidance: input.operatingGuidance }).where(eq(workspaces.orgId, ctx.orgId)).returning()
+      if (!row) throw new TRPCError({ code: 'NOT_FOUND', message: 'workspace not created yet' })
+      await audit(tx, {
+        actor: ctx.actor, action: 'workspace.guidance.update', entityType: 'workspace', entityId: ctx.orgId,
+        detail: { length: input.operatingGuidance.length }, ip: ctx.ip, userAgent: ctx.userAgent,
+      })
+      return row
     })
     return toWorkspaceView(updated)
   }),

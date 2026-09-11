@@ -1,0 +1,506 @@
+/**
+ * The `knowledge` tRPC surface (uploads, paste, crawl, list, delete, flagged chunks, gaps) as ONE
+ * service module, mirroring `apps/api/src/drafts/service.ts` + `routers/drafts.ts`: every procedure
+ * is a plain exported async function `(deps, orgId, actor, input) => result`, soft outcomes are a
+ * typed `{ ok: false; code; message? }` (never a thrown error), and `routers/knowledge.ts` does
+ * nothing but map those codes onto `TRPCError`s. Task 11's E2E calls these functions directly with
+ * `{ api, enqueue, store, logger }` — no logic may live only in the router.
+ *
+ * Discipline every function here keeps (CLAUDE.md):
+ *  - one `withOrg` transaction per call, holding no network I/O — the presign call (`startUpload`)
+ *    and the object delete (`deleteSource`) both happen AFTER the transaction has returned;
+ *  - every write guarded on what it was read at (a status IN list, `injection_flagged = true`), so
+ *    zero rows is a soft outcome, never an error;
+ *  - `enqueue` only after the transaction commits, and a collapsed duplicate (`null`) is logged at
+ *    debug, never thrown — the three `knowledge.*` queues are `short`-policy, so a second identical
+ *    enqueue while the first is still `created` is expected, not a bug.
+ */
+import { randomUUID, createHash } from 'node:crypto'
+import { and, count, desc, eq, inArray, ne, sql } from 'drizzle-orm'
+import type pino from 'pino'
+import {
+  KNOWLEDGE_DEFAULT_CRAWL_PAGES,
+  type KnowledgeFailureReason, type KnowledgeSourceKind, type KnowledgeSourceStatus,
+  type PasteInput, type StartCrawlInput, type StartUploadInput,
+} from '@aesa/contracts'
+import { resolveSetting } from '@aesa/core'
+import {
+  audit, bumpKnowledgeVersion, knowledgeChunks, knowledgeDocuments, knowledgeSources, workspaces,
+  type AuditActor, type OrgTx,
+} from '@aesa/db'
+import { uploadKey, type ObjectStore } from '@aesa/knowledge'
+import { JOB_NAMES } from '@aesa/queue'
+import type { ApiFacade, EnqueueFn } from '../deps.ts'
+import { loadOrgSettings } from '../org-settings.ts'
+import { computeGaps, type GapsView } from './gaps.ts'
+
+/** Who is acting — the same shape as `drafts/service.ts`'s `DraftActor`, minus `source` (knowledge
+ * has no session-less email surface). */
+export interface KnowledgeActor {
+  userId: string
+  actor: AuditActor
+  ip?: string | null
+  userAgent?: string | null
+}
+
+export interface KnowledgeServiceDeps {
+  api: ApiFacade
+  enqueue: EnqueueFn
+  store: ObjectStore
+  logger: pino.Logger
+  /** Test seam; production leaves it unset and reads the wall clock per call. */
+  now?: () => Date
+}
+
+const clock = (deps: KnowledgeServiceDeps): Date => deps.now?.() ?? new Date()
+
+/** The one-click upload URL's lifetime — the brief's `expiresSeconds: 600`. */
+const UPLOAD_URL_TTL_SECONDS = 600
+/** `flaggedChunks`'s cap, newest first. */
+const FLAGGED_CHUNKS_LIMIT = 200
+
+type SoftCode = 'not_found' | 'forbidden_cap' | 'bad_request'
+interface SoftFailure { ok: false; code: SoftCode; message?: string }
+
+function capFailure(setting: string, cap: number): SoftFailure {
+  return { ok: false, code: 'forbidden_cap', message: `${setting} reached (${cap})` }
+}
+
+// ---------------------------------------------------------------------------
+// the source view
+// ---------------------------------------------------------------------------
+
+export interface KnowledgeCrawlProgress { fetched: number; ingested: number; skipped: number }
+
+export interface KnowledgeSourceView {
+  id: string
+  kind: KnowledgeSourceKind
+  status: KnowledgeSourceStatus
+  title: string
+  url: string | null
+  mime: string | null
+  byteSize: number | null
+  documentCount: number
+  chunkCount: number
+  failureReason: KnowledgeFailureReason | null
+  failureDetail: string | null
+  crawlProgress: KnowledgeCrawlProgress | null
+  createdAt: Date
+  completedAt: Date | null
+}
+
+interface SourceRow {
+  id: string; kind: string; status: string; title: string; url: string | null; mime: string | null; byteSize: number | null
+  documentCount: number; chunkCount: number; failureReason: string | null; failureDetail: string | null
+  crawlConfig: unknown; createdAt: Date; completedAt: Date | null
+}
+
+/** `crawl_config.progress` is jsonb, read defensively (same discipline as the worker's own
+ * `crawlConfigOf` in `knowledge-crawl.ts`) — null for a non-crawl source or one that hasn't
+ * reported progress yet, never a half-shaped object. */
+function crawlProgressOf(kind: string, raw: unknown): KnowledgeCrawlProgress | null {
+  if (kind !== 'crawl' || typeof raw !== 'object' || raw === null) return null
+  const progress = (raw as { progress?: unknown }).progress
+  if (typeof progress !== 'object' || progress === null) return null
+  const { fetched, ingested, skipped } = progress as Record<string, unknown>
+  if (typeof fetched !== 'number' || typeof ingested !== 'number' || typeof skipped !== 'number') return null
+  return { fetched, ingested, skipped }
+}
+
+function toSourceView(row: SourceRow): KnowledgeSourceView {
+  return {
+    id: row.id, kind: row.kind as KnowledgeSourceKind, status: row.status as KnowledgeSourceStatus, title: row.title,
+    url: row.url, mime: row.mime, byteSize: row.byteSize, documentCount: row.documentCount, chunkCount: row.chunkCount,
+    failureReason: row.failureReason as KnowledgeFailureReason | null, failureDetail: row.failureDetail,
+    crawlProgress: crawlProgressOf(row.kind, row.crawlConfig), createdAt: row.createdAt, completedAt: row.completedAt,
+  }
+}
+
+const SOURCE_LIST_COLUMNS = {
+  id: knowledgeSources.id, kind: knowledgeSources.kind, status: knowledgeSources.status, title: knowledgeSources.title,
+  url: knowledgeSources.url, mime: knowledgeSources.mime, byteSize: knowledgeSources.byteSize,
+  documentCount: knowledgeSources.documentCount, chunkCount: knowledgeSources.chunkCount,
+  failureReason: knowledgeSources.failureReason, failureDetail: knowledgeSources.failureDetail,
+  crawlConfig: knowledgeSources.crawlConfig, createdAt: knowledgeSources.createdAt, completedAt: knowledgeSources.completedAt,
+}
+
+// ---------------------------------------------------------------------------
+// list
+// ---------------------------------------------------------------------------
+
+export interface KnowledgeListResult {
+  knowledgeVersion: number
+  counts: { sources: number; readyChunks: number; flaggedChunks: number }
+  sources: KnowledgeSourceView[]
+}
+
+export async function listSources(deps: KnowledgeServiceDeps, orgId: string): Promise<KnowledgeListResult> {
+  return deps.api.withOrg(orgId, async (tx) => {
+    const [workspace] = await tx.select({ knowledgeVersion: workspaces.knowledgeVersion }).from(workspaces).where(eq(workspaces.orgId, orgId)).limit(1)
+    const rows = await tx.select(SOURCE_LIST_COLUMNS).from(knowledgeSources).where(eq(knowledgeSources.orgId, orgId)).orderBy(desc(knowledgeSources.createdAt))
+
+    const [chunkCounts] = await tx.select({
+      ready: sql<number>`count(*) FILTER (WHERE ${knowledgeChunks.embedding} IS NOT NULL AND NOT ${knowledgeChunks.injectionFlagged})`,
+      flagged: sql<number>`count(*) FILTER (WHERE ${knowledgeChunks.injectionFlagged})`,
+    }).from(knowledgeChunks).where(eq(knowledgeChunks.orgId, orgId))
+
+    return {
+      knowledgeVersion: workspace?.knowledgeVersion ?? 0,
+      counts: { sources: rows.length, readyChunks: Number(chunkCounts?.ready ?? 0), flaggedChunks: Number(chunkCounts?.flagged ?? 0) },
+      sources: rows.map(toSourceView),
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// the max_sources cap
+// ---------------------------------------------------------------------------
+
+/** "Non-failed sources" (controller ruling): `status <> 'failed'` — a failed source doesn't hold a
+ * slot, so an owner can always retry after cleaning up. */
+async function checkSourceCap(tx: OrgTx, orgId: string): Promise<{ ok: true } | SoftFailure> {
+  const settings = await loadOrgSettings(tx, ['knowledge.max_sources'])
+  const cap = resolveSetting('knowledge.max_sources', { org: settings })
+  const [row] = await tx.select({ value: count() })
+    .from(knowledgeSources)
+    .where(and(eq(knowledgeSources.orgId, orgId), ne(knowledgeSources.status, 'failed')))
+  if ((row?.value ?? 0) >= cap) return capFailure('knowledge.max_sources', cap)
+  return { ok: true }
+}
+
+// ---------------------------------------------------------------------------
+// startUpload / completeUpload
+// ---------------------------------------------------------------------------
+
+export type StartUploadResult =
+  | { ok: true; sourceId: string; url: string; headers: Record<string, string>; expiresAt: Date }
+  | SoftFailure
+
+export async function startUpload(
+  deps: KnowledgeServiceDeps, orgId: string, actor: KnowledgeActor, input: StartUploadInput,
+): Promise<StartUploadResult> {
+  const now = clock(deps)
+  const outcome = await deps.api.withOrg(orgId, async (tx) => {
+    const capCheck = await checkSourceCap(tx, orgId)
+    if (!capCheck.ok) return capCheck
+
+    const sourceId = randomUUID()
+    const storageKey = uploadKey(orgId, sourceId, input.fileName)
+    await tx.insert(knowledgeSources).values({
+      id: sourceId, orgId, kind: 'upload', status: 'queued', title: input.fileName,
+      storageKey, mime: input.mime, byteSize: input.byteSize, createdBy: actor.userId,
+    })
+    await audit(tx, {
+      actor: actor.actor, action: 'knowledge.source.created', entityType: 'knowledge_source', entityId: sourceId,
+      detail: { kind: 'upload', title: input.fileName, mime: input.mime, byteSize: input.byteSize },
+      ip: actor.ip, userAgent: actor.userAgent,
+    })
+    return { ok: true as const, sourceId, storageKey }
+  })
+  if (!outcome.ok) return outcome
+
+  // Outside the transaction: the presign call is network I/O the app role's 5 s idle-in-transaction
+  // timeout would otherwise race.
+  const presigned = await deps.store.presignPut(outcome.storageKey, { contentType: input.mime, expiresSeconds: UPLOAD_URL_TTL_SECONDS })
+  return { ok: true, sourceId: outcome.sourceId, url: presigned.url, headers: presigned.headers, expiresAt: new Date(now.getTime() + UPLOAD_URL_TTL_SECONDS * 1000) }
+}
+
+export type CompleteUploadResult = { ok: true } | SoftFailure
+
+/** The job (`knowledge.ingest`) verifies the object actually landed; this call only checks the
+ * source is a `queued` upload that belongs to this org before waking it. */
+export async function completeUpload(
+  deps: KnowledgeServiceDeps, orgId: string, actor: KnowledgeActor, input: { sourceId: string },
+): Promise<CompleteUploadResult> {
+  const outcome = await deps.api.withOrg(orgId, async (tx) => {
+    const [source] = await tx.select({ id: knowledgeSources.id, kind: knowledgeSources.kind, status: knowledgeSources.status })
+      .from(knowledgeSources).where(and(eq(knowledgeSources.orgId, orgId), eq(knowledgeSources.id, input.sourceId))).limit(1)
+    if (!source) return { ok: false as const, code: 'not_found' as const }
+    if (source.kind !== 'upload') return { ok: false as const, code: 'bad_request' as const, message: 'source is not an upload' }
+    if (source.status !== 'queued') return { ok: false as const, code: 'bad_request' as const, message: `source is ${source.status}, not queued` }
+
+    await audit(tx, {
+      actor: actor.actor, action: 'knowledge.source.upload_completed', entityType: 'knowledge_source', entityId: source.id,
+      detail: { sourceId: source.id }, ip: actor.ip, userAgent: actor.userAgent,
+    })
+    return { ok: true as const, sourceId: source.id }
+  })
+  if (!outcome.ok) return outcome
+
+  const jobId = await deps.enqueue(JOB_NAMES.knowledgeIngest, { orgId, sourceId: outcome.sourceId }, { entityId: outcome.sourceId })
+  if (jobId === null) deps.logger.debug({ orgId, sourceId: outcome.sourceId }, 'knowledge.ingest enqueue returned no job id (duplicate collapsed)')
+  return { ok: true }
+}
+
+// ---------------------------------------------------------------------------
+// paste
+// ---------------------------------------------------------------------------
+
+export type PasteResult = { ok: true; sourceId: string } | SoftFailure
+
+/** `content_hash` here is a cheap sha256 fingerprint of the raw pasted text — NOT a dedupe key; the
+ * ingest job replaces it with the parsed-blocks hash once it has actually chunked the text. */
+export async function pasteSource(
+  deps: KnowledgeServiceDeps, orgId: string, actor: KnowledgeActor, input: PasteInput,
+): Promise<PasteResult> {
+  const outcome = await deps.api.withOrg(orgId, async (tx) => {
+    const capCheck = await checkSourceCap(tx, orgId)
+    if (!capCheck.ok) return capCheck
+
+    const contentHash = createHash('sha256').update(input.text, 'utf8').digest('hex')
+    const [row] = await tx.insert(knowledgeSources).values({
+      orgId, kind: 'paste', status: 'queued', title: input.title, pastedText: input.text, contentHash, createdBy: actor.userId,
+    }).returning({ id: knowledgeSources.id })
+    await audit(tx, {
+      actor: actor.actor, action: 'knowledge.source.created', entityType: 'knowledge_source', entityId: row!.id,
+      detail: { kind: 'paste', title: input.title, textLength: input.text.length }, ip: actor.ip, userAgent: actor.userAgent,
+    })
+    return { ok: true as const, sourceId: row!.id }
+  })
+  if (!outcome.ok) return outcome
+
+  const jobId = await deps.enqueue(JOB_NAMES.knowledgeIngest, { orgId, sourceId: outcome.sourceId }, { entityId: outcome.sourceId })
+  if (jobId === null) deps.logger.debug({ orgId, sourceId: outcome.sourceId }, 'knowledge.ingest enqueue returned no job id (duplicate collapsed)')
+  return outcome
+}
+
+// ---------------------------------------------------------------------------
+// startCrawl / refreshCrawl
+// ---------------------------------------------------------------------------
+
+/** `crawl_config.maxPages`, read defensively (same fallback the worker's `crawlConfigOf` uses). */
+function existingMaxPagesOf(raw: unknown): number {
+  if (typeof raw === 'object' && raw !== null) {
+    const v = (raw as { maxPages?: unknown }).maxPages
+    if (typeof v === 'number' && v > 0) return v
+  }
+  return KNOWLEDGE_DEFAULT_CRAWL_PAGES
+}
+
+/** Shared by `startCrawl`'s "found a `ready` row" branch and the standalone `refreshCrawl`:
+ * `status → queued`, `crawl_config` reset to just `{ maxPages }` (which is what clears `progress`),
+ * the failure trail cleared, guarded on the caller's `fromStatuses`. Returns false when the guard
+ * matched nothing (a concurrent writer already moved the source). */
+async function requeueCrawlSource(
+  tx: OrgTx, orgId: string, source: { id: string; crawlConfig: unknown }, fromStatuses: KnowledgeSourceStatus[],
+  pageCap: number, actor: KnowledgeActor,
+): Promise<boolean> {
+  const maxPages = Math.min(existingMaxPagesOf(source.crawlConfig), pageCap)
+  const rows = await tx.update(knowledgeSources)
+    .set({ status: 'queued', crawlConfig: { maxPages }, failureReason: null, failureDetail: null, completedAt: null, claimToken: null })
+    .where(and(eq(knowledgeSources.orgId, orgId), eq(knowledgeSources.id, source.id), inArray(knowledgeSources.status, fromStatuses)))
+    .returning({ id: knowledgeSources.id })
+  if (rows.length === 0) return false
+  await audit(tx, {
+    actor: actor.actor, action: 'knowledge.source.crawl_requeued', entityType: 'knowledge_source', entityId: source.id,
+    detail: { sourceId: source.id, maxPages }, ip: actor.ip, userAgent: actor.userAgent,
+  })
+  return true
+}
+
+export type StartCrawlResult = { ok: true; sourceId: string } | SoftFailure
+
+/**
+ * One non-failed crawl source per URL per org (controller ruling): a match on `ready` re-queues
+ * that row (the `refreshCrawl` path); a match on `queued`/`processing` returns its id with nothing
+ * else done — a crawl is already pending. Only a URL with no live match ever inserts a new row,
+ * which is the only branch the `max_sources` cap applies to.
+ */
+export async function startCrawl(
+  deps: KnowledgeServiceDeps, orgId: string, actor: KnowledgeActor, input: StartCrawlInput,
+): Promise<StartCrawlResult> {
+  const outcome = await deps.api.withOrg(orgId, async (tx) => {
+    const settings = await loadOrgSettings(tx, ['knowledge.max_sources', 'knowledge.max_crawl_pages'])
+    const pageCap = resolveSetting('knowledge.max_crawl_pages', { org: settings })
+
+    const [existing] = await tx.select({ id: knowledgeSources.id, status: knowledgeSources.status, crawlConfig: knowledgeSources.crawlConfig })
+      .from(knowledgeSources)
+      .where(and(eq(knowledgeSources.orgId, orgId), eq(knowledgeSources.kind, 'crawl'), eq(knowledgeSources.url, input.url), ne(knowledgeSources.status, 'failed')))
+      .limit(1)
+
+    if (existing) {
+      if (existing.status === 'ready') {
+        const requeued = await requeueCrawlSource(tx, orgId, existing, ['ready'], pageCap, actor)
+        return { ok: true as const, sourceId: existing.id, shouldEnqueue: requeued }
+      }
+      // queued | processing: already pending — no new enqueue, no audit.
+      return { ok: true as const, sourceId: existing.id, shouldEnqueue: false }
+    }
+
+    const capCheck = await checkSourceCap(tx, orgId)
+    if (!capCheck.ok) return capCheck
+
+    const maxPages = Math.min(input.maxPages, pageCap)
+    const [row] = await tx.insert(knowledgeSources).values({
+      orgId, kind: 'crawl', status: 'queued', title: input.url, url: input.url, crawlConfig: { maxPages }, createdBy: actor.userId,
+    }).returning({ id: knowledgeSources.id })
+    await audit(tx, {
+      actor: actor.actor, action: 'knowledge.source.created', entityType: 'knowledge_source', entityId: row!.id,
+      detail: { kind: 'crawl', url: input.url, maxPages }, ip: actor.ip, userAgent: actor.userAgent,
+    })
+    return { ok: true as const, sourceId: row!.id, shouldEnqueue: true }
+  })
+  if (!outcome.ok) return outcome
+
+  if (outcome.shouldEnqueue) {
+    const jobId = await deps.enqueue(JOB_NAMES.knowledgeCrawl, { orgId, sourceId: outcome.sourceId }, { entityId: outcome.sourceId })
+    if (jobId === null) deps.logger.debug({ orgId, sourceId: outcome.sourceId }, 'knowledge.crawl enqueue returned no job id (duplicate collapsed)')
+  }
+  return { ok: true, sourceId: outcome.sourceId }
+}
+
+export type RefreshCrawlResult = { ok: true } | SoftFailure
+
+export async function refreshCrawl(
+  deps: KnowledgeServiceDeps, orgId: string, actor: KnowledgeActor, input: { sourceId: string },
+): Promise<RefreshCrawlResult> {
+  const outcome = await deps.api.withOrg(orgId, async (tx) => {
+    const [source] = await tx.select({ id: knowledgeSources.id, kind: knowledgeSources.kind, status: knowledgeSources.status, crawlConfig: knowledgeSources.crawlConfig })
+      .from(knowledgeSources).where(and(eq(knowledgeSources.orgId, orgId), eq(knowledgeSources.id, input.sourceId))).limit(1)
+    if (!source) return { ok: false as const, code: 'not_found' as const }
+    if (source.kind !== 'crawl') return { ok: false as const, code: 'bad_request' as const, message: 'source is not a crawl' }
+    if (source.status !== 'ready' && source.status !== 'failed') {
+      return { ok: false as const, code: 'bad_request' as const, message: `source is ${source.status}, not ready or failed` }
+    }
+
+    const settings = await loadOrgSettings(tx, ['knowledge.max_crawl_pages'])
+    const pageCap = resolveSetting('knowledge.max_crawl_pages', { org: settings })
+    const requeued = await requeueCrawlSource(tx, orgId, source, ['ready', 'failed'], pageCap, actor)
+    if (!requeued) return { ok: false as const, code: 'bad_request' as const, message: 'source changed status before it could be requeued' }
+    return { ok: true as const, sourceId: source.id }
+  })
+  if (!outcome.ok) return outcome
+
+  const jobId = await deps.enqueue(JOB_NAMES.knowledgeCrawl, { orgId, sourceId: outcome.sourceId }, { entityId: outcome.sourceId })
+  if (jobId === null) deps.logger.debug({ orgId, sourceId: outcome.sourceId }, 'knowledge.crawl enqueue returned no job id (duplicate collapsed)')
+  return { ok: true }
+}
+
+// ---------------------------------------------------------------------------
+// deleteSource
+// ---------------------------------------------------------------------------
+
+export type DeleteSourceResult = { ok: true } | { ok: false; code: 'not_found' }
+
+export async function deleteSource(
+  deps: KnowledgeServiceDeps, orgId: string, actor: KnowledgeActor, input: { sourceId: string },
+): Promise<DeleteSourceResult> {
+  const outcome = await deps.api.withOrg(orgId, async (tx) => {
+    const [source] = await tx.select({ id: knowledgeSources.id, kind: knowledgeSources.kind, storageKey: knowledgeSources.storageKey })
+      .from(knowledgeSources).where(and(eq(knowledgeSources.orgId, orgId), eq(knowledgeSources.id, input.sourceId))).limit(1)
+    if (!source) return { ok: false as const, code: 'not_found' as const }
+
+    const deleted = await tx.delete(knowledgeSources)
+      .where(and(eq(knowledgeSources.orgId, orgId), eq(knowledgeSources.id, source.id)))
+      .returning({ id: knowledgeSources.id })
+    if (deleted.length === 0) return { ok: false as const, code: 'not_found' as const }
+
+    await bumpKnowledgeVersion(tx, orgId)
+    await audit(tx, {
+      actor: actor.actor, action: 'knowledge.source.deleted', entityType: 'knowledge_source', entityId: source.id,
+      detail: { kind: source.kind }, ip: actor.ip, userAgent: actor.userAgent,
+    })
+    return { ok: true as const, kind: source.kind, storageKey: source.storageKey }
+  })
+  if (!outcome.ok) return outcome
+
+  // Outside the transaction, and never allowed to fail the mutation: the row is already gone.
+  if (outcome.kind === 'upload' && outcome.storageKey) {
+    try {
+      await deps.store.delete(outcome.storageKey)
+    } catch (err) {
+      deps.logger.warn({ sourceId: input.sourceId, err: err instanceof Error ? err.message : String(err) }, 'knowledge: failed to delete the uploaded object')
+    }
+  }
+  return { ok: true }
+}
+
+// ---------------------------------------------------------------------------
+// flaggedChunks / unflagChunk / deleteChunk
+// ---------------------------------------------------------------------------
+
+export interface FlaggedChunkView {
+  id: string
+  sourceId: string
+  sourceTitle: string
+  documentUri: string
+  headingPath: string[]
+  content: string
+  reason: string | null
+}
+
+export async function flaggedChunks(deps: KnowledgeServiceDeps, orgId: string): Promise<{ chunks: FlaggedChunkView[] }> {
+  const chunks = await deps.api.withOrg(orgId, (tx) =>
+    tx.select({
+      id: knowledgeChunks.id, sourceId: knowledgeSources.id, sourceTitle: knowledgeSources.title,
+      documentUri: knowledgeDocuments.uri, headingPath: knowledgeChunks.headingPath, content: knowledgeChunks.content,
+      reason: knowledgeChunks.injectionReason,
+    })
+      .from(knowledgeChunks)
+      .innerJoin(knowledgeDocuments, eq(knowledgeDocuments.id, knowledgeChunks.documentId))
+      .innerJoin(knowledgeSources, eq(knowledgeSources.id, knowledgeDocuments.sourceId))
+      .where(and(eq(knowledgeChunks.orgId, orgId), eq(knowledgeChunks.injectionFlagged, true)))
+      .orderBy(desc(knowledgeChunks.createdAt))
+      .limit(FLAGGED_CHUNKS_LIMIT),
+  )
+  return { chunks }
+}
+
+export type UnflagChunkResult = { ok: true } | { ok: false; code: 'not_found' }
+
+export async function unflagChunk(
+  deps: KnowledgeServiceDeps, orgId: string, actor: KnowledgeActor, input: { chunkId: string },
+): Promise<UnflagChunkResult> {
+  const outcome = await deps.api.withOrg(orgId, async (tx) => {
+    const rows = await tx.update(knowledgeChunks)
+      .set({ injectionFlagged: false, injectionReason: null })
+      .where(and(eq(knowledgeChunks.orgId, orgId), eq(knowledgeChunks.id, input.chunkId), eq(knowledgeChunks.injectionFlagged, true)))
+      .returning({ id: knowledgeChunks.id, documentId: knowledgeChunks.documentId, embedding: knowledgeChunks.embedding })
+    const row = rows[0]
+    if (!row) return { ok: false as const, code: 'not_found' as const }
+
+    await bumpKnowledgeVersion(tx, orgId)
+    await audit(tx, {
+      actor: actor.actor, action: 'knowledge.chunk.unflagged', entityType: 'knowledge_chunk', entityId: row.id,
+      detail: { chunkId: row.id, documentId: row.documentId }, ip: actor.ip, userAgent: actor.userAgent,
+    })
+    return { ok: true as const, documentId: row.documentId, needsEmbed: row.embedding === null }
+  })
+  if (!outcome.ok) return outcome
+
+  if (outcome.needsEmbed) {
+    const jobId = await deps.enqueue(JOB_NAMES.knowledgeEmbedBatch, { orgId, documentId: outcome.documentId }, { entityId: outcome.documentId })
+    if (jobId === null) deps.logger.debug({ orgId, documentId: outcome.documentId }, 'knowledge.embed-batch enqueue returned no job id (duplicate collapsed)')
+  }
+  return { ok: true }
+}
+
+export type DeleteChunkResult = { ok: true } | { ok: false; code: 'not_found' }
+
+export async function deleteChunk(
+  deps: KnowledgeServiceDeps, orgId: string, actor: KnowledgeActor, input: { chunkId: string },
+): Promise<DeleteChunkResult> {
+  return deps.api.withOrg(orgId, async (tx) => {
+    const rows = await tx.delete(knowledgeChunks)
+      .where(and(eq(knowledgeChunks.orgId, orgId), eq(knowledgeChunks.id, input.chunkId), eq(knowledgeChunks.injectionFlagged, true)))
+      .returning({ id: knowledgeChunks.id, documentId: knowledgeChunks.documentId })
+    const row = rows[0]
+    if (!row) return { ok: false as const, code: 'not_found' as const }
+
+    await bumpKnowledgeVersion(tx, orgId)
+    await audit(tx, {
+      actor: actor.actor, action: 'knowledge.chunk.deleted', entityType: 'knowledge_chunk', entityId: row.id,
+      detail: { chunkId: row.id, documentId: row.documentId }, ip: actor.ip, userAgent: actor.userAgent,
+    })
+    return { ok: true as const }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// gaps
+// ---------------------------------------------------------------------------
+
+export async function gaps(deps: KnowledgeServiceDeps, orgId: string): Promise<GapsView> {
+  const now = clock(deps)
+  return deps.api.withOrg(orgId, (tx) => computeGaps(tx, orgId, now))
+}

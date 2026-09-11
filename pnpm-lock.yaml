@@ -44,6 +44,9 @@ importers:
       '@aesa/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@aesa/knowledge':
+        specifier: workspace:*
+        version: link:../../packages/knowledge
       '@aesa/mail':
         specifier: workspace:*
         version: link:../../packages/mail

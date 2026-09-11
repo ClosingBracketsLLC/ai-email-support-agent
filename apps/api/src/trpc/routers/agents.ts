@@ -6,23 +6,16 @@
 import { TRPCError } from '@trpc/server'
 import { and, asc, eq, sql } from 'drizzle-orm'
 import { AgentIdInput, DRAFT_MODEL_ID, SandboxOutputView, SandboxRunInput, SandboxStartInput, UpdateAgentInput } from '@aesa/contracts'
-import { resolveSetting, type SettingKey } from '@aesa/core'
+import { resolveSetting } from '@aesa/core'
 import {
-  agentCategoryPolicies, agentRuns, agents, audit, bumpMeter, categories, mailboxConnections, orgSettings,
+  agentCategoryPolicies, agentRuns, agents, audit, bumpMeter, categories, mailboxConnections,
   SANDBOX_METERS, usageCounters,
 } from '@aesa/db'
 import { JOB_NAMES } from '@aesa/queue'
+import { loadOrgSettings } from '../../org-settings.ts'
 import { managerProcedure, orgProcedure, router } from '../init.ts'
 
 const utcDayString = (d: Date): string => d.toISOString().slice(0, 10)
-
-/** Mirrors the worker's `buildOrgSettings` (apps/worker/src/jobs/ticket-draft.ts) — turns the
- * `org_settings` rows for one key into the map `resolveSetting` expects. */
-function buildOrgSettings(rows: { key: string; value: unknown }[]): Partial<Record<SettingKey, unknown>> {
-  const out: Partial<Record<SettingKey, unknown>> = {}
-  for (const row of rows) out[row.key as SettingKey] = row.value
-  return out
-}
 
 /** Owner-authored free text (personaText/guidanceExtra/signature can run to thousands of characters) —
  * the audit row logs a length, never the body. Everything else changed by this input is short and
@@ -141,12 +134,8 @@ export const agentsRouter = router({
         throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'agent is not active' })
       }
 
-      // The `orgId` predicate is a brace, not the lock: RLS already scopes this read. It is here
-      // because every other read in this file carries it, and because a table that ever landed in
-      // `RLS_EXEMPT`'s list would otherwise silently read another org's cap (fix wave A5, final-C M3).
-      const settingsRows = await tx.select({ key: orgSettings.key, value: orgSettings.value })
-        .from(orgSettings).where(and(eq(orgSettings.orgId, ctx.orgId), eq(orgSettings.key, 'sandbox.daily_cap')))
-      const cap = resolveSetting('sandbox.daily_cap', { org: buildOrgSettings(settingsRows) })
+      const settings = await loadOrgSettings(tx, ['sandbox.daily_cap'])
+      const cap = resolveSetting('sandbox.daily_cap', { org: settings })
 
       const [counter] = await tx.select({ value: usageCounters.value }).from(usageCounters)
         .where(and(eq(usageCounters.orgId, ctx.orgId), eq(usageCounters.day, day), eq(usageCounters.meter, SANDBOX_METERS.runs)))
