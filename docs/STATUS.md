@@ -1,7 +1,11 @@
 # Project status
 
 Updated 2026-09-11. The spec (`docs/superpowers/specs/2026-09-07-ai-email-support-agent-design.md`)
-defines seven build phases; this file records where the build stands against them.
+defines Phase 0 (rails and tenancy) plus seven build phases, Phases 1–7; this file records where the
+build stands against them. As of 2026-09-11: Phases 0–3 and the brand are on `main`; Phase 4 is
+complete on `phase-4` and open as PR #5; Phases 5 (autonomy and learning), 6 (provider choice / BYOK)
+and 7 (billing, caps, launch hardening) remain, each starting at `superpowers:writing-plans` from the
+spec's *Build phases* paragraph for that phase.
 
 ## Done
 
@@ -374,7 +378,7 @@ the record)</summary>
 </details>
 
 
-### Phase 3 — draft, review, send (complete on branch `phase-3`; PR not yet opened)
+### Phase 3 — draft, review, send (complete; merged into `main` via PR #3 on 2026-09-11, carrying the brand)
 
 - Plan: `docs/superpowers/plans/2026-09-09-phase-3-draft-review-send.md` (23 tasks, executed with
   subagent-driven development). Commits `acf1f4f..HEAD` on `phase-3`, branched from `main` at
@@ -704,7 +708,7 @@ the record)</summary>
   their guarded UPDATE's `RETURNING`, the draft insert retiring every live draft except `sending`,
   and the app's five copy/state minors.
 
-### Brand — the aesa identity (complete on branch `brand`; PR follows PR #3)
+### Brand — the aesa identity (complete; merged into `phase-3` via PR #4 and landed on `main` with PR #3 on 2026-09-11)
 
 - Plan: `docs/superpowers/plans/2026-09-10-brand-system.md` (7 tasks, executed with
   subagent-driven development). Commits `0f3efbe..1d843c7` on `brand`, branched from `phase-3` at
@@ -826,7 +830,7 @@ the record)</summary>
   (`pnpm --filter @aesa/worker test test/e2e-phase3.test.ts`), and `apps/worker` has no dependency
   on anything this wave touched.
 
-### Phase 4 — knowledge (complete on branch `phase-4`; PR not yet opened)
+### Phase 4 — knowledge (complete on branch `phase-4`; PR #5 open against `main`, https://github.com/ClosingBracketsLLC/ai-email-support-agent/pull/5)
 
 - Plan: `docs/superpowers/plans/2026-09-10-phase-4-knowledge.md` (11 tasks, executed with
   subagent-driven development). Commits **`de35bf9..HEAD`** on `phase-4`, branched from `main` at
@@ -1175,9 +1179,10 @@ the record)</summary>
 
 ## Next: Phase 5 — autonomy and learning
 
-**Where to start.** `phase-4` is complete on its branch and lands on `main` through a GitHub PR with
-a merge commit on Robert's go-ahead (the standing flow from his 2026-09-09 instruction), after
-`phase-3` (PR #3, which carries `brand`). Once it is merged, check out `main`, pull, and branch
+**Where to start.** `phase-4` is complete and open as PR #5 against `main`
+(https://github.com/ClosingBracketsLLC/ai-email-support-agent/pull/5); Robert merges it with a merge
+commit and deletes the branch (the standing flow from his 2026-09-09 instruction). Phases 0–3 and the
+brand are already on `main` (PR #3, merged 2026-09-11). Once PR #5 is merged, check out `main`, pull, and branch
 `phase-5` off it. Start with `superpowers:writing-plans` against the spec's *Build phases → Phase 5*
 section. Run the local setup from `CLAUDE.md` — including `pnpm db:up && pnpm s3:init` and the
 `S3_*` exports, so the minio-gated storage suite actually runs — and confirm the 2,134-test baseline (2,132 + 2 minio-gated skips without `S3_*` exported)
@@ -1377,7 +1382,6 @@ these 18 carry:
 
 ## Later phases (see the spec for scope and verification)
 
-- Phase 5 — autonomy and learning (resolved-answer memory, evidence score, graduation).
 - Phase 6 — provider choice (BYOK adapters, probes, per-agent model config).
 - Phase 7 — billing, caps, launch hardening. Owes the `plan` column and the `{ plan }` argument at every `resolveSetting` site: until then every org sits on the catalog defaults (100 sources, 200 crawl pages, 5,000,000 daily embed tokens) and `PLANS.trial` is inert (Phase 4 final review, seams D1).
 
