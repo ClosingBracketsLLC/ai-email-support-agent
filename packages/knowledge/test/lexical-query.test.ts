@@ -22,6 +22,18 @@ describe('relaxedTsQuery', () => {
     expect(relaxedTsQuery('CAFÉ café')).toBe('café:*')   // lowercased and deduped, accents kept
   })
 
+  it('caps the term list at 24, keeping the first in order of appearance', () => {
+    // The `text` fallback feeds up to 1,000 characters of the customer's own email in; every `:*`
+    // expands over every tenant's lexemes in the GIN index before `org_id` narrows anything.
+    const long = Array.from({ length: 300 }, (_, i) => `word${i}`).join(' ')
+    const capped = relaxedTsQuery(long)!
+    expect(capped.split(' | ')).toHaveLength(24)
+    expect(capped.split(' | ')).toEqual(Array.from({ length: 24 }, (_, i) => `word${i}:*`))
+
+    const short = 'alpha bravo charlie delta echo foxtrot golf hotel india juliet'
+    expect(relaxedTsQuery(short)!.split(' | ')).toHaveLength(10)   // a 10-token question is untouched
+  })
+
   it('dedupes while preserving first-seen order', () => {
     expect(relaxedTsQuery('refund my refund for the refund')).toBe('refund:*')
     expect(relaxedTsQuery('shipping refund shipping')).toBe('shipping:* | refund:*')

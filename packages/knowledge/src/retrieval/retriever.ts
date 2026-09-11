@@ -1,5 +1,6 @@
 import { and, eq, inArray } from 'drizzle-orm'
-import { knowledgeChunks, withOrg, workspaces, type Db } from '@aesa/db'
+import { knowledgeChunks, withOrg, workspaces, type Db, type OrgTx } from '@aesa/db'
+// type-only — erases at runtime; `@aesa/agent` is a devDependency on purpose (every consumer already depends on it)
 import type { RetrievedChunk, Retriever } from '@aesa/agent'
 import type { Embedder, Reranker } from '../embed/types.ts'
 import { fuseRanked } from './fuse.ts'
@@ -112,7 +113,9 @@ function capContent(chunks: RetrievedChunk[], maxContentChars: number): Retrieve
 export function createRetriever(deps: RetrieverDeps): DetailedRetriever {
   const limits = { ...DEFAULT_RETRIEVAL_LIMITS, ...deps.limits }
 
-  async function readKnowledgeVersion(tx: { select: Db['select'] }, orgId: string): Promise<number> {
+  /** `OrgTx`, not a structural `{ select }`: only `withOrg` mints one, so a read that escaped a
+   * tenant transaction cannot typecheck. */
+  async function readKnowledgeVersion(tx: OrgTx, orgId: string): Promise<number> {
     const [row] = await tx.select({ knowledgeVersion: workspaces.knowledgeVersion }).from(workspaces).where(eq(workspaces.orgId, orgId)).limit(1)
     return row?.knowledgeVersion ?? 0
   }
@@ -190,7 +193,11 @@ export function createRetriever(deps: RetrieverDeps): DetailedRetriever {
         : await tx
             .select({ id: knowledgeChunks.id, orgId: knowledgeChunks.orgId, headingPath: knowledgeChunks.headingPath, content: knowledgeChunks.content })
             .from(knowledgeChunks)
-            .where(and(eq(knowledgeChunks.orgId, orgId), inArray(knowledgeChunks.id, ids)))
+            // `injection_flagged` is re-applied here, not just on the legs that produced these ids:
+            // this is the set that becomes prompt text, and a quarantined chunk must not reach a
+            // model because one leg's filter was wrong or an owner flagged it mid-run. Same
+            // defense-in-depth rationale as `assertSameOrg` below.
+            .where(and(eq(knowledgeChunks.orgId, orgId), eq(knowledgeChunks.injectionFlagged, false), inArray(knowledgeChunks.id, ids)))
       return { rows, knowledgeVersion: await readKnowledgeVersion(tx, orgId) }
     })
     assertSameOrg(orgId, rows)

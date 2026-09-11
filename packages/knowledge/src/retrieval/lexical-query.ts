@@ -35,8 +35,18 @@ const STOP_WORDS: ReadonlySet<string> = new Set([
 const MIN_TOKEN_LENGTH = 3
 
 /**
+ * The ceiling on OR-ed prefix terms. The `text` fallback feeds up to 1,000 characters of the
+ * customer's own email into this function, so an unbounded query could reach ~250 `term:*` clauses
+ * — and the GIN index is on `tsv` alone, so EVERY prefix expands over every tenant's lexemes before
+ * the `org_id` filter narrows anything. 24 content words is already far more signal than a support
+ * question carries; the first ones in a message are also the ones that state its subject, so the
+ * cap keeps the HEAD of the list rather than sampling it.
+ */
+const MAX_TERMS = 24
+
+/**
  * `null` when the question has no content word left — the caller skips the leg entirely rather
- * than sending Postgres an empty `to_tsquery`.
+ * than sending Postgres an empty `to_tsquery`. At most `MAX_TERMS` terms come back.
  *
  * The output is safe to bind into `to_tsquery('simple', $1)`: every token is stripped to letters
  * and digits, so no tsquery operator, quote or parenthesis can survive from the customer's text.
@@ -46,6 +56,7 @@ export function relaxedTsQuery(question: string): string | null {
   const terms: string[] = []
   const seen = new Set<string>()
   for (const token of tokens) {
+    if (terms.length >= MAX_TERMS) break
     if (token.length < MIN_TOKEN_LENGTH || STOP_WORDS.has(token)) continue
     // Belt and braces: the split above already yields letters and digits only, but the result of
     // this function is interpolated by Postgres into a tsquery, so nothing else may leave here.

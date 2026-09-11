@@ -1,3 +1,4 @@
+// type-only — erases at runtime; `@aesa/agent` is a devDependency on purpose (every consumer already depends on it)
 import type { RetrievedChunk } from '@aesa/agent'
 import type { Reranker } from '../embed/types.ts'
 

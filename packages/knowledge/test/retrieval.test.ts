@@ -152,6 +152,21 @@ describe('createRetriever', () => {
     // ...and the flag is per org: the identical chunk in a neighbour org is untouched.
     const neighbour = await retriever.retrieveDetailed({ orgId: orgs[40]!, questions: [question], text: '', signal })
     expect(headings(neighbour)).toContain('Gift cards')
+
+    // A text whose only lexical match in the corpus IS the flagged chunk ('balances' appears in no
+    // other golden or decoy content), through the lexical-only path so the vector leg — which
+    // always returns its `perQuery` nearest rows whatever their distance — cannot pad the result.
+    // Nothing comes back: the flag is enforced by the leg AND re-applied by the re-read that builds
+    // the prompt text, not merely by whichever query produced the id.
+    const lexicalOnly = createRetriever({
+      db: handle.db,
+      embedder: { model: 'hash-v1', version: 1, dimensions: 1024, embed: async () => { throw new EmbedError('transient', 'voyage down') } },
+      logger: { warn: () => {} },
+    })
+    const quarantined = await lexicalOnly.retrieveDetailed({ orgId, questions: [], text: 'balances', signal })
+    expect(quarantined.chunks).toEqual([])
+    const unflagged = await lexicalOnly.retrieveDetailed({ orgId: orgs[40]!, questions: [], text: 'balances', signal })
+    expect(headings(unflagged)).toEqual(['Gift cards'])   // control: the same text finds it while unflagged
   })
 
   it('excludes chunks written by another embedding model from the vector leg', async () => {
