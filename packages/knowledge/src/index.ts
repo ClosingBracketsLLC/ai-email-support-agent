@@ -17,6 +17,20 @@ export {
   type CreateVoyageEmbedderOptions,
   type CreateVoyageRerankerOptions,
 } from './embed/voyage.ts'
+export { fuseRanked, RRF_K } from './retrieval/fuse.ts'
+export { rerankChunks } from './retrieval/rerank.ts'
+export {
+  assertSameOrg,
+  createRetriever,
+  DEFAULT_RETRIEVAL_LIMITS,
+  RERANK_CANDIDATES,
+  type DetailedRetriever,
+  type RetrievalLimits,
+  type RetrievalResult,
+  type RetrieveInput,
+  type RetrieverDeps,
+} from './retrieval/retriever.ts'
+export { lexicalSearchSql, vectorLiteral, vectorSearchSql } from './retrieval/sql.ts'
 export { createMemoryStore } from './storage/memory.ts'
 export { createS3Store, type CreateS3StoreOptions } from './storage/s3.ts'
 export { type ObjectStore } from './storage/types.ts'
