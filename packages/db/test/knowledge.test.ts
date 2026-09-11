@@ -25,9 +25,12 @@ describe('knowledge tables', () => {
         { orgId, documentId: doc!.id, ordinal: 0, headingPath: ['Returns'], content: 'Returns are accepted within 30 days.', tokenCount: 9, embedding: sql.raw(`'${v(0)}'::vector`) as never, embeddingModel: 'hash-v1', embeddingVersion: 1 },
         { orgId, documentId: doc!.id, ordinal: 1, headingPath: ['Shipping'], content: 'We ship worldwide.', tokenCount: 5, embedding: sql.raw(`'${v(5)}'::vector`) as never, embeddingModel: 'hash-v1', embeddingVersion: 1 },
       ])
-      const rows = await tx.execute(sql`SELECT ordinal, tsv::text AS tsv, (embedding <=> ${v(0)}::vector) AS distance FROM knowledge_chunks WHERE org_id = ${orgId} ORDER BY embedding <=> ${v(0)}::vector`)
-      expect(rows.rows.map((r) => r.ordinal)).toEqual([0, 1])
-      expect(String(rows.rows[0]!.tsv)).toContain("'returns'")   // simple config: no stemming, lowercased tokens — 'returns' stays 'returns'
+      // Probe with v(5) — ordinal 1's own embedding, NOT the vector either row was inserted first with —
+      // so the ordering flip actually exercises ORDER BY embedding <=> :probe rather than coincidentally
+      // matching insertion order the way probing with v(0) (ordinal 0's own embedding) would.
+      const rows = await tx.execute(sql`SELECT ordinal, tsv::text AS tsv, (embedding <=> ${v(5)}::vector) AS distance FROM knowledge_chunks WHERE org_id = ${orgId} ORDER BY embedding <=> ${v(5)}::vector`)
+      expect(rows.rows.map((r) => r.ordinal)).toEqual([1, 0])
+      expect(String(rows.rows[0]!.tsv)).toContain("'worldwide'")   // simple config: no stemming, lowercased tokens
       expect(Number(rows.rows[0]!.distance)).toBeCloseTo(0, 6)
     })
   })
@@ -47,7 +50,13 @@ describe('knowledge tables', () => {
 
   it('bumpKnowledgeVersion increments and returns the new version', async () => {
     const a = await withOrg(handle.db, orgId, (tx) => bumpKnowledgeVersion(tx, orgId))
+    expect(a).toBe(1)   // workspaces.knowledge_version defaults to 0; nothing earlier in this file bumps it
     const b = await withOrg(handle.db, orgId, (tx) => bumpKnowledgeVersion(tx, orgId))
     expect(b).toBe(a + 1)
+  })
+
+  it('bumpKnowledgeVersion rejects when the org has no workspace row', async () => {
+    const orphanOrgId = await createTestOrganization(handle, 'Orphan Org')   // organization row, no matching workspaces row
+    await expect(withOrg(handle.db, orphanOrgId, (tx) => bumpKnowledgeVersion(tx, orphanOrgId))).rejects.toThrow(/no workspace/)
   })
 })

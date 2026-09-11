@@ -834,7 +834,11 @@ merged, check out `main`, pull, and branch `phase-4` off it. Start with
 `superpowers:writing-plans` against the spec's *Build phases → Phase 4* section. Run the local setup
 from `CLAUDE.md` and confirm the 1,641-test baseline above before writing the plan. The `brand`
 branch (cut from `phase-3`) is complete and lands on `main` the same way, through its own PR with a
-merge commit, on Robert's go-ahead, after PR #3.
+merge commit, on Robert's go-ahead, after PR #3. A dev Postgres volume created before Phase 4 predates
+`scripts/db-init/001-roles.sql`'s pgvector install and needs `pnpm db:down && pnpm db:up` to pick it
+up. In production, install the `vector` extension once, as the cluster superuser, before deploying
+Phase 4's migrations — `packages/db/migrations/0012_pgvector.sql` runs as the non-superuser
+`aesa_owner` and cannot install it itself (the Phase 4 runbook will repeat this).
 
 **The hand-off.** Phase 4 is knowledge: the document parsers, the site crawler, Voyage embeddings,
 retrieval, and the `minio`/R2 upload path. Two seams are already in place and waiting for it:
