@@ -716,9 +716,10 @@ the record)</summary>
   rasters, ICO, the generated `BRAND` module), `073e9f5` (Task 4, the api's favicons/social
   card/review-page CSS), `658b70e` (Task 5, the app's theme, bundled fonts, `app.json`),
   `1d843c7` (Task 6, the app's SVG mark/wordmark/lockup, the eight icons, brand-toned chips and
-  banners) — plus the docs commit that closes it (this commit, Task 7). A whole-branch review
-  follows this record, per `superpowers:subagent-driven-development`; its fixes, if any, are
-  appended below afterward. Gate at this commit: typecheck and lint clean across all 14
+  banners) — plus the docs commit that closes it (this commit, Task 7). The whole-branch review
+  record is `docs/superpowers/reviews/2026-09-10-brand-final-review.md` (verdict, the three
+  Important findings, the fix wave `4a7f110`/`78e8ec4`/`9b50dcd`, the parked residuals and the
+  rulings); its fix wave is the paragraph at the end of this record. Gate at this commit: typecheck and lint clean across all 14
   packages/apps (`brand` added); `pnpm test` green with **1,787 tests** plus 4 conditional skips
   (`@aesa/contracts` 21, `@aesa/crypto` 42, `brand` 110, `@aesa/platform-mail` 18, `@aesa/core`
   204, `@aesa/llm` 98, `@aesa/agent` 65, `@aesa/db` 72, `@aesa/queue` 17, `@aesa/mail` 237,
@@ -800,7 +801,7 @@ the record)</summary>
   colour-only — one icon variant per name (spec §5) — a WCAG 1.4.1 point for the whole-branch
   review or a later pass; the sidebar keeps a tint as a second channel alongside colour.
 - **Fix wave** (whole-branch review, "with fixes"): `4a7f110` (app: the three Important findings
-  below), `78e8ec4` (api: a comment-only fix), and this commit (brand/docs). The three Important
+  below), `78e8ec4` (api: a comment-only fix), and `9b50dcd` (brand/docs). The three Important
   findings: the font bundle went from 32 bundled faces to the 5 the theme names — `fonts.ts` now
   imports each face from its own per-weight subpath (`@expo-google-fonts/fraunces/500Medium` etc.)
   instead of the package barrel, verified by the web export's `.ttf` count; the sidebar's active
