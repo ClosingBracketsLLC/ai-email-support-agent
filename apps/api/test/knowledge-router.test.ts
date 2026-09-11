@@ -12,7 +12,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import {
   auditLog, drafts, knowledgeChunks, knowledgeDocuments, knowledgeSources, orgSettings, workspaces,
 } from '@aesa/db'
-import { vectorLiteral, type createMemoryStore } from '@aesa/knowledge'
+import { vectorLiteral } from '@aesa/knowledge'
+import { createMemoryStore, type ObjectStore } from '@aesa/knowledge/storage'
 import type { EnqueueFn } from '../src/deps.ts'
 import type { AppRouter } from '../src/trpc/router.ts'
 import { WEB, createTestApi, insertAgent, insertConnectedMailbox, insertTicket, listen, signInWithOtp } from './helpers/app.ts'
@@ -127,10 +128,36 @@ describe('knowledge router', () => {
 
     await org.c.knowledge.completeUpload.mutate({ sourceId: res.sourceId })
     expect(sent).toEqual([{ name: 'knowledge.ingest', data: { orgId: org.orgId, sourceId: res.sourceId }, opts: { entityId: res.sourceId } }])
+    expect(await auditRows(org.orgId, 'knowledge.source.upload_completed', res.sourceId)).toHaveLength(1)
 
     const pasted = await org.c.knowledge.paste.mutate({ title: 'Notes', text: 'hello world' })
     await expect(org.c.knowledge.completeUpload.mutate({ sourceId: pasted.sourceId }))
       .rejects.toMatchObject({ data: { code: 'BAD_REQUEST' } })
+  })
+
+  it("startUpload's presign asks for exactly a 600-second URL (a recording spy wrapping the memory store, passed through createTestApi's store override)", async () => {
+    const inner = createMemoryStore()
+    const presignCalls: { key: string; opts: { contentType: string; expiresSeconds: number } }[] = []
+    const spyStore: ObjectStore = {
+      presignPut: async (key, opts) => { presignCalls.push({ key, opts }); return inner.presignPut(key, opts) },
+      head: (key) => inner.head(key),
+      get: (key) => inner.get(key),
+      delete: (key) => inner.delete(key),
+    }
+    const t2 = await createTestApi({}, { store: spyStore })
+    try {
+      const base2 = await listen(t2.app)
+      const signed = await signInWithOtp(t2.app, t2.mail, 'presign-spy@example.com', 'Owner')
+      const c2 = client(base2, signed.cookie)
+      await c2.workspace.create.mutate({ businessName: 'Acme', timezone: 'UTC' })
+      const res = await c2.knowledge.startUpload.mutate({ fileName: 'a.txt', mime: 'text/plain', byteSize: 3 })
+
+      expect(presignCalls).toHaveLength(1)
+      expect(presignCalls[0]!.key).toContain(res.sourceId)
+      expect(presignCalls[0]!.opts).toEqual({ contentType: 'text/plain', expiresSeconds: 600 })
+    } finally {
+      await t2.close()
+    }
   })
 
   it('startUpload over knowledge.max_sources is FORBIDDEN with a clear message', async () => {
@@ -157,8 +184,9 @@ describe('knowledge router', () => {
 
   // ── startCrawl / refreshCrawl ────────────────────────────────────────────
 
-  it('startCrawl dedupes a live source per URL: queued/processing return the same id with no new enqueue; ready re-queues; failed inserts a new row', async () => {
+  it('startCrawl dedupes a live source per URL: queued/processing return the same id with no new enqueue; a ready re-queue uses the CALLER\'s clamped maxPages, not the stored one; failed inserts a new row', async () => {
     const org = await seedOrg()
+    await setCap(org.orgId, 'knowledge.max_crawl_pages', 300)
     const url = 'https://example.com/kb'
 
     const first = await org.c.knowledge.startCrawl.mutate({ url, maxPages: 50 })
@@ -172,19 +200,22 @@ describe('knowledge router', () => {
     expect(sent).toEqual([])
     expect(await auditRows(org.orgId, 'knowledge.source.created', first.sourceId)).toHaveLength(1)
 
-    // Flip to `ready` (as the crawl job would) and call again: re-queued on the SAME row.
+    // Flip to `ready` (as the crawl job would) and call again with a DIFFERENT maxPages: the
+    // caller's own clamped value (min(150, 300) = 150) wins over the stored 50 — minor #1 (an
+    // owner re-asking to crawl a finished site gets what THEY just asked for, unlike the standalone
+    // `refreshCrawl` below, which keeps the row's own stored budget instead).
     await t.api.withOrg(org.orgId, (tx) => tx.update(knowledgeSources)
       .set({ status: 'ready', crawlConfig: { maxPages: 50, progress: { fetched: 10, ingested: 9, skipped: 1 } } })
       .where(eq(knowledgeSources.id, first.sourceId)))
     sent.length = 0
-    const third = await org.c.knowledge.startCrawl.mutate({ url, maxPages: 999 })
+    const third = await org.c.knowledge.startCrawl.mutate({ url, maxPages: 150 })
     expect(third.sourceId).toBe(first.sourceId)
     expect(sent).toEqual([{ name: 'knowledge.crawl', data: { orgId: org.orgId, sourceId: first.sourceId }, opts: { entityId: first.sourceId } }])
     expect(await auditRows(org.orgId, 'knowledge.source.crawl_requeued', first.sourceId)).toHaveLength(1)
     const [requeued] = await t.api.withOrg(org.orgId, (tx) => tx.select().from(knowledgeSources).where(eq(knowledgeSources.id, first.sourceId)))
     expect(requeued).toMatchObject({ status: 'queued' })
     expect((requeued!.crawlConfig as { progress?: unknown }).progress).toBeUndefined()
-    expect((requeued!.crawlConfig as { maxPages: number }).maxPages).toBe(50) // kept, not the caller's 999
+    expect((requeued!.crawlConfig as { maxPages: number }).maxPages).toBe(150) // the caller's clamped value, not the stored 50
 
     // Flip to `failed`: excluded from the dedupe match, so a new call inserts a fresh row.
     await t.api.withOrg(org.orgId, (tx) => tx.update(knowledgeSources).set({ status: 'failed' }).where(eq(knowledgeSources.id, first.sourceId)))
@@ -192,6 +223,26 @@ describe('knowledge router', () => {
     expect(fourth.sourceId).not.toBe(first.sourceId)
     const all = await t.api.withOrg(org.orgId, (tx) => tx.select().from(knowledgeSources).where(eq(knowledgeSources.orgId, org.orgId)))
     expect(all.filter((r) => r.kind === 'crawl')).toHaveLength(2)
+  })
+
+  it('startCrawl normalizes the URL: http:// is BAD_REQUEST, and case/fragment variants of one https URL dedupe to a single source', async () => {
+    const org = await seedOrg()
+    await expect(org.c.knowledge.startCrawl.mutate({ url: 'http://example.com/kb', maxPages: 10 }))
+      .rejects.toMatchObject({ data: { code: 'BAD_REQUEST' }, message: expect.stringContaining('https://') })
+
+    // `normalizeUrl` (packages/knowledge/src/crawler/url.ts) lowercases the host and strips the
+    // fragment, but does NOT collapse a bare trailing slash (only a `/index.html` suffix) — so the
+    // pair this dedupes on differs by case and fragment, not by trailing slash.
+    const first = await org.c.knowledge.startCrawl.mutate({ url: 'https://Example.com/kb#section', maxPages: 10 })
+    const second = await org.c.knowledge.startCrawl.mutate({ url: 'https://example.com/kb', maxPages: 10 })
+    expect(second.sourceId).toBe(first.sourceId)
+
+    const [row] = await t.api.withOrg(org.orgId, (tx) => tx.select().from(knowledgeSources).where(eq(knowledgeSources.id, first.sourceId)))
+    expect(row).toMatchObject({ url: 'https://example.com/kb', title: 'https://example.com/kb' })
+
+    const all = await t.api.withOrg(org.orgId, (tx) =>
+      tx.select().from(knowledgeSources).where(and(eq(knowledgeSources.orgId, org.orgId), eq(knowledgeSources.kind, 'crawl'))))
+    expect(all).toHaveLength(1)
   })
 
   it('startCrawl clamps maxPages to knowledge.max_crawl_pages and checks the source cap only when it inserts a new row', async () => {
@@ -206,7 +257,7 @@ describe('knowledge router', () => {
       .rejects.toMatchObject({ data: { code: 'FORBIDDEN' } })
   })
 
-  it('refreshCrawl re-queues a ready or failed crawl source and enqueues knowledge.crawl; a queued source is BAD_REQUEST', async () => {
+  it('refreshCrawl re-queues a ready or failed crawl source, KEEPING its own stored maxPages budget (only reclamped to a shrunk cap), and enqueues knowledge.crawl; a queued source is BAD_REQUEST', async () => {
     const org = await seedOrg()
     const failed = await insertSource(org.orgId, {
       kind: 'crawl', status: 'failed', title: 'https://example.com/x', url: 'https://example.com/x',
@@ -216,8 +267,21 @@ describe('knowledge router', () => {
     const res = await org.c.knowledge.refreshCrawl.mutate({ sourceId: failed.id })
     expect(res).toEqual({ ok: true })
     expect(sent).toEqual([{ name: 'knowledge.crawl', data: { orgId: org.orgId, sourceId: failed.id }, opts: { entityId: failed.id } }])
+    expect(await auditRows(org.orgId, 'knowledge.source.crawl_requeued', failed.id)).toHaveLength(1)
     const [row] = await t.api.withOrg(org.orgId, (tx) => tx.select().from(knowledgeSources).where(eq(knowledgeSources.id, failed.id)))
     expect(row).toMatchObject({ status: 'queued', failureReason: null, failureDetail: null })
+    // `refreshCrawl` takes no `maxPages` input — unlike `startCrawl`'s ready-requeue above, it keeps
+    // the row's OWN stored budget (7), not the (unset, so default 200) cap.
+    expect((row!.crawlConfig as { maxPages: number }).maxPages).toBe(7)
+
+    // A stored budget above a cap that has since shrunk is reclamped down, not left over the cap.
+    const overCap = await insertSource(org.orgId, {
+      kind: 'crawl', status: 'ready', title: 'https://example.com/w', url: 'https://example.com/w', crawlConfig: { maxPages: 50 },
+    })
+    await setCap(org.orgId, 'knowledge.max_crawl_pages', 3)
+    await org.c.knowledge.refreshCrawl.mutate({ sourceId: overCap.id })
+    const [reclamped] = await t.api.withOrg(org.orgId, (tx) => tx.select().from(knowledgeSources).where(eq(knowledgeSources.id, overCap.id)))
+    expect((reclamped!.crawlConfig as { maxPages: number }).maxPages).toBe(3)
 
     const queued = await insertSource(org.orgId, { kind: 'crawl', status: 'queued', title: 'https://example.com/y', url: 'https://example.com/y' })
     await expect(org.c.knowledge.refreshCrawl.mutate({ sourceId: queued.id })).rejects.toMatchObject({ data: { code: 'BAD_REQUEST' } })

@@ -1,6 +1,6 @@
 import { hkdfSync } from 'node:crypto'
 import { Secret } from '@aesa/crypto'
-import { parseS3Env, type S3Config } from '@aesa/knowledge'
+import { parseS3Env, type S3Config } from '@aesa/knowledge/storage'
 import { parseMailConfig, type MailConfig } from '@aesa/platform-mail'
 import { z } from 'zod'
 
@@ -105,11 +105,14 @@ export interface ApiConfig {
    * connect flow's PKCE verifier ciphertext (packages/crypto's encrypt/decrypt). Never derived from a
    * secret this api doesn't already hold, and never persisted anywhere itself. */
   flowKey: Buffer
-  /** The six `S3_*` as one config (raw secret — `index.ts` wraps it in a `Secret` right before
-   * `createS3Store`, the same point every other credential in this app gets wrapped), or null when
-   * object storage is not configured at all. */
-  s3: S3Config | null
+  /** The six `S3_*` as one config, or null when object storage is not configured at all. */
+  s3: ApiS3Config | null
 }
+
+/** `parseS3Env`'s shape with the secret wrapped — the same rule every other credential in this file
+ * follows (`Secret` serializes as `[redacted]`), and the same shape the worker's own `WorkerS3Config`
+ * (`apps/worker/src/config.ts`) uses. */
+export type ApiS3Config = Omit<S3Config, 'secretAccessKey'> & { secretAccessKey: Secret }
 
 function oauthPair(name: string, id: string | undefined, secret: string | undefined): OAuthClient | null {
   if (!id && !secret) return null
@@ -163,10 +166,11 @@ export function loadConfig(env: NodeJS.ProcessEnv): ApiConfig {
 
   // All-or-none, and it throws on a half-configured deploy — read from the ALREADY-PARSED values so
   // the six names are documented in EnvSchema above rather than only inside `parseS3Env`.
-  const s3 = parseS3Env({
+  const rawS3 = parseS3Env({
     S3_ENDPOINT: d.S3_ENDPOINT, S3_REGION: d.S3_REGION, S3_BUCKET: d.S3_BUCKET,
     S3_ACCESS_KEY_ID: d.S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY: d.S3_SECRET_ACCESS_KEY, S3_FORCE_PATH_STYLE: d.S3_FORCE_PATH_STYLE,
   })
+  const s3: ApiS3Config | null = rawS3 ? { ...rawS3, secretAccessKey: new Secret(rawS3.secretAccessKey) } : null
   // Unconditional (unlike the worker's role-gated check): the api always serves the presigned-upload
   // flow, so a production api with no bucket to point browsers at would look healthy while every
   // upload silently failed.

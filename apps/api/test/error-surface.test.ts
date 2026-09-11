@@ -186,4 +186,51 @@ describe('the api module graph', () => {
     expect(result.seen).not.toContain('@aesa/agent')              // ...and never the package root
     expect(result.seen.filter((sp) => sp.includes('@aesa/llm') || sp.includes('@anthropic-ai'))).toEqual([])
   })
+
+  /**
+   * Task 9 (knowledge): the api imports `@aesa/knowledge` for its `ObjectStore` port
+   * (`config.ts`'s `parseS3Env`, `index.ts`'s `createS3Store`/`createMemoryStore`, the knowledge
+   * router/service's `ObjectStore` type and `uploadKey`). The package's ROOT barrel also re-exports
+   * the chunker and the embedders, which value-import `estimateTokens` from `@aesa/llm`'s root —
+   * the very Anthropic-SDK entry point this file exists to keep out — and the parsers/crawler
+   * engine, which pull `pdfjs-dist`, `mammoth` and (the crawler's own pinned fetch) `undici`. So
+   * the api imports through the pure `@aesa/knowledge/storage` (and `/url`) sub-paths ONLY, never
+   * the package root — same shape as `@aesa/agent/policy` above. `./src/config.ts` and
+   * `./src/trpc/router.ts` (which pulls in every router, including `knowledge.ts` →
+   * `../knowledge/service.ts`) are the two entry points that would otherwise drag the whole
+   * knowledge graph into an api process.
+   *
+   * `undici` gets a narrower check than the other four: `@aesa/crypto`'s root barrel (`index.ts`)
+   * ALSO re-exports the SSRF-pinned fetch (`ssrf/pinned-fetch.ts`), which is undici's OTHER source
+   * here — a real, pre-existing, sanctioned dependency (`mailboxes.ts`'s `hashToken` import pulls
+   * the same barrel; the connect flow's own outbound OAuth calls are what that guard is for), and
+   * one this task has no charter to touch. So the assertion is "undici enters only through
+   * `@aesa/crypto`, never through `@aesa/knowledge`" rather than "undici never appears at all".
+   */
+  it.each([
+    ['./src/config.ts', 'loadConfig'],
+    ['./src/trpc/router.ts', 'appRouter'],
+  ])('importing %s never pulls in @anthropic-ai/sdk, @aesa/llm, pdfjs-dist or mammoth, and only reaches undici through @aesa/crypto', (modulePath, exportName) => {
+    const probe = `
+      import { registerHooks } from 'node:module'
+      const seen = []
+      registerHooks({ resolve(specifier, context, next) { seen.push({ specifier, parent: context.parentURL ?? null }); return next(specifier, context) } })
+      const mod = await import('${modulePath}')
+      console.log(JSON.stringify({ hasExport: ${JSON.stringify(exportName)} in mod, seen }))
+    `
+    const stdout = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', probe], {
+      cwd: API_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'],
+    })
+    const result = JSON.parse(stdout.trim().split('\n').at(-1)!) as { hasExport: boolean; seen: { specifier: string; parent: string | null }[] }
+
+    expect(result.hasExport).toBe(true)                            // the module really loaded
+
+    const hardForbidden = ['@anthropic-ai/', '@aesa/llm', 'pdfjs-dist', 'mammoth']
+    expect(result.seen.filter((s) => hardForbidden.some((f) => s.specifier.includes(f)))).toEqual([])
+
+    const undiciFromOutsideCrypto = result.seen.filter((s) => s.specifier === 'undici' && !(s.parent ?? '').includes('/packages/crypto/'))
+    expect(undiciFromOutsideCrypto).toEqual([])
+
+    expect(result.seen.filter((s) => s.specifier === '@aesa/knowledge')).toEqual([])   // the pure sub-paths only
+  })
 })

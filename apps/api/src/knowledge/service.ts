@@ -28,7 +28,8 @@ import {
   audit, bumpKnowledgeVersion, knowledgeChunks, knowledgeDocuments, knowledgeSources, workspaces,
   type AuditActor, type OrgTx,
 } from '@aesa/db'
-import { uploadKey, type ObjectStore } from '@aesa/knowledge'
+import { uploadKey, type ObjectStore } from '@aesa/knowledge/storage'
+import { normalizeUrl } from '@aesa/knowledge/url'
 import { JOB_NAMES } from '@aesa/queue'
 import type { ApiFacade, EnqueueFn } from '../deps.ts'
 import { loadOrgSettings } from '../org-settings.ts'
@@ -156,8 +157,17 @@ export async function listSources(deps: KnowledgeServiceDeps, orgId: string): Pr
 // the max_sources cap
 // ---------------------------------------------------------------------------
 
-/** "Non-failed sources" (controller ruling): `status <> 'failed'` — a failed source doesn't hold a
- * slot, so an owner can always retry after cleaning up. */
+/**
+ * "Non-failed sources" (controller ruling): `status <> 'failed'` — a failed source doesn't hold a
+ * slot, so an owner can always retry after cleaning up.
+ *
+ * Read-then-insert, with no lock: two concurrent calls that both read `cap − 1` both pass, so the
+ * org can land one row over its cap. Deliberately unlike `agents.ts`'s sandbox cap (an
+ * `pg_advisory_xact_lock`-serialized gate) — that cap guards a real-money model call per run; this
+ * one guards a count against a limit in the tens or hundreds (`knowledge.max_sources` defaults to
+ * 100), where a rare off-by-one from a genuine race is cheap to notice and clean up, and not worth
+ * a lock on every upload/paste/crawl start.
+ */
 async function checkSourceCap(tx: OrgTx, orgId: string): Promise<{ ok: true } | SoftFailure> {
   const settings = await loadOrgSettings(tx, ['knowledge.max_sources'])
   const cap = resolveSetting('knowledge.max_sources', { org: settings })
@@ -176,6 +186,12 @@ export type StartUploadResult =
   | { ok: true; sourceId: string; url: string; headers: Record<string, string>; expiresAt: Date }
   | SoftFailure
 
+/**
+ * An abandoned `queued` upload — the presign call below throws, or the owner simply never PUTs the
+ * file — holds a `knowledge.max_sources` slot until the owner deletes it by hand: nothing here ever
+ * expires a `queued` source on its own. A daily sweep for stale `queued` uploads is a Phase 7
+ * carry-over (the same shape `sweeps.daily` already gives draft/run-event retention), not this task.
+ */
 export async function startUpload(
   deps: KnowledgeServiceDeps, orgId: string, actor: KnowledgeActor, input: StartUploadInput,
 ): Promise<StartUploadResult> {
@@ -207,8 +223,14 @@ export async function startUpload(
 
 export type CompleteUploadResult = { ok: true } | SoftFailure
 
-/** The job (`knowledge.ingest`) verifies the object actually landed; this call only checks the
- * source is a `queued` upload that belongs to this org before waking it. */
+/**
+ * The job (`knowledge.ingest`) verifies the object actually landed; this call only checks the
+ * source is a `queued` upload that belongs to this org before waking it. That check is a plain
+ * SELECT, not a guarded UPDATE — safe because `knowledge.ingest`'s own claim (`guardedSourceWrite`,
+ * `queued → processing` with a fresh claim token) is what actually matters, and it re-checks the
+ * same precondition under its own transaction; a stale read here just means an extra, harmless
+ * enqueue the job's claim then no-ops.
+ */
 export async function completeUpload(
   deps: KnowledgeServiceDeps, orgId: string, actor: KnowledgeActor, input: { sourceId: string },
 ): Promise<CompleteUploadResult> {
@@ -280,12 +302,14 @@ function existingMaxPagesOf(raw: unknown): number {
 /** Shared by `startCrawl`'s "found a `ready` row" branch and the standalone `refreshCrawl`:
  * `status → queued`, `crawl_config` reset to just `{ maxPages }` (which is what clears `progress`),
  * the failure trail cleared, guarded on the caller's `fromStatuses`. Returns false when the guard
- * matched nothing (a concurrent writer already moved the source). */
+ * matched nothing (a concurrent writer already moved the source). `maxPages` is the caller's ALREADY
+ * -DECIDED budget, not computed here: `startCrawl` re-queuing a `ready` row uses the CALLER's newly
+ * clamped `maxPages` (an owner asking to crawl again gets what they just asked for), while
+ * `refreshCrawl` — which takes no `maxPages` input at all — keeps the row's own stored budget,
+ * reclamped only to a cap that may have shrunk since. */
 async function requeueCrawlSource(
-  tx: OrgTx, orgId: string, source: { id: string; crawlConfig: unknown }, fromStatuses: KnowledgeSourceStatus[],
-  pageCap: number, actor: KnowledgeActor,
+  tx: OrgTx, orgId: string, source: { id: string }, fromStatuses: KnowledgeSourceStatus[], maxPages: number, actor: KnowledgeActor,
 ): Promise<boolean> {
-  const maxPages = Math.min(existingMaxPagesOf(source.crawlConfig), pageCap)
   const rows = await tx.update(knowledgeSources)
     .set({ status: 'queued', crawlConfig: { maxPages }, failureReason: null, failureDetail: null, completedAt: null, claimToken: null })
     .where(and(eq(knowledgeSources.orgId, orgId), eq(knowledgeSources.id, source.id), inArray(knowledgeSources.status, fromStatuses)))
@@ -302,25 +326,39 @@ export type StartCrawlResult = { ok: true; sourceId: string } | SoftFailure
 
 /**
  * One non-failed crawl source per URL per org (controller ruling): a match on `ready` re-queues
- * that row (the `refreshCrawl` path); a match on `queued`/`processing` returns its id with nothing
+ * that row (the `refreshCrawl` path, with the CALLER's clamped `maxPages` — see
+ * `requeueCrawlSource`'s doc comment); a match on `queued`/`processing` returns its id with nothing
  * else done — a crawl is already pending. Only a URL with no live match ever inserts a new row,
  * which is the only branch the `max_sources` cap applies to.
+ *
+ * No unique index backs the dedupe match: two concurrent `startCrawl` calls for the same brand-new
+ * URL can both miss the `existing` read and both insert — accepted, not guarded, because a `failed`
+ * crawl must stay re-addable (the dedupe query's `status <> 'failed'` is exactly what makes a retry
+ * after a failure insert fresh rather than resurrecting the dead row), and a unique index over
+ * `(org_id, kind, url)` would have to special-case `failed` out of it to keep that possible.
  */
 export async function startCrawl(
   deps: KnowledgeServiceDeps, orgId: string, actor: KnowledgeActor, input: StartCrawlInput,
 ): Promise<StartCrawlResult> {
+  // A plain https-only syntactic check (see `@aesa/knowledge/url`'s own doc comment) — the crawler
+  // engine refuses a non-https seed outright, so accepting one here would only ever produce a source
+  // that lands `failed` on its first attempt. Outside the transaction: it needs no database read.
+  const url = normalizeUrl(input.url)
+  if (url === null) return { ok: false, code: 'bad_request', message: 'Crawls need an https:// address' }
+
   const outcome = await deps.api.withOrg(orgId, async (tx) => {
     const settings = await loadOrgSettings(tx, ['knowledge.max_sources', 'knowledge.max_crawl_pages'])
     const pageCap = resolveSetting('knowledge.max_crawl_pages', { org: settings })
 
-    const [existing] = await tx.select({ id: knowledgeSources.id, status: knowledgeSources.status, crawlConfig: knowledgeSources.crawlConfig })
+    const [existing] = await tx.select({ id: knowledgeSources.id, status: knowledgeSources.status })
       .from(knowledgeSources)
-      .where(and(eq(knowledgeSources.orgId, orgId), eq(knowledgeSources.kind, 'crawl'), eq(knowledgeSources.url, input.url), ne(knowledgeSources.status, 'failed')))
+      .where(and(eq(knowledgeSources.orgId, orgId), eq(knowledgeSources.kind, 'crawl'), eq(knowledgeSources.url, url), ne(knowledgeSources.status, 'failed')))
       .limit(1)
 
     if (existing) {
       if (existing.status === 'ready') {
-        const requeued = await requeueCrawlSource(tx, orgId, existing, ['ready'], pageCap, actor)
+        const maxPages = Math.min(input.maxPages, pageCap)
+        const requeued = await requeueCrawlSource(tx, orgId, existing, ['ready'], maxPages, actor)
         return { ok: true as const, sourceId: existing.id, shouldEnqueue: requeued }
       }
       // queued | processing: already pending — no new enqueue, no audit.
@@ -332,11 +370,11 @@ export async function startCrawl(
 
     const maxPages = Math.min(input.maxPages, pageCap)
     const [row] = await tx.insert(knowledgeSources).values({
-      orgId, kind: 'crawl', status: 'queued', title: input.url, url: input.url, crawlConfig: { maxPages }, createdBy: actor.userId,
+      orgId, kind: 'crawl', status: 'queued', title: url, url, crawlConfig: { maxPages }, createdBy: actor.userId,
     }).returning({ id: knowledgeSources.id })
     await audit(tx, {
       actor: actor.actor, action: 'knowledge.source.created', entityType: 'knowledge_source', entityId: row!.id,
-      detail: { kind: 'crawl', url: input.url, maxPages }, ip: actor.ip, userAgent: actor.userAgent,
+      detail: { kind: 'crawl', url, maxPages }, ip: actor.ip, userAgent: actor.userAgent,
     })
     return { ok: true as const, sourceId: row!.id, shouldEnqueue: true }
   })
@@ -365,7 +403,10 @@ export async function refreshCrawl(
 
     const settings = await loadOrgSettings(tx, ['knowledge.max_crawl_pages'])
     const pageCap = resolveSetting('knowledge.max_crawl_pages', { org: settings })
-    const requeued = await requeueCrawlSource(tx, orgId, source, ['ready', 'failed'], pageCap, actor)
+    // The row's OWN stored budget, only reclamped — `refreshCrawl` takes no `maxPages` input, so
+    // there is no caller value to prefer (see `requeueCrawlSource`'s doc comment).
+    const maxPages = Math.min(existingMaxPagesOf(source.crawlConfig), pageCap)
+    const requeued = await requeueCrawlSource(tx, orgId, source, ['ready', 'failed'], maxPages, actor)
     if (!requeued) return { ok: false as const, code: 'bad_request' as const, message: 'source changed status before it could be requeued' }
     return { ok: true as const, sourceId: source.id }
   })

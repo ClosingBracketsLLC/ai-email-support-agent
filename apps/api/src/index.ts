@@ -1,8 +1,7 @@
 import { assertInvariants, loadDotEnv } from '@aesa/core'
 import { audit } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
-import { Secret } from '@aesa/crypto'
-import { createMemoryStore, createS3Store, type ObjectStore } from '@aesa/knowledge'
+import { createMemoryStore, createS3Store, type ObjectStore } from '@aesa/knowledge/storage'
 import { createAuth } from './auth.ts'
 import { createSendOnlyBoss } from './boss.ts'
 import { loadConfig } from './config.ts'
@@ -27,10 +26,11 @@ const enqueue = createEnqueue(boss)
 const auth = createAuth({ db: handle.db, config, mail, logger, audit: (orgId, entry) => api.withOrg(orgId, (tx) => audit(tx, entry)) })
 
 // S3 (minio locally) when configured; loadConfig already refuses to boot a production api with no
-// bucket, so the memory-store fallback below is reachable only in dev/test.
+// bucket, so the memory-store fallback below is reachable only in dev/test. `config.s3` already
+// carries its secret as a `Secret` (loadConfig wraps it); createS3Store takes it as-is.
 let store: ObjectStore
 if (config.s3) {
-  store = createS3Store({ ...config.s3, secretAccessKey: new Secret(config.s3.secretAccessKey) })
+  store = createS3Store(config.s3)
 } else {
   logger.warn('S3_* missing; knowledge uploads use an in-memory object store (the web upload flow needs minio locally — see .env.example)')
   store = createMemoryStore()

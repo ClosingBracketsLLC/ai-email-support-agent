@@ -1,3 +1,4 @@
+import { Secret } from '@aesa/crypto'
 import { describe, expect, it } from 'vitest'
 import { loadConfig } from '../src/config.ts'
 
@@ -48,9 +49,13 @@ describe('api config', () => {
     it('is null in development when S3_* is unset', () => {
       expect(loadConfig(BASE).s3).toBeNull()
     })
-    it('parses the six S3_* into one config, the secret still a raw string (index.ts wraps it right before createS3Store)', () => {
+    it('parses the six S3_* into one config with the secret wrapped, and never prints it', () => {
       const c = loadConfig({ ...BASE, ...S3_ENV })
-      expect(c.s3).toEqual({ endpoint: 'http://localhost:9000', region: 'us-east-1', bucket: 'aesa-dev', accessKeyId: 'aesa', secretAccessKey: 'aesaaesa', forcePathStyle: true })
+      expect(c.s3).toMatchObject({ endpoint: 'http://localhost:9000', region: 'us-east-1', bucket: 'aesa-dev', accessKeyId: 'aesa', forcePathStyle: true })
+      // Same rule as every other credential in this file: the bucket's secret never survives a config dump.
+      expect(c.s3?.secretAccessKey).toBeInstanceOf(Secret)
+      expect(c.s3?.secretAccessKey.expose()).toBe('aesaaesa')
+      expect(JSON.stringify(c)).not.toContain('aesaaesa')
     })
     it('refuses a half-configured S3_* set', () => {
       expect(() => loadConfig({ ...BASE, S3_BUCKET: 'aesa-dev' })).toThrow(/S3_\* variables are all-or-none/)

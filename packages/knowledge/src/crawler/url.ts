@@ -1,3 +1,10 @@
+/**
+ * Also `@aesa/knowledge/url` — a pure sub-path (imports only `node:net`) so the api can normalize a
+ * crawl URL (`knowledge.startCrawl`) without pulling in the rest of the crawler. This file must
+ * NEVER import `@aesa/llm`, `../parsers/`, `../chunker.ts`, `../embed/`, or `./engine.ts` — the same
+ * discipline `../storage/index.ts`'s header documents, and for the same reason: the api process must
+ * never resolve the Anthropic SDK, `pdfjs-dist`, `mammoth` or `undici` through this import.
+ */
 import { isIP } from 'node:net'
 
 function isIpLiteralHost(hostname: string): boolean {
