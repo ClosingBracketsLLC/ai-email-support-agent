@@ -658,6 +658,9 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
     dmarcPass: ctx.dmarcPass,
     categoryMode: ctx.categoryMode,
     isRedraft,
+    memoryConflict: false, // Task 6 wires this
+    unresolvedQuestions: false,
+    threadTooLong: false,
     humanDecisionCount: ctx.humanDecisionCount,
     evidence: null, // Phase 5
     threshold: null,

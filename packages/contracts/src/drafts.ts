@@ -13,7 +13,8 @@ export type DecisionAction = (typeof DECISION_ACTIONS)[number]
 export const DECISION_REASONS = [
   'platform_killswitch', 'workspace_killswitch', 'agent_disabled', 'subscription_inactive',
   'tripwire', 'agent_escalate', 'no_reply', 'redraft_unfulfilled', 'guardrail_failed',
-  'dmarc_fail', 'category_off', 'category_review', 'redraft', 'guardrail_warning', 'cold_start',
+  'dmarc_fail', 'category_off', 'category_review', 'redraft', 'guardrail_warning',
+  'memory_conflict', 'unresolved_questions', 'thread_too_long', 'cold_start',
   'below_threshold', 'attachments', 'allowance_exhausted', 'auto_send_cap', 'mailbox_unhealthy', 'ok',
 ] as const
 export type DecisionReason = (typeof DECISION_REASONS)[number]
@@ -39,6 +40,8 @@ export const DRAFT_EXPIRE_DAYS = 7
 export const DRAFT_MODEL_ID = 'claude-opus-5' as const
 
 export const DraftIdInput = z.object({ draftId: z.uuid() })
+/** A customer flagging an auto-sent reply as wrong (spec §Learning loop's "Flag" action) — same shape as DraftIdInput. */
+export const FlagAutoSentInput = DraftIdInput
 export const ApproveDraftInput = z.object({
   draftId: z.uuid(),
   /** Present = the owner edited the body; absent = approved unchanged. Validated by the guardrails at the approve gate. */
@@ -48,6 +51,7 @@ export const RejectDraftInput = z.object({
   draftId: z.uuid(),
   action: z.enum(REJECT_ACTIONS),
   reason: z.string().trim().max(REJECT_REASON_MAX).default(''),
+  addToGuidance: z.boolean().default(false),
 })
 export const ActivitySummaryInput = z.object({ days: z.union([z.literal(7), z.literal(30)]).default(7) })
 export const SandboxStartInput = z.object({

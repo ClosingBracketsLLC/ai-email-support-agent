@@ -25,6 +25,13 @@ describe('digest email settings', () => {
   })
 })
 
+describe('autonomy and learning settings', () => {
+  it('resolve their code defaults', () => {
+    expect(resolveSetting('notifications.push_auto_sends', {})).toBe(false)
+    expect(resolveSetting('guidance.daily_suggest_cap', {})).toBe(50)
+  })
+})
+
 describe('knowledge settings', () => {
   it('knows the knowledge caps and their plan defaults', () => {
     expect(resolveSetting('knowledge.max_sources', {})).toBe(100)

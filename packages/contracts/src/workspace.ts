@@ -41,7 +41,8 @@ export function deriveAllowedHosts(websiteUrl: string | null, contactUrls: reado
   return [...hosts]
 }
 
-export const UpdateGuidanceInput = z.object({ operatingGuidance: z.string().trim().max(8000) })
+export const OPERATING_GUIDANCE_MAX = 8000
+export const UpdateGuidanceInput = z.object({ operatingGuidance: z.string().trim().max(OPERATING_GUIDANCE_MAX) })
 export type UpdateGuidanceInput = z.infer<typeof UpdateGuidanceInput>
 
 /** Base for the Better Auth organization slug; the api appends a random suffix and retries on collision. */

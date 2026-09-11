@@ -420,6 +420,9 @@ async function runAgentSandboxUnsafe(
       dmarcPass: true,
       categoryMode,
       isRedraft: false,
+      memoryConflict: false, // Task 6 wires this
+      unresolvedQuestions: false,
+      threadTooLong: false,
       humanDecisionCount,
       evidence: null,
       threshold: null,

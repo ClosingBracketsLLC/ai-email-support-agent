@@ -19,6 +19,9 @@ const basePass: DecisionInput = {
   dmarcPass: true,
   categoryMode: 'auto',
   isRedraft: false,
+  memoryConflict: false,
+  unresolvedQuestions: false,
+  threadTooLong: false,
   humanDecisionCount: COLD_START_DECISIONS,
   evidence: 0.9,
   threshold: 0.85,
@@ -60,6 +63,19 @@ describe('decide() — evaluation order (spec §Decision)', () => {
     [
       'warningCount > 0 → review/guardrail_warning',
       { guardrail: { ok: true, warningCount: 1 } },
+      { action: 'review', reason: 'guardrail_warning' },
+    ],
+    ['memoryConflict → review/memory_conflict', { memoryConflict: true }, { action: 'review', reason: 'memory_conflict' }],
+    ['unresolvedQuestions → review/unresolved_questions', { unresolvedQuestions: true }, { action: 'review', reason: 'unresolved_questions' }],
+    ['threadTooLong → review/thread_too_long', { threadTooLong: true }, { action: 'review', reason: 'thread_too_long' }],
+    [
+      'memoryConflict precedes cold_start',
+      { memoryConflict: true, humanDecisionCount: 0 },
+      { action: 'review', reason: 'memory_conflict' },
+    ],
+    [
+      'guardrail_warning precedes memoryConflict',
+      { guardrail: { ok: true, warningCount: 1 }, memoryConflict: true },
       { action: 'review', reason: 'guardrail_warning' },
     ],
     [
