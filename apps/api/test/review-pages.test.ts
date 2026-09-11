@@ -141,6 +141,9 @@ describe('review pages (/a/:draftId)', () => {
     // A capability url whose body carries the customer's message and a live token: never cached, and
     // never a Referer when the reader clicks through to the app.
     expect(res.headers['cache-control']).toBe('no-store')
+    expect(res.headers['content-security-policy']).toBe("default-src 'none'; style-src 'unsafe-inline'; form-action 'self'")
+    expect(res.headers['x-frame-options']).toBe('DENY')
+    expect(res.headers['x-content-type-options']).toBe('nosniff')
     expect(res.body).toContain('<meta name="referrer" content="no-referrer">')
     // Task 4 (brand): the review page carries the favicons, the token CSS and the SVG wordmark header — no web font, no script.
     expect(res.body).toContain('<link rel="icon" href="/favicon.svg" type="image/svg+xml">')
@@ -188,6 +191,9 @@ describe('review pages (/a/:draftId)', () => {
       // Identical HEADERS as well as identical bytes: a no-store on some of them and not others would
       // be exactly the oracle this page exists to deny.
       expect(res.headers['cache-control']).toBe('no-store')
+      expect(res.headers['content-security-policy']).toBe("default-src 'none'; style-src 'unsafe-inline'; form-action 'self'")
+      expect(res.headers['x-frame-options']).toBe('DENY')
+      expect(res.headers['x-content-type-options']).toBe('nosniff')
       expect(res.body).toContain('<meta name="referrer" content="no-referrer">')
       expect(res.body).toContain(FRIENDLY_COPY)
     }

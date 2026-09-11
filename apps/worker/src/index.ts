@@ -40,12 +40,18 @@ logger.info({ roles: [...config.roles], kekActive: config.kekRing?.active ?? nul
 // and send.execute (whose producer is the API's approve mutation, same story). Create all six
 // unconditionally at boot, before any role-gated registration, so a send never silently no-ops on a
 // role-partitioned or under-configured replica.
-await createQueueRetrying(boss, JOB_NAMES.notifyDispatch)
+// The policy must match `defineJob`'s `queue.policy`; pg-boss `createQueue` ignores a second call, so
+// the FIRST process to boot decides. ticket.triage and mailbox.sync stay optionless — they are
+// `standard` on purpose (CLAUDE.md Jobs: their burst source is a push webhook, deduped instead through
+// `enqueue`'s `debounceSeconds`). `options.name` below is redundant with the positional `name` arg —
+// pg-boss's own `PgBoss.Queue` type requires it, but `manager.js`'s `createQueue` ignores it at
+// runtime (`name = name || options.name`) — it's here only to satisfy the type.
+await createQueueRetrying(boss, JOB_NAMES.notifyDispatch, { name: JOB_NAMES.notifyDispatch, policy: 'short' })
 await createQueueRetrying(boss, JOB_NAMES.ticketTriage)
-await createQueueRetrying(boss, JOB_NAMES.ticketDraft)
-await createQueueRetrying(boss, JOB_NAMES.agentSandbox)
+await createQueueRetrying(boss, JOB_NAMES.ticketDraft, { name: JOB_NAMES.ticketDraft, policy: 'short' })
+await createQueueRetrying(boss, JOB_NAMES.agentSandbox, { name: JOB_NAMES.agentSandbox, policy: 'short' })
 await createQueueRetrying(boss, JOB_NAMES.mailboxSync)
-await createQueueRetrying(boss, JOB_NAMES.sendExecute)
+await createQueueRetrying(boss, JOB_NAMES.sendExecute, { name: JOB_NAMES.sendExecute, policy: 'short' })
 
 // notify.dispatch's producers span every role (ticket.triage's escalations under `agent`,
 // mailbox.sync/renew-watch's reauth notices and mailbox.poll-sweep's stuck-pending retry under

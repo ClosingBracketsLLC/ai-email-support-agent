@@ -231,9 +231,22 @@ async function safeRender(req: FastifyRequest, work: () => Promise<string>): Pro
  * copy. Applying it unconditionally is also what keeps the four failure modes identical in their HEADERS
  * as well as their bytes — a `no-store` present on some review responses and absent on others would be
  * exactly the oracle `friendlyPage()` exists to deny.
+ *
+ * Three defence-in-depth headers ride alongside it, unconditionally, for the same reason. The pages
+ * render a customer's message body (escaped, but still attacker-influenced text) inside a page that
+ * carries a live single-use action token, so: `content-security-policy` — `style-src 'unsafe-inline'`
+ * because the brand branch put the review pages' CSS in an inline `<style>` (`src/brand/css.ts`), and
+ * `default-src 'none'` blocks everything else since the pages have no script and load no external
+ * resource; `x-frame-options: DENY` stops the approve/hold form from being framed for a clickjack;
+ * `x-content-type-options: nosniff` stops a browser from ever second-guessing the `text/html` type.
  */
 function reviewReply(reply: FastifyReply, body: string): FastifyReply {
-  return reply.code(200).header('cache-control', 'no-store').type('text/html; charset=utf-8').send(body)
+  return reply.code(200)
+    .header('cache-control', 'no-store')
+    .header('content-security-policy', "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'")
+    .header('x-frame-options', 'DENY')
+    .header('x-content-type-options', 'nosniff')
+    .type('text/html; charset=utf-8').send(body)
 }
 
 export function registerReviewRoutes(routes: FastifyInstance, deps: ServerDeps): void {

@@ -48,6 +48,16 @@ export default tseslint.config(
     rules: { '@typescript-eslint/no-restricted-imports': ['error', appImports] },
   },
   {
+    files: ['apps/api/src/**/*.ts', 'apps/worker/src/**/*.ts', 'packages/*/src/**/*.ts'],
+    ignores: ['packages/queue/src/**'],
+    rules: {
+      'no-restricted-syntax': ['error', {
+        selector: "CallExpression[callee.type='MemberExpression'][callee.property.name='send'][callee.object.name='boss']",
+        message: "Enqueue through @aesa/queue's enqueue(): it sets the `${orgId}:${entityId}` singletonKey the `short` queues dedupe on; a bare boss.send on one of them collapses with every other keyless send.",
+      }],
+    },
+  },
+  {
     files: ['packages/db/**/*.ts', 'apps/*/src/index.ts', '**/test/**/*.ts', '**/scripts/**/*.ts'],
     rules: { '@typescript-eslint/no-restricted-imports': 'off' },
   },

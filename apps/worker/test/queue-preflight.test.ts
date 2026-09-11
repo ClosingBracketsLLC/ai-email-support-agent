@@ -38,6 +38,29 @@ describe('worker boot: pre-created queues accept sends with no registrations', (
     }
   })
 
+  /** Phase 3 carry: a queue first created by an api-only boot stayed `standard` (pre-creation passed no
+   *  options) until a worker replica ran `updateQueue`, so `enqueue`'s singletonKey was inert until then.
+   *  This pins the CONTRACT — `createQueueRetrying(boss, name, { policy: 'short' })` actually sticks the
+   *  policy on the queue row — on THROWAWAY names. It must not touch the real `ticket.draft`/
+   *  `send.execute`/`agent.sandbox`/`notify.dispatch` queue rows: `pgboss_test` is shared and other
+   *  worker suites use those queues concurrently, and deleting/recreating one mid-run would break them.
+   *  The real four names carrying `{ policy: 'short' }` at boot is proven by reading index.ts's and
+   *  boss.ts's pre-create lists directly — there is no cheaper runtime assertion than that. */
+  it.each([JOB_NAMES.ticketDraft, JOB_NAMES.sendExecute, JOB_NAMES.agentSandbox, JOB_NAMES.notifyDispatch])('pre-creating %s carries policy short', async (name) => {
+    const boss: PgBoss = await startTestBoss()
+    const queueName = `preflight-policy-${name}-${crypto.randomUUID().slice(0, 8)}`
+    try {
+      // `name` here is redundant with the positional arg — pg-boss's own `PgBoss.Queue` type requires
+      // it, but `manager.js`'s `createQueue` ignores it at runtime — it's here only to satisfy the type.
+      await createQueueRetrying(boss, queueName, { name: queueName, policy: 'short' })
+      const queue = await boss.getQueue(queueName)
+      expect(queue?.policy).toBe('short')
+    } finally {
+      try { await boss.deleteQueue(queueName) } catch { /* best-effort cleanup of this test's own throwaway queue */ }
+      await boss.stop({ graceful: false, wait: true })
+    }
+  })
+
   it('sanity check: WITHOUT createQueueRetrying, the exact same send silently returns null (the bug this fix prevents)', async () => {
     const boss: PgBoss = await startTestBoss()
     const orgId = crypto.randomUUID()
