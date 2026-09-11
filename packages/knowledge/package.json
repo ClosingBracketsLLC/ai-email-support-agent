@@ -1,0 +1,14 @@
+{
+  "name": "@aesa/knowledge",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": { "typecheck": "tsc --noEmit", "test": "vitest run" },
+  "dependencies": {
+    "@aesa/contracts": "workspace:*", "@aesa/core": "workspace:*", "@aesa/crypto": "workspace:*", "@aesa/db": "workspace:*", "@aesa/llm": "workspace:*",
+    "@aws-sdk/client-s3": "^3.1130.0", "@aws-sdk/s3-request-presigner": "^3.1130.0",
+    "drizzle-orm": "^0.44.0", "html-to-text": "^10.0.1", "htmlparser2": "^12.0.0", "mammoth": "^1.12.2", "pdfjs-dist": "^6.3.289",
+    "robots-parser": "^3.0.1", "tsx": "^4.20.0", "undici": "^7.10.0", "zod": "^4.0.0"
+  },
+  "devDependencies": { "@aesa/agent": "workspace:*", "@types/html-to-text": "^9.0.4", "@types/node": "^22", "jszip": "^3.10.1", "typescript": "^5.9.2", "vitest": "^3.2.0" }
+}
