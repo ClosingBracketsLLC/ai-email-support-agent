@@ -77,7 +77,9 @@ describe('worker config', () => {
     })
 
     it('does NOT throw in production when the sync role is not active, even with neither configured', () => {
-      const config = loadConfig({ DATABASE_URL, NODE_ENV: 'production', WORKER_ROLES: 'agent', ANTHROPIC_API_KEY: 'sk-ant-x' })
+      // VOYAGE_API_KEY rides along because the `agent` role's own production gate (Task 8) now needs
+      // it too — this case is about the SYNC guards staying quiet, not about the agent's.
+      const config = loadConfig({ DATABASE_URL, NODE_ENV: 'production', WORKER_ROLES: 'agent', ANTHROPIC_API_KEY: 'sk-ant-x', VOYAGE_API_KEY: 'pa-x' })
       expect(config.kekRing).toBeNull()
       expect(config.platformSender).toBeNull()
     })
@@ -112,7 +114,7 @@ describe('worker config', () => {
     })
 
     it('does NOT throw in production without the cron role — that replica never sends platform mail', () => {
-      expect(loadConfig({ DATABASE_URL, NODE_ENV: 'production', WORKER_ROLES: 'agent', ANTHROPIC_API_KEY: 'sk-ant-x' }).mail.transport).toBe('devsink')
+      expect(loadConfig({ DATABASE_URL, NODE_ENV: 'production', WORKER_ROLES: 'agent', ANTHROPIC_API_KEY: 'sk-ant-x', VOYAGE_API_KEY: 'pa-x' }).mail.transport).toBe('devsink')
     })
 
     it('builds the resend transport config in production when the cron role is fully configured', () => {
@@ -134,6 +136,61 @@ describe('worker config', () => {
     it('rejects a non-http(s) APP_BASE_URL / APP_WEB_ORIGIN', () => {
       expect(() => loadConfig({ DATABASE_URL, APP_BASE_URL: 'nope' })).toThrow(/APP_BASE_URL must be an http\(s\) URL/)
       expect(() => loadConfig({ DATABASE_URL, APP_WEB_ORIGIN: 'aesa://app' })).toThrow(/APP_WEB_ORIGIN must be an http\(s\) URL/)
+    })
+  })
+  describe('knowledge: Voyage, the embed model, rerank and S3 (Task 8)', () => {
+    const s3Env = {
+      S3_ENDPOINT: 'http://localhost:9000', S3_REGION: 'us-east-1', S3_BUCKET: 'aesa-dev',
+      S3_ACCESS_KEY_ID: 'aesa', S3_SECRET_ACCESS_KEY: 'aesaaesa', S3_FORCE_PATH_STYLE: 'true',
+    }
+
+    it('loads with nulls in development when neither VOYAGE_API_KEY nor S3_* is set', () => {
+      const config = loadConfig({ DATABASE_URL, WORKER_ROLES: 'knowledge,agent' })
+      expect(config.voyageApiKey).toBeNull()
+      expect(config.s3).toBeNull()
+      expect(config.knowledgeEmbedModel).toBe('voyage-4')
+      expect(config.knowledgeRerank).toBe(false)
+    })
+
+    it('wraps VOYAGE_API_KEY in a Secret that never leaks the raw value', () => {
+      const config = loadConfig({ DATABASE_URL, VOYAGE_API_KEY: 'pa-voyage-key' })
+      expect(config.voyageApiKey?.expose()).toBe('pa-voyage-key')
+      expect(String(config.voyageApiKey)).toBe('[redacted]')
+    })
+
+    it('reads the embed model and the rerank flag', () => {
+      expect(loadConfig({ DATABASE_URL, KNOWLEDGE_EMBED_MODEL: 'voyage-4-lite' }).knowledgeEmbedModel).toBe('voyage-4-lite')
+      expect(loadConfig({ DATABASE_URL, KNOWLEDGE_RERANK: 'on' }).knowledgeRerank).toBe(true)
+      expect(() => loadConfig({ DATABASE_URL, KNOWLEDGE_EMBED_MODEL: 'voyage-9' })).toThrow(/KNOWLEDGE_EMBED_MODEL/)
+      expect(() => loadConfig({ DATABASE_URL, KNOWLEDGE_RERANK: 'yes' })).toThrow(/KNOWLEDGE_RERANK/)
+    })
+
+    it('parses the six S3_* into one config, and refuses a half-configured set', () => {
+      const config = loadConfig({ DATABASE_URL, ...s3Env })
+      expect(config.s3).toEqual({ endpoint: 'http://localhost:9000', region: 'us-east-1', bucket: 'aesa-dev', accessKeyId: 'aesa', secretAccessKey: 'aesaaesa', forcePathStyle: true })
+      expect(() => loadConfig({ DATABASE_URL, S3_BUCKET: 'aesa-dev' })).toThrow(/S3_\* variables are all-or-none/)
+    })
+
+    it('throws in production when the agent role is active and VOYAGE_API_KEY is missing', () => {
+      expect(() => loadConfig({ DATABASE_URL, NODE_ENV: 'production', WORKER_ROLES: 'agent', ANTHROPIC_API_KEY: 'sk-ant-x' }))
+        .toThrow(/VOYAGE_API_KEY is required in production when WORKER_ROLES includes `agent` or `knowledge`/)
+    })
+
+    it('throws in production when the knowledge role is active and S3_* is missing (Voyage present)', () => {
+      expect(() => loadConfig({ DATABASE_URL, NODE_ENV: 'production', WORKER_ROLES: 'knowledge', VOYAGE_API_KEY: 'pa-k' }))
+        .toThrow(/S3_\* .* are required in production when WORKER_ROLES includes `knowledge`/)
+    })
+
+    it('boots in production once the knowledge role has both', () => {
+      const config = loadConfig({ DATABASE_URL, NODE_ENV: 'production', WORKER_ROLES: 'knowledge', VOYAGE_API_KEY: 'pa-k', ...s3Env })
+      expect(config.voyageApiKey?.expose()).toBe('pa-k')
+      expect(config.s3?.bucket).toBe('aesa-dev')
+    })
+
+    it('does NOT throw in production for a role that needs neither (send)', () => {
+      const config = loadConfig({ DATABASE_URL, NODE_ENV: 'production', WORKER_ROLES: 'send' })
+      expect(config.voyageApiKey).toBeNull()
+      expect(config.s3).toBeNull()
     })
   })
 })

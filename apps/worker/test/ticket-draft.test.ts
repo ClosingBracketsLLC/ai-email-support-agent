@@ -23,6 +23,7 @@ import {
 } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
+import type { DetailedRetriever } from '@aesa/knowledge'
 import {
   createFakeProvider, LlmError,
   type Capabilities, type ChatRequest, type ChatResult, type LlmProvider,
@@ -429,7 +430,9 @@ describe('runTicketDraft', () => {
     expect(draft!.guardrailResult).toMatchObject({ ok: true })
     expect(draft!.confidenceBreakdown).toMatchObject({
       blockers: { tripwire: false, guardrail: false, dmarcFail: false, attachments: false, redraft: false, categoryOff: false, coldStart: true },
-      model: 0.82, memory: null, grounding: null, evidence: null, warnings: [],
+      model: 0.82, memory: null, evidence: null, warnings: [],
+      // `emptyRetriever`: nothing retrieved, nothing cited, and no mode/version to record.
+      grounding: { score: null, mode: null, knowledgeVersion: null, retrieved: 0, cited: 0 },
     })
 
     const [run1] = await runsFor(ticketId)
@@ -829,6 +832,53 @@ describe('runTicketDraft', () => {
     const [run1] = await runsFor(ticketId)
     expect(run1!.status).toBe('failed')
     expect(run1!.errorCode).toBe('retrieval')
+  })
+
+  it('7c. grounding: a detailed retriever fills score/mode/knowledgeVersion, and the prompt event records the retrieval', async () => {
+    const ticketId = await seedDraftableTicket()
+    const chunks = [
+      { id: crypto.randomUUID(), heading: 'Returns', content: 'Returns are free within 30 days.', score: 0.41 },
+      { id: crypto.randomUUID(), heading: 'Shipping', content: 'Orders ship the same working day.', score: 0.77 },
+    ]
+    const provider = createFakeProvider([{ parsed: reply({ citedChunkIds: [chunks[0]!.id, 'a-chunk-that-was-never-retrieved'] }) }])
+    const retriever: DetailedRetriever = {
+      retrieve: async () => { throw new Error('the job must use retrieveDetailed when it exists') },
+      retrieveDetailed: async () => ({ chunks, answers: [], knowledgeVersion: 12, mode: 'lexical', degraded: true }),
+    }
+    const { deps } = makeDeps(provider, { retriever })
+
+    await run(deps, ticketId)
+
+    const [draft] = await draftsFor(ticketId)
+    expect(draft!.retrievedChunkIds).toEqual([chunks[0]!.id, chunks[1]!.id])
+    // The invented id never became a citation, so it can never raise the score either.
+    expect(draft!.citedChunkIds).toEqual([chunks[0]!.id])
+    expect(draft!.confidenceBreakdown).toMatchObject({
+      grounding: { score: 0.41, mode: 'lexical', knowledgeVersion: 12, retrieved: 2, cited: 1 },
+    })
+
+    const [run1] = await runsFor(ticketId)
+    const events = await eventsFor(run1!.id)
+    expect(events.map((e) => e.kind)).toEqual(['prompt', 'call', 'guardrail', 'decision'])
+    expect(events[0]!.payload).toMatchObject({ knowledge: { retrieved: 2, mode: 'lexical' } })
+  })
+
+  it('7d. grounding: a retrieval nothing was cited from leaves the score null but still records the mode', async () => {
+    const ticketId = await seedDraftableTicket()
+    const chunks = [{ id: crypto.randomUUID(), heading: 'Returns', content: 'Returns are free within 30 days.', score: 0.9 }]
+    const provider = createFakeProvider([{ parsed: reply({ citedChunkIds: [] }) }])
+    const retriever: DetailedRetriever = {
+      retrieve: async () => ({ chunks, answers: [] }),
+      retrieveDetailed: async () => ({ chunks, answers: [], knowledgeVersion: 3, mode: 'hybrid', degraded: false }),
+    }
+    const { deps } = makeDeps(provider, { retriever })
+
+    await run(deps, ticketId)
+
+    const [draft] = await draftsFor(ticketId)
+    expect(draft!.confidenceBreakdown).toMatchObject({
+      grounding: { score: null, mode: 'hybrid', knowledgeVersion: 3, retrieved: 1, cited: 0 },
+    })
   })
 
   it('13d. an automatic redraft that THROWS still stores attempt 1 under guardrail_failed, and leaves an error event', async () => {

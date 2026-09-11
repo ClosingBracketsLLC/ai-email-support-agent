@@ -35,6 +35,9 @@ export async function createSendOnlyBoss(connectionString: string): Promise<PgBo
   await createQueueRetrying(boss, JOB_NAMES.agentSandbox, { name: JOB_NAMES.agentSandbox, policy: 'short' })
   await createQueueRetrying(boss, JOB_NAMES.sendExecute, { name: JOB_NAMES.sendExecute, policy: 'short' })
   await createQueueRetrying(boss, JOB_NAMES.notifyDispatch, { name: JOB_NAMES.notifyDispatch, policy: 'short' })
+  await createQueueRetrying(boss, JOB_NAMES.knowledgeIngest, { name: JOB_NAMES.knowledgeIngest, policy: 'short' })
+  await createQueueRetrying(boss, JOB_NAMES.knowledgeCrawl, { name: JOB_NAMES.knowledgeCrawl, policy: 'short' })
+  await createQueueRetrying(boss, JOB_NAMES.knowledgeEmbedBatch, { name: JOB_NAMES.knowledgeEmbedBatch, policy: 'short' })
 
   return boss
 }

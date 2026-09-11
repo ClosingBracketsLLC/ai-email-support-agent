@@ -4,21 +4,28 @@
  * `ANTHROPIC_API_KEY` is unit-testable without a real pg-boss instance — `register` is an
  * injectable seam (defaulting to the three real registrars) that tests replace with spies.
  *
+ * ONE retriever, too (Phase 4): `createRetriever` over the SAME embedder `createKnowledgeDeps`
+ * builds for the `knowledge` role (`createKnowledgeEmbedder` — Voyage when a key is configured, the
+ * hash embedder in dev/test), so the model that WROTE a workspace's vectors is always the model that
+ * queries them; `embedding_model` is part of the vector leg's WHERE, and a mismatch would silently
+ * return nothing from it. The optional reranker rides along under `KNOWLEDGE_RERANK=on`.
+ *
  * ONE provider is built for the whole role and handed to ALL THREE jobs: `createManagedProvider`
  * wraps the raw Anthropic adapter in metering (every rung of the structured-output ladder becomes
  * its own `llm_calls` row), the shared per-model concurrency pool, and the ladder itself. Triage's
  * calls are therefore metered too now — a deliberate change from Phase 2's bare adapter; triage
  * keeps its own `usage_counters` spend guard on top.
  */
-import { emptyRetriever } from '@aesa/agent'
 import { createManagedProvider } from '@aesa/llm'
 import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import { createMeterSink, type Db } from '@aesa/db'
+import { createRetriever } from '@aesa/knowledge'
 import type { WorkerConfig } from './config.ts'
 import { registerAgentSandbox, type AgentSandboxDeps } from './jobs/agent-sandbox.ts'
 import { registerTicketDraft, type TicketDraftDeps } from './jobs/ticket-draft.ts'
 import { registerTicketTriage, type TicketTriageDeps } from './jobs/ticket-triage.ts'
+import { createKnowledgeEmbedder, createKnowledgeReranker } from './knowledge-deps.ts'
 
 export interface AgentRoleDeps {
   boss: PgBoss
@@ -66,12 +73,20 @@ export async function maybeRegisterAgentRole(deps: AgentRoleDeps, register: Agen
     apiKey: deps.config.anthropicApiKey,
     sink: createMeterSink(deps.db, { onError: (err) => deps.logger.warn({ err }, 'llm metering write failed') }),
   })
+  // Built ONCE, shared by draft and sandbox: an embedder per job would be two per-model rate
+  // budgets and two chances to disagree about the model.
+  const retriever = createRetriever({
+    db: deps.db,
+    embedder: createKnowledgeEmbedder(deps.config, deps.logger),
+    reranker: createKnowledgeReranker(deps.config),
+    logger: deps.logger,
+  })
   await register.registerTriage(deps.boss, {
     db: deps.db, provider, logger: deps.logger, enqueueNotify: deps.enqueueNotify, enqueueDraft: deps.enqueueDraft,
   })
   await register.registerDraft(deps.boss, {
-    db: deps.db, provider, retriever: emptyRetriever, logger: deps.logger,
+    db: deps.db, provider, retriever, logger: deps.logger,
     enqueueNotify: deps.enqueueNotify, enqueueDraft: deps.enqueueDraft,
   })
-  await register.registerSandbox(deps.boss, { db: deps.db, provider, retriever: emptyRetriever, logger: deps.logger })
+  await register.registerSandbox(deps.boss, { db: deps.db, provider, retriever, logger: deps.logger })
 }
