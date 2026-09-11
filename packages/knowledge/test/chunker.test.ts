@@ -15,17 +15,31 @@ describe('chunkBlocks', () => {
     const chunks = chunkBlocks([b('paragraph', ['A'], 'a'), b('paragraph', ['B'], 'b')])
     expect(chunks.map((c) => c.headingPath)).toEqual([['A'], ['B']])
   })
-  it('splits a long block at sentence boundaries with a real (distinct-sentence) overlap and never exceeds max', () => {
+  it('carries a whole-sentence cross-chunk overlap: as many trailing sentences of the previous piece as fit within `overlap` characters, at least one (phase-4 controller ruling, reversing fix review #7\'s single-sentence rule)', () => {
     // Distinct sentences (fix review #7): with the original fixture's IDENTICAL repeated sentence,
-    // `startsWith` passed even at zero real overlap. Each sentence is unique here, so the
-    // assertion only passes if chunks[1] genuinely opens with chunks[0]'s actual last sentence.
+    // any overlap window would trivially "match". Each sentence is unique here, so the assertion
+    // only passes if chunks[1] genuinely opens with chunks[0]'s actual trailing sentence(s).
     const sentences = Array.from({ length: 60 }, (_, i) => `Sentence number ${i} talks about topic ${i} in a fairly detailed and thorough way for our customers. `).join('')
     const chunks = chunkBlocks([b('paragraph', ['Long'], sentences)], { target: 1600, max: 3000, overlap: 200 })
     expect(chunks.length).toBeGreaterThan(1)
     for (const c of chunks) expect(c.content.length).toBeLessThanOrEqual(3000)
-    const chunk0Parts = chunks[0]!.content.split('. ')
-    const lastSentenceOfChunk0 = chunk0Parts[chunk0Parts.length - 1]!
-    expect(chunks[1]!.content.startsWith(lastSentenceOfChunk0)).toBe(true)
+
+    // Re-derive, from chunks[1] ALONE (not from chunker internals), the prefix formed by its own
+    // leading whole sentences that together fit the 200-char overlap window — that is exactly what
+    // the chunker carried over from the end of chunks[0], so chunks[0] must end with it.
+    const chunk1Sentences = chunks[1]!.content.split(/(?<=[.!?])\s+/)
+    let prefix = chunk1Sentences[0]!
+    let sentenceCount = 1
+    for (let i = 1; i < chunk1Sentences.length; i++) {
+      const candidate = `${prefix} ${chunk1Sentences[i]}`
+      if (candidate.length > 200) break
+      prefix = candidate
+      sentenceCount++
+    }
+    expect(chunks[0]!.content.endsWith(prefix)).toBe(true)
+    // More than a single trailing sentence is carried here — this fixture's ~95-char sentences let
+    // two fit within the 200-char window, distinguishing this from the old exactly-one-sentence rule.
+    expect(sentenceCount).toBeGreaterThanOrEqual(2)
   })
   it('hard-splits a sentence longer than max and caps the chunk count', () => {
     const chunks = chunkBlocks([b('paragraph', [], 'x'.repeat(10_000))], { max: 3000, maxChunks: 2 })

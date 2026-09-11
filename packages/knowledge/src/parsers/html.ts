@@ -14,8 +14,10 @@ const TEXT_TAGS = new Set(['p', 'li', 'td', 'th', 'dd', 'dt', 'blockquote', 'pre
 const HEADING_TAGS = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
 /** Block-level containers that flush the "loose" paragraph buffer on open AND close — text sitting
  * directly under one of these with no wrapping content tag (e.g. `<div>plain text</div>`) still
- * becomes a paragraph block instead of being silently dropped. */
-const LOOSE_FLUSH_TAGS = new Set(['div', 'section', 'article', 'main', 'p', 'li', 'table', 'tr', 'ul', 'ol', 'blockquote', 'pre', ...HEADING_TAGS])
+ * becomes a paragraph block instead of being silently dropped. `dl`/`dt`/`dd` join this set (fix
+ * review carry-over) so a `<dl>` flushes any loose prose ahead of it in document order, same as
+ * any other block-level container. */
+const LOOSE_FLUSH_TAGS = new Set(['div', 'section', 'article', 'main', 'p', 'li', 'table', 'tr', 'ul', 'ol', 'blockquote', 'pre', 'dl', 'dt', 'dd', ...HEADING_TAGS])
 
 function isHttpOrRootLink(href: string): boolean {
   return href.startsWith('http://') || href.startsWith('https://') || href.startsWith('/')
@@ -32,8 +34,10 @@ export function parseHtml(html: string): { title: string | null; canonical: stri
   let textSkipDepth = 0
   let linkSkipDepth = 0
   let inTitle = false
+  // Accumulates ONE <title> element's text (possibly split across several text nodes by an
+  // entity); a SECOND <title> replaces `title` outright on close rather than appending to it.
+  let titleBuffer = ''
   let headingLevel = 1
-  let anchorDepth = 0
 
   // Text accumulation for the current block.
   let buffer = ''
@@ -79,13 +83,10 @@ export function parseHtml(html: string): { title: string | null; canonical: stri
           if (TEXT_SKIP_TAGS.has(name)) textSkipDepth++
           if (LINK_SKIP_TAGS.has(name)) { textSkipDepth++; linkSkipDepth++ }
         }
-        if (name === 'title') inTitle = true
+        if (name === 'title') { inTitle = true; titleBuffer = '' }
         if (name === 'link' && (attribs.rel ?? '').toLowerCase() === 'canonical' && attribs.href) canonical = attribs.href
         if (name === 'meta' && (attribs.name ?? '').toLowerCase() === 'robots' && /noindex/i.test(attribs.content ?? '')) noindex = true
-        if (name === 'a') {
-          anchorDepth++
-          if (attribs.href && linkSkipDepth === 0 && isHttpOrRootLink(attribs.href)) links.push(attribs.href)
-        }
+        if (name === 'a' && attribs.href && linkSkipDepth === 0 && isHttpOrRootLink(attribs.href)) links.push(attribs.href)
 
         if (HEADING_TAGS.has(name)) {
           flush()
@@ -109,8 +110,14 @@ export function parseHtml(html: string): { title: string | null; canonical: stri
           inListItem = true
           buffer = ''
         } else if (TEXT_TAGS.has(name)) {
-          if (bufferKind !== (name === 'pre' ? 'code' : 'paragraph')) flush()
-          bufferKind = name === 'pre' ? 'code' : 'paragraph'
+          // A text tag (e.g. <p>) nested inside a list item is inert: the <li> itself owns
+          // `buffer` (ontext routes straight into it below whenever `inListItem` is true,
+          // regardless of `bufferKind`), so entering/leaving a nested <p> must not flush that
+          // buffer out as its own top-level block or otherwise disturb it.
+          if (!inListItem) {
+            if (bufferKind !== (name === 'pre' ? 'code' : 'paragraph')) flush()
+            bufferKind = name === 'pre' ? 'code' : 'paragraph'
+          }
         } else if (name === 'br') {
           if (bufferKind !== null || inListItem) {
             buffer += ' '
@@ -123,13 +130,13 @@ export function parseHtml(html: string): { title: string | null; canonical: stri
       ontext(data) {
         consecutiveBr = 0
         if (textSkipDepth > 0) return
-        if (inTitle) { title = title === null ? data : `${title} ${data}`; return }
+        if (inTitle) { titleBuffer += data; return }
         if (inListItem) { buffer += data; return }
         if (bufferKind !== null) { buffer += data; return }
-        // A link's own label text with no wrapping content block (a standalone nav-style <a>)
-        // stays dropped, same as before — only its href is harvested. Anchor text INSIDE a real
-        // content block (p/li/heading/pre) was already captured above, before this check.
-        if (anchorDepth > 0) return
+        // An anchor's label is text everywhere — inside loose prose exactly as inside a <p> (fix
+        // review carry-over: the old `anchorDepth` exception that dropped a standalone anchor's
+        // text is gone). Text inside nav/header/footer/etc. is still dropped by the
+        // `textSkipDepth` check above, so link soup from navigation chrome stays out either way.
         looseBuffer += data
       },
       onclosetag(name) {
@@ -140,8 +147,12 @@ export function parseHtml(html: string): { title: string | null; canonical: stri
           if (TEXT_SKIP_TAGS.has(name)) textSkipDepth--
           if (LINK_SKIP_TAGS.has(name)) { textSkipDepth--; linkSkipDepth-- }
         }
-        if (name === 'title') inTitle = false
-        if (name === 'a') anchorDepth = Math.max(anchorDepth - 1, 0)
+        if (name === 'title') {
+          inTitle = false
+          // REPLACES any earlier <title> — the last one wins (fix review carry-over, reversing
+          // fix review #10's "concatenate" rule).
+          title = titleBuffer
+        }
 
         if (HEADING_TAGS.has(name)) {
           const text = collapse(buffer)
@@ -160,7 +171,7 @@ export function parseHtml(html: string): { title: string | null; canonical: stri
           listDepth = Math.max(listDepth - 1, 0)
           if (listDepth === 0) flushList()
         } else if (TEXT_TAGS.has(name)) {
-          flush()
+          if (!inListItem) flush()
         }
       },
     },

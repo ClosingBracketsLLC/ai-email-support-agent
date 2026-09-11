@@ -7,7 +7,8 @@ import { parsePdf } from './pdf.ts'
 
 /** The parser child's forked entry point: reads exactly one IPC message, parses the file it
  * names, and replies with either `{ blocks }` or `{ error, message }` before exiting. Never logs —
- * the child's stdout/stderr are piped and discarded by the parent, but a bounded, single-purpose
+ * the child's stdout and stderr are both `'ignore'` (see `child-runner.ts`'s `fork` call), so
+ * nothing written to either would ever reach the parent anyway, but a bounded, single-purpose
  * process that talks only over IPC should stay silent regardless. */
 type ChildInput = { kind: 'pdf' | 'docx'; path: string; limits: ParseLimits }
 type ChildReply = { blocks: Block[] } | { error: string; message?: string }

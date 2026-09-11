@@ -13,20 +13,55 @@ describe('parseHtml', () => {
   it('extracts the title, canonical and noindex', () => {
     expect(parsed.title).toBe('Acme · Returns'); expect(parsed.canonical).toBe('https://acme.example/returns'); expect(parsed.noindex).toBe(true)
   })
-  it('drops nav/script/style/footer, keeps headings as path and text', () => {
+  it('drops nav/script/style/footer text, keeps headings as path and text — and (phase-4 controller ruling) the three trailing top-level anchors\' labels now survive as loose prose, back-to-back with no source whitespace between them', () => {
     expect(parsed.blocks.map((b) => [b.kind, b.headingPath.join(' › '), b.text])).toEqual([
       ['heading', 'Returns', 'Returns'],
       ['paragraph', 'Returns', 'Items can be returned within 30 days.'],
       ['heading', 'Returns › Exceptions', 'Exceptions'],
       ['list', 'Returns › Exceptions', '• Sale items\n• Gift cards'],
+      // "Shipping", "Other" and "mail" — the three anchors sitting directly in <body>, with no
+      // wrapping tag and no whitespace between them in the source — join into one loose-prose
+      // block once anchor text is no longer dropped outside nav/header/footer (carry-over (a)).
+      ['paragraph', 'Returns › Exceptions', 'ShippingOthermail'],
     ])
   })
   it('collects http(s) links only, unresolved (the crawler resolves against the page URL)', () => {
     expect(parsed.links).toEqual(['/', '/shipping', 'https://other.example/x'])
   })
-  it('concatenates a second <title> rather than losing the first (fix review #10)', () => {
+  it('a second <title> REPLACES the first (phase-4 controller ruling, reversing fix review #10)', () => {
     const two = parseHtml('<html><head><title>First</title><title>Second</title></head><body></body></html>')
-    expect(two.title).toBe('First Second')
+    expect(two.title).toBe('Second')
+  })
+})
+
+describe('parseHtml: anchor text is TEXT everywhere (phase-4 controller ruling, dropping the anchorDepth exception)', () => {
+  it('captures an anchor\'s label as part of loose prose exactly as inside a <p>, and still collects its href', () => {
+    const loose = parseHtml('<div>Read the <a href="/x">returns policy</a> now for details.</div>')
+    expect(loose.blocks).toEqual([{ kind: 'paragraph', headingPath: [], text: 'Read the returns policy now for details.' }])
+    expect(loose.links).toEqual(['/x'])
+  })
+  it('still drops anchor text inside nav/header/footer — only loose top-level anchor text changed', () => {
+    const navOnly = parseHtml('<nav><a href="/home">Home</a></nav>')
+    expect(navOnly.blocks).toEqual([])
+    expect(navOnly.links).toEqual(['/home'])
+  })
+})
+
+describe('parseHtml: dl/dt/dd join the loose-flush tags (fix review carry-over)', () => {
+  it('flushes loose prose before a <dl>, and each <dt>/<dd> becomes its own block, in document order', () => {
+    const parsed = parseHtml('<body>Some intro prose.<dl><dt>Shipping</dt><dd>Three days</dd></dl></body>')
+    expect(parsed.blocks.map((b) => [b.kind, b.text])).toEqual([
+      ['paragraph', 'Some intro prose.'],
+      ['paragraph', 'Shipping'],
+      ['paragraph', 'Three days'],
+    ])
+  })
+})
+
+describe('parseHtml: a <p> nested inside a <li> is item text, not a stray block (fix review carry-over)', () => {
+  it('keeps each <li><p>...</p></li> as one list item, not a lost top-level paragraph', () => {
+    const parsed = parseHtml('<ul><li><p>Alpha</p></li><li><p>Beta</p></li></ul>')
+    expect(parsed.blocks).toEqual([{ kind: 'list', headingPath: [], text: '• Alpha\n• Beta' }])
   })
 })
 

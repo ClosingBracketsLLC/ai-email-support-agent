@@ -23,15 +23,22 @@ function hardSplit(text: string, max: number): string[] {
   return pieces
 }
 
-/** The single last complete sentence of a finished piece, truncated to `overlap` characters if
- * it's longer — the sentence-aligned context carried into the next piece, so a chunk boundary
- * never drops the thread a retrieval match would otherwise need (fix review #7: this must be
- * exactly ONE sentence, not as many trailing sentences as fit in `overlap` characters, so the
- * next piece's content literally starts with it). */
-function lastSentenceOverlap(text: string, overlap: number): string {
+/** As many WHOLE trailing sentences of a finished piece as fit within `overlap` characters, at
+ * least one — the sentence-aligned context carried into the next piece, so a chunk boundary never
+ * drops the thread a retrieval match would otherwise need. Built backward from the end: the last
+ * sentence is always included (the floor — even alone it may exceed `overlap`, in which case it's
+ * truncated to `overlap` characters, keeping its start rather than dropping it entirely); each
+ * earlier sentence joins only while the combined text still fits. */
+function trailingSentencesOverlap(text: string, overlap: number): string {
   const sentences = splitSentences(text)
-  const last = sentences.length > 0 ? sentences[sentences.length - 1]! : ''
-  return last.length > overlap ? last.slice(0, overlap) : last
+  if (sentences.length === 0) return ''
+  let combined = sentences[sentences.length - 1]!
+  for (let i = sentences.length - 2; i >= 0; i--) {
+    const candidate = `${sentences[i]} ${combined}`
+    if (candidate.length > overlap) break
+    combined = candidate
+  }
+  return combined.length > overlap ? combined.slice(0, overlap) : combined
 }
 
 /** Pack one oversized block's text into pieces no larger than `max`, targeting `target`: sentences
@@ -50,7 +57,7 @@ function packBlockText(text: string, target: number, max: number, overlap: numbe
       const joined = `${current} ${sentence}`
       if (joined.length <= target) { current = joined; continue }
 
-      const overlapText = lastSentenceOverlap(current, overlap)
+      const overlapText = trailingSentencesOverlap(current, overlap)
       finalize()
       current = overlapText.length > 0 ? `${overlapText} ${sentence}` : sentence
       // A hard-cut fragment carries no sentence boundary to overlap from; guard the hard bound
