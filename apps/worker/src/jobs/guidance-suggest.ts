@@ -5,10 +5,12 @@
  * `approveDraft` is the producer — it never runs on this role). Three short transactions with the
  * model call strictly between the cap check and the insert:
  *
- *   1. one READ tx: the draft, the workspace, the agent's guidance and the category label. Skips
- *      (never reaches the model) on a null `finalBody`, a non-human `decisionSource`, a cosmetic
- *      edit (`editDistanceRatio < COSMETIC_RATIO_MIN`), or a suggestion already on record for this
- *      draft — a `short`-queue redelivery must never call the model twice for the same edit.
+ *   1. one READ tx: the platform kill lever (checked FIRST, same as every other model-calling job —
+ *      ticket-draft.ts's `loadPreClaim`, agent-sandbox.ts's preload, send-execute.ts's claim), then
+ *      the draft, the workspace, the agent's guidance and the category label. Skips (never reaches
+ *      the model) on the lever being on, a null `finalBody`, a non-human `decisionSource`, a
+ *      cosmetic edit (`editDistanceRatio < COSMETIC_RATIO_MIN`), or a suggestion already on record
+ *      for this draft — a `short`-queue redelivery must never call the model twice for the same edit.
  *   2. one CAP tx: `pg_advisory_xact_lock` on the org, then a fail-closed compare against
  *      `guidance.daily_suggest_cap` — over cap returns `'capped'` and bumps nothing, under cap bumps
  *      the meter BEFORE the call, same "the spend row is written before the model call" rule
@@ -25,7 +27,7 @@ import { runGuidanceSuggestCall } from '@aesa/agent'
 import { resolveSetting } from '@aesa/core'
 import {
   agents, audit, bumpMeter, categories, drafts, GUIDANCE_METERS, guidanceSuggestions, orgSettings,
-  usageCounters, withOrg, workspaces, type Db,
+  platformState, usageCounters, withOrg, workspaces, type Db,
 } from '@aesa/db'
 import type { LlmProvider } from '@aesa/llm'
 import { defineJob, JOB_NAMES, registerJob, type JobDefinition } from '@aesa/queue'
@@ -65,6 +67,11 @@ interface Loaded {
 
 async function load(db: Db, orgId: string, draftId: string): Promise<Loaded | null> {
   return withOrg(db, orgId, async (tx) => {
+    // The platform kill lever is a policy no-op, checked first, same as ticket-draft.ts's
+    // loadPreClaim and agent-sandbox.ts's preload: no call, no cap bump, no row.
+    const [lever] = await tx.select({ value: platformState.value }).from(platformState).where(eq(platformState.key, 'killswitch.global'))
+    if (lever?.value === true) return null
+
     const [d] = await tx.select({
       agentId: drafts.agentId, categoryId: drafts.categoryId, body: drafts.body, finalBody: drafts.finalBody,
       editDistanceRatio: drafts.editDistanceRatio, decisionSource: drafts.decisionSource,

@@ -8,7 +8,8 @@ import pino from 'pino'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import {
   agents, auditLog, categories, drafts, ensureDefaultCategories, guidanceSuggestions,
-  mailboxConnections, orgSettings, tickets, usageCounters, user, withOrg, workspaces,
+  mailboxConnections, orgSettings, platformState, tickets, usageCounters, user, withOrg, withPlatform,
+  workspaces,
 } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
@@ -203,5 +204,26 @@ describe('guidance.suggest', () => {
 
     expect(outcome).toBe('capped')
     expect(provider.calls).toHaveLength(0)
+  })
+
+  it('the platform kill lever is a policy no-op: skipped, no cap bump, no call, no row', async () => {
+    await withPlatform(app.db, 'test:killswitch', (tx) =>
+      tx.insert(platformState).values({ key: 'killswitch.global', value: true })
+        .onConflictDoUpdate({ target: platformState.key, set: { value: true } }))
+    const draftId = await seedApprovedDraft({ editDistanceRatio: 0.4 })
+    const provider = createFakeProvider([{ parsed: { suggestion: 'should never run', rationale: '' } }])
+    const deps = makeDeps(provider)
+
+    let outcome: Awaited<ReturnType<typeof run>>
+    try {
+      outcome = await run(deps, draftId)
+    } finally {
+      await withPlatform(app.db, 'test:killswitch', (tx) => tx.delete(platformState).where(eq(platformState.key, 'killswitch.global')))
+    }
+
+    expect(outcome).toBe('skipped')
+    expect(provider.calls).toHaveLength(0)
+    expect(await allSuggestions()).toHaveLength(0)
+    expect(await meter('guidance_suggest_calls')).toBe(0)
   })
 })
