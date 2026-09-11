@@ -31,6 +31,8 @@ export interface SendRoleDeps {
   logger: pino.Logger
   enqueueNotify: SendExecuteDeps['enqueueNotify']
   enqueueDraft: SendExecuteDeps['enqueueDraft']
+  /** index.ts wires this to `enqueueMemoryCapture` — Phase 5's `memory.capture`, fired post-commit. */
+  onSent?: SendExecuteDeps['onSent']
 }
 
 export type SendRoleRegistrar = (boss: PgBoss, deps: SendExecuteDeps) => Promise<void>
@@ -62,5 +64,6 @@ export async function maybeRegisterSendRole(deps: SendRoleDeps, register: SendRo
     logger: deps.logger,
     enqueueNotify: deps.enqueueNotify,
     enqueueDraft: deps.enqueueDraft,
+    onSent: deps.onSent,
   })
 }
