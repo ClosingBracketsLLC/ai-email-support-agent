@@ -157,8 +157,9 @@ export function createProviderResolver(deps: ProviderResolverDeps): ProviderReso
   // ONE limiter for the process, keyed `byok:${orgId}:${credentialId}` by `createByokProvider`, so a
   // rebuilt provider for the same credential still draws from that credential's own two slots.
   const limiter = createLlmLimiter({ maxConcurrentPerKey: BYOK_MAX_CONCURRENT_PER_CREDENTIAL })
-  /** Keyed on `${credentialId}:${lastProbedAt}` — see the file header. */
-  const cache = new Map<string, { provider: LlmProvider; builtAt: number }>()
+  /** Keyed on `${credentialId}:${lastProbedAt}` — see the file header. Each entry carries its own
+   *  `credentialId` so an LRU eviction can trim `keyByCredential` too. */
+  const cache = new Map<string, { provider: LlmProvider; builtAt: number; credentialId: string }>()
   /** The freshness key each credential currently occupies, so a rebuild (or `invalidate`) can drop
    *  the entry it replaces instead of leaving a stale key holding a decrypted secret. */
   const keyByCredential = new Map<string, string>()
@@ -174,10 +175,17 @@ export function createProviderResolver(deps: ProviderResolverDeps): ProviderReso
     const previous = keyByCredential.get(credentialId)
     if (previous !== undefined && previous !== key) cache.delete(previous)
     if (cache.size >= PROVIDER_CACHE_MAX) {
-      const oldest = cache.keys().next()
-      if (!oldest.done) cache.delete(oldest.value)
+      const oldest = cache.entries().next()
+      if (!oldest.done) {
+        const [oldestKey, entry] = oldest.value
+        cache.delete(oldestKey)
+        // The evicted entry is usually the only one that credential holds, so drop its freshness key
+        // too — otherwise `keyByCredential` grows one dead string pair per eviction for the life of
+        // the process. Guarded: a credential rebuilt since is pointing at a newer key we must keep.
+        if (keyByCredential.get(entry.credentialId) === oldestKey) keyByCredential.delete(entry.credentialId)
+      }
     }
-    cache.set(key, { provider, builtAt: nowMs() })
+    cache.set(key, { provider, builtAt: nowMs(), credentialId })
     keyByCredential.set(credentialId, key)
   }
 

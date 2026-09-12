@@ -245,10 +245,12 @@ async function settleRun(
 /**
  * Phase 6's two `provider_unavailable` landings — the resolver could not produce a provider at all,
  * and the tenant's key was rejected mid-call. Unlike this file's three GRANDFATHERED landings
- * (`triage_cap`, `triage_failed` and the verdict's `triage_flags`/`sentiment_angry`, which pair
- * their own guarded write with `insertEscalationNotification` because they also write the VERDICT
- * columns in the same UPDATE), these write nothing but the three fields `escalateTicket` owns — so
- * they go through it, as CLAUDE.md's Escalation rule requires and as `ticket.draft` already does.
+ * (`triage_cap`, `triage_failed` and the verdict's `triage_flags`/`sentiment_angry`), which pair
+ * their own guarded write with `insertEscalationNotification` and are named in CLAUDE.md's
+ * Escalation rule — `triage_failed` and the verdict landing because they write the VERDICT columns
+ * in the same UPDATE, `triage_cap` because it predates `escalateTicket` — these write nothing but
+ * the three fields `escalateTicket` owns, so they go through it, as that rule requires and as
+ * `ticket.draft` already does.
  * Its dedupe key is the reason-scoped one `ticket.draft` uses for the same reason, so which job
  * noticed the dead key first cannot change whether the owner is paged.
  */
