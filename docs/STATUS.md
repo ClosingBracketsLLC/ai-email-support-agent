@@ -1,7 +1,12 @@
 # Project status
 
 Updated 2026-09-11. The spec (`docs/superpowers/specs/2026-09-07-ai-email-support-agent-design.md`)
-defines seven build phases; this file records where the build stands against them.
+defines Phase 0 (rails and tenancy) plus seven build phases, Phases 1–7; this file records where the
+build stands against them. As of 2026-09-11: Phases 0–4 and the brand are on `main` (Phase 4 via PR #5,
+merge commit `ef81169`); Phase 5 (autonomy and learning) is complete on branch `phase-5` and lands on
+`main` through a GitHub PR on Robert's go-ahead; Phases 6 (provider choice / BYOK) and 7 (billing,
+caps, launch hardening) remain, each starting at `superpowers:writing-plans` from the spec's *Build
+phases* paragraph for that phase.
 
 ## Done
 
@@ -374,7 +379,7 @@ the record)</summary>
 </details>
 
 
-### Phase 3 — draft, review, send (complete on branch `phase-3`; PR not yet opened)
+### Phase 3 — draft, review, send (complete; merged into `main` via PR #3 on 2026-09-11, carrying the brand)
 
 - Plan: `docs/superpowers/plans/2026-09-09-phase-3-draft-review-send.md` (23 tasks, executed with
   subagent-driven development). Commits `acf1f4f..HEAD` on `phase-3`, branched from `main` at
@@ -704,7 +709,7 @@ the record)</summary>
   their guarded UPDATE's `RETURNING`, the draft insert retiring every live draft except `sending`,
   and the app's five copy/state minors.
 
-### Brand — the aesa identity (complete on branch `brand`; PR follows PR #3)
+### Brand — the aesa identity (complete; merged into `phase-3` via PR #4 and landed on `main` with PR #3 on 2026-09-11)
 
 - Plan: `docs/superpowers/plans/2026-09-10-brand-system.md` (7 tasks, executed with
   subagent-driven development). Commits `0f3efbe..1d843c7` on `brand`, branched from `phase-3` at
@@ -826,7 +831,7 @@ the record)</summary>
   (`pnpm --filter @aesa/worker test test/e2e-phase3.test.ts`), and `apps/worker` has no dependency
   on anything this wave touched.
 
-### Phase 4 — knowledge (complete on branch `phase-4`; PR not yet opened)
+### Phase 4 — knowledge (complete; merged into `main` via PR #5 on 2026-09-11, merge commit `ef81169`)
 
 - Plan: `docs/superpowers/plans/2026-09-10-phase-4-knowledge.md` (11 tasks, executed with
   subagent-driven development). Commits **`de35bf9..HEAD`** on `phase-4`, branched from `main` at
