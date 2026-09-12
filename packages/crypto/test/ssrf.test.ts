@@ -1,10 +1,9 @@
-import { createServer, type Server } from 'node:http'
-import type { AddressInfo } from 'node:net'
 import { gzipSync } from 'node:zlib'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { isBlockedAddress } from '../src/ssrf/ranges.ts'
 import { resolvePublic } from '../src/ssrf/resolve-public.ts'
 import { buildPinnedDispatcher, fetchThroughPinnedDispatcher, pinnedFetch, validateOutboundUrl } from '../src/ssrf/pinned-fetch.ts'
+import { startLocalOrigin, type LocalOrigin } from './helpers/ssrf-server.ts'
 
 describe('ssrf ranges', () => {
   it.each(['127.0.0.1', '10.1.2.3', '172.16.5.5', '192.168.0.1', '169.254.169.254', '100.64.0.1', '0.0.0.0', '224.0.0.1', '::1', 'fc00::1', 'fe80::1', '::ffff:127.0.0.1', '64:ff9b::7f00:1', '2002:7f00:1::'])(
@@ -60,11 +59,11 @@ describe('pinnedFetch transport (real sockets)', () => {
   // so a content-length bug that trusts the origin's (compressed) header is easy to catch.
   const GZIP_PAYLOAD = 'x'.repeat(1080)
   const GZIPPED = gzipSync(GZIP_PAYLOAD)
-  let server: Server
+  let origin: LocalOrigin
   let port = 0
 
   beforeAll(async () => {
-    server = createServer((req, res) => {
+    origin = await startLocalOrigin((req, res) => {
       if (req.url === '/small') return void res.writeHead(200, { 'content-type': 'text/plain' }).end('hello')
       if (req.url === '/large') return void res.writeHead(200, { 'content-type': 'application/octet-stream' }).end(Buffer.alloc(LARGE, 0x61))
       if (req.url === '/redirect') return void res.writeHead(302, { location: 'https://elsewhere.example/' }).end('go away')
@@ -80,10 +79,9 @@ describe('pinnedFetch transport (real sockets)', () => {
       }
       res.writeHead(404).end()
     })
-    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
-    port = (server.address() as AddressInfo).port
+    port = origin.port
   })
-  afterAll(async () => { await new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve()))) })
+  afterAll(async () => { await origin.close() })
 
   const get = (path: string, init = {}) =>
     fetchThroughPinnedDispatcher(new URL(`http://pinned.invalid:${port}${path}`), buildPinnedDispatcher('127.0.0.1', 4), init)
