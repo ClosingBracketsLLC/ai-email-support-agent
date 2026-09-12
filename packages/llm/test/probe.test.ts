@@ -79,6 +79,20 @@ describe('probeProvider', () => {
     expect(Number.isNaN(Date.parse(r.probedAt))).toBe(false)
   })
 
+  it('scrubs a NON-LlmError throw before it reaches `error.message` (which is persisted on last_probe)', async () => {
+    // The only path into the probe result that no adapter's `mapError` has already scrubbed — and
+    // the whole result is written to `llm_credentials.last_probe`, which the api returns.
+    const fake = {
+      kind: 'fake',
+      capabilities: () => ({ structuredOutput: 'native' as const, tools: true, effort: true, cacheMinTokens: 512 }),
+      chat: async () => { throw new Error('connect failed for Bearer sk-live-abcdef123456') },
+    }
+    const r = await probeProvider(fake, 'm', meta)
+    expect(r.ok).toBe(false)
+    expect(r.error!.message).not.toContain('sk-')
+    expect(r.error!.message).toContain('[redacted]')
+  })
+
   it('is driven through the ladder only by a caller that wants the ladder: the raw adapter keys are unsuffixed', async () => {
     // The ladder would suffix the probe's own idempotency keys again (`…:structured:native:native`)
     // — the probe's contract is to drive the RAW adapter's rungs itself.

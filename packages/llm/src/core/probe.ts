@@ -4,6 +4,7 @@
 import type { ProbeResultView } from '@aesa/contracts'
 import { z } from 'zod'
 import { LlmError } from './errors.ts'
+import { scrubSecrets } from './shared.ts'
 import type { ChatMeta, LlmProvider } from './types.ts'
 
 /** Deliberately two trivial fields: the probe is testing whether the ENDPOINT honours a
@@ -69,7 +70,11 @@ export async function probeProvider(
       meta: { ...base, idempotencyKey: `${meta.idempotencyPrefix}:chat` },
     })
   } catch (err) {
-    const e = err instanceof LlmError ? err : new LlmError(String(err), 'permanent', false)
+    // An `LlmError` was already scrubbed by whichever adapter's `mapError` produced it; anything
+    // else is an arbitrary throw whose message this stringifies verbatim — and this message is
+    // PERSISTED (`llm_credentials.last_probe`, which the api returns and Settings → AI renders) and
+    // passed to `markCredentialDead`, so it must pass the same scrub every adapter message does.
+    const e = err instanceof LlmError ? err : new LlmError(scrubSecrets(String(err)), 'permanent', false)
     return {
       ok: false,
       probedAt,

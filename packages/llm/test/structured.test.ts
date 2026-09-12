@@ -215,12 +215,49 @@ describe('withStructuredLadder', () => {
     expect(plain.usage.cacheWrite1hTokens).toBeUndefined()
   })
 
-  it('an LlmError from any rung propagates unchanged', async () => {
+  it('an LlmError from any rung propagates unchanged — except a `permanent` one on the NATIVE rung', async () => {
     const failure = new LlmError('boom', 'permanent', false)
-    const fake = createFakeProvider([{ error: failure }], { capabilities: { structuredOutput: 'native' } })
+    // json_mode (rung 2) is the one every non-native model starts at: a permanent error there is
+    // the request itself failing, and it still propagates.
+    const onJsonMode = createFakeProvider([{ error: failure }], { capabilities: { structuredOutput: 'json_mode' } })
+    await expect(withStructuredLadder(onJsonMode).chat(baseRequest())).rejects.toBe(failure)
+
+    // The repair rung (3) too.
+    const onRepair = createFakeProvider(
+      [{ parsed: null }, { parsed: null }, { error: failure }],
+      { capabilities: { structuredOutput: 'native' } },
+    )
+    await expect(withStructuredLadder(onRepair).chat(baseRequest())).rejects.toBe(failure)
+  })
+
+  it('rung 1: an endpoint that REJECTS json_schema (permanent) falls through to json_mode instead of failing the call', async () => {
+    // Phase 6: the probe raises `native` per CREDENTIAL, so a model on that credential that does not
+    // honour `json_schema` answers 400 -> `permanent`. That must cost one extra call, not the draft.
+    const fake = createFakeProvider(
+      [
+        { error: new LlmError('400 json_schema unsupported', 'permanent', false) },
+        { parsed: { outcome: 'reply', confidence: 0.6 }, parseStrategy: 'json_mode' },
+      ],
+      { capabilities: { structuredOutput: 'native' } },
+    )
     const provider = withStructuredLadder(fake)
 
-    await expect(provider.chat(baseRequest())).rejects.toBe(failure)
+    const result = await provider.chat(baseRequest())
+
+    expect(result.parsed).toEqual({ outcome: 'reply', confidence: 0.6 })
+    expect(result.parseStrategy).toBe('json_mode')
+    expect(fake.calls).toHaveLength(2)
+    expect(fake.calls.map((c) => c.meta.idempotencyKey)).toEqual(['k:native', 'k:json_mode'])
+    // The rejected rung returned no usage at all, so the result carries only the rung that answered.
+    expect(result.usage.apiCalls).toBe(1)
+  })
+
+  it('rung 1: any OTHER error code on the native rung still propagates — the credential, not the rung, is what failed', async () => {
+    const rateLimited = new LlmError('429 slow down', 'rate_limit', true)
+    const fake = createFakeProvider([{ error: rateLimited }], { capabilities: { structuredOutput: 'native' } })
+
+    await expect(withStructuredLadder(fake).chat(baseRequest())).rejects.toBe(rateLimited)
+    expect(fake.calls).toHaveLength(1)
   })
 
   it('a json_mode-only model skips rung 1 entirely', async () => {

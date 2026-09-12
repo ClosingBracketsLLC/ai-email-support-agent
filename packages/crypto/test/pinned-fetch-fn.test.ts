@@ -24,6 +24,22 @@ describe('createPinnedFetch', () => {
     await expect(f('https://llm.example.com/v1/models')).rejects.toThrow(/private|blocked|public/i)
   })
 
+  it('refuses a non-string body loudly, before anything is resolved or sent', async () => {
+    const seen: unknown[] = []
+    const f = createPinnedFetch({ resolver: publicResolver, transport: async (url) => { seen.push(url); return new Response('{}') } })
+    // A stream, FormData or a Blob cannot be pinned by this transport; sending the request without
+    // the body would reach the endpoint as a confusing 400 instead of failing here.
+    await expect(f('https://llm.example.com/v1/chat', { method: 'POST', body: new Uint8Array([1, 2, 3]) }))
+      .rejects.toThrow(PinnedFetchError)
+    await expect(f('https://llm.example.com/v1/chat', { method: 'POST', body: new URLSearchParams({ a: 'b' }) }))
+      .rejects.toMatchObject({ code: 'unsupported_body', message: 'unsupported body type' })
+    expect(seen).toHaveLength(0)
+    // A string body, and no body at all, are both still fine.
+    await f('https://llm.example.com/v1/chat', { method: 'POST', body: '{"model":"m"}' })
+    await f('https://llm.example.com/v1/models')
+    expect(seen).toHaveLength(2)
+  })
+
   it('an aborted signal rejects promptly', async () => {
     const f = createPinnedFetch({ resolver: publicResolver })
     const ac = new AbortController()

@@ -5,6 +5,8 @@ import { z } from 'zod'
 import { JOB_SIGNAL_MARGIN_SECONDS } from '@aesa/core'
 import { defineJob, registerJob, scrubJobError } from '../src/define-job.ts'
 import { enqueue } from '../src/enqueue.ts'
+import { JOB_NAMES } from '../src/names.ts'
+import { QUEUE_OPTIONS } from '../src/queue-options.ts'
 import { deleteAllJobs, queryJobs, startTestBoss, uniqueName } from './helpers/boss.ts'
 
 describe('defineJob / enqueue', () => {
@@ -16,6 +18,19 @@ describe('defineJob / enqueue', () => {
   it('refuses expireInSeconds at or below the signal margin', () => {
     expect(() => defineJob({ name: 'x', schema: z.object({ orgId: z.uuid() }), queue: { expireInSeconds: JOB_SIGNAL_MARGIN_SECONDS }, handler: async () => {} }))
       .toThrow(/expireInSeconds/)
+  })
+
+  it('resolves a JOB_NAMES name with no `queue` from QUEUE_OPTIONS', () => {
+    // The whole point of the table: a job file that names a real queue and passes no options gets
+    // that queue's options, `policy: 'short'` included — pg-boss's singleton index depends on it.
+    const def = defineJob({ name: JOB_NAMES.ticketDraft, schema: z.object({ orgId: z.uuid() }), handler: async () => {} })
+    expect(def.queue).toEqual(QUEUE_OPTIONS[JOB_NAMES.ticketDraft])
+    expect(def.queue.policy).toBe('short')
+  })
+
+  it('refuses a name that is in neither QUEUE_OPTIONS nor the call', () => {
+    expect(() => defineJob({ name: 'nope.unknown', schema: z.object({ orgId: z.uuid() }), handler: async () => {} }))
+      .toThrow(/no queue options/)
   })
 
   it('registerJob scrubs a DrizzleQueryError before pg-boss records it', () => {

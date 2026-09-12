@@ -11,7 +11,7 @@ export function validateOutboundUrl(input: string, opts: { allowNonstandardPort?
   return url
 }
 
-export type PinnedFetchErrorCode = 'redirect_not_followed' | 'body_too_large'
+export type PinnedFetchErrorCode = 'redirect_not_followed' | 'body_too_large' | 'unsupported_body'
 
 export class PinnedFetchError extends Error {
   readonly code: PinnedFetchErrorCode
@@ -161,6 +161,11 @@ export function createPinnedFetch(opts: CreatePinnedFetchOptions = {}): typeof f
   const fn = async (input: string | URL | Request, init: RequestInit = {}): Promise<Response> => {
     const href = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
     const url = validateOutboundUrl(href, { allowNonstandardPort: opts.allowNonstandardPort })
+    // The SDKs send string bodies; anything else (a stream, FormData, a Blob) is not something this
+    // transport can pin. Dropping it silently would send a bodyless POST and turn a caller's mistake
+    // into an endpoint's confusing 400, so it is refused loudly instead, before anything is sent.
+    const body = init.body ?? undefined
+    if (body !== undefined && typeof body !== 'string') throw new PinnedFetchError('unsupported body type', 'unsupported_body')
     const { address, family } = await resolvePublic(url.hostname, { resolver: opts.resolver })
     const headers: Record<string, string> = {}
     new Headers(init.headers ?? undefined).forEach((value, key) => {
@@ -169,9 +174,7 @@ export function createPinnedFetch(opts: CreatePinnedFetchOptions = {}): typeof f
     return transport(url, buildPinnedDispatcher(address, family), {
       method: init.method ?? 'GET',
       headers,
-      // The SDKs send string bodies; anything else (a stream, FormData) is not something this
-      // transport can pin, so it is dropped rather than silently half-sent.
-      ...(typeof init.body === 'string' ? { body: init.body } : {}),
+      ...(body === undefined ? {} : { body }),
       ...(init.signal ? { signal: init.signal } : {}),
       ...(opts.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }),
       ...(opts.maxBodyBytes === undefined ? {} : { maxBodyBytes: opts.maxBodyBytes }),

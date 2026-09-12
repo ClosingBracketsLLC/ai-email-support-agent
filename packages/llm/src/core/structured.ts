@@ -7,9 +7,11 @@
  * `llm_calls` row per rung. A `finish: 'refusal'` result from any model call is returned
  * immediately — the model has already declined; asking again would just waste a call. An
  * `LlmError` thrown by any rung is not caught here — it propagates to the caller unchanged; retry
- * policy belongs to the job layer (spec §Budgets), not this package.
+ * policy belongs to the job layer (spec §Budgets), not this package. The ONE exception is rung 1:
+ * a `permanent` error from the NATIVE rung is a rejected rung, not a failed request (see there).
  */
 import { z } from 'zod'
+import { LlmError } from './errors.ts'
 import type { ChatRequest, ChatResult, ChatUsage, LlmProvider, StructuredMode } from './types.ts'
 
 export const REPAIR_MAX_OUTPUT_TOKENS = 1024
@@ -142,12 +144,31 @@ export function withStructuredLadder(inner: LlmProvider): LlmProvider {
 
       // Rung 1: the model's own structured-output feature — only when it has one.
       if (caps.structuredOutput === 'native') {
-        const result = await callRung('native', 'native')
-        usage = sumUsage(usage, result.usage)
-        latencyMs += result.latencyMs
-        last = result
-        if (isRefusal(result)) return { ...result, usage, latencyMs }
-        if (result.parsed !== null) return { ...result, usage, latencyMs }
+        /**
+         * The one caught rung. `native` is no longer only a hand-curated fact about a model this
+         * platform ships against: Phase 6's probe RAISES it onto any OpenAI-compatible endpoint that
+         * honoured `json_schema` once, per CREDENTIAL, and that verdict is then applied to every
+         * model on it. A server that does not honour the rung for THIS model answers 400, which
+         * `mapError` calls `permanent` — not retryable, not a `FALLBACK_CODE`, so without this catch
+         * a raised verdict would fail every draft and triage on that credential outright. A rejected
+         * rung is exactly the `parsed: null` case: fall through to json_mode below, which runs for
+         * every `!== 'none'` model anyway. Only `permanent`, and only here — every other code (`auth`,
+         * `rate_limit`, `context_too_long`, …) describes the credential or the request as a whole and
+         * still propagates unchanged, from this rung as from every other.
+         */
+        let result: ChatResult<T> | null = null
+        try {
+          result = await callRung('native', 'native')
+        } catch (err) {
+          if (!(err instanceof LlmError) || err.code !== 'permanent') throw err
+        }
+        if (result) {
+          usage = sumUsage(usage, result.usage)
+          latencyMs += result.latencyMs
+          last = result
+          if (isRefusal(result)) return { ...result, usage, latencyMs }
+          if (result.parsed !== null) return { ...result, usage, latencyMs }
+        }
       }
 
       // Rung 2: the forced-tool fallback — whenever the model can take structured output at all
