@@ -32,6 +32,12 @@ describe('runGuidanceSuggestCall', () => {
     expect(provider.calls[0]).toMatchObject({ model: GUIDANCE_SUGGEST_MODEL, meta: { role: 'guidance_suggest' }, maxOutputTokens: 512 })
   })
 
+  it('honours a model override (a BYOK agent suggests on its own triage model)', async () => {
+    const provider = createFakeProvider([{ parsed: { suggestion: 'Say ten days.', rationale: 'r' } }])
+    await runGuidanceSuggestCall(provider, INPUT, META, new AbortController().signal, 'deepseek-chat')
+    expect(provider.calls[0]!.model).toBe('deepseek-chat')
+  })
+
   it('an unparsable result is a null suggestion, never a throw (the job records nothing)', async () => {
     const provider = createFakeProvider([{ text: 'nope', parseStrategy: 'none' }])
     await expect(runGuidanceSuggestCall(provider, INPUT, META, new AbortController().signal)).resolves.toEqual({ suggestion: null, rationale: '' })

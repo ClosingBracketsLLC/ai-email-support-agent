@@ -43,12 +43,15 @@ export function buildGuidanceSuggestPrompt(input: GuidanceSuggestInput): { syste
   return { system, user }
 }
 
+/** `model` defaults to the MANAGED Haiku; Phase 6's `guidance.suggest` passes the agent's resolved
+ *  triage model, so a BYOK workspace's edit never leaves its own provider. */
 export async function runGuidanceSuggestCall(
   provider: LlmProvider, input: GuidanceSuggestInput, meta: ChatMeta, signal: AbortSignal,
+  model: string = GUIDANCE_SUGGEST_MODEL,
 ): Promise<{ suggestion: string | null; rationale: string }> {
   const { system, user } = buildGuidanceSuggestPrompt(input)
   const result = await provider.chat({
-    model: GUIDANCE_SUGGEST_MODEL, system, messages: [{ role: 'user', content: user }],
+    model, system, messages: [{ role: 'user', content: user }],
     output: { name: 'guidance_rule', schema: GuidanceSuggestion }, maxOutputTokens: 512,
     signal: AbortSignal.any([signal, AbortSignal.timeout(GUIDANCE_SUGGEST_TIMEOUT_MS)]), meta,
   })

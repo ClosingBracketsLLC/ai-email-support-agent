@@ -46,6 +46,7 @@ const INPUT: DraftPromptInput = {
   knowledge: { chunks: [], answers: [] },
   cacheAgentBlocks: false,
   effort: 'medium',
+  model: DRAFT_MODEL,
 }
 
 const DECISION: DraftDecision = {
