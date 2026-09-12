@@ -1,8 +1,9 @@
 /**
  * The structured-output ladder (task brief §core/structured.ts): native structured output ->
- * forced-tool json_mode -> one low-effort repair call -> local balanced-brace extraction -> give
+ * forced-tool json_mode -> (Phase 6, for a model with NEITHER: one plain-text JSON request) -> one
+ * low-effort repair call -> local balanced-brace extraction -> give
  * up. Each rung that calls the model suffixes `meta.idempotencyKey` (`:native`, `:json_mode`,
- * `:repair`) so `withMetering`, wrapped INSIDE this ladder in the registry, records one distinct
+ * `:plain`, `:repair`) so `withMetering`, wrapped INSIDE this ladder in the registry, records one distinct
  * `llm_calls` row per rung. A `finish: 'refusal'` result from any model call is returned
  * immediately — the model has already declined; asking again would just waste a call. An
  * `LlmError` thrown by any rung is not caught here — it propagates to the caller unchanged; retry
@@ -116,6 +117,8 @@ export function withStructuredLadder(inner: LlmProvider): LlmProvider {
       return inner.capabilities(model)
     },
 
+    ...(inner.listModels ? { listModels: (signal?: AbortSignal) => inner.listModels!(signal) } : {}),
+
     async chat<T>(req: ChatRequest<T>): Promise<ChatResult<T>> {
       const output = req.output
       if (!output) return inner.chat(req)
@@ -160,20 +163,31 @@ export function withStructuredLadder(inner: LlmProvider): LlmProvider {
       }
 
       if (!last) {
-        // caps.structuredOutput === 'none': the model has neither native structured output nor
-        // tool support, so neither rung above could run and no provider call was ever made.
-        // There is nothing to repair or extract from, so the ladder stops here rather than
-        // spending a call the model has no way to fulfil.
-        return {
-          text: '',
-          parsed: null,
-          parseStrategy: 'none',
-          usage,
-          finish: 'unknown',
-          provider: inner.kind,
-          model: req.model,
-          latencyMs,
-        }
+        // caps.structuredOutput === 'none' (Phase 6, ruling ledger 74): neither adapter rung
+        // exists, so ask in plain text — the instruction rides as one more VOLATILE system block
+        // so the adapter's stability ordering holds — and parse the reply here. A direct parse is
+        // `plain`; anything else falls through to the repair + extract rungs below exactly as a
+        // failed json_mode reply would.
+        const plainSchema = JSON.stringify(z.toJSONSchema(output.schema))
+        const plain = await inner.chat<T>({
+          ...req,
+          output: undefined,
+          system: [
+            ...req.system,
+            {
+              id: 'json-instruction',
+              stability: 'volatile',
+              text: `Reply with ONE JSON object that satisfies this JSON schema exactly, and nothing else — no prose, no code fence.\n${plainSchema}`,
+            },
+          ],
+          meta: { ...req.meta, idempotencyKey: `${baseKey}:plain` },
+        })
+        usage = sumUsage(usage, plain.usage)
+        latencyMs += plain.latencyMs
+        last = plain
+        if (isRefusal(plain)) return { ...plain, usage, latencyMs }
+        const direct = tryParse(plain.text, output.schema)
+        if (direct !== undefined) return { ...plain, usage, latencyMs, parsed: direct, parseStrategy: 'plain' }
       }
 
       // Rung 3: one repair call — plain text in, plain text out, no `output`/tools, so the ladder

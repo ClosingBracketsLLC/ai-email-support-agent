@@ -85,7 +85,12 @@ export interface ChatUsage {
   apiCalls: number
 }
 
-export type ParseStrategy = 'native' | 'json_mode' | 'repair' | 'extract' | 'none'
+/**
+ * Which rung produced `parsed`. `plain` is Phase 6's rung for a model whose `structuredOutput` is
+ * `'none'`: no adapter rung exists, so the ladder asks for JSON in plain text and parses the reply
+ * itself. `none` means nothing parsed.
+ */
+export type ParseStrategy = 'native' | 'json_mode' | 'plain' | 'repair' | 'extract' | 'none'
 
 export interface ChatResult<T> {
   text: string
@@ -103,4 +108,11 @@ export interface LlmProvider {
   readonly kind: string
   capabilities(model: string): Capabilities
   chat<T>(req: ChatRequest<T>): Promise<ChatResult<T>>
+  /**
+   * The model ids this endpoint actually serves, when the adapter can ask. Optional: a
+   * BYOK endpoint may not implement `/models` at all, and `probeProvider` treats a failure here
+   * as informational, never fatal. Every wrapper in this package forwards it when the inner
+   * provider has one.
+   */
+  listModels?(signal?: AbortSignal): Promise<string[]>
 }

@@ -31,6 +31,8 @@ export function withMetering(inner: LlmProvider, sink: MeterSink, opts?: { prici
       return inner.capabilities(model)
     },
 
+    ...(inner.listModels ? { listModels: (signal?: AbortSignal) => inner.listModels!(signal) } : {}),
+
     async chat<T>(req: ChatRequest<T>): Promise<ChatResult<T>> {
       const start = performance.now()
       try {
