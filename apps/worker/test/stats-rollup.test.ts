@@ -20,8 +20,8 @@ import type PgBoss from 'pg-boss'
 import pino from 'pino'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import {
-  agentCategoryPolicies, agents, categories, categoryStatsDaily, drafts, ensureDefaultCategories,
-  mailboxConnections, notifications, resolvedAnswers, tickets, user, withOrg, workspaces,
+  agentCategoryPolicies, agentModelConfig, agents, categories, categoryStatsDaily, drafts, ensureDefaultCategories,
+  llmCredentials, mailboxConnections, notifications, resolvedAnswers, tickets, user, withOrg, workspaces,
 } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
@@ -136,6 +136,35 @@ describe('stats.rollup', () => {
       status: 'sent', decisionSource: 'app', decidedBy: userId, decidedAt, editDistanceRatio: 0,
       createdAt: decidedAt, confidenceBreakdown: { evidence },
     })
+  }
+
+  /** A `byok` `agent_model_config` row on the `draft` role — `resolveModelConfig`'s catalog lookup
+   *  (`qualityTierFor`) turns `{ provider: 'openai', model: 'gpt-5' }` into tier `standard` and
+   *  `{ provider: 'custom', model: <anything> }` into `limited` (a `custom` credential's preset has
+   *  no suggested models, so every model is unlisted). Defaults `modelGenerationAt` far enough in
+   *  the past (well past the rollup's own 30-day window) that it filters nothing, for tests whose
+   *  whole point is the tier, not the generation window. */
+  async function seedByokModelConfig(
+    orgId: string, agentId: string, opts: { provider: string; model: string; modelGenerationAt?: Date },
+  ): Promise<void> {
+    await withOrg(app.db, orgId, async (tx) => {
+      const [cred] = await tx.insert(llmCredentials).values({
+        orgId, provider: opts.provider, label: 'Test model', keyFingerprint: 'abcdef12…9xyz', createdBy: `user:${userId}`,
+      }).returning({ id: llmCredentials.id })
+      await tx.insert(agentModelConfig).values({
+        orgId, agentId, role: 'draft', mode: 'byok', credentialId: cred!.id, model: opts.model,
+        modelGenerationAt: opts.modelGenerationAt ?? daysAgo(365),
+      })
+    })
+  }
+
+  /** A `managed`-mode `agent_model_config` row whose ONLY purpose is an explicit `modelGenerationAt`
+   *  cutoff (tier stays `calibrated`, same as no row at all) — the shape `SetAgentModelInput` allows
+   *  (`mode: 'managed', credentialId: null`) and the shape the api's own model-change route would
+   *  write when it bumps the generation on a managed agent. */
+  async function seedModelGeneration(orgId: string, agentId: string, modelGenerationAt: Date): Promise<void> {
+    await withOrg(app.db, orgId, (tx) =>
+      tx.insert(agentModelConfig).values({ orgId, agentId, role: 'draft', mode: 'managed', modelGenerationAt }))
   }
 
   async function statsRow(orgId: string, agentId: string, categoryId: string, day: string) {
@@ -377,6 +406,99 @@ describe('stats.rollup', () => {
 
     const jobs = await notifyJobs()
     expect(jobs.some((j) => (j.data as { notificationId: string }).notificationId === notifs[0]!.id)).toBe(true)
+  })
+
+  describe('graduation scales with the agent\'s model quality tier (Task 7)', () => {
+    it('a standard-tier agent needs 40 decisions: 30 unchanged approvals in 30 days suggest nothing; 40 suggest', async () => {
+      const { orgId, connectionId, agentId, categoryId } = await seedOrg({ mode: 'review', autoGraduate: false })
+      // openai + gpt-5 is a listed `standard` model (packages/contracts/src/llm.ts PROVIDER_PRESETS) —
+      // graduationRulesFor('standard') raises minDecisions from the default 20 to 40.
+      await seedByokModelConfig(orgId, agentId, { provider: 'openai', model: 'gpt-5' })
+
+      // 30 unchanged approvals, all within the rollup's 30-day window (spread over the last 25 days
+      // so several land on the same day — harmless, since only the total count matters here).
+      for (let i = 0; i < 30; i++) await seedUnchangedApproval(orgId, connectionId, agentId, categoryId, daysAgo(1 + (i % 25)), 0.9)
+      await runStatsRollup(boss, makeDeps())
+      let policy = await getPolicy(orgId, agentId, categoryId)
+      expect(policy.mode).toBe('review')
+      expect(policy.suggestedAt).toBeNull()   // 30 < the standard tier's 40 — the default 20 would have suggested
+
+      // 10 more (40 total) crosses the standard tier's own bar.
+      for (let i = 30; i < 40; i++) await seedUnchangedApproval(orgId, connectionId, agentId, categoryId, daysAgo(1 + (i % 25)), 0.9)
+      await runStatsRollup(boss, makeDeps())
+      policy = await getPolicy(orgId, agentId, categoryId)
+      expect(policy.mode).toBe('review')   // suggestion only, never auto (autoGraduate: false)
+      expect(policy.suggestedAt?.toISOString()).toBe(NOW.toISOString())
+      expect(policy.suggestedOf).toBe(20)         // GRADUATION_RULES.sampleSize — unaffected by the tier
+      expect(policy.suggestedWouldSend).toBe(20)  // all 40 decisions carry evidence 0.9 ≥ the 80% bar
+    })
+
+    it('a limited-tier agent is never suggested Autopilot and never auto-graduates, even at 60/60 unchanged', async () => {
+      const { orgId, connectionId, agentId, categoryId } = await seedOrg({ mode: 'review', autoGraduate: true })
+      // `custom` has no catalog entries at all, so ANY model on it resolves `limited` — graduationRulesFor
+      // returns canGraduate: false, which skips the graduation branch entirely regardless of signals.
+      await seedByokModelConfig(orgId, agentId, { provider: 'custom', model: 'some-self-hosted-model' })
+
+      for (let i = 0; i < 60; i++) await seedUnchangedApproval(orgId, connectionId, agentId, categoryId, daysAgo(1 + (i % 25)), 0.95)
+
+      // Pass-level `suggested`/`graduated` accumulate across every org this run visits, including
+      // earlier tests' now-`review` categories re-evaluated on every call (see file header) — so,
+      // per that convention, this test asserts only on ITS OWN org's policy row and notifications.
+      await runStatsRollup(boss, makeDeps())
+
+      const policy = await getPolicy(orgId, agentId, categoryId)
+      expect(policy.mode).toBe('review')       // never auto-graduated, though autoGraduate is true
+      expect(policy.suggestedAt).toBeNull()    // never suggested either
+      expect(await notificationsFor(orgId, 'graduation')).toHaveLength(0)
+    })
+
+    it("decisions before model_generation_at do not count: 25 unchanged approvals, then the model changed 3 days ago and 5 more since → the window holds 5 → no suggestion", async () => {
+      const { orgId, connectionId, agentId, categoryId } = await seedOrg({ mode: 'review', autoGraduate: false })
+      // Worked example: generationAt = now − 3d; drafts decided at now − 10d … now − 4d (25 rows) are
+      // excluded; now − 2d … now (5 rows) included → the filtered sample is 5 < GRADUATION_RULES.minDecisions (20).
+      const generationAt = daysAgo(3)
+      await seedModelGeneration(orgId, agentId, generationAt)   // tier stays calibrated — isolates the window, not the tier
+
+      for (let i = 0; i < 25; i++) await seedUnchangedApproval(orgId, connectionId, agentId, categoryId, daysAgo(4 + (i % 7)), 0.9)
+      for (let i = 0; i < 5; i++) await seedUnchangedApproval(orgId, connectionId, agentId, categoryId, daysAgo(i % 3), 0.9)
+
+      await runStatsRollup(boss, makeDeps())
+
+      const policy = await getPolicy(orgId, agentId, categoryId)
+      expect(policy.mode).toBe('review')
+      expect(policy.suggestedAt).toBeNull()   // the window holds only 5 decisions, not 30
+      expect(await notificationsFor(orgId, 'graduation')).toHaveLength(0)
+    })
+
+    it('the demotion backstop and the daily table are UNCHANGED by the tier (limited agent, two rejections → still demoted; category_stats_daily rows identical)', async () => {
+      const { orgId, connectionId, agentId, categoryId } = await seedOrg({ mode: 'auto' })
+      await seedByokModelConfig(orgId, agentId, { provider: 'custom', model: 'some-self-hosted-model' })
+
+      // Same two rejections as the tier-less demotion test above — the tier plays no part in demotion.
+      await seedDraft(orgId, connectionId, agentId, categoryId, {
+        createdAt: daysAgo(2), decidedAt: daysAgo(2), decisionSource: 'app', status: 'rejected',
+      })
+      await seedDraft(orgId, connectionId, agentId, categoryId, {
+        createdAt: daysAgo(3), decidedAt: daysAgo(3), decisionSource: 'app', status: 'rejected',
+      })
+
+      const result = await runStatsRollup(boss, makeDeps())
+      expect(result.demoted).toBeGreaterThanOrEqual(1)
+
+      const policy = await getPolicy(orgId, agentId, categoryId)
+      expect(policy.mode).toBe('review')
+      expect(policy.demotedReason).toBe('rejections')
+      expect(policy.demotedAt?.toISOString()).toBe(NOW.toISOString())
+
+      // The daily table's shape is identical to the tier-less demotion test's — same drafted/rejected
+      // counters on each day, proving the tier and generation-window changes touch graduation ONLY.
+      expect(await statsRow(orgId, agentId, categoryId, dayString(2))).toMatchObject({ drafted: 1, rejected: 1 })
+      expect(await statsRow(orgId, agentId, categoryId, dayString(3))).toMatchObject({ drafted: 1, rejected: 1 })
+
+      const notifs = await notificationsFor(orgId, 'demotion')
+      expect(notifs).toHaveLength(1)
+      expect(notifs[0]!.title).toBe('Autopilot paused for Order status')
+    })
   })
 
   describe('the Monday sampling nudge', () => {

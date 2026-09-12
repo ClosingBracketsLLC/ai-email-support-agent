@@ -14,12 +14,12 @@
 import { and, asc, count, eq, gte, isNotNull, or, sql } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import type pino from 'pino'
-import { AUTO_SENT_CONFIRM_DAYS, DEMOTION_RULES, evaluateDemotion, evaluateGraduation, GRADUATION_RULES } from '@aesa/core'
+import { AUTO_SENT_CONFIRM_DAYS, DEMOTION_RULES, evaluateDemotion, evaluateGraduation, GRADUATION_RULES, graduationRulesFor } from '@aesa/core'
 import { DEFAULT_AUTO_SEND_THRESHOLD } from '@aesa/contracts'
 import {
   agentCategoryPolicies, agents, categories, categoryStatsDaily, demoteCategory, drafts, graduateCategory,
-  notifications, readDemotionSignals, resolvedAnswers, withOrgIdentity, withPlatform,
-  type AuditActor, type Db, type OrgTx,
+  notifications, readDemotionSignals, resolveModelConfig, resolvedAnswers, withOrgIdentity, withPlatform,
+  type AuditActor, type Db, type OrgTx, type ResolvedModelConfig,
 } from '@aesa/db'
 import { registerCron } from '@aesa/queue'
 import { utcDayString, utcWeekString } from '../date-utils.ts'
@@ -74,14 +74,22 @@ interface DailyCounts {
   held: number
 }
 
+/**
+ * Every human decision this pass loaded for one (agent, category), kept as individual rows rather
+ * than pre-summed counts — Task 7's generation window (`resolveModelConfig`'s `modelGenerationAt`)
+ * filters graduation's sample to decisions at or after the agent's current model, and that filter
+ * can only be applied at eval time (in `evaluatePolicies`, once the tier is known) against each
+ * decision's own `decidedAt`, never against a count already collapsed here.
+ */
 interface CategorySignals {
-  unchanged: number
-  edited: number
-  rejected: number
-  lastRejectionAt: Date | null
   /** Every unchanged human approval this pass loaded, in no particular order — sorted (newest
    *  first) only once graduation is actually evaluated for this (agent, category). */
   unchangedApprovals: { decidedAt: Date; evidence: number | null }[]
+  /** One entry per edited human approval — only its length (post-filter) feeds `evaluateGraduation`. */
+  editedAt: Date[]
+  /** One entry per rejection — its length and its max (the last-rejection date, post-filter) feed
+   *  `evaluateGraduation`. */
+  rejectedAt: Date[]
 }
 
 const dailyKey = (agentId: string, categoryId: string, day: string) => `${agentId}:${categoryId}:${day}`
@@ -130,7 +138,7 @@ function aggregateDrafts(rows: LoadedDraft[], now: Date, cutoff: Date): { daily:
     const key = catKey(agentId, categoryId)
     let s = signals.get(key)
     if (!s) {
-      s = { unchanged: 0, edited: 0, rejected: 0, lastRejectionAt: null, unchangedApprovals: [] }
+      s = { unchangedApprovals: [], editedAt: [], rejectedAt: [] }
       signals.set(key, s)
     }
     return s
@@ -151,17 +159,13 @@ function aggregateDrafts(rows: LoadedDraft[], now: Date, cutoff: Date): { daily:
       const decided = DECIDED_SEND_STATUSES.has(row.status)
       if (decided && ratio === 0) {
         bump(agentId, categoryId, day, 'approvedUnchanged')
-        const s = sigFor(agentId, categoryId)
-        s.unchanged += 1
-        s.unchangedApprovals.push({ decidedAt: row.decidedAt, evidence: extractEvidence(row.confidenceBreakdown) })
+        sigFor(agentId, categoryId).unchangedApprovals.push({ decidedAt: row.decidedAt, evidence: extractEvidence(row.confidenceBreakdown) })
       } else if (decided && ratio > 0) {
         bump(agentId, categoryId, day, 'approvedEdited')
-        sigFor(agentId, categoryId).edited += 1
+        sigFor(agentId, categoryId).editedAt.push(row.decidedAt)
       } else if (row.status === 'rejected') {
         bump(agentId, categoryId, day, 'rejected')
-        const s = sigFor(agentId, categoryId)
-        s.rejected += 1
-        if (!s.lastRejectionAt || row.decidedAt > s.lastRejectionAt) s.lastRejectionAt = row.decidedAt
+        sigFor(agentId, categoryId).rejectedAt.push(row.decidedAt)
       }
     }
 
@@ -227,7 +231,17 @@ async function loadPolicies(org: OrgTx, orgId: string): Promise<PolicyRow[]> {
 }
 
 /** Step (d): a `review` category is checked for graduation, an `auto` category for demotion — `off`
- *  falls through both and is left untouched, same as an owner who never opted in at all. */
+ *  falls through both and is left untouched, same as an owner who never opted in at all.
+ *
+ *  Task 7 (provider choice): graduation additionally depends on the agent's model quality tier —
+ *  `resolveModelConfig` (the SAME reader the api and every model call use) is resolved ONCE per
+ *  agent per pass (`modelConfigByAgent`, since this loop can visit one agent across many
+ *  categories), and `graduationRulesFor(tier)` both raises the decision bar for `standard`
+ *  (`minDecisions: 40`) and turns it off entirely for `limited` (`canGraduate: false`) — a `limited`
+ *  agent is never suggested and never auto-graduates, no matter its signals. Its `modelGenerationAt`
+ *  additionally windows the graduation sample alone: a decision from before the agent's current
+ *  model is excluded from the count, the unchanged-approval sample and the last-rejection age.
+ *  Demotion is untouched by either — `readDemotionSignals` below never resolves a model config. */
 async function evaluatePolicies(
   org: OrgTx, orgId: string, policies: PolicyRow[], signals: Map<string, CategorySignals>, now: Date, day: string,
 ): Promise<{ suggested: number; graduated: number; demoted: number; pending: PendingNotify[] }> {
@@ -236,6 +250,15 @@ async function evaluatePolicies(
   let suggested = 0
   let graduated = 0
   let demoted = 0
+  const modelConfigByAgent = new Map<string, ResolvedModelConfig>()
+  const modelConfigFor = async (agentId: string): Promise<ResolvedModelConfig> => {
+    let cfg = modelConfigByAgent.get(agentId)
+    if (!cfg) {
+      cfg = await resolveModelConfig(org, agentId, 'draft')
+      modelConfigByAgent.set(agentId, cfg)
+    }
+    return cfg
+  }
 
   for (const policy of policies) {
     if (policy.mode === 'review') {
@@ -243,12 +266,25 @@ async function evaluatePolicies(
       const fresh = policy.demotedAt === null || policy.demotedAt < cooldownCutoff
       if (!fresh) continue
 
+      const cfg = await modelConfigFor(policy.agentId)
+      const rules = graduationRulesFor(cfg.tier)
+      if (!rules.canGraduate) continue   // e.g. `limited` — no suggestion, no auto-graduation, ever
+
+      const genAt = cfg.modelGenerationAt
+      const inWindow = (d: Date) => genAt === null || d.getTime() >= genAt.getTime()
       const s = signals.get(catKey(policy.agentId, policy.categoryId))
-      const daysSinceLastRejection = s?.lastRejectionAt ? Math.floor((now.getTime() - s.lastRejectionAt.getTime()) / 86_400_000) : null
-      const eligible = evaluateGraduation({ unchanged: s?.unchanged ?? 0, edited: s?.edited ?? 0, rejected: s?.rejected ?? 0, daysSinceLastRejection })
+      const unchangedApprovals = (s?.unchangedApprovals ?? []).filter((a) => inWindow(a.decidedAt))
+      const editedCount = (s?.editedAt ?? []).filter(inWindow).length
+      const rejectedInWindow = (s?.rejectedAt ?? []).filter(inWindow)
+      const lastRejectionAt = rejectedInWindow.length ? new Date(Math.max(...rejectedInWindow.map((d) => d.getTime()))) : null
+      const daysSinceLastRejection = lastRejectionAt ? Math.floor((now.getTime() - lastRejectionAt.getTime()) / 86_400_000) : null
+      const eligible = evaluateGraduation(
+        { unchanged: unchangedApprovals.length, edited: editedCount, rejected: rejectedInWindow.length, daysSinceLastRejection },
+        rules,
+      )
       if (!eligible) continue
 
-      const sample = [...(s?.unchangedApprovals ?? [])].sort((a, b) => b.decidedAt.getTime() - a.decidedAt.getTime()).slice(0, GRADUATION_RULES.sampleSize)
+      const sample = [...unchangedApprovals].sort((a, b) => b.decidedAt.getTime() - a.decidedAt.getTime()).slice(0, GRADUATION_RULES.sampleSize)
       const wouldSend = sample.filter((a) => (a.evidence ?? 0) >= DEFAULT_AUTO_SEND_THRESHOLD / 100).length
       const result = await graduateCategory(org, {
         orgId, agentId: policy.agentId, categoryId: policy.categoryId, categoryLabel: policy.categoryLabel,
