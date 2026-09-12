@@ -36,7 +36,7 @@ import {
   CrawlError, crawlSite, createPinnedCrawlFetch, ParseError, prepareDocument,
   type CrawledPage, type CrawlProgress, type CrawlSummary, type PreparedDocument,
 } from '@aesa/knowledge'
-import { defineJob, enqueue, JOB_NAMES, registerJob, type JobDefinition } from '@aesa/queue'
+import { defineJob, enqueue, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
 import { utcDayString } from '../date-utils.ts'
 import { errorMessage } from '../err-message.ts'
 import {
@@ -60,7 +60,7 @@ export const CRAWL_LEASE_SECONDS = 300
 /** How many ingested pages the FIRST persistence batch carries ("first 20 pages fast", spec §Knowledge). */
 const FIRST_BATCH = 20
 
-export const knowledgeCrawlJob: JobDefinition<KnowledgeCrawlPayload> = defineJob({
+export const knowledgeCrawlJob: RegisteredJobDefinition<KnowledgeCrawlPayload> = defineJob({
   name: JOB_NAMES.knowledgeCrawl,
   schema: KnowledgeCrawlPayload,
   // retryLimit 1 with a FIXED 300 s delay (no backoff) in QUEUE_OPTIONS — hardcoded there to
@@ -349,7 +349,7 @@ export async function runKnowledgeCrawl(deps: KnowledgeDeps, payload: KnowledgeC
 }
 
 export async function registerKnowledgeCrawl(boss: PgBoss, deps: KnowledgeDeps): Promise<void> {
-  const wired: JobDefinition<KnowledgeCrawlPayload> = {
+  const wired: RegisteredJobDefinition<KnowledgeCrawlPayload> = {
     ...knowledgeCrawlJob,
     handler: async (ctx) => {
       await runKnowledgeCrawl(deps, ctx.data, ctx.signal)

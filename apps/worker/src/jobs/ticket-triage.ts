@@ -29,7 +29,7 @@ import {
   usageCounters, withOrg, workspaces, type Db, type OrgTx,
 } from '@aesa/db'
 import type { LlmProvider } from '@aesa/llm'
-import { defineJob, registerJob, JOB_NAMES, type JobDefinition } from '@aesa/queue'
+import { defineJob, registerJob, JOB_NAMES, type RegisteredJobDefinition } from '@aesa/queue'
 
 /** The usage_counters meter this job's spend guard reads and writes. */
 const TRIAGE_METER = 'triage_calls'
@@ -45,7 +45,7 @@ export type TicketTriagePayload = z.infer<typeof TicketTriagePayload>
  * an intentionally-unreachable placeholder; `registerTicketTriage` below builds the real, deps-bound
  * definition and registers THAT.
  */
-export const ticketTriageJob: JobDefinition<TicketTriagePayload> = defineJob({
+export const ticketTriageJob: RegisteredJobDefinition<TicketTriagePayload> = defineJob({
   name: JOB_NAMES.ticketTriage,
   schema: TicketTriagePayload,
   handler: async () => {
@@ -70,7 +70,7 @@ export interface TicketTriageDeps {
 }
 
 export async function registerTicketTriage(boss: PgBoss, deps: TicketTriageDeps): Promise<void> {
-  const wired: JobDefinition<TicketTriagePayload> = {
+  const wired: RegisteredJobDefinition<TicketTriagePayload> = {
     ...ticketTriageJob,
     handler: async (ctx) => {
       await runTicketTriage(deps, ctx.data, ctx.signal)

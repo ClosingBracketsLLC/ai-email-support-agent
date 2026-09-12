@@ -39,7 +39,7 @@ import {
   usageCounters, withOrg,
 } from '@aesa/db'
 import { batchTexts, EmbedError, vectorLiteral } from '@aesa/knowledge'
-import { defineJob, enqueue, JOB_NAMES, registerJob, type JobDefinition } from '@aesa/queue'
+import { defineJob, enqueue, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
 import { utcDayString } from '../date-utils.ts'
 import { errorMessage } from '../err-message.ts'
 import {
@@ -52,7 +52,7 @@ export type KnowledgeEmbedBatchPayload = z.infer<typeof KnowledgeEmbedBatchPaylo
 
 const ACTOR = 'system:knowledge.embed-batch' as const
 
-export const knowledgeEmbedBatchJob: JobDefinition<KnowledgeEmbedBatchPayload> = defineJob({
+export const knowledgeEmbedBatchJob: RegisteredJobDefinition<KnowledgeEmbedBatchPayload> = defineJob({
   name: JOB_NAMES.knowledgeEmbedBatch,
   schema: KnowledgeEmbedBatchPayload,
   // retryLimit 5 with backoff (QUEUE_OPTIONS): Voyage's 429s are the expected failure here, and
@@ -286,7 +286,7 @@ export async function runKnowledgeEmbedBatch(
 }
 
 export async function registerKnowledgeEmbedBatch(boss: PgBoss, deps: KnowledgeDeps): Promise<void> {
-  const wired: JobDefinition<KnowledgeEmbedBatchPayload> = {
+  const wired: RegisteredJobDefinition<KnowledgeEmbedBatchPayload> = {
     ...knowledgeEmbedBatchJob,
     handler: async (ctx) => {
       // `includeMetadata` is on for every queue (registerJob), so `retryCount`/`retryLimit` are the

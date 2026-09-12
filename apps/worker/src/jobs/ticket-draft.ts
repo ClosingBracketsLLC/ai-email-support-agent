@@ -38,7 +38,7 @@ import {
 import { computeCostMicros, findPricing, LlmError, type ChatMeta, type LlmProvider } from '@aesa/llm'
 // type-only: the base `Retriever` is what this job depends on; this is the shape of the richer one.
 import type { DetailedRetriever } from '@aesa/knowledge'
-import { defineJob, enqueue, JOB_NAMES, registerJob, type JobDefinition } from '@aesa/queue'
+import { defineJob, enqueue, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
 import { utcDayString } from '../date-utils.ts'
 import { gateAndRecordRun, readCapsUnlocked } from '../drafting/caps.ts'
 import { claimTicket, recordFailure, unwindClaimStamp, type ClaimedTicket } from '../drafting/claim.ts'
@@ -103,7 +103,7 @@ export type TicketDraftPayload = z.infer<typeof TicketDraftPayload>
  * `retryLimit: 1`: a failed attempt already counted a failure and cleared its claim stamp, so the
  * one retry can claim immediately; past that the ticket's own failure ceiling (2) escalates it.
  */
-export const ticketDraftJob: JobDefinition<TicketDraftPayload> = defineJob({
+export const ticketDraftJob: RegisteredJobDefinition<TicketDraftPayload> = defineJob({
   name: JOB_NAMES.ticketDraft,
   schema: TicketDraftPayload,
   // policy: 'short' (QUEUE_OPTIONS) — NOT pg-boss's default `standard`, on which the `singletonKey`
@@ -136,7 +136,7 @@ export interface TicketDraftDeps {
 }
 
 export async function registerTicketDraft(boss: PgBoss, deps: TicketDraftDeps): Promise<void> {
-  const wired: JobDefinition<TicketDraftPayload> = {
+  const wired: RegisteredJobDefinition<TicketDraftPayload> = {
     ...ticketDraftJob,
     handler: async (ctx) => {
       await runTicketDraft(deps, ctx.data, ctx.signal)

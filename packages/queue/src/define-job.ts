@@ -38,7 +38,17 @@ export interface JobDefinition<T extends { orgId: string }> {
   handler: (ctx: JobContext<T>) => Promise<void>
 }
 
-export function defineJob<T extends { orgId: string }>(def: JobDefinition<T>): JobDefinition<T> {
+/**
+ * What `defineJob` actually hands back: `queue` is narrowed from optional to required, because
+ * `defineJob` always resolves it (from the call's own `queue` or from `QUEUE_OPTIONS`) before
+ * returning, or throws. `registerJob` takes THIS type, not the looser `JobDefinition`, so a
+ * hand-built definition literal that forgets `queue` is a compile error here rather than a runtime
+ * crash on the `!` a non-null assertion would have hidden. `enqueue()` stays on `JobDefinition` — it
+ * only ever reads `.name`/`.schema`, never `.queue`, so it has no reason to demand the narrower type.
+ */
+export type RegisteredJobDefinition<T extends { orgId: string }> = JobDefinition<T> & { queue: JobQueueOptions }
+
+export function defineJob<T extends { orgId: string }>(def: JobDefinition<T>): RegisteredJobDefinition<T> {
   const shape = (def.schema as unknown as { shape?: Record<string, unknown> }).shape
   if (!shape || !('orgId' in shape)) throw new Error(`job ${def.name}: payload schema must be a z.object with an orgId field`)
   const resolved = def.queue ?? QUEUE_OPTIONS[def.name as JobName]
@@ -72,8 +82,8 @@ export interface RegisterJobOptions {
 }
 
 /** Creates/updates the queue with the definition's options and registers a worker that validates, times and aborts. */
-export async function registerJob<T extends { orgId: string }>(boss: PgBoss, def: JobDefinition<T>, opts: RegisterJobOptions = {}): Promise<void> {
-  const queue = def.queue!   // defineJob always resolves this before returning a definition
+export async function registerJob<T extends { orgId: string }>(boss: PgBoss, def: RegisteredJobDefinition<T>, opts: RegisterJobOptions = {}): Promise<void> {
+  const queue = def.queue
   const { policy = 'standard', ...queueOpts } = queue
   await createQueueRetrying(boss, def.name, { name: def.name, policy, ...queueOpts })
   await boss.updateQueue(def.name, { name: def.name, policy, ...queueOpts })   // createQueue is a no-op on an existing queue

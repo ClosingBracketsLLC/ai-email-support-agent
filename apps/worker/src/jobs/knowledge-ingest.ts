@@ -35,7 +35,7 @@ import {
   DEFAULT_PARSE_LIMITS, ParseError, parseMarkdown, parseText, prepareDocument, runParserInChild,
   type Block, type PreparedDocument,
 } from '@aesa/knowledge'
-import { defineJob, enqueue, JOB_NAMES, registerJob, type JobDefinition } from '@aesa/queue'
+import { defineJob, enqueue, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
 import { failSource, guardedSourceWrite } from '../knowledge/sources.ts'
 import type { KnowledgeDeps } from '../knowledge-deps.ts'
 
@@ -49,7 +49,7 @@ const ACTOR = 'system:knowledge.ingest' as const
  * against this (it only ever reads `.name`/`.schema`). `registerKnowledgeIngest` builds the
  * deps-bound definition and registers THAT.
  */
-export const knowledgeIngestJob: JobDefinition<KnowledgeIngestPayload> = defineJob({
+export const knowledgeIngestJob: RegisteredJobDefinition<KnowledgeIngestPayload> = defineJob({
   name: JOB_NAMES.knowledgeIngest,
   schema: KnowledgeIngestPayload,
   // policy: 'short' (QUEUE_OPTIONS): the owner can re-trigger the same source (a second
@@ -279,7 +279,7 @@ async function persistDocument(
 }
 
 export async function registerKnowledgeIngest(boss: PgBoss, deps: KnowledgeDeps): Promise<void> {
-  const wired: JobDefinition<KnowledgeIngestPayload> = {
+  const wired: RegisteredJobDefinition<KnowledgeIngestPayload> = {
     ...knowledgeIngestJob,
     handler: async (ctx) => {
       await runKnowledgeIngest(deps, ctx.data, ctx.signal)

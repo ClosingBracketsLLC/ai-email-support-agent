@@ -40,7 +40,7 @@ import {
   getAccessToken, ProviderAuthError, ProviderRateLimitError, runSync, type MailboxClient, type MailboxProvider,
 } from '@aesa/mail'
 import type { MailLimiter } from '@aesa/mail'
-import { defineJob, enqueue, registerJob, JOB_NAMES, type JobDefinition } from '@aesa/queue'
+import { defineJob, enqueue, registerJob, JOB_NAMES, type RegisteredJobDefinition } from '@aesa/queue'
 import type { WorkerConfig } from '../config.ts'
 import { utcDayString } from '../date-utils.ts'
 import { errorMessage } from '../err-message.ts'
@@ -65,7 +65,7 @@ export type MailboxSyncPayload = z.infer<typeof MailboxSyncPayload>
  * this file's own poll-sweep/rate-limit re-enqueues, `enqueue()` against this — which only ever reads
  * `.name`/`.schema` — never against a handler bound to no deps.
  */
-export const mailboxSyncJob: JobDefinition<MailboxSyncPayload> = defineJob({
+export const mailboxSyncJob: RegisteredJobDefinition<MailboxSyncPayload> = defineJob({
   name: JOB_NAMES.mailboxSync,
   schema: MailboxSyncPayload,
   // No retryLimit/retryBackoff (QUEUE_OPTIONS): the handler below always catches and returns
@@ -282,7 +282,7 @@ export async function runMailboxSync(boss: PgBoss, deps: MailboxSyncDeps, payloa
 }
 
 export async function registerMailboxSync(boss: PgBoss, deps: MailboxSyncDeps): Promise<void> {
-  const wired: JobDefinition<MailboxSyncPayload> = {
+  const wired: RegisteredJobDefinition<MailboxSyncPayload> = {
     ...mailboxSyncJob,
     handler: async (ctx) => {
       await runMailboxSync(boss, deps, ctx.data)

@@ -10,12 +10,12 @@ import { z } from 'zod'
 import { MEMORY_EXPIRY_DAYS, MEMORY_STRIKES_TO_RETIRE } from '@aesa/core'
 import { audit, customerHash, drafts, ensureCustomerHashSalt, messages, resolvedAnswers, tickets, withOrg, type Db } from '@aesa/db'
 import { scrubForMemory, type Embedder } from '@aesa/knowledge'
-import { defineJob, enqueue, JOB_NAMES, registerJob, type JobDefinition } from '@aesa/queue'
+import { defineJob, enqueue, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
 
 export const MemoryCapturePayload = z.object({ orgId: z.string(), draftId: z.string() })
 export type MemoryCapturePayload = z.infer<typeof MemoryCapturePayload>
 
-export const memoryCaptureJob: JobDefinition<MemoryCapturePayload> = defineJob({
+export const memoryCaptureJob: RegisteredJobDefinition<MemoryCapturePayload> = defineJob({
   name: JOB_NAMES.memoryCapture, schema: MemoryCapturePayload,
   handler: async () => { throw new Error('memory.capture: register it through registerMemoryCapture(boss, deps)') },
 })

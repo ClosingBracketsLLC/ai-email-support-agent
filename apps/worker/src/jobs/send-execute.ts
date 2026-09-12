@@ -65,7 +65,7 @@ import {
   buildReferences, getAccessToken, MARKER_HEADER, MessageGoneError, ProviderAuthError,
   type MailboxClient, type MailboxProvider, type MailLimiter,
 } from '@aesa/mail'
-import { defineJob, enqueue, JOB_NAMES, registerJob, type JobDefinition } from '@aesa/queue'
+import { defineJob, enqueue, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
 import type { WorkerConfig } from '../config.ts'
 import { utcDayString } from '../date-utils.ts'
 import { buildReplyPolicy, personaFor } from '../drafting/policy.ts'
@@ -147,7 +147,7 @@ export type SendExecutePayload = z.infer<typeof SendExecutePayload>
  * re-entry scans for the marker first, so a retry can never duplicate a delivered reply. The last
  * attempt dead-letters (step 12) rather than disappearing into pg-boss's `failed` state.
  */
-export const sendExecuteJob: JobDefinition<SendExecutePayload> = defineJob({
+export const sendExecuteJob: RegisteredJobDefinition<SendExecutePayload> = defineJob({
   name: JOB_NAMES.sendExecute,
   schema: SendExecutePayload,
   // policy: 'short' (QUEUE_OPTIONS) — pg-boss's default `standard` ignores `singletonKey` outright
@@ -189,11 +189,11 @@ export interface SendExecuteContext {
 }
 
 export async function registerSendExecute(boss: PgBoss, deps: SendExecuteDeps): Promise<void> {
-  const wired: JobDefinition<SendExecutePayload> = {
+  const wired: RegisteredJobDefinition<SendExecutePayload> = {
     ...sendExecuteJob,
     handler: async (ctx) => {
       const retryCount = ctx.job.retryCount ?? 0
-      const retryLimit = ctx.job.retryLimit ?? (sendExecuteJob.queue!.retryLimit ?? 0)   // defineJob always resolves .queue
+      const retryLimit = ctx.job.retryLimit ?? (sendExecuteJob.queue.retryLimit ?? 0)
       await runSendExecute(deps, ctx.data, { signal: ctx.signal, attempt: retryCount + 1, lastAttempt: retryCount >= retryLimit })
     },
   }

@@ -10,7 +10,7 @@ import type PgBoss from 'pg-boss'
 import { z } from 'zod'
 import type { KekRing } from '@aesa/crypto'
 import { getOrgBoxPublicKey, provisionOrgKeys, withOrg, type Db } from '@aesa/db'
-import { defineJob, registerJob, JOB_NAMES, type JobDefinition } from '@aesa/queue'
+import { defineJob, registerJob, JOB_NAMES, type RegisteredJobDefinition } from '@aesa/queue'
 
 export const KeysProvisionPayload = z.object({ orgId: z.string() })
 export type KeysProvisionPayload = z.infer<typeof KeysProvisionPayload>
@@ -20,7 +20,7 @@ export type KeysProvisionPayload = z.infer<typeof KeysProvisionPayload>
  * ever reads `.name`/`.schema` — never against a handler bound to no deps. `registerKeysProvision` below
  * builds the real, deps-bound definition and registers THAT.
  */
-export const keysProvisionJob: JobDefinition<KeysProvisionPayload> = defineJob({
+export const keysProvisionJob: RegisteredJobDefinition<KeysProvisionPayload> = defineJob({
   name: JOB_NAMES.keysProvision,
   schema: KeysProvisionPayload,
   handler: async () => {
@@ -47,7 +47,7 @@ export async function runKeysProvision(deps: KeysProvisionDeps, payload: KeysPro
 }
 
 export async function registerKeysProvision(boss: PgBoss, deps: KeysProvisionDeps): Promise<void> {
-  const wired: JobDefinition<KeysProvisionPayload> = {
+  const wired: RegisteredJobDefinition<KeysProvisionPayload> = {
     ...keysProvisionJob,
     handler: async (ctx) => {
       await runKeysProvision(deps, ctx.data)

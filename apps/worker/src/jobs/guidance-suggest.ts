@@ -30,13 +30,13 @@ import {
   platformState, usageCounters, withOrg, workspaces, type Db,
 } from '@aesa/db'
 import type { LlmProvider } from '@aesa/llm'
-import { defineJob, JOB_NAMES, registerJob, type JobDefinition } from '@aesa/queue'
+import { defineJob, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
 import { utcDayString } from '../date-utils.ts'
 
 export const GuidanceSuggestPayload = z.object({ orgId: z.string(), draftId: z.string() })
 export type GuidanceSuggestPayload = z.infer<typeof GuidanceSuggestPayload>
 
-export const guidanceSuggestJob: JobDefinition<GuidanceSuggestPayload> = defineJob({
+export const guidanceSuggestJob: RegisteredJobDefinition<GuidanceSuggestPayload> = defineJob({
   name: JOB_NAMES.guidanceSuggest, schema: GuidanceSuggestPayload,
   // retryLimit 1 (QUEUE_OPTIONS): a redelivery re-reads the same draft and the sourceDraftId gate in
   // step 1 makes a successful first attempt's retry a no-op anyway; there is no transient-failure
