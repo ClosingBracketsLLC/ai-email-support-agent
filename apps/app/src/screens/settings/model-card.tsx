@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useRef, useState } from 'react'
 import { Pressable, StyleSheet, Text, View } from 'react-native'
 import type { CredentialHealth, LlmEffort, LlmProviderId, ModelConfigMode } from '@aesa/contracts'
-import { LLM_EFFORTS, MANAGED_MODELS, PROVIDER_PRESETS, presetModel } from '@aesa/contracts'
+import { LLM_EFFORTS, LLM_ERROR_MESSAGES, MANAGED_MODELS, PROVIDER_PRESETS, presetModel } from '@aesa/contracts'
 import { Banner } from '@/components/banner'
 import { Button } from '@/components/button'
 import { Card } from '@/components/card'
@@ -31,10 +31,12 @@ const CHANGE_NOTE = 'Autopilot categories go back to Review when the model chang
  * leaving a dead button. */
 const CUSTOM_MODEL_HINT = 'Enter the model id this endpoint serves (for example qwen3:32b).'
 
-/** The api's own sentence for the one soft refusal this card can hit (`trpc/routers/llm.ts`). */
+/** The api's own sentence for the one soft refusal this card can hit — the shared constant the
+ *  router throws (`@aesa/contracts`'s `LLM_ERROR_MESSAGES`), so a reword happens in one place; the
+ *  owner-facing wording below stays this card's. */
 function saveErrorCopy(error: unknown): string {
   const message = (error as { message?: unknown } | null | undefined)?.message
-  return message === 'that connection was rejected by the provider; test it before using it'
+  return message === LLM_ERROR_MESSAGES.credential_dead
     ? 'That connection was rejected by the provider — test it on the AI screen first.'
     : 'Could not save the model. Try again.'
 }

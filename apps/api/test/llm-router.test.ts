@@ -12,7 +12,7 @@ import { createTRPCClient, httpBatchLink } from '@trpc/client'
 import { and, eq } from 'drizzle-orm'
 import superjson from 'superjson'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { LLM_MAX_CREDENTIALS, MANAGED_MODELS, presetModel } from '@aesa/contracts'
+import { LLM_ERROR_MESSAGES, LLM_MAX_CREDENTIALS, MANAGED_MODELS, presetModel } from '@aesa/contracts'
 import { loadKekRing, type KekRing } from '@aesa/crypto'
 import { llmCredentials, provisionOrgKeys } from '@aesa/db'
 import type { AppRouter } from '../src/trpc/router.ts'
@@ -110,37 +110,44 @@ describe('llm router', () => {
     for (let i = 0; i < LLM_MAX_CREDENTIALS; i++) {
       await org.c.llm.add.mutate({ provider: 'openai', label: `key ${i}`, apiKey: `sk-openai-cap-${i}-ab12` })
     }
+    // The MESSAGE is asserted beside the code, and against the shared constant: the app's two
+    // screens key their owner copy on these exact sentences (the two soft codes that share
+    // PRECONDITION_FAILED make the code alone useless to them), so a router reworded in place —
+    // rather than in `@aesa/contracts` — must fail here (review C-I3).
     await expect(org.c.llm.add.mutate({ provider: 'openai', label: 'one too many', apiKey: 'sk-openai-cap-6-ab12' }))
-      .rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' } })
+      .rejects.toMatchObject({ message: LLM_ERROR_MESSAGES.cap_reached, data: { code: 'PRECONDITION_FAILED' } })
 
     // A custom endpoint that resolves to a private address (the router hits real DNS; `.invalid` is
     // reserved by RFC 2606 and never resolves, so the guard refuses it before anything is written).
     await expect(org.c.llm.add.mutate({
       provider: 'custom', label: 'internal', apiKey: 'k'.repeat(24), baseUrl: 'https://vllm.internal.invalid/v1', probeModel: 'qwen3-32b',
-    })).rejects.toMatchObject({ data: { code: 'BAD_REQUEST' } })
+    })).rejects.toMatchObject({ message: LLM_ERROR_MESSAGES.unsafe_url, data: { code: 'BAD_REQUEST' } })
 
-    await expect(org.c.llm.probe.mutate({ credentialId: randomUUID() })).rejects.toMatchObject({ data: { code: 'NOT_FOUND' } })
-    await expect(org.c.llm.remove.mutate({ credentialId: randomUUID() })).rejects.toMatchObject({ data: { code: 'NOT_FOUND' } })
-    await expect(org.c.llm.agentModel.query({ agentId: randomUUID() })).rejects.toMatchObject({ data: { code: 'NOT_FOUND' } })
+    await expect(org.c.llm.probe.mutate({ credentialId: randomUUID() }))
+      .rejects.toMatchObject({ message: LLM_ERROR_MESSAGES.credential_not_found, data: { code: 'NOT_FOUND' } })
+    await expect(org.c.llm.remove.mutate({ credentialId: randomUUID() }))
+      .rejects.toMatchObject({ message: LLM_ERROR_MESSAGES.credential_not_found, data: { code: 'NOT_FOUND' } })
+    await expect(org.c.llm.agentModel.query({ agentId: randomUUID() }))
+      .rejects.toMatchObject({ message: LLM_ERROR_MESSAGES.not_found, data: { code: 'NOT_FOUND' } })
 
     const base3 = { agentId: org.agentId, draftModel: null, triageModel: null, effort: null, fallbackToManaged: false } as const
     await expect(org.c.llm.setAgentModel.mutate({ ...base3, agentId: randomUUID(), mode: 'byok', credentialId: randomUUID() }))
-      .rejects.toMatchObject({ data: { code: 'NOT_FOUND' } })
+      .rejects.toMatchObject({ message: LLM_ERROR_MESSAGES.not_found, data: { code: 'NOT_FOUND' } })
     await expect(org.c.llm.setAgentModel.mutate({ ...base3, mode: 'byok', credentialId: randomUUID() }))
-      .rejects.toMatchObject({ data: { code: 'NOT_FOUND' } })
+      .rejects.toMatchObject({ message: LLM_ERROR_MESSAGES.credential_not_found, data: { code: 'NOT_FOUND' } })
 
     const [live] = await t.api.withOrg(org.orgId, (tx) => tx.select({ id: llmCredentials.id }).from(llmCredentials).limit(1))
     await t.api.withOrg(org.orgId, (tx) => tx.update(llmCredentials).set({ healthStatus: 'dead' })
       .where(and(eq(llmCredentials.orgId, org.orgId), eq(llmCredentials.id, live!.id))))
     await expect(org.c.llm.setAgentModel.mutate({ ...base3, mode: 'byok', credentialId: live!.id }))
-      .rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' } })
+      .rejects.toMatchObject({ message: LLM_ERROR_MESSAGES.credential_dead, data: { code: 'PRECONDITION_FAILED' } })
 
     // An org whose keys were never provisioned cannot seal anything yet.
     const signed = await signInWithOtp(t.app, t.mail, `llm-nokeys-${org.seq}@example.com`, 'Owner')
     const bare = client(base, signed.cookie)
     await bare.workspace.create.mutate({ businessName: 'Bare', timezone: 'UTC' })
     await expect(bare.llm.add.mutate({ provider: 'openai', label: 'too early', apiKey: 'sk-openai-early-ab12' }))
-      .rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' } })
+      .rejects.toMatchObject({ message: LLM_ERROR_MESSAGES.keys_not_provisioned, data: { code: 'PRECONDITION_FAILED' } })
   })
 
   it('members can read the connections; only managers can add, probe, remove or change a model', async () => {

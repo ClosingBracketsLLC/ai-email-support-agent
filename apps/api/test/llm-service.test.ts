@@ -329,14 +329,72 @@ describe('llm service', () => {
     expect(afterModel.find((r) => r.role === 'triage')).toMatchObject({ modelGeneration: 2 })
     expect((await policiesOf(org.orgId, org.agentId)).filter((p) => p.mode === 'auto')).toEqual([])
 
-    // A credential the last probe found dead cannot be chosen at all.
-    await t.api.withOrg(org.orgId, (tx) => tx.update(llmCredentials).set({ healthStatus: 'dead' }).where(eq(llmCredentials.id, credentialId)))
-    expect(await setAgentModel(deps, org.orgId, byok(org.agentId, credentialId, { draftModel: 'gpt-5' }), org.actor))
+    // A credential the last probe found dead cannot be NEWLY chosen. (Re-saving the one this agent
+    // is ALREADY on is allowed — its own test below.)
+    const other = await addCredential(deps, org.orgId, { provider: 'openai', label: 'Spare', apiKey: 'sk-openai-spare-abcd' }, org.actor)
+    if (!other.ok) throw new Error('unreachable')
+    await t.api.withOrg(org.orgId, (tx) => tx.update(llmCredentials).set({ healthStatus: 'dead' }).where(eq(llmCredentials.id, other.credentialId)))
+    expect(await setAgentModel(deps, org.orgId, byok(org.agentId, other.credentialId), org.actor))
       .toEqual({ ok: false, code: 'credential_dead' })
     expect(await setAgentModel(deps, org.orgId, byok(org.agentId, randomUUID()), org.actor))
       .toEqual({ ok: false, code: 'credential_not_found' })
     expect(await setAgentModel(deps, org.orgId, byok(randomUUID(), credentialId), org.actor))
       .toEqual({ ok: false, code: 'not_found' })
+  })
+
+  it('setAgentModel: a first save that only restates Managed AI is a no-op — no generation bump, no demotion, no page', async () => {
+    // An always-managed agent has NO `agent_model_config` row (deviation 2), and the Model card lets
+    // an owner tap a connection and tap "Managed AI" again without the change banner ever appearing.
+    // `!existing` used to count that as a model change and demote everything (review C-I1).
+    const org = await seedOrg()
+    const autos = await makeAuto(org.orgId, org.agentId, 3)
+    sent.length = 0
+    const managed: SetAgentModelInput = {
+      agentId: org.agentId, mode: 'managed', credentialId: null, draftModel: null, triageModel: null, effort: null, fallbackToManaged: false,
+    }
+
+    expect(await setAgentModel(deps, org.orgId, managed, org.actor)).toEqual({ ok: true, generationBumped: false, demoted: 0 })
+
+    expect((await policiesOf(org.orgId, org.agentId)).filter((p) => p.mode === 'auto').map((p) => p.categoryId).sort())
+      .toEqual([...autos].sort())
+    expect(sent.filter((s) => s.name === JOB_NAMES.notifyDispatch)).toEqual([])
+    for (const row of await configOf(org.orgId, org.agentId)) {
+      expect(row).toMatchObject({ mode: 'managed', credentialId: null, model: null, modelGeneration: 1 })
+      // Never `now`: `model_generation_at` windows `stats.rollup`'s graduation sample, and this save
+      // changed no model — the agent's own createdAt excludes no decision it could have made.
+      expect(row.modelGenerationAt.getTime()).toBeLessThan(Date.now() - 1)
+    }
+    // And again now that a row DOES exist: still nothing.
+    expect(await setAgentModel(deps, org.orgId, managed, org.actor)).toEqual({ ok: true, generationBumped: false, demoted: 0 })
+    expect((await configOf(org.orgId, org.agentId)).every((r) => r.modelGeneration === 1)).toBe(true)
+    // An effort change on top is still not a model change, but it IS persisted.
+    expect(await setAgentModel(deps, org.orgId, { ...managed, effort: 'high' }, org.actor)).toEqual({ ok: true, generationBumped: false, demoted: 0 })
+    expect((await configOf(org.orgId, org.agentId)).every((r) => r.effort === 'high' && r.modelGeneration === 1)).toBe(true)
+  })
+
+  it('setAgentModel: an agent ALREADY on a rejected key can still save — turning on fallbackToManaged is the remedy for exactly that state', async () => {
+    const org = await seedOrg()
+    const added = await addCredential(deps, org.orgId, { provider: 'openai', label: 'OpenAI', apiKey: 'sk-openai-dead-abcd' }, org.actor)
+    if (!added.ok) throw new Error('unreachable')
+    await setAgentModel(deps, org.orgId, byok(org.agentId, added.credentialId), org.actor)
+    await t.api.withOrg(org.orgId, (tx) =>
+      tx.update(llmCredentials).set({ healthStatus: 'dead' }).where(eq(llmCredentials.id, added.credentialId)))
+    await makeAuto(org.orgId, org.agentId, 2)
+    sent.length = 0
+
+    // Same credential, same models — only the fallback switch moves. Nothing is a model change here.
+    const res = await setAgentModel(deps, org.orgId, byok(org.agentId, added.credentialId, { fallbackToManaged: true }), org.actor)
+    expect(res).toEqual({ ok: true, generationBumped: false, demoted: 0 })
+    for (const row of await configOf(org.orgId, org.agentId)) expect(row).toMatchObject({ fallbackToManaged: true, modelGeneration: 1 })
+    expect((await policiesOf(org.orgId, org.agentId)).filter((p) => p.mode === 'auto')).toHaveLength(2)
+
+    // Moving to a DIFFERENT dead credential is still refused.
+    const spare = await addCredential(deps, org.orgId, { provider: 'deepseek', label: 'Spare', apiKey: 'sk-deepseek-dead-abcd' }, org.actor)
+    if (!spare.ok) throw new Error('unreachable')
+    await t.api.withOrg(org.orgId, (tx) =>
+      tx.update(llmCredentials).set({ healthStatus: 'dead' }).where(eq(llmCredentials.id, spare.credentialId)))
+    expect(await setAgentModel(deps, org.orgId, byok(org.agentId, spare.credentialId), org.actor))
+      .toEqual({ ok: false, code: 'credential_dead' })
   })
 
   it('setAgentModel managed after byok: rows go managed with null model/credential, generation bumps, demotion runs', async () => {

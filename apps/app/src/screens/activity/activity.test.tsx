@@ -27,6 +27,7 @@ interface Summary {
   escalated: number
   autoSent: number
   costMicros: number
+  byokCostMicros: number
   aiHandledConversations: number
   recent: RecentItem[]
 }
@@ -57,7 +58,7 @@ jest.mock('@/lib/trpc', () => ({
 function summary(overrides: Partial<Summary> = {}): Summary {
   return {
     days: 7, drafted: 10, approvedUnchanged: 3, approvedEdited: 2, rejected: 1, sent: 5, escalated: 1,
-    autoSent: 0, costMicros: 420_000, aiHandledConversations: 4, recent: [], ...overrides,
+    autoSent: 0, costMicros: 420_000, byokCostMicros: 0, aiHandledConversations: 4, recent: [], ...overrides,
   }
 }
 function recentItem(overrides: Partial<RecentItem> = {}): RecentItem {
@@ -113,6 +114,24 @@ test('renders the tiles from a mocked summary, including the AI cost and the app
   expect(within(screen.getByTestId('stat-escalated')).getByText('1')).toBeTruthy()
   expect(within(screen.getByTestId('stat-ai-cost')).getByText('$0.42')).toBeTruthy()
   expect(within(screen.getByTestId('stat-ai-handled')).getByText('4')).toBeTruthy()
+})
+
+test('the AI cost tile shows managed + BYOK spend, and says how much of it is on the workspace\'s own keys', async () => {
+  // Phase 6 routes BYOK cost to its own meter (it must never trip the platform's daily cap); a
+  // workspace fully on its own key used to read "$0.00" here while it was spending real money.
+  mockSummaryByDays[7] = summary({ costMicros: 420_000, byokCostMicros: 1_580_000 })
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('stat-ai-cost')).toBeTruthy())
+  expect(within(screen.getByTestId('stat-ai-cost')).getByText('$2.00')).toBeTruthy()
+  expect(within(screen.getByTestId('stat-ai-cost')).getByText('$1.58 of this on your own provider keys')).toBeTruthy()
+})
+
+test('the AI cost tile has no BYOK subtitle when nothing was spent on a workspace key', async () => {
+  mockSummaryByDays[7] = summary({ costMicros: 420_000, byokCostMicros: 0 })
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('stat-ai-cost')).toBeTruthy())
+  expect(within(screen.getByTestId('stat-ai-cost')).getByText('$0.42')).toBeTruthy()
+  expect(within(screen.getByTestId('stat-ai-cost')).queryByText(/your own provider keys/)).toBeNull()
 })
 
 test('the Auto-sent tile renders activity.summary.autoSent', async () => {

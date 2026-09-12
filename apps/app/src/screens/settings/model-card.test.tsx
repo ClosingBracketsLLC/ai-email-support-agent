@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider, notifyManager } from '@tanstack/react-query'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native'
 import type { ReactNode } from 'react'
-import { MANAGED_MODELS } from '@aesa/contracts'
+import { LLM_ERROR_MESSAGES, MANAGED_MODELS } from '@aesa/contracts'
 import { ModelCard } from './model-card'
 
 // See inbox.test.tsx: TanStack's default scheduler defers notifications through a real setTimeout(0),
@@ -327,7 +327,7 @@ test('a custom endpoint has nothing to prefill, so both fields say what to put i
 
 test('a refused save says what to do about it', async () => {
   mockCredentials = [credential()]
-  mockSetImpl = () => Promise.reject({ message: 'that connection was rejected by the provider; test it before using it', data: { code: 'PRECONDITION_FAILED' } })
+  mockSetImpl = () => Promise.reject({ message: LLM_ERROR_MESSAGES.credential_dead, data: { code: 'PRECONDITION_FAILED' } })
   await setup()
   await waitFor(() => expect(screen.getByTestId(`model-credential-${CRED_ID}`)).toBeTruthy())
 

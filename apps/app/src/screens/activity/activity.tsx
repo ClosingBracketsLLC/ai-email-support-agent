@@ -82,7 +82,15 @@ export function ActivityScreen() {
                 replies the agent both decided AND delivered on its own inside the window. */}
             <StatTile testID="stat-auto-sent" label="Auto-sent" value={String(summary.data.autoSent)} />
             <StatTile testID="stat-escalated" label="Escalated" value={String(summary.data.escalated)} />
-            <StatTile testID="stat-ai-cost" label="AI cost" value={formatUsd(summary.data.costMicros)} />
+            {/* The headline is BOTH meters: Managed AI's platform cost and whatever the workspace's
+                own provider keys cost it (Phase 6 routes BYOK spend to its own meter so it can never
+                trip the platform's daily cap — but an owner asking "what is this costing me" means
+                the total). The subtitle appears only when there is BYOK spend to explain. */}
+            <StatTile
+              testID="stat-ai-cost" label="AI cost"
+              value={formatUsd(summary.data.costMicros + summary.data.byokCostMicros)}
+              subtitle={summary.data.byokCostMicros > 0 ? `${formatUsd(summary.data.byokCostMicros)} of this on your own provider keys` : undefined}
+            />
             <StatTile testID="stat-ai-handled" label="AI-handled conversations" value={String(summary.data.aiHandledConversations)} />
           </View>
 

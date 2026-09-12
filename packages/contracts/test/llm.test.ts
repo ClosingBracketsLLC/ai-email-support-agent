@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
-  AddCredentialInput, DEMOTION_REASONS, DRAFT_MODEL_ID, LLM_PROVIDERS, MANAGED_MODELS, NEEDS_OWNER_REASONS, NOTIFICATION_KINDS,
-  PROVIDER_PRESETS, presetModel, qualityTierFor, SetAgentModelInput,
+  AddCredentialInput, DEMOTION_REASONS, DRAFT_MODEL_ID, LLM_ERROR_MESSAGES, LLM_PROVIDERS, MANAGED_MODELS, NEEDS_OWNER_REASONS,
+  NOTIFICATION_KINDS, PROVIDER_PRESETS, presetModel, qualityTierFor, SetAgentModelInput,
 } from '../src/index.ts'
 
 describe('llm contracts', () => {
@@ -15,6 +15,14 @@ describe('llm contracts', () => {
       if (id !== 'custom') { expect(presetModel(id, 'draft')).not.toBeNull(); expect(presetModel(id, 'triage')).not.toBeNull() }
     }
     expect(presetModel('custom', 'draft')).toBeNull()
+  })
+
+  it('LLM_ERROR_MESSAGES carries a non-empty sentence for every soft refusal the api can return', () => {
+    // The api throws these and the two app screens key their owner copy on them; a key that vanishes
+    // (or empties) is a screen that silently falls back to "try again".
+    const keys = ['keys_not_provisioned', 'cap_reached', 'unsafe_url', 'credential_dead', 'credential_not_found', 'not_found'] as const
+    expect(Object.keys(LLM_ERROR_MESSAGES).sort()).toEqual([...keys].sort())
+    for (const key of keys) expect(LLM_ERROR_MESSAGES[key].length).toBeGreaterThan(0)
   })
 
   it('DRAFT_MODEL_ID still names the managed draft model', () => {

@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider, notifyManager } from '@tanstack/react
 import { fireEvent, render, screen, waitFor } from '@testing-library/react-native'
 import type { ReactNode } from 'react'
 import type { CredentialHealth } from '@aesa/contracts'
-import { MANAGED_MODELS } from '@aesa/contracts'
+import { LLM_ERROR_MESSAGES, MANAGED_MODELS } from '@aesa/contracts'
 import { AiSettingsScreen, PROBE_WAIT_CAP_MS, awaitingProbe } from './ai'
 
 // See inbox.test.tsx: TanStack's default scheduler defers notifications through a real setTimeout(0),
@@ -210,7 +210,7 @@ test('a base URL that is not https says so under the field instead of a silently
 })
 
 test('an unsafe custom endpoint is refused in the owner\'s words', async () => {
-  mockAddImpl = () => Promise.reject({ message: 'that endpoint must be a public https address', data: { code: 'BAD_REQUEST' } })
+  mockAddImpl = () => Promise.reject({ message: LLM_ERROR_MESSAGES.unsafe_url, data: { code: 'BAD_REQUEST' } })
   await setup()
   await waitFor(() => expect(screen.getByTestId('ai-add-open')).toBeTruthy())
   await openAddForm()

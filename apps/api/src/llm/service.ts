@@ -26,7 +26,7 @@ import { createHash } from 'node:crypto'
 import { and, count, countDistinct, desc, eq, gte, isNotNull, isNull, sql } from 'drizzle-orm'
 import type pino from 'pino'
 import {
-  LLM_MAX_CREDENTIALS, PROVIDER_PRESETS, ProbeResult, presetModel,
+  LLM_MAX_CREDENTIALS, MANAGED_MODELS, PROVIDER_PRESETS, ProbeResult, presetModel,
   type AddCredentialInput, type CredentialHealth, type LlmProviderId, type ProbeResultView, type SetAgentModelInput,
 } from '@aesa/contracts'
 import { resolvePublic, sealTo, validateOutboundUrl, type Resolver } from '@aesa/crypto'
@@ -384,8 +384,9 @@ export async function getAgentModel(
 /**
  * The Model card's Save. One transaction: read the agent (a cross-org id is `not_found` by
  * construction — RLS hides the row), read the credential when the choice is BYOK, write BOTH role
- * rows, and — only when the DRAFT row's (mode, credential, model) actually changed — bump the model
- * generation and demote every category that was on Autopilot.
+ * rows, and — only when the DRAFT role's RESOLVED (mode, credential, model) actually changed — bump
+ * the model generation and demote every category that was on Autopilot. Resolved, not the raw row:
+ * "no row at all" IS Managed AI, so saving Managed AI over it is a no-op, not a model change.
  *
  * Why the generation and the demotion hang off the draft row alone: the draft model is what writes
  * the replies Autopilot sends unattended, and `stats.rollup` counts a category's evidence from the
@@ -397,7 +398,7 @@ export async function setAgentModel(
   const now = clock(deps)
 
   const outcome = await deps.api.withOrg(orgId, async (tx) => {
-    const [agent] = await tx.select({ id: agents.id }).from(agents)
+    const [agent] = await tx.select({ id: agents.id, createdAt: agents.createdAt }).from(agents)
       .where(and(eq(agents.orgId, orgId), eq(agents.id, input.agentId)))
     if (!agent) return { ok: false as const, code: 'not_found' as const }
 
@@ -405,6 +406,7 @@ export async function setAgentModel(
     let credentialId: string | null = null
     let draftModel: string | null = null
     let triageModel: string | null = null
+    let credentialDead = false
 
     if (input.mode === 'byok') {
       const [credential] = await tx.select({
@@ -418,9 +420,10 @@ export async function setAgentModel(
         // wins and this re-read finds nothing — `credential_not_found`, never a half-moved agent.
         .for('share')
       if (!credential) return { ok: false as const, code: 'credential_not_found' as const }
-      // A key the probe found rejected outright cannot be chosen: it would fail every call the
-      // moment it was saved, and (without `fallbackToManaged`) strand the agent entirely.
-      if (credential.healthStatus === 'dead') return { ok: false as const, code: 'credential_dead' as const }
+      // Whether this is refusable is decided BELOW, once the agent's current credential is known —
+      // the check cannot move up here without taking `agent_model_config` before `llm_credentials`,
+      // which is the opposite of the order `removeCredential` takes (see the file header).
+      credentialDead = credential.healthStatus === 'dead'
 
       provider = credential.provider as LlmProviderId
       credentialId = credential.id
@@ -431,8 +434,7 @@ export async function setAgentModel(
     // a null model and `resolveModelConfig` fills the role's default in.
 
     const [existing] = await tx.select({
-      mode: agentModelConfig.mode, credentialId: agentModelConfig.credentialId,
-      model: agentModelConfig.model, modelGeneration: agentModelConfig.modelGeneration,
+      modelGeneration: agentModelConfig.modelGeneration,
       modelGenerationAt: agentModelConfig.modelGenerationAt,
     }).from(agentModelConfig)
       .where(and(
@@ -442,12 +444,38 @@ export async function setAgentModel(
       .limit(1)
       .for('update')
 
-    const changed = !existing
-      || existing.mode !== input.mode
-      || existing.credentialId !== credentialId
-      || existing.model !== draftModel
-    const modelGeneration = changed ? (existing?.modelGeneration ?? 0) + 1 : existing.modelGeneration
-    const modelGenerationAt = changed ? now : existing!.modelGenerationAt
+    /**
+     * What this agent's draft role RESOLVES to today, through the same reader the worker calls —
+     * not the raw row. An agent that has only ever run Managed AI has no `agent_model_config` row at
+     * all (deviation 2), and `!existing` counted that as a change: a first "Managed AI" save then
+     * bumped the generation, moved `stats.rollup`'s graduation window and demoted every category the
+     * workspace had spent weeks graduating, with the untrue reason `model_changed` (review C-I1).
+     * A byok row whose credential was deleted resolves as managed for the same reason, and that
+     * removal already bumped and demoted — re-saving managed over it changes nothing either.
+     */
+    const current = await resolveModelConfig(tx, input.agentId, 'draft')
+    // The requested shape in the RESOLVED vocabulary: managed keeps a null model in the row, and
+    // `resolveModelConfig` fills the platform constant in, so that is what it must be compared to.
+    const requestedModel = input.mode === 'byok' ? draftModel : MANAGED_MODELS.draft
+
+    // A key the probe found rejected outright cannot be NEWLY chosen: it would fail every call the
+    // moment it was saved, and (without `fallbackToManaged`) strand the agent entirely. But an agent
+    // ALREADY on that credential must still be able to save — turning on "Fall back to Managed AI",
+    // or changing effort, is the one remedy the product offers at exactly that moment, and refusing
+    // it left the owner with no way out but abandoning BYOK (review C-I2).
+    if (credentialDead && credentialId !== current.credentialId) return { ok: false as const, code: 'credential_dead' as const }
+
+    const changed = current.mode !== input.mode
+      || current.credentialId !== credentialId
+      || current.model !== requestedModel
+    const modelGeneration = changed ? (existing?.modelGeneration ?? 0) + 1 : (existing?.modelGeneration ?? 1)
+    // `model_generation_at` is NOT NULL, and it is what windows `stats.rollup`'s graduation sample.
+    // An unchanged save must never move it: with a row, it keeps the row's stamp; with no row (the
+    // first save of an always-managed agent, which changed nothing) the honest answer is "this model
+    // has been in place since the agent existed" — the agent's own `created_at`, which excludes no
+    // decision it could ever have made. Stamping `now` there would discard the very evidence the
+    // same model produced (review C-I1).
+    const modelGenerationAt = changed ? now : (existing?.modelGenerationAt ?? agent.createdAt)
 
     const shared = {
       orgId, agentId: input.agentId, mode: input.mode, credentialId,

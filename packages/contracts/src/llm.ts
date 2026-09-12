@@ -24,6 +24,26 @@ export const LLM_EFFORTS = ['low', 'medium', 'high'] as const
 export type LlmEffort = (typeof LLM_EFFORTS)[number]
 export const LLM_MAX_CREDENTIALS = 5
 
+/**
+ * The owner-facing sentence for every soft refusal Settings → AI can produce, keyed on the service's
+ * own soft code. ONE source for two readers that cannot see each other: `trpc/routers/llm.ts` throws
+ * these as its `TRPCError.message`, and the app's two screens (`settings/ai.tsx`,
+ * `settings/model-card.tsx`) key their own owner copy on them — the app only ever sees the message,
+ * because `keys_not_provisioned` and `cap_reached` share one tRPC code. Before this constant the
+ * literals lived in three files and a reword on the api side silently collapsed the screen's copy to
+ * "try again" (review C-I3). The screens keep their own, warmer wording; what must not drift is the
+ * KEY. Plain strings, not zod — this file is zod-only by rule, and these are constants, not schemas.
+ */
+export const LLM_ERROR_MESSAGES = {
+  keys_not_provisioned: 'this workspace is still being set up; try again in a moment',
+  cap_reached: 'connection limit reached',
+  unsafe_url: 'that endpoint must be a public https address',
+  credential_dead: 'that connection was rejected by the provider; test it before using it',
+  credential_not_found: 'provider connection not found',
+  not_found: 'agent not found',
+} as const
+export type LlmErrorKey = keyof typeof LLM_ERROR_MESSAGES
+
 export interface SuggestedModel { id: string; role: ModelConfigRole | 'both'; tier: QualityTier }
 
 export interface ProviderPreset {

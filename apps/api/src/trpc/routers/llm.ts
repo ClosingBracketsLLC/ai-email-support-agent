@@ -9,7 +9,7 @@
  * can call the same functions directly.
  */
 import { TRPCError } from '@trpc/server'
-import { AddCredentialInput, AgentIdInput, CredentialIdInput, SetAgentModelInput } from '@aesa/contracts'
+import { AddCredentialInput, AgentIdInput, CredentialIdInput, LLM_ERROR_MESSAGES, SetAgentModelInput } from '@aesa/contracts'
 import type { AuditActor } from '@aesa/db'
 import type pino from 'pino'
 import type { ApiFacade, EnqueueFn } from '../../deps.ts'
@@ -32,8 +32,11 @@ const serviceDeps = (ctx: LlmContext): LlmServiceDeps => ({ api: ctx.deps.api, e
 const appActor = (ctx: LlmContext): LlmActor => ({ userId: ctx.user.id, actor: ctx.actor, ip: ctx.ip, userAgent: ctx.userAgent })
 
 /** "Not this workspace's credential" and "no such credential" are reported the same way on purpose:
- * the difference would leak whether an id exists in another workspace. */
-const notFound = (what: string): TRPCError => new TRPCError({ code: 'NOT_FOUND', message: `${what} not found` })
+ * the difference would leak whether an id exists in another workspace. Every message here comes from
+ * `LLM_ERROR_MESSAGES` in `@aesa/contracts`: the app keys its own owner copy on these exact strings
+ * (the two soft codes that share `PRECONDITION_FAILED` make the code alone useless to it), so a
+ * reword must happen in ONE place or the screen silently falls back to "try again" (review C-I3). */
+const notFound = (message: string): TRPCError => new TRPCError({ code: 'NOT_FOUND', message })
 
 export const llmRouter = router({
   list: orgProcedure.query(({ ctx }) => listCredentials(serviceDeps(ctx), ctx.orgId)),
@@ -49,29 +52,29 @@ export const llmRouter = router({
     if (res.ok) return { credentialId: res.credentialId }
     switch (res.code) {
       case 'keys_not_provisioned':
-        throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'this workspace is still being set up; try again in a moment' })
+        throw new TRPCError({ code: 'PRECONDITION_FAILED', message: LLM_ERROR_MESSAGES.keys_not_provisioned })
       case 'cap_reached':
-        throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'connection limit reached' })
+        throw new TRPCError({ code: 'PRECONDITION_FAILED', message: LLM_ERROR_MESSAGES.cap_reached })
       case 'unsafe_url':
-        throw new TRPCError({ code: 'BAD_REQUEST', message: 'that endpoint must be a public https address' })
+        throw new TRPCError({ code: 'BAD_REQUEST', message: LLM_ERROR_MESSAGES.unsafe_url })
     }
   }),
 
   probe: managerProcedure.input(CredentialIdInput).mutation(async ({ ctx, input }) => {
     const res = await probeCredential(serviceDeps(ctx), ctx.orgId, input.credentialId, appActor(ctx))
-    if (!res.ok) throw notFound('provider connection')
+    if (!res.ok) throw notFound(LLM_ERROR_MESSAGES.credential_not_found)
     return { ok: true as const }
   }),
 
   remove: managerProcedure.input(CredentialIdInput).mutation(async ({ ctx, input }) => {
     const res = await removeCredential(serviceDeps(ctx), ctx.orgId, input.credentialId, appActor(ctx))
-    if (!res.ok) throw notFound('provider connection')
+    if (!res.ok) throw notFound(LLM_ERROR_MESSAGES.credential_not_found)
     return { ok: true as const, agentsReset: res.agentsReset }
   }),
 
   agentModel: orgProcedure.input(AgentIdInput).query(async ({ ctx, input }) => {
     const res = await getAgentModel(serviceDeps(ctx), ctx.orgId, input.agentId)
-    if (!res) throw notFound('agent')
+    if (!res) throw notFound(LLM_ERROR_MESSAGES.not_found)
     return res
   }),
 
@@ -79,10 +82,10 @@ export const llmRouter = router({
     const res = await setAgentModel(serviceDeps(ctx), ctx.orgId, input, appActor(ctx))
     if (res.ok) return { ok: true as const, generationBumped: res.generationBumped, demoted: res.demoted }
     switch (res.code) {
-      case 'not_found': throw notFound('agent')
-      case 'credential_not_found': throw notFound('provider connection')
+      case 'not_found': throw notFound(LLM_ERROR_MESSAGES.not_found)
+      case 'credential_not_found': throw notFound(LLM_ERROR_MESSAGES.credential_not_found)
       case 'credential_dead':
-        throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'that connection was rejected by the provider; test it before using it' })
+        throw new TRPCError({ code: 'PRECONDITION_FAILED', message: LLM_ERROR_MESSAGES.credential_dead })
     }
   }),
 })

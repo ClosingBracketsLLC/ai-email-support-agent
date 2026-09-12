@@ -2,7 +2,9 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
 import { Pressable, StyleSheet, Text, View } from 'react-native'
 import type { CredentialHealth, LlmProviderId, ProbeResultView } from '@aesa/contracts'
-import { AddCredentialInput, HttpsUrl, LLM_MAX_CREDENTIALS, LLM_PROVIDERS, MANAGED_MODELS, PROVIDER_PRESETS, canManageWorkspace } from '@aesa/contracts'
+import {
+  AddCredentialInput, HttpsUrl, LLM_ERROR_MESSAGES, LLM_MAX_CREDENTIALS, LLM_PROVIDERS, MANAGED_MODELS, PROVIDER_PRESETS, canManageWorkspace,
+} from '@aesa/contracts'
 import { Banner } from '@/components/banner'
 import { Button } from '@/components/button'
 import { Card } from '@/components/card'
@@ -29,16 +31,19 @@ const HEALTH_HINT: Record<CredentialHealth, string | null> = {
 }
 
 /**
- * The api's own sentences for a soft refusal (`apps/api/src/trpc/routers/llm.ts`), in the owner's
- * words. Keyed on the message rather than a code because that is how the api's soft outcomes travel
- * over tRPC (the `autopilot.tsx` idiom); anything unrecognized falls back to a plain "try again"
- * rather than rendering the server's own wording.
+ * The api's own sentences for a soft refusal, in the owner's words. Keyed on the MESSAGE rather than
+ * a code because that is how the api's soft outcomes travel over tRPC (the `autopilot.tsx` idiom) —
+ * and `keys_not_provisioned` and `cap_reached` share one tRPC code, so the code could not tell them
+ * apart anyway. The keys are `LLM_ERROR_MESSAGES` from `@aesa/contracts`, which is also what
+ * `trpc/routers/llm.ts` throws: one shared constant, so a reword on the api side can no longer
+ * silently collapse this copy to "try again" (review C-I3). The VALUES stay this screen's own,
+ * warmer wording. Anything unrecognized still falls back rather than rendering the server's phrasing.
  */
 const ADD_ERROR_COPY: Record<string, string> = {
-  'that endpoint must be a public https address':
+  [LLM_ERROR_MESSAGES.unsafe_url]:
     "That endpoint can't be reached safely: it must be an https address on the public internet.",
-  'connection limit reached': `You can connect ${LLM_MAX_CREDENTIALS} providers. Remove one to add another.`,
-  'this workspace is still being set up; try again in a moment':
+  [LLM_ERROR_MESSAGES.cap_reached]: `You can connect ${LLM_MAX_CREDENTIALS} providers. Remove one to add another.`,
+  [LLM_ERROR_MESSAGES.keys_not_provisioned]:
     'This workspace is still being set up — try again in a moment.',
 }
 function addErrorCopy(error: unknown): string {
