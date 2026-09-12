@@ -12,6 +12,7 @@ export default function SettingsLayout() {
       <Stack.Screen name="knowledge" options={{ title: 'Knowledge' }} />
       <Stack.Screen name="autopilot" options={{ title: 'Autopilot' }} />
       <Stack.Screen name="memory" options={{ title: 'Learned answers' }} />
+      <Stack.Screen name="ai" options={{ title: 'AI' }} />
       <Stack.Screen name="notifications" options={{ title: 'Notifications' }} />
     </Stack>
   )

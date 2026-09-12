@@ -72,7 +72,7 @@ test('a failed workspace switch shows an error and leaves the row pressable agai
   expect(mockSetActive).toHaveBeenCalledTimes(2)
 })
 
-test('Autopilot and Learned answers are live rows now, each opening its own screen', async () => {
+test('Autopilot, Learned answers and AI are live rows now, each opening its own screen', async () => {
   await setup()
   await waitFor(() => expect(screen.getByTestId('settings-autopilot')).toBeTruthy())
 
@@ -81,4 +81,9 @@ test('Autopilot and Learned answers are live rows now, each opening its own scre
 
   await fireEvent.press(screen.getByTestId('settings-memory'))
   expect(mockPush).toHaveBeenCalledWith('/settings/memory')
+
+  // Phase 6: the AI row lost its "Phase 6" badge and opens Settings › AI.
+  await fireEvent.press(screen.getByTestId('settings-ai'))
+  expect(mockPush).toHaveBeenCalledWith('/settings/ai')
+  expect(screen.queryByText('Phase 6')).toBeNull()
 })
