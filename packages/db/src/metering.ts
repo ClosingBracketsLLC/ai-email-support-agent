@@ -8,6 +8,9 @@ import { withOrg, type OrgTx } from './tenant.ts'
 export const LLM_METERS = {
   calls: 'llm_calls',
   costMicros: 'llm_cost_micros',
+  /** The BYOK twin of `costMicros` — a call made under an owner's own credential prices the
+   * OWNER's spend, never the platform bill, so it must never land in the same meter (Phase 6). */
+  costMicrosByok: 'llm_cost_micros_byok',
   inputTokens: 'llm_input_tokens',
   outputTokens: 'llm_output_tokens',
 } as const
@@ -102,6 +105,9 @@ export function createMeterSink(db: Db, opts?: { now?: () => Date; onError?: (er
             finish: rec.finish,
             parseStrategy: rec.parseStrategy,
             errorCode: rec.errorCode,
+            credentialId: rec.credentialId,
+            mode: rec.mode,
+            costUnknown: rec.costUnknown,
           })
             .onConflictDoNothing({ target: llmCalls.idempotencyKey })
             .returning({ id: llmCalls.id })
@@ -110,7 +116,7 @@ export function createMeterSink(db: Db, opts?: { now?: () => Date; onError?: (er
 
           const day = utcDayString(now())
           await bumpMeter(tx, rec.orgId, day, LLM_METERS.calls, 1)
-          await bumpMeter(tx, rec.orgId, day, LLM_METERS.costMicros, rec.costMicros)
+          await bumpMeter(tx, rec.orgId, day, rec.mode === 'byok' ? LLM_METERS.costMicrosByok : LLM_METERS.costMicros, rec.costMicros)
           await bumpMeter(tx, rec.orgId, day, LLM_METERS.inputTokens, rec.usage.inputTokens + rec.usage.cacheReadTokens + rec.usage.cacheWriteTokens)
           await bumpMeter(tx, rec.orgId, day, LLM_METERS.outputTokens, rec.usage.outputTokens)
         })

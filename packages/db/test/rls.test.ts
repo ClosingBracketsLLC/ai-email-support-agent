@@ -4,7 +4,7 @@ import { AUTH_TABLES, ORG_ID_PREDICATE_SQL } from '../src/index.ts'
 import { createTestDatabase } from './helpers/test-db.ts'
 
 /** Tables that legitimately carry no org_id. Every other ordinary table in `public` must be tenant-scoped. */
-const RLS_EXEMPT = ['platform_state', 'webhook_events', ...AUTH_TABLES]   // Better Auth tables are not tenant data (ruling, STATUS.md)
+const RLS_EXEMPT = ['platform_state', 'webhook_events', 'model_pricing', ...AUTH_TABLES]   // Better Auth tables are not tenant data (ruling, STATUS.md); model_pricing is platform price-table data, like platform_state
 
 /** pg renders a policy expression with its own casts and parentheses; compare the shape, not the formatting. */
 const normalize = (predicate: string) => predicate.toLowerCase().replaceAll('::text', '').replace(/[()\s]/g, '')
@@ -40,6 +40,7 @@ describe('row-level security', () => {
         'oauth_flows', 'mailbox_connections', 'mailbox_credentials', 'gmail_access_requests',
         'agents', 'categories', 'agent_category_policies', 'tickets', 'messages', 'notifications',
         'resolved_answers', 'category_stats_daily', 'guidance_suggestions',
+        'llm_credentials', 'llm_credential_secrets', 'agent_model_config',
       ]))
 
     for (const t of tables.rows) {

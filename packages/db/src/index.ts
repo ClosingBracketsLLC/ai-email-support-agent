@@ -12,3 +12,5 @@ export {
   countHumanDecisions, demoteCategory, graduateCategory, readDemotionSignals,
   type DemotionSignals, type DemotionWindows,
 } from './autonomy.ts'
+export { managedConfig, resolveModelConfig, type ResolvedModelConfig } from './model-config.ts'
+export { loadModelPricing } from './pricing.ts'

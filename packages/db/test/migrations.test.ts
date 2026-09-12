@@ -5,7 +5,7 @@ import { platformState } from '../src/index.ts'
 import { createDb, runMigrations } from '../src/raw.ts'
 import { createTestDatabase } from './helpers/test-db.ts'
 
-const EXPECTED_TABLES = ['account', 'agent_category_policies', 'agent_run_events', 'agent_runs', 'agents', 'audit_log', 'categories', 'category_stats_daily', 'draft_action_tokens', 'drafts', 'gmail_access_requests', 'guidance_suggestions', 'invitation', 'knowledge_chunks', 'knowledge_documents', 'knowledge_sources', 'llm_calls', 'mailbox_connections', 'mailbox_credentials', 'member', 'messages', 'notification_devices', 'notifications', 'oauth_flows', 'org_data_keys', 'org_settings', 'organization', 'outbound_sends', 'platform_state', 'resolved_answers', 'session', 'tickets', 'usage_counters', 'user', 'verification', 'webhook_events', 'workspaces']
+const EXPECTED_TABLES = ['account', 'agent_category_policies', 'agent_model_config', 'agent_run_events', 'agent_runs', 'agents', 'audit_log', 'categories', 'category_stats_daily', 'draft_action_tokens', 'drafts', 'gmail_access_requests', 'guidance_suggestions', 'invitation', 'knowledge_chunks', 'knowledge_documents', 'knowledge_sources', 'llm_calls', 'llm_credential_secrets', 'llm_credentials', 'mailbox_connections', 'mailbox_credentials', 'member', 'messages', 'model_pricing', 'notification_devices', 'notifications', 'oauth_flows', 'org_data_keys', 'org_settings', 'organization', 'outbound_sends', 'platform_state', 'resolved_answers', 'session', 'tickets', 'usage_counters', 'user', 'verification', 'webhook_events', 'workspaces']
 
 describe('migrations', () => {
   let t: Awaited<ReturnType<typeof createTestDatabase>>

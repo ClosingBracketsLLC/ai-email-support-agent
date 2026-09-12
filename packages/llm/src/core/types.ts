@@ -22,6 +22,12 @@ export interface ChatMeta {
   runId?: string
   role: LlmRole
   idempotencyKey: string
+  /** Phase 6 BYOK routing: which meter (`llm_cost_micros` vs `llm_cost_micros_byok`) the call's
+   * cost bumps. Absent (a pre-Phase-6 caller, or a probe/sandbox call with nothing to route)
+   * defaults to `'managed'` in `withMetering`. */
+  mode?: 'managed' | 'byok'
+  /** The `llm_credentials` row this call was made under, when `mode` is `'byok'`. */
+  credentialId?: string
 }
 
 /** The two structured-output rungs an adapter can be asked for. `json_mode` is Phase 2's
