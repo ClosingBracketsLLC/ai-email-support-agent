@@ -14,19 +14,41 @@ const LONG_DIGITS_RE = /\d{5,}/g
 
 const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
+/** A sign-off block is short — a closing line, a name, maybe a title and a company. Past this many
+ *  non-blank lines after it, the "sign-off" line is prose that merely starts with a sign-off word. */
+const SIGNOFF_MAX_TRAILING_LINES = 3
+
 export function scrubForMemory(text: string, opts: { customerName?: string | null; customerEmail?: string | null } = {}): string {
   const lines = text.replace(/\r\n?/g, '\n').split('\n')
-  // 1. Drop a greeting on the first non-blank line.
   const firstIdx = lines.findIndex((l) => l.trim() !== '')
-  if (firstIdx >= 0 && GREETING_RE.test(lines[firstIdx]!.trim())) lines.splice(firstIdx, 1)
-  // 2. Drop everything from the LAST sign-off line onward, when it sits in the trailing half of the message
-  //    (a greeting-only first line already removed can otherwise push a short sign-off block just
-  //    outside a "trailing third" window; a half keeps the same "only near the end" intent).
+  /**
+   * 1. The sign-off cut: drop everything from the LAST qualifying sign-off line onward. Computed on
+   *    the ORIGINAL lines, before the greeting is removed below, so both bounds below are the
+   *    message's own.
+   *
+   *    THREE bounds, all load-bearing:
+   *    - it sits in the trailing HALF of the message (a greeting-only first line can otherwise push
+   *      a short sign-off block just outside a "trailing third" window);
+   *    - it is NOT the message's first content line. A real reply can OPEN with a sign-off word —
+   *      "Thanks for getting in touch. I have checked …" — and a one-line reply's only line IS its
+   *      trailing half, so without this the whole answer was cut and `memory.capture` learned
+   *      nothing from it (`memory.skipped`, `empty_after_scrub`);
+   *    - at most `SIGNOFF_MAX_TRAILING_LINES` non-blank lines follow it, because a sign-off block is
+   *      short. A middle paragraph opening "Thanks for confirming that." keeps the answer under it.
+   *
+   *    A greeting on the first content line is dropped by step 2, not by this cut — which is why an
+   *    all-greeting-plus-sign-off message still scrubs to the empty string.
+   */
   let cut = -1
-  for (let i = lines.length - 1; i >= Math.floor(lines.length / 2); i--) {
-    if (SIGNOFF_RE.test(lines[i]!.trim())) { cut = i; break }
+  for (let i = lines.length - 1; i > firstIdx && i >= Math.floor(lines.length / 2); i--) {
+    if (!SIGNOFF_RE.test(lines[i]!.trim())) continue
+    if (lines.slice(i + 1).filter((l) => l.trim() !== '').length > SIGNOFF_MAX_TRAILING_LINES) continue
+    cut = i
+    break
   }
-  const kept = cut >= 0 ? lines.slice(0, cut) : lines
+  const kept = cut >= 0 ? lines.slice(0, cut) : [...lines]
+  // 2. Drop a greeting on the first non-blank line.
+  if (firstIdx >= 0 && firstIdx < kept.length && GREETING_RE.test(kept[firstIdx]!.trim())) kept.splice(firstIdx, 1)
   let out = kept.join('\n')
   // 3. Token masks, most specific first. A phone match with no separator character (a bare digit
   //    run like an order number) is left for the long-digits mask below rather than [phone] — a

@@ -204,8 +204,12 @@ export const workspaceRouter = router({
       if (!suggestion) throw new TRPCError({ code: 'NOT_FOUND', message: 'suggestion not found' })
       if (suggestion.status !== 'pending') throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'already decided' })
 
+      // `FOR UPDATE`: the append is a read-modify-write, and a concurrent accept (or `rejectDraft`'s
+      // own "add this to your guidance") that read the same pre-append value would overwrite this
+      // rule with its own. The workspace row is the LAST position in the global lock order and the
+      // suggestion row above is not part of it, so taking it here inverts nothing.
       const [workspace] = await tx.select({ operatingGuidance: workspaces.operatingGuidance })
-        .from(workspaces).where(eq(workspaces.orgId, ctx.orgId)).limit(1)
+        .from(workspaces).where(eq(workspaces.orgId, ctx.orgId)).limit(1).for('update')
       if (!workspace) throw new TRPCError({ code: 'NOT_FOUND', message: 'workspace not created yet' })
 
       const current = workspace.operatingGuidance

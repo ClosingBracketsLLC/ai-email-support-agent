@@ -23,11 +23,17 @@ export async function countHumanDecisions(tx: OrgTx, agentId: string, categoryId
   return row?.value ?? 0
 }
 
+/**
+ * `org_id` is in `p`, and in every predicate below, because these helpers do NOT always run under
+ * RLS: `stats.rollup` sweeps every org from ONE platform transaction and lends each org's identity
+ * to a SAVEPOINT (`withOrgIdentity`), where the `aesa_platform` role sees every tenant's rows. The
+ * explicit predicate is the filter there — the repo's usual belt-and-braces everywhere else.
+ */
 export async function readDemotionSignals(
-  tx: OrgTx, p: { agentId: string; categoryId: string; now: Date; windows: DemotionWindows },
+  tx: OrgTx, p: { orgId: string; agentId: string; categoryId: string; now: Date; windows: DemotionWindows },
 ): Promise<DemotionSignals> {
   const daysAgo = (n: number) => new Date(p.now.getTime() - n * 86_400_000)
-  const scope = and(eq(drafts.agentId, p.agentId), eq(drafts.categoryId, p.categoryId))
+  const scope = and(eq(drafts.orgId, p.orgId), eq(drafts.agentId, p.agentId), eq(drafts.categoryId, p.categoryId))
   const [rejections] = await tx.select({ value: count() }).from(drafts)
     .where(and(scope, eq(drafts.status, 'rejected'), gte(drafts.decidedAt, daysAgo(p.windows.rejectionWindowDays))))
   const [flags] = await tx.select({ value: count() }).from(drafts)
@@ -56,13 +62,17 @@ const DEMOTION_COPY: Record<DemotionReason, string> = {
   edit_rate: 'More than 30% of recent drafts needed edits.',
 }
 
-/** Guarded `auto → review`; zero rows means a concurrent demotion (or the owner) got there first. */
+/** Guarded `auto → review` (and on `org_id`, see `readDemotionSignals`); zero rows means a concurrent
+ *  demotion, the owner, or a foreign org got there first. */
 export async function demoteCategory(tx: OrgTx, p: {
   orgId: string; agentId: string; categoryId: string; categoryLabel: string; reason: DemotionReason; now: Date; day: string; actor: AuditActor
 }): Promise<{ demoted: boolean; notificationId?: string }> {
   const rows = await tx.update(agentCategoryPolicies)
     .set({ mode: 'review', demotedAt: p.now, demotedReason: p.reason, suggestedAt: null, suggestedWouldSend: null, suggestedOf: null })
-    .where(and(eq(agentCategoryPolicies.agentId, p.agentId), eq(agentCategoryPolicies.categoryId, p.categoryId), eq(agentCategoryPolicies.mode, 'auto')))
+    .where(and(
+      eq(agentCategoryPolicies.orgId, p.orgId), eq(agentCategoryPolicies.agentId, p.agentId),
+      eq(agentCategoryPolicies.categoryId, p.categoryId), eq(agentCategoryPolicies.mode, 'auto'),
+    ))
     .returning({ agentId: agentCategoryPolicies.agentId })
   if (rows.length === 0) return { demoted: false }
   await audit(tx, { actor: p.actor, action: 'autonomy.demoted', entityType: 'agent', entityId: p.agentId, detail: { categoryId: p.categoryId, reason: p.reason } })
@@ -87,7 +97,10 @@ export async function graduateCategory(tx: OrgTx, p: {
     ? { mode: 'auto', autoSendMinConfidence: p.threshold, graduatedAt: p.now, suggestedAt: null, suggestedWouldSend: null, suggestedOf: null }
     : { suggestedAt: p.now, suggestedWouldSend: p.wouldSend, suggestedOf: p.of }
   const rows = await tx.update(agentCategoryPolicies).set(patch)
-    .where(and(eq(agentCategoryPolicies.agentId, p.agentId), eq(agentCategoryPolicies.categoryId, p.categoryId), eq(agentCategoryPolicies.mode, 'review')))
+    .where(and(
+      eq(agentCategoryPolicies.orgId, p.orgId), eq(agentCategoryPolicies.agentId, p.agentId),
+      eq(agentCategoryPolicies.categoryId, p.categoryId), eq(agentCategoryPolicies.mode, 'review'),
+    ))
     .returning({ agentId: agentCategoryPolicies.agentId })
   if (rows.length === 0) return { changed: false }
   await audit(tx, {

@@ -277,6 +277,14 @@ export async function loadDraftView(tx: OrgTx, orgId: string, draftId: string): 
  */
 const FAILED_DRAFT_TICKET_STATUSES = ['needs_owner', 'triaged'] as const
 
+/**
+ * The one ticket status on which a `sent` AUTO draft is still the owner's to see: the ticket the
+ * reply went out on, before the customer has written back. `send.execute`'s completion is what puts
+ * a ticket here, so it is where the owner lands from the auto-send push, the digest, or the inbox's
+ * recent list — and `flagAutoSent` is the only action it offers.
+ */
+const AUTO_SENT_DRAFT_TICKET_STATUS = 'waiting_on_customer'
+
 /** The read and the write agree: a `failed` draft is the owner's while the ticket is `triaged` (the
  * stale hand-back) or `needs_owner` FOR the send failure — not for a later, unrelated escalation
  * (`owner_handling`, `tripwire`, …) that happens to sit on a ticket still carrying one (final fix wave). */
@@ -286,26 +294,45 @@ function failedDraftIsOwners(ticket: { status: string; needsOwnerReason: string 
 }
 
 /**
- * The draft the ticket screen opens on: the one LIVE draft (at most one, by the partial unique) —
- * or, when there is none AND the ticket is still one of `FAILED_DRAFT_TICKET_STATUSES`, its most
- * recent `failed` one.
+ * The draft the ticket screen opens on: the one LIVE draft (at most one, by the partial unique) — or,
+ * when there is none, one of exactly TWO bounded fallbacks:
  *
- * The fallback exists because A3's return path is otherwise unreachable from the app (round 2,
- * re-review 2): a terminal send failure leaves the draft `failed`, which is outside
- * `drafts_live_per_ticket_uidx`, so "Not sent — … Back to review" had nothing to render against and
- * `drafts.resume` had no button. `failed` is the ONLY non-live status served this way — a `rejected`,
- * `superseded`, `expired` or `sent` draft is finished business and stays out of the panel — and the
- * ticket-status bound is what stops the banner from becoming permanent furniture on a resolved
- * ticket, where nothing polls it away and its button would be refused anyway (round 3).
+ *  - the ticket is `waiting_on_customer` and the newest `sent` draft on it was the AGENT's
+ *    (`decision_source = 'auto'`) — the auto-send the owner may want to flag. This is what makes
+ *    "Should not have sent" reachable from the ticket the reply went out on: `flagAutoSent` accepts
+ *    exactly a `sent` + `auto` + never-flagged draft, and until this fallback existed the panel that
+ *    renders the button had nothing to render against (final fix wave). An owner-approved `sent`
+ *    draft is NOT served: it has no flag path and is finished business;
+ *  - the ticket is one of `FAILED_DRAFT_TICKET_STATUSES` and it has a `failed` draft — A3's
+ *    "Not sent — … Back to review" return path, otherwise unreachable from the app (round 2,
+ *    re-review 2) because `failed` is outside `drafts_live_per_ticket_uidx`.
  *
- * `inbox.list`'s join is deliberately NOT widened: a `needs_owner/send_failed` row shows no draft
- * chip, which keeps the list's "a draft is waiting for you" chip honest.
+ * `failed` and `sent`+`auto` are the ONLY non-live statuses served this way — a `rejected`,
+ * `superseded`, `expired` or owner-`sent` draft stays out of the panel — and BOTH are bounded by the
+ * ticket's status for the same reason: it stops the banner from becoming permanent furniture on a
+ * ticket nothing polls, where its button would be refused anyway (round 3). A `resolved` (or
+ * reopened) ticket carrying either leftover shows nothing.
+ *
+ * `inbox.list`'s join is deliberately NOT widened: a `needs_owner/send_failed` or recently
+ * auto-sent row shows no draft chip, which keeps the list's "a draft is waiting for you" chip honest.
  */
 export async function loadLiveDraftView(
   tx: OrgTx, orgId: string, ticketId: string, ticket: { status: string; needsOwnerReason: string | null },
 ): Promise<DraftView | null> {
   const [live] = await draftViewQuery(tx, orgId, and(eq(drafts.ticketId, ticketId), inArray(drafts.status, [...LIVE_DRAFT_STATUSES]))!)
   if (live) return toDraftView(live)
+
+  // The auto-send fallback, ordered like the failed one below: `decided_at` is what an auto landing
+  // stamps, `created_at` breaks a same-instant tie, and NULLS LAST keeps the order total.
+  if (ticket.status === AUTO_SENT_DRAFT_TICKET_STATUS) {
+    const [autoSent] = await draftViewQuery(
+      tx, orgId,
+      and(eq(drafts.ticketId, ticketId), eq(drafts.status, 'sent'), eq(drafts.decisionSource, 'auto'))!,
+      [sql`${drafts.decidedAt} DESC NULLS LAST`, desc(drafts.createdAt)],
+    )
+    if (autoSent) return toDraftView(autoSent)
+  }
+
   if (!failedDraftIsOwners(ticket)) return null
 
   // `decided_at` is always set on a `failed` draft (both edges into it, `approved → failed` and
@@ -348,7 +375,7 @@ async function maybeDemote(
   if (!policy || policy.mode !== 'auto') return undefined
 
   const reason = evaluateDemotion(await readDemotionSignals(tx, {
-    agentId: p.agentId, categoryId: p.categoryId, now: p.now, windows: DEMOTION_RULES,
+    orgId: p.orgId, agentId: p.agentId, categoryId: p.categoryId, now: p.now, windows: DEMOTION_RULES,
   }))
   if (!reason) return undefined
 
@@ -826,8 +853,13 @@ export async function rejectDraft(
         let guidanceAdded = false
         const rule = input.reason.trim()
         if (input.addToGuidance && rule) {
+          // `FOR UPDATE`: this is a read-modify-write of ONE text column, and two rejections (or a
+          // reject racing `workspace.acceptSuggestion`) that both read the pre-append value would
+          // each write their own `current + rule` — the second silently erasing the first owner's
+          // rule. The workspace row is the LAST position in the global lock order (this file's
+          // header), so taking it here stays inside it.
           const [workspace] = await tx.select({ operatingGuidance: workspaces.operatingGuidance })
-            .from(workspaces).where(eq(workspaces.orgId, orgId)).limit(1)
+            .from(workspaces).where(eq(workspaces.orgId, orgId)).limit(1).for('update')
           const current = workspace?.operatingGuidance ?? ''
           const next = `${current.trimEnd()}${current.trim() ? '\n' : ''}- ${rule}`
           // Past the cap nothing is appended and the caller is told so — the owner's rejection still

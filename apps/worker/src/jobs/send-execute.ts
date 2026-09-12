@@ -125,6 +125,7 @@ const LEVER_WORDS = {
   agent_inactive: 'this agent is not active',
   connection_unavailable: 'this mailbox is not connected',
   category_off: "the agent is switched off for this ticket's category",
+  category_not_auto: 'this category is no longer on Autopilot',
 } as const
 type KillLever = keyof typeof LEVER_WORDS
 
@@ -357,6 +358,13 @@ function firstKillLever(c: ClaimedSend): KillLever | null {
   if (c.agent === null || c.agent.status !== 'active') return 'agent_inactive'
   if (c.connection.status !== 'connected') return 'connection_unavailable'
   if (c.categoryMode === 'off') return 'category_off'
+  // The auto-send's own lever (Phase 5, final fix wave): the agent decided this reply because the
+  // category was on Autopilot, and it is not any more — the owner switched it to Review or Off, or a
+  // demotion did it for them, inside the hold window. Nobody read this draft, so the authority it
+  // went out under is simply gone and it holds for the owner like any other lever. It reads the
+  // DRAFT's `decision_source`, never the ticket status: a Hold + re-approve rewrites that column to
+  // `app`, and a reply the owner approved themselves is theirs to send whatever the category's mode.
+  if (c.draft.decisionSource === 'auto' && c.categoryMode !== 'auto') return 'category_not_auto'
   return null
 }
 

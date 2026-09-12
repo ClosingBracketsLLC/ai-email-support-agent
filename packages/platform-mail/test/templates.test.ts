@@ -79,6 +79,17 @@ describe('digestMail', () => {
     expect(mail.text).not.toContain('…and')
   })
 
+  it('folds the auto-sent count into ONE line, singular and plural, and omits it at zero', () => {
+    const base = { to: 'owner@acme.test', businessName: 'Acme', drafts: [draft(1)], escalations: [], inboxUrl: 'https://app.test/inbox' }
+
+    expect(digestMail(base).text).not.toContain('went out on')
+    expect(digestMail({ ...base, autoSent: 0 }).text).not.toContain('went out on')
+    expect(digestMail({ ...base, autoSent: 1 }).text).toContain('1 reply went out on its own in the last 24 hours.')
+    expect(digestMail({ ...base, autoSent: 6 }).text).toContain('6 replies went out on their own in the last 24 hours.')
+    // It is news, not a section: the headline and the subject still count only what needs a decision.
+    expect(digestMail({ ...base, autoSent: 6 }).subject).toBe('1 draft waiting for review · Acme')
+  })
+
   it('omits the category and confidence segments when they are unknown', () => {
     const mail = digestMail({
       to: 'owner@acme.test', businessName: 'Acme', escalations: [], inboxUrl: 'https://app.test/inbox',

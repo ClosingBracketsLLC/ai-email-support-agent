@@ -106,9 +106,35 @@ describe('autonomy', () => {
       })
 
       const signals = await withOrg(handle.db, orgId, (tx) => readDemotionSignals(tx, {
-        agentId, categoryId, now: NOW, windows: { rejectionWindowDays: 7, flagWindowDays: 30, decisionWindowDays: 30 },
+        orgId, agentId, categoryId, now: NOW, windows: { rejectionWindowDays: 7, flagWindowDays: 30, decisionWindowDays: 30 },
       }))
       expect(signals).toEqual({ rejectionsInWindow: 1, flagsInWindow: 1, heldThenChanged: true, decisions: { unchanged: 3, edited: 1 } })
+    })
+
+    // `stats.rollup` runs these helpers under `withOrgIdentity` — a PLATFORM-role transaction lent one
+    // org's identity, where RLS is not the filter. The `org_id` predicate is, so a mismatched orgId
+    // with a real agent/category pair must read nothing rather than another tenant's rows.
+    it('filters on org_id in SQL: a foreign orgId reads zero signals and demotes nothing', async () => {
+      const foreignOrgId = await createTestOrganization(handle)
+
+      const signals = await withOrg(handle.db, orgId, (tx) => readDemotionSignals(tx, {
+        orgId: foreignOrgId, agentId, categoryId, now: NOW, windows: { rejectionWindowDays: 7, flagWindowDays: 30, decisionWindowDays: 30 },
+      }))
+      expect(signals).toEqual({ rejectionsInWindow: 0, flagsInWindow: 0, heldThenChanged: false, decisions: { unchanged: 0, edited: 0 } })
+
+      const demoted = await withOrg(handle.db, orgId, (tx) => demoteCategory(tx, {
+        orgId: foreignOrgId, agentId, categoryId, categoryLabel: 'Order status', reason: 'rejections', now: NOW, day: DAY, actor: 'user:test',
+      }))
+      expect(demoted).toEqual({ demoted: false })
+      const [policy] = await withOrg(handle.db, orgId, (tx) =>
+        tx.select().from(agentCategoryPolicies).where(eq(agentCategoryPolicies.agentId, agentId)))
+      expect(policy!.mode).toBe('auto')
+
+      const graduated = await withOrg(handle.db, orgId, (tx) => graduateCategory(tx, {
+        orgId: foreignOrgId, agentId, categoryId, categoryLabel: 'Order status', threshold: 80, wouldSend: 1, of: 1,
+        now: NOW, day: DAY, weekKey: '2026-W37', actor: 'user:test', auto: false,
+      }))
+      expect(graduated).toEqual({ changed: false })
     })
   })
 

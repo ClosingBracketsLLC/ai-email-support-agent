@@ -261,7 +261,7 @@ async function evaluatePolicies(
       }
       if (result.notificationId) pending.push({ orgId, entityId: result.notificationId })
     } else if (policy.mode === 'auto') {
-      const demotionSignals = await readDemotionSignals(org, { agentId: policy.agentId, categoryId: policy.categoryId, now, windows: DEMOTION_RULES })
+      const demotionSignals = await readDemotionSignals(org, { orgId, agentId: policy.agentId, categoryId: policy.categoryId, now, windows: DEMOTION_RULES })
       const reason = evaluateDemotion(demotionSignals)
       if (!reason) continue
       const result = await demoteCategory(org, {

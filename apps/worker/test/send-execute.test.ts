@@ -257,12 +257,22 @@ async function seedApprovedDraft(opts: SeedOpts = {}): Promise<Seeded> {
   })
 }
 
+/** Upserts this fixture's (agent, category) policy — the row `claimSend` reads into `categoryMode`. */
+async function setCategoryMode(mode: 'off' | 'review' | 'auto'): Promise<void> {
+  await withOrg(app.db, fx.orgId, (tx) =>
+    tx.insert(agentCategoryPolicies)
+      .values({ orgId: fx.orgId, agentId: fx.agentId, categoryId: fx.categoryId, mode, autoSendMinConfidence: 80 })
+      .onConflictDoUpdate({ target: [agentCategoryPolicies.agentId, agentCategoryPolicies.categoryId], set: { mode } }))
+}
+
 /**
  * The auto-send shape (Phase 5): the SAME approved draft + queued send, but decided by the agent —
  * `decision_source: 'auto'`, an `auto_decided_at` stamp, no `decided_by` — on a ticket parked in
- * `auto_sending` for the hold window rather than in the review queue.
+ * `auto_sending` for the hold window rather than in the review queue, under the `auto` category
+ * policy that is the only thing that could have produced such a draft.
  */
 async function seedAutoSend(opts: SeedOpts = {}): Promise<Seeded> {
+  await setCategoryMode('auto')
   return seedApprovedDraft({
     ...opts,
     ticket: { status: 'auto_sending', redraftCount: 0, ownerRedraftFeedback: null, ...opts.ticket },
@@ -1396,6 +1406,44 @@ describe('send.execute', () => {
     // The ticket stays in the hold window: the owner's Resume is what puts the reply back in flight.
     expect((await getTicket(s.ticketId)).status).toBe('auto_sending')
     expect(notified).toHaveLength(1)
+  })
+
+  it('P5 a category that left Autopilot inside the hold window holds the auto-send (held:category_not_auto)', async () => {
+    // The lever this covers: the owner switched the category to Review (or the demotion backstop did
+    // it for them) AFTER the agent decided, while the send was still sitting out its hold window.
+    // `category_off` does not fire — the category is on, it is just no longer on Autopilot.
+    const s = await seedAutoSend()
+    await setCategoryMode('review')
+    const { deps, notified } = makeDeps()
+
+    await run(deps, s.sendId)
+
+    expect(fx.mailbox.sentMessages()).toHaveLength(0)
+    const send = await getSend(s.sendId)
+    expect(send.status).toBe('held')
+    expect(send.lastError).toBe('held:category_not_auto')
+    expect((await getDraft(s.draftId)).status).toBe('held')
+    // Same landing as every other lever: the ticket waits in the hold window for the owner.
+    expect((await getTicket(s.ticketId)).status).toBe('auto_sending')
+    expect(await auditActions(s.sendId)).toContain('send.held')
+    const rows = await orgNotifications()
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.title).toBe('Reply on hold — this category is no longer on Autopilot')
+    expect(notified.map((n) => n.notificationId)).toEqual([rows[0]!.id])
+  })
+
+  it('P5 category_not_auto reads the DRAFT: the same draft under an auto category sends, and a human-approved draft in a Review category is untouched', async () => {
+    const auto = await seedAutoSend()          // policy left on `auto`
+    await run(makeDeps().deps, auto.sendId)
+    expect((await getSend(auto.sendId)).status).toBe('sent')
+
+    // A draft the owner approved themselves (`decision_source: 'app'`) — a Hold + re-approve rewrites
+    // the column to `app`, which is exactly why the lever keys off it and not off the ticket status.
+    const human = await seedApprovedDraft()
+    await setCategoryMode('review')
+    await run(makeDeps().deps, human.sendId)
+    expect((await getSend(human.sendId)).status).toBe('sent')
+    expect(fx.mailbox.sentMessages()).toHaveLength(2)
   })
 
   it('P5 the last attempt dead-letters an auto-send out of auto_sending, not out of awaiting_review', async () => {

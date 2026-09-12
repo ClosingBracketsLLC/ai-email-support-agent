@@ -284,6 +284,50 @@ describe('inbox router (read-only)', () => {
     expect((await c.inbox.ticket.query({ ticketId: handling.id })).draft).toBeNull()
   })
 
+  // Final fix wave: the draft panel's "Should not have sent" button had no draft to render against
+  // from the ticket screen — `loadLiveDraftView` served live drafts (and the failed fallback) only,
+  // and an auto-send's draft is `sent`, on a `waiting_on_customer` ticket.
+  it('inbox.ticket serves the newest SENT auto draft on a waiting_on_customer ticket, and nothing else', async () => {
+    const signed = await signInWithOtp(t.app, t.mail, 'owner-auto-sent-draft@example.com', 'Owner')
+    const c = client(base, signed.cookie)
+    const { orgId } = await c.workspace.create.mutate({ businessName: 'Acme', timezone: 'UTC' })
+    const connectionId = await insertConnectedMailbox(t.api, orgId, signed.user.id, 'support@autosent.test')
+    const agentId = await insertAgent(t.api, orgId, connectionId, 'support@autosent.test')
+    const now = Date.now()
+
+    const markSent = (draftId: string, source: 'auto' | 'app', decidedAt: Date) =>
+      t.api.withOrg(orgId, (tx) => tx.update(drafts)
+        .set({ decisionSource: source, decidedAt, ...(source === 'auto' ? { autoDecidedAt: decidedAt } : { decidedBy: signed.user.id }) })
+        .where(eq(drafts.id, draftId)))
+
+    // The state an auto-send leaves behind: draft `sent`, ledger row `sent`, ticket waiting.
+    const ticket = await insertTicket(orgId, connectionId, { status: 'waiting_on_customer', agentId, lastInboundAt: new Date(now) })
+    const older = await seedPendingDraft(t.api, orgId, ticket.id, { agentId, status: 'sent' })
+    const newest = await seedPendingDraft(t.api, orgId, ticket.id, { agentId, status: 'sent' })
+    await markSent(older.id, 'auto', new Date(now - 60_000))
+    await markSent(newest.id, 'auto', new Date(now))
+
+    const one = await c.inbox.ticket.query({ ticketId: ticket.id })
+    expect(one.draft).toMatchObject({ id: newest.id, status: 'sent', decisionSource: 'auto', flaggedAt: null })
+
+    // The LIST join stays live-only: a recently-sent ticket shows no draft chip.
+    const list = await c.inbox.list.query({ section: 'recent' })
+    expect(list.tickets.find((tk) => tk.id === ticket.id)!.draft).toBeNull()
+
+    // Bounded by the ticket status, exactly like the failed fallback: a resolved ticket carrying the
+    // same rows shows nothing (nothing polls it, and the flag would be refused anyway).
+    const done = await insertTicket(orgId, connectionId, { status: 'resolved', agentId, lastInboundAt: new Date(now) })
+    const doneDraft = await seedPendingDraft(t.api, orgId, done.id, { agentId, status: 'sent' })
+    await markSent(doneDraft.id, 'auto', new Date(now))
+    expect((await c.inbox.ticket.query({ ticketId: done.id })).draft).toBeNull()
+
+    // ...and bounded by `decision_source`: a reply the OWNER approved is finished business.
+    const human = await insertTicket(orgId, connectionId, { status: 'waiting_on_customer', agentId, lastInboundAt: new Date(now) })
+    const humanDraft = await seedPendingDraft(t.api, orgId, human.id, { agentId, status: 'sent' })
+    await markSent(humanDraft.id, 'app', new Date(now))
+    expect((await c.inbox.ticket.query({ ticketId: human.id })).draft).toBeNull()
+  })
+
   it('parseCursor decodes exactly what encodeInboxCursor minted and flags anything else as degraded', async () => {
     // The cursor is opaque (base64url JSON, not an ISO instant) — `degraded` is the belt for
     // anything that isn't a cursor `inbox.list` itself minted: unparseable base64/JSON, a missing

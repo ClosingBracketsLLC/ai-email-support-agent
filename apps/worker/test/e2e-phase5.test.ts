@@ -55,7 +55,7 @@ import { and, eq } from 'drizzle-orm'
 import pg from 'pg'
 import type PgBoss from 'pg-boss'
 import pino from 'pino'
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import type { DraftDecision } from '@aesa/agent'
 import { createApiFacade, createEnqueue } from '@aesa/api/deps'
 import { approveDraft, holdDraft, markViewed, rejectDraft, type DraftActor, type DraftServiceDeps } from '@aesa/api/drafts'
@@ -123,11 +123,13 @@ const BASE_VERDICT = {
  * Passes every guardrail screen: no markup, no link, no address, no number, no promise token — and
  * therefore `warningCount: 0`, which an auto-send needs (`decide()`'s `guardrail_warning` gate).
  *
- * It also deliberately does NOT open with "Thanks": `scrubForMemory` cuts from the last sign-off-
- * shaped line in the message's trailing HALF onward, and a one-line reply's only line IS its
- * trailing half — so `e2e-phase3/4`'s own `CLEAN_BODY` ("Thanks for getting in touch. …") scrubs to
- * the empty string and `memory.capture` correctly refuses to learn anything from it
- * (`memory.skipped`, `empty_after_scrub`). Recorded as a carry in `docs/STATUS.md`.
+ * It does not open with "Thanks" — which was once load-bearing and no longer is: `scrubForMemory`
+ * used to cut from the last sign-off-shaped line in the message's trailing HALF onward, and a
+ * one-line reply's only line IS its trailing half, so `e2e-phase3/4`'s own `CLEAN_BODY` ("Thanks for
+ * getting in touch. …") scrubbed to the empty string and nothing was learned from it
+ * (`memory.skipped`, `empty_after_scrub`). That defect is FIXED (final fix wave): the sign-off cut
+ * never removes the first content line, and `packages/knowledge/test/scrub.test.ts` pins that exact
+ * body. This body stays as it is because the scenarios' stored `A:` assertions read against it.
  */
 const CLEAN_BODY = 'I have checked the details you gave us and everything looks correct on our side.'
 
@@ -224,14 +226,21 @@ describe('Phase 5 close-out E2E (real pg-boss autonomy + learning jobs, the real
   // ---- the `enqueueSend` seam and its gate (header, notes 2 and 3) ----------
 
   let sendGate: Promise<void> | null = null
-  /** Parks every auto-send enqueue until the returned release is called. */
+  let releaseSendGate: (() => void) | null = null
+  /** Parks every auto-send enqueue until the returned release is called (idempotent). */
   function gateSends(): () => void {
-    let release!: () => void
     sendGate = new Promise<void>((resolve) => {
-      release = () => { sendGate = null; resolve() }
+      releaseSendGate = () => { sendGate = null; releaseSendGate = null; resolve() }
     })
-    return release
+    return () => releaseSendGate?.()
   }
+  /**
+   * A failed assertion between `gateSends()` and its release would leave the seam parked FOREVER:
+   * every later scenario's auto-send enqueue awaits that promise, so one real failure turned the
+   * remaining scenarios into 240-second timeouts and buried it. Releasing here costs nothing when
+   * the scenario already released (the release is idempotent and the gate is per-scenario).
+   */
+  afterEach(() => { releaseSendGate?.() })
 
   const enqueueSendSeam = async (orgId: string, sendId: string): Promise<void> => {
     if (sendGate) await sendGate

@@ -7,7 +7,9 @@ import { agents, categories, tickets } from './support.ts'
  * A human-approved (or, until sampled, auto-sent) reply, scrubbed and embedded, retrieved into the
  * next similar draft's prompt as "an answer this business has given before" (spec §Learning loop).
  * Never a raw customer body: `question_text`/`answer_body` are the scrubbed forms `@aesa/knowledge`'s
- * `scrubForMemory` produces. `expires_at` is FIXED at capture/approval time (365 d), never rolled by reuse.
+ * `scrubForMemory` produces. `expires_at` is a FIXED 365 days from the HUMAN decision that set it —
+ * capture, a reinforcing approval, or `confirmCandidate` — and nothing else moves it: being retrieved
+ * into a prompt, or cited by a draft nobody approved, buys an answer no extra life (CLAUDE.md, Memory).
  */
 export const resolvedAnswers = pgTable('resolved_answers', {
   id: id(), orgId: orgId(),
