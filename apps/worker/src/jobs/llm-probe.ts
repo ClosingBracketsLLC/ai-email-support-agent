@@ -170,11 +170,14 @@ export async function runLlmProbe(deps: LlmProbeDeps, p: LlmProbePayload, signal
       tx
         .update(llmCredentialSecrets)
         .set({ keyCiphertext: ciphertext, encryption: 'dek', dataKeyVersion: version, updatedAt: sql`now()` })
-        // Guarded on the encryption it was READ at: a concurrent probe that re-wrapped first wins.
+        // Guarded on the exact BYTES this probe opened, not just on the wrapping: an owner who
+        // re-keyed mid-probe leaves a different sealed blob behind, and `encryption = 'sealed'`
+        // alone would let this run overwrite their new key with the old one it is still holding.
         .where(and(
           eq(llmCredentialSecrets.credentialId, p.credentialId),
           eq(llmCredentialSecrets.orgId, p.orgId),
           eq(llmCredentialSecrets.encryption, 'sealed'),
+          eq(llmCredentialSecrets.keyCiphertext, opened.ciphertext),
         )))
   }
 
@@ -208,7 +211,13 @@ async function landVerdict(
     } else {
       const failures = cred.consecutiveFailures + 1
       // One bad minute keeps whatever health the credential already had; a pattern is a verdict.
-      const next = failures >= DEGRADED_AFTER_FAILURES ? 'degraded' : cred.healthStatus
+      // `dead` is the exception: it is sticky until a probe SUCCEEDS. `markCredentialDead` already
+      // left `consecutive_failures` at 1, so the very next transient failure would otherwise compute
+      // 2 >= DEGRADED_AFTER_FAILURES and quietly PROMOTE a rejected key back to `degraded` — which
+      // the resolver would then hand to a draft.
+      const next = cred.healthStatus === 'dead'
+        ? 'dead'
+        : failures >= DEGRADED_AFTER_FAILURES ? 'degraded' : cred.healthStatus
       await set({
         healthStatus: next,
         consecutiveFailures: failures,

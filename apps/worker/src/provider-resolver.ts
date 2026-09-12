@@ -63,6 +63,10 @@ export interface OpenedCredentialKey {
   apiKey: Secret
   /** `sealed` means `llm.probe` has not re-wrapped this row yet — the probe job acts on that. */
   encryption: 'sealed' | 'dek'
+  /** The EXACT bytes this key was opened from. `llm.probe`'s re-wrap guards its UPDATE on them, so a
+   *  key the owner rotated while the probe was in flight can never be overwritten by the old one —
+   *  `encryption` alone identifies the wrapping, not the blob, and would not catch sealed → sealed. */
+  ciphertext: Buffer
 }
 
 /**
@@ -86,8 +90,29 @@ export async function openCredentialKey(
     row.encryption === 'sealed'
       ? openSealedForOrg(tx, deps.ring, row.keyCiphertext)
       : decrypt((await loadOrgDek(tx, deps.ring)).dek, row.keyCiphertext, secretAad(orgId, credentialId)))
-  const parsed = JSON.parse(plaintext.toString('utf8')) as { apiKey: string }
-  return { apiKey: new Secret(parsed.apiKey), encryption: row.encryption as 'sealed' | 'dek' }
+  return {
+    apiKey: new Secret(readApiKey(plaintext)),
+    encryption: row.encryption as 'sealed' | 'dek',
+    ciphertext: row.keyCiphertext,
+  }
+}
+
+/**
+ * `JSON.parse` quotes the first ~10 characters of its input in the `SyntaxError` it throws — which
+ * here is the API key itself, and that error would reach the job's failure output and the worker
+ * log. So the parse is wrapped and BOTH failure modes (unparseable, or parsed to something without
+ * a string `apiKey`) raise the same plaintext-free message.
+ */
+function readApiKey(plaintext: Buffer): string {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(plaintext.toString('utf8'))
+  } catch {
+    throw new Error('llm credential secret is not readable')
+  }
+  const apiKey = (parsed as { apiKey?: unknown } | null)?.apiKey
+  if (typeof apiKey !== 'string' || apiKey.length === 0) throw new Error('llm credential secret is not readable')
+  return apiKey
 }
 
 export function createProviderResolver(deps: ProviderResolverDeps): ProviderResolver {
@@ -199,11 +224,23 @@ function baseUrlFor(provider: LlmProviderId, stored: string | null): string {
   return url
 }
 
-/** Tests only: one fixed provider for every org, agent and role. */
-export function staticResolver(provider: LlmProvider, config: Partial<ResolvedModelConfig> = {}): ProviderResolver {
+/** Tests only: one fixed provider for every org, agent and role, with an optional fallback beside it. */
+export function staticResolver(
+  provider: LlmProvider, config: Partial<ResolvedModelConfig> = {}, fallback: LlmProvider | null = null,
+): ProviderResolver {
   return {
     async resolve(_orgId, _agentId, role): Promise<ResolvedProvider> {
-      return { ok: true, provider, fallback: null, config: { ...managedConfig(role), ...config } }
+      return { ok: true, provider, fallback, config: { ...managedConfig(role), ...config } }
+    },
+    invalidate(): void {},
+  }
+}
+
+/** Tests only: a resolver that refuses every call, for driving a job's `provider_unavailable` landing. */
+export function staticRefusal(reason: ProviderUnavailableReason, config: Partial<ResolvedModelConfig> = {}): ProviderResolver {
+  return {
+    async resolve(_orgId, _agentId, role): Promise<ResolvedProvider> {
+      return { ok: false, reason, config: { ...managedConfig(role), ...config } }
     },
     invalidate(): void {},
   }

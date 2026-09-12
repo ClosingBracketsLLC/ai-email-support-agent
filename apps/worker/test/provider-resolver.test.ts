@@ -18,7 +18,7 @@ import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
 import { createFakeProvider, noopMeterSink, type LlmProvider } from '@aesa/llm'
 import { createWorkerLogger } from '../src/logging.ts'
 import {
-  createProviderResolver, markCredentialDead, secretAad, staticResolver, type ProviderResolverDeps,
+  createProviderResolver, markCredentialDead, secretAad, staticRefusal, staticResolver, type ProviderResolverDeps,
 } from '../src/provider-resolver.ts'
 
 const ring: KekRing = loadKekRing({ AESA_KEK_V1: randomBytes(32).toString('base64'), AESA_KEK_ACTIVE: '1' })
@@ -201,6 +201,24 @@ describe('createProviderResolver', () => {
     expect(await resolver.resolve(orgId, agentId, 'draft')).toMatchObject({ ok: false, reason: 'no_kek' })
   })
 
+  it('a secret row whose plaintext is not the expected JSON fails WITHOUT echoing the key', async () => {
+    const agentId = await createAgent()
+    const credentialId = await createCredential({ healthStatus: 'healthy' })
+    // A bare key rather than `{"apiKey": …}` — `JSON.parse`'s own SyntaxError would quote the first
+    // characters of its input, i.e. the key, straight into the job failure and the worker log.
+    const { dek } = await withOrg(app.db, orgId, (tx) => loadOrgDek(tx, ring))
+    await withPlatform(app.db, 'test:seed-secret', (tx) =>
+      tx.insert(llmCredentialSecrets).values({
+        credentialId, orgId, encryption: 'dek', dataKeyVersion: 1,
+        keyCiphertext: encrypt(dek, Buffer.from('sk-live-abcdefghijklmnop', 'utf8'), secretAad(orgId, credentialId)),
+      }))
+    await seedConfig(agentId, { credentialId, model: 'gpt-5' })
+    const { resolver } = makeResolver()
+
+    await expect(resolver.resolve(orgId, agentId, 'draft')).rejects.toThrow('llm credential secret is not readable')
+    await expect(resolver.resolve(orgId, agentId, 'draft')).rejects.not.toThrow(/sk-/)
+  })
+
   it('byok config with no secret row → { ok: false, reason: no_secret }', async () => {
     const agentId = await createAgent()
     const credentialId = await createCredential({ healthStatus: 'healthy' })
@@ -345,6 +363,16 @@ describe('staticResolver', () => {
     expect((await resolver.resolve('org_1', null, 'draft')).ok).toBe(true)
   })
 
+  it('takes a fallback provider as its third argument', async () => {
+    const provider = createFakeProvider([{ text: 'x' }], { kind: 'byok' })
+    const fallback = createFakeProvider([{ text: 'y' }], { kind: 'managed' })
+
+    const r = await staticResolver(provider, { mode: 'byok' }, fallback).resolve('org_1', null, 'draft')
+
+    expect(r.ok && r.provider).toBe(provider)
+    expect(r.ok && r.fallback).toBe(fallback)
+  })
+
   it('takes a config patch, so a test can pretend it is a byok credential', async () => {
     const provider = createFakeProvider([{ text: 'x' }], { kind: 'fake' })
     const resolver = staticResolver(provider, { mode: 'byok', credentialId: 'cred_1', provider: 'openai', model: 'gpt-5' })
@@ -352,6 +380,19 @@ describe('staticResolver', () => {
     const r = await resolver.resolve('org_1', null, 'draft')
 
     expect(r.config).toMatchObject({ mode: 'byok', credentialId: 'cred_1', provider: 'openai', model: 'gpt-5' })
+  })
+})
+
+describe('staticRefusal', () => {
+  it('refuses every call with the reason it was built for, carrying the config patch', async () => {
+    const resolver = staticRefusal('credential_dead', { mode: 'byok', credentialId: 'cred_1', provider: 'openai' })
+
+    const r = await resolver.resolve('org_1', 'agent_1', 'draft')
+
+    expect(r).toMatchObject({ ok: false, reason: 'credential_dead' })
+    expect(r.config).toMatchObject({ mode: 'byok', credentialId: 'cred_1', provider: 'openai' })
+    resolver.invalidate('cred_1')
+    expect((await resolver.resolve('org_1', 'agent_1', 'triage')).ok).toBe(false)
   })
 })
 

@@ -251,6 +251,74 @@ describe('llm.probe', () => {
     expect((await auditsFor(credentialId)).map((a) => a.action)).toEqual(['llm.credential_probed', 'llm.credential_probed'])
   })
 
+  it('a dead credential stays dead through a transient failure, and only a SUCCESSFUL probe revives it', async () => {
+    const credentialId = await createCredential({ healthStatus: 'healthy' })
+    await seedDekSecret(credentialId)
+    const notified: string[] = []
+    const enqueueNotify = async (_org: string, id: string) => void notified.push(id)
+    const { deps: authDeps } = makeDeps({
+      fetchFn: probeFetch({ chatError: { status: 401, message: 'invalid key' } }).fetchFn, enqueueNotify,
+    })
+    expect(await runLlmProbe(authDeps, { orgId, credentialId, reason: 'manual' }, AbortSignal.timeout(30_000))).toBe('dead')
+    expect(notified).toHaveLength(1)
+
+    // `markCredentialDead` left consecutive_failures at 1, so this 500 computes 2 — which would have
+    // PROMOTED a rejected key to `degraded`, and the resolver would then hand it to a draft.
+    const { deps: flakyDeps } = makeDeps({
+      fetchFn: probeFetch({ chatError: { status: 500, message: 'upstream is on fire' } }).fetchFn, enqueueNotify,
+    })
+    expect(await runLlmProbe(flakyDeps, { orgId, credentialId, reason: 'manual' }, AbortSignal.timeout(30_000))).toBe('dead')
+    const still = await readCredential(credentialId)
+    expect(still?.healthStatus).toBe('dead')
+    expect(still?.consecutiveFailures).toBe(2)
+    // No SECOND page: the credential was already dead, so nothing flipped.
+    expect(notified).toHaveLength(1)
+
+    // Only a probe that actually works clears it.
+    const { deps: okDeps } = makeDeps({ enqueueNotify })
+    expect(await runLlmProbe(okDeps, { orgId, credentialId, reason: 'manual' }, AbortSignal.timeout(30_000))).toBe('healthy')
+    const revived = await readCredential(credentialId)
+    expect(revived?.healthStatus).toBe('healthy')
+    expect(revived?.consecutiveFailures).toBe(0)
+    expect(revived?.lastError).toBeNull()
+  })
+
+  it('a key rotated mid-probe survives: the re-wrap is guarded on the exact bytes it opened', async () => {
+    const credentialId = await createCredential()
+    const opened = await sealedFor('sk-the-key-this-probe-opened')
+    const rekeyed = await sealedFor('sk-the-owners-newer-key-222')
+
+    // The rotation fires from INSIDE the probe's own network step — after the key was opened, before
+    // the re-wrap runs. That is the real race: `encryption = 'sealed'` alone still matches the NEW
+    // row, so without the bytes guard this run would overwrite the owner's new key with the old one.
+    const upstream = probeFetch().fetchFn
+    let rotated = false
+    const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (!rotated) {
+        rotated = true
+        await withPlatform(app.db, 'test:rekey', async (tx) => {
+          await tx
+            .delete(llmCredentialSecrets)
+            .where(and(eq(llmCredentialSecrets.credentialId, credentialId), eq(llmCredentialSecrets.orgId, orgId)))
+          await tx.insert(llmCredentialSecrets).values({
+            credentialId, orgId, keyCiphertext: Buffer.from(rekeyed, 'base64'), encryption: 'sealed',
+          })
+        })
+      }
+      return upstream(input as string, init)
+    }) as unknown as typeof fetch
+
+    const { deps, invalidated } = makeDeps({ fetchFn })
+    expect(await runLlmProbe(deps, { orgId, credentialId, sealed: opened, reason: 'connect' }, AbortSignal.timeout(30_000))).toBe('healthy')
+    expect(rotated).toBe(true)
+
+    const row = await readSecret(credentialId)
+    expect(row?.encryption).toBe('sealed')
+    expect(row?.keyCiphertext.equals(Buffer.from(rekeyed, 'base64'))).toBe(true)
+    // And the cached provider is dropped either way, so the next resolve reads the row as it now is.
+    expect(invalidated).toContain(credentialId)
+  })
+
   it('an endpoint that honours only json_mode stores json_mode', async () => {
     const credentialId = await createCredential()
     await seedDekSecret(credentialId)

@@ -79,7 +79,7 @@ describe('maybeRegisterAgentRole', () => {
     expect(registered).toBe(false)
   })
 
-  it('logs a warning and skips registration in development when ANTHROPIC_API_KEY is missing', async () => {
+  it('logs a warning and skips registration in development when ANTHROPIC_API_KEY is missing (and there is no ring either)', async () => {
     const { logger, lines } = testLogger()
     let registered = false
     await maybeRegisterAgentRole(
@@ -87,8 +87,34 @@ describe('maybeRegisterAgentRole', () => {
       spyRegistrars(() => { registered = true }),
     )
     expect(registered).toBe(false)
-    expect(lines).toHaveLength(1)
-    expect(JSON.parse(lines[0]!).msg).toMatch(/ANTHROPIC_API_KEY/)
+    // Two independent gates, two sentences: no ring (so no llm.probe) and no key (so no model jobs).
+    const msgs = lines.map((l) => JSON.parse(l).msg as string)
+    expect(msgs.filter((m) => m.includes('ANTHROPIC_API_KEY'))).toHaveLength(1)
+    expect(msgs.filter((m) => m.includes('BYOK disabled'))).toHaveLength(1)
+  })
+
+  /** The gate the two keys buy different things: `llm.probe` only ever calls the TENANT's endpoint,
+   *  so a dev box with a ring and no Anthropic key must still be able to add and probe a BYOK key. */
+  it('no ANTHROPIC_API_KEY but a ring, in dev: llm.probe registers, the five model jobs do not, one warn', async () => {
+    const { logger, lines } = testLogger()
+    let probeDeps: LlmProbeDeps | undefined
+    let modelJobs = 0
+    await maybeRegisterAgentRole(
+      {
+        boss: fakeBoss, db: fakeDb, logger,
+        config: baseConfig({ env: 'development', anthropicApiKey: null, kekRing: ring }),
+        enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {},
+      },
+      {
+        ...spyRegistrars(() => { modelJobs += 1 }),
+        registerLlmProbe: async (_boss, jobDeps) => { probeDeps = jobDeps },
+      },
+    )
+    expect(probeDeps?.ring).toBe(ring)
+    expect(modelJobs).toBe(0)
+    const msgs = lines.map((l) => JSON.parse(l).msg as string)
+    expect(msgs.filter((m) => m.includes('ANTHROPIC_API_KEY'))).toHaveLength(1)
+    expect(msgs.filter((m) => m.includes('BYOK disabled'))).toHaveLength(0)
   })
 
   it('same in test env — boots without the key rather than crashing', async () => {
@@ -156,10 +182,11 @@ describe('maybeRegisterAgentRole', () => {
     expect(guidanceDeps?.providers).toBe(triageDeps?.providers)
   })
 
-  it('registers llm.probe when the KEK ring is present, on the SAME resolver every job got', async () => {
+  it('key AND ring: all six register, llm.probe on the SAME resolver every job got', async () => {
     const { logger, lines } = testLogger()
     let probeDeps: LlmProbeDeps | undefined
     let draftDeps: TicketDraftDeps | undefined
+    let modelJobs = 0
     await maybeRegisterAgentRole(
       {
         boss: fakeBoss, db: fakeDb, logger,
@@ -167,11 +194,15 @@ describe('maybeRegisterAgentRole', () => {
         enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {},
       },
       {
-        registerTriage: async () => {}, registerDraft: async (_boss, jobDeps) => { draftDeps = jobDeps },
-        registerSandbox: async () => {}, registerMemoryCapture: async () => {}, registerGuidanceSuggest: async () => {},
+        registerTriage: async () => { modelJobs += 1 },
+        registerDraft: async (_boss, jobDeps) => { modelJobs += 1; draftDeps = jobDeps },
+        registerSandbox: async () => { modelJobs += 1 },
+        registerMemoryCapture: async () => { modelJobs += 1 },
+        registerGuidanceSuggest: async () => { modelJobs += 1 },
         registerLlmProbe: async (_boss, jobDeps) => { probeDeps = jobDeps },
       },
     )
+    expect(modelJobs).toBe(5)
     expect(probeDeps?.db).toBe(fakeDb)
     expect(probeDeps?.ring).toBe(ring)
     // The probe's whole job is to invalidate what the resolver cached — a second resolver would

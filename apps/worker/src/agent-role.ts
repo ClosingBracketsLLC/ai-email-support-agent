@@ -80,33 +80,60 @@ const DEFAULT_REGISTRARS: AgentRoleRegistrars = {
 
 /**
  * Registers `ticket.triage`, `ticket.draft`, `agent.sandbox`, `memory.capture`, `guidance.suggest`
- * and — when a KEK ring is configured — `llm.probe`, when `WORKER_ROLES` includes `agent`. A missing `ANTHROPIC_API_KEY`: refuses
- * to start in production (an `agent`-role worker with no model access would sit there looking
- * healthy while silently never drafting anything — better to fail loud at boot), but in dev/test
- * just logs a warning and skips registration so local dev without a key still boots for every other
- * role.
+ * and `llm.probe` when `WORKER_ROLES` includes `agent`. Two INDEPENDENT gates decide which of them
+ * actually register, because the two keys buy different things:
+ *
+ *  - `ANTHROPIC_API_KEY` (the platform's managed key) gates the FIVE model-calling jobs. Missing in
+ *    production is a hard refusal — a replica with no model access would sit there looking healthy
+ *    while silently never drafting. Outside production it is one warning and `managed = null`: the
+ *    resolver still answers BYOK configs and simply refuses managed ones with `no_managed_key`.
+ *  - The KEK ring gates `llm.probe` alone, which opens a tenant's key under the org DEK and needs no
+ *    managed provider at all — so a dev box with a ring and no Anthropic key still adds, probes and
+ *    re-wraps BYOK credentials.
+ *
+ * The five jobs are skipped rather than registered on a null provider only because they still carry
+ * the transitional `deps.provider: LlmProvider`; Task 6 drops it and registers them unconditionally
+ * on the resolver.
  */
 export async function maybeRegisterAgentRole(deps: AgentRoleDeps, register: AgentRoleRegistrars = DEFAULT_REGISTRARS): Promise<void> {
   if (!deps.config.roles.has('agent')) return
 
-  if (!deps.config.anthropicApiKey) {
-    if (deps.config.env === 'production') {
-      throw new Error('ANTHROPIC_API_KEY is required in production when WORKER_ROLES includes `agent`')
-    }
-    deps.logger.warn('ANTHROPIC_API_KEY missing; skipping ticket.triage/ticket.draft/agent.sandbox registration (agent role inactive)')
-    return
+  if (!deps.config.anthropicApiKey && deps.config.env === 'production') {
+    throw new Error('ANTHROPIC_API_KEY is required in production when WORKER_ROLES includes `agent`')
   }
 
   // ONE sink for the role: the managed provider, every BYOK provider the resolver builds and
   // `llm.probe`'s own raw adapter all write their `llm_calls` rows through it.
   const sink = createMeterSink(deps.db, { onError: (err) => deps.logger.warn({ err }, 'llm metering write failed') })
-  const provider = createManagedProvider({ apiKey: deps.config.anthropicApiKey, sink, ...(deps.pricing ? { pricing: deps.pricing } : {}) })
+  const provider = deps.config.anthropicApiKey
+    ? createManagedProvider({ apiKey: deps.config.anthropicApiKey, sink, ...(deps.pricing ? { pricing: deps.pricing } : {}) })
+    : null
   // Phase 6: ONE resolver for the role. It caches a decrypted BYOK key per credential and keys the
-  // per-credential rate budget, so a second instance would double both.
+  // per-credential rate budget, so a second instance would double both. A null `managed` is a real
+  // state, not a bug: it is what makes `resolve` answer `no_managed_key` instead of guessing.
   const providers = createProviderResolver({
     db: deps.db, ring: deps.config.kekRing, managed: provider, sink, logger: deps.logger,
     ...(deps.pricing ? { pricing: deps.pricing } : {}),
   })
+
+  // `llm.probe` needs the ring and NOT the managed provider — it only ever calls the tenant's own
+  // endpoint. Registered first, and independently, so a ringed dev box with no Anthropic key can
+  // still add and probe a BYOK credential. Production never reaches the else branch: `loadConfig`
+  // refuses an `agent` replica without a ring.
+  if (deps.config.kekRing) {
+    await register.registerLlmProbe(deps.boss, {
+      db: deps.db, ring: deps.config.kekRing, sink, logger: deps.logger, enqueueNotify: deps.enqueueNotify,
+      resolver: providers, ...(deps.pricing ? { pricing: deps.pricing } : {}),
+    })
+  } else {
+    deps.logger.warn('BYOK disabled: no KEK ring (llm.probe not registered)')
+  }
+
+  if (!provider) {
+    deps.logger.warn('ANTHROPIC_API_KEY missing; skipping ticket.triage/ticket.draft/agent.sandbox/memory.capture/guidance.suggest registration')
+    return
+  }
+
   // Built ONCE, shared by the retriever AND `memory.capture`: two instances would be two per-model
   // rate budgets and two chances for the write side (memory.capture) and the read side (the
   // retriever's answers leg) to disagree about which model wrote a vector.
@@ -124,16 +151,4 @@ export async function maybeRegisterAgentRole(deps: AgentRoleDeps, register: Agen
   await register.registerSandbox(deps.boss, { db: deps.db, provider, providers, retriever, logger: deps.logger })
   await register.registerMemoryCapture(deps.boss, { db: deps.db, embedder, logger: deps.logger })
   await register.registerGuidanceSuggest(deps.boss, { db: deps.db, provider, providers, logger: deps.logger })
-
-  // `llm.probe` opens a tenant's key under the org DEK, so it needs the ring. Production never
-  // reaches the else branch — `loadConfig` refuses an `agent` replica without one — but a dev box
-  // that only ever uses managed AI still boots, drafts, and simply cannot add a BYOK key.
-  if (deps.config.kekRing) {
-    await register.registerLlmProbe(deps.boss, {
-      db: deps.db, ring: deps.config.kekRing, sink, logger: deps.logger, enqueueNotify: deps.enqueueNotify,
-      resolver: providers, ...(deps.pricing ? { pricing: deps.pricing } : {}),
-    })
-  } else {
-    deps.logger.warn('BYOK disabled: no KEK ring (llm.probe not registered)')
-  }
 }
