@@ -22,7 +22,7 @@ const HEALTH_TONE: Record<CredentialHealth, ChipTone> = {
 }
 /** What a health status actually means for replies — the sentence under a chip that isn't `healthy`. */
 const HEALTH_HINT: Record<CredentialHealth, string | null> = {
-  unknown: 'Testing this key now.',
+  unknown: 'Waiting for the provider to answer the first test.',
   healthy: null,
   degraded: 'Recent calls failed. Agents on this key still try it.',
   dead: 'The provider rejected this key. Agents on it fall back to Managed AI only if you asked them to.',
@@ -73,17 +73,48 @@ function probeSummary(probe: ProbeResultView | null): string {
  * two later by writing the row. */
 const PROBE_POLL_MS = 4_000
 
-/** The credential this session pressed "Test connection" on, and what its `lastProbedAt` was at that
- * moment — the result has landed once that value moves. */
-interface TestingProbe { credentialId: string; probedAt: number | null }
+/** How long the screen waits for an answer before it stops asking and says so. A probe that has not
+ * landed in two minutes is not late, it is stuck (a collapsed enqueue, a worker that never picked the
+ * job up), and only the six-hourly reprobe sweep or another "Test connection" will move it — polling
+ * on forever would just promise an update that is not coming. */
+export const PROBE_WAIT_CAP_MS = 120_000
 
-/** True while a probe result is still expected: a connection the worker has never answered for
- * (`unknown`), or the one just tested, until its `lastProbedAt` moves. A connection that has since
- * been removed matches neither, so the poll always stops. */
-function awaitingProbe(credentials: CredentialRow[] | undefined, testing: TestingProbe | null): boolean {
+/** The credential this session pressed "Test connection" on: what its `lastProbedAt` was at that
+ * moment (the result has landed once that value moves), and when the press armed the wait. */
+export interface TestingProbe { credentialId: string; probedAt: number | null; armedAt: number }
+
+/** The minimum of a connection row this decision reads — `CredentialRow` satisfies it. */
+interface ProbeWatchRow { id: string; healthStatus: CredentialHealth; lastProbedAt: Date | null; createdAt: Date }
+
+/**
+ * True while a probe result is still expected AND still worth waiting for. Two arms, each with its own
+ * clock, and each capped at `PROBE_WAIT_CAP_MS` from the action that armed it:
+ *  - the connection just tested, until its `lastProbedAt` moves — armed by the press;
+ *  - any connection the worker has never answered for (`unknown`), armed by its own `createdAt`, which
+ *    IS the moment the key was added and (being server data) survives a remount of this screen.
+ * A connection that has since been removed matches neither, so the poll always stops.
+ */
+export function awaitingProbe(
+  credentials: readonly ProbeWatchRow[] | undefined, testing: TestingProbe | null, now: number,
+): boolean {
   if (!credentials) return false
-  if (credentials.some((c) => c.healthStatus === 'unknown')) return true
-  return testing !== null && credentials.some((c) => c.id === testing.credentialId && (c.lastProbedAt?.getTime() ?? null) === testing.probedAt)
+  if (testing !== null && now - testing.armedAt < PROBE_WAIT_CAP_MS && matchesTested(credentials, testing)) return true
+  return credentials.some((c) => c.healthStatus === 'unknown' && now - c.createdAt.getTime() < PROBE_WAIT_CAP_MS)
+}
+
+/** The armed wait is over the cap with nothing to show for it — the screen stops polling and says so
+ * rather than leaving a banner promising an update that will not arrive. */
+export function probeTimedOut(
+  credentials: readonly ProbeWatchRow[] | undefined, testing: TestingProbe | null, now: number,
+): boolean {
+  if (!credentials || awaitingProbe(credentials, testing, now)) return false
+  if (testing !== null && matchesTested(credentials, testing)) return true
+  return credentials.some((c) => c.healthStatus === 'unknown')
+}
+
+/** The tested connection is still sitting on the `lastProbedAt` it had when the press armed the wait. */
+function matchesTested(credentials: readonly ProbeWatchRow[], testing: TestingProbe): boolean {
+  return credentials.some((c) => c.id === testing.credentialId && (c.lastProbedAt?.getTime() ?? null) === testing.probedAt)
 }
 
 function relativeTime(date: Date): string {
@@ -120,7 +151,7 @@ export function AiSettingsScreen() {
   // at the point these options are built; `awaitingProbe` returning false is what ends the poll.
   const list = useQuery({
     ...trpc.llm.list.queryOptions(),
-    refetchInterval: (query) => (awaitingProbe(query.state.data?.credentials, testing) ? PROBE_POLL_MS : false),
+    refetchInterval: (query) => (awaitingProbe(query.state.data?.credentials, testing, Date.now()) ? PROBE_POLL_MS : false),
   })
 
   /** Every mutation here changes which model an agent runs on, so all three readers resync. */
@@ -145,7 +176,9 @@ export function AiSettingsScreen() {
   const canManage = canManageWorkspace(ws.data.role)
   const credentials = list.data.credentials
   const busy = probe.isPending || remove.isPending
-  const waiting = awaitingProbe(credentials, testing)
+  const now = Date.now()
+  const waiting = awaitingProbe(credentials, testing, now)
+  const timedOut = probeTimedOut(credentials, testing, now)
 
   function pressRemove(credentialId: string) {
     if (!canManage || busy) return
@@ -174,6 +207,11 @@ export function AiSettingsScreen() {
 
       {error ? <Banner tone="error" testID="ai-error">{error}</Banner> : null}
       {waiting ? <Banner tone="info" testID="ai-testing">Testing a key now — this page updates itself when the provider answers.</Banner> : null}
+      {timedOut ? (
+        <Banner tone="warning" testID="ai-probe-timeout">
+          We haven&apos;t heard back from the provider yet — try Test connection again in a minute.
+        </Banner>
+      ) : null}
 
       {credentials.length === 0 && !adding ? (
         <Muted testID="ai-empty">No provider connected — every agent is on Managed AI.</Muted>
@@ -189,10 +227,14 @@ export function AiSettingsScreen() {
           onTest={() => {
             if (!canManage || busy) return
             setError(null)
-            setTesting({ credentialId: cred.id, probedAt: cred.lastProbedAt?.getTime() ?? null })
+            // Testing a key is the opposite of removing it: an armed confirmation on THIS card is
+            // disarmed rather than left sitting one press away from a delete the owner moved on from.
+            setConfirmingRemove(null)
+            setTesting({ credentialId: cred.id, probedAt: cred.lastProbedAt?.getTime() ?? null, armedAt: Date.now() })
             probe.mutate({ credentialId: cred.id })
           }}
           onRemove={() => pressRemove(cred.id)}
+          onCancelRemove={() => setConfirmingRemove(null)}
         />
       ))}
 
@@ -233,7 +275,7 @@ interface CredentialRow {
  * do to it. Remove is a two-press confirmation that always names the blast radius first — every agent
  * on this key goes back to Managed AI the moment it is gone. */
 function CredentialCard({
-  credential, canManage, busy, confirming, onTest, onRemove,
+  credential, canManage, busy, confirming, onTest, onRemove, onCancelRemove,
 }: {
   credential: CredentialRow
   canManage: boolean
@@ -241,6 +283,7 @@ function CredentialCard({
   confirming: boolean
   onTest: () => void
   onRemove: () => void
+  onCancelRemove: () => void
 }) {
   const c = useColors()
   const hint = HEALTH_HINT[credential.healthStatus]
@@ -277,11 +320,16 @@ function CredentialCard({
       {canManage ? (
         <>
           {confirming ? (
-            <Banner tone="warning" testID={`credential-remove-warning-${credential.id}`}>
-              {credential.agentsUsing === 0
-                ? 'Remove this connection? No agent is using it.'
-                : `Remove this connection? ${plural(credential.agentsUsing, 'agent falls', 'agents fall')} back to Managed AI.`}
-            </Banner>
+            <>
+              <Banner tone="warning" testID={`credential-remove-warning-${credential.id}`}>
+                {credential.agentsUsing === 0
+                  ? 'Remove this connection? No agent is using it.'
+                  : `Remove this connection? ${plural(credential.agentsUsing, 'agent falls', 'agents fall')} back to Managed AI.`}
+              </Banner>
+              {/* The way out. Without it the only exits from an armed confirmation were removing the
+                  key or leaving the screen; Test connection disarms it too (the parent's `onTest`). */}
+              <Button variant="secondary" label="Cancel" onPress={onCancelRemove} disabled={busy} testID={`credential-remove-cancel-${credential.id}`} />
+            </>
           ) : null}
           <View style={styles.actions}>
             <View style={styles.grow}>
@@ -336,8 +384,14 @@ function AddProviderForm({ onCancel, onAdded }: { onCancel: () => void; onAdded:
     : null
 
   const add = useMutation(trpc.llm.add.mutationOptions({
+    // The pasted key rides this mutation's `variables`, which the MutationCache would otherwise retain
+    // for the default five-minute gcTime after the call settled. Nothing reads it there — but nothing
+    // needs it there either, so it is dropped the moment the mutation settles.
+    gcTime: 0,
     onSuccess: () => {
-      // The key is dropped the moment the api has it — it was only ever in this component's state.
+      // Cleared as soon as the api has it: from here the key exists only inside this mutation's
+      // in-flight variables, which `gcTime: 0` drops on settle. It is never a query key, a URL, a log
+      // line or a persisted store, and the api cannot hand one back.
       setApiKey('')
       setLabel('')
       setBaseUrl('')

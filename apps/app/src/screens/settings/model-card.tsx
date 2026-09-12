@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Pressable, StyleSheet, Text, View } from 'react-native'
 import type { CredentialHealth, LlmEffort, LlmProviderId, ModelConfigMode } from '@aesa/contracts'
 import { LLM_EFFORTS, MANAGED_MODELS, PROVIDER_PRESETS, presetModel } from '@aesa/contracts'
@@ -26,6 +26,10 @@ const effortId = (e: LlmEffort | null): string => e ?? 'default'
 const effortLabel = (e: LlmEffort | null): string => (e === null ? 'Default' : EFFORT_LABEL[e])
 
 const CHANGE_NOTE = 'Autopilot categories go back to Review when the model changes.'
+/** A `custom` connection has no catalog suggestion to prefill from (`presetModel` returns null), so
+ * both fields land empty and Save is disabled until the owner names the models — say so rather than
+ * leaving a dead button. */
+const CUSTOM_MODEL_HINT = 'Enter the model id this endpoint serves (for example qwen3:32b).'
 
 /** The api's own sentence for the one soft refusal this card can hit (`trpc/routers/llm.ts`). */
 function saveErrorCopy(error: unknown): string {
@@ -64,24 +68,37 @@ export function ModelCard({ agentId, canManage }: { agentId: string; canManage: 
   const [dirty, setDirty] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState<string | null>(null)
+  // The version pair `agent-edit.tsx` keeps, plus a ref mirror of `dirty`.
+  //
+  // `dirty` gates the seeding effect below, and a save has to clear it WITHOUT the effect re-running
+  // against whatever `current.data` happens to hold at that instant — which, until the invalidation's
+  // refetch lands (or if it never does), is the PRE-save config. That is what snapped every field back
+  // under the green banner. So the effect keys on the data alone and reads the flag off a ref: it fires
+  // only when the config itself changes, and the save clears the ref up front (nothing to protect — the
+  // server now agrees with the form) while `dirty` itself is cleared after the refetch and only if
+  // nothing was edited since this save started.
+  const editVersion = useRef(0)
+  const pendingVersion = useRef<number | null>(null)
+  const dirtyRef = useRef(false)
 
   const draft = current.data?.draft
   const triage = current.data?.triage
 
   useEffect(() => {
-    if (!draft || !triage || dirty) return
+    if (!draft || !triage || dirtyRef.current) return
     setMode(draft.mode)
     setCredentialId(draft.credentialId)
     setDraftModel(draft.mode === 'byok' ? draft.model : '')
     setTriageModel(triage.mode === 'byok' ? triage.model : '')
     setEffort(draft.effort)
     setFallbackToManaged(draft.fallbackToManaged)
-  }, [dirty, draft?.mode, draft?.credentialId, draft?.model, draft?.effort, draft?.fallbackToManaged, triage?.mode, triage?.model])
+  }, [draft?.mode, draft?.credentialId, draft?.model, draft?.effort, draft?.fallbackToManaged, triage?.mode, triage?.model])
 
   const save = useMutation(trpc.llm.setAgentModel.mutationOptions({
     onSuccess: async (result: { demoted: number }) => {
       setError(null)
-      setDirty(false)
+      // The form now IS the server's state, so the refetch below is free to seed from it.
+      if (editVersion.current === pendingVersion.current) dirtyRef.current = false
       setSaved(result.demoted > 0
         ? `Saved — ${result.demoted} Autopilot ${result.demoted === 1 ? 'category went' : 'categories went'} back to Review.`
         : 'Saved.')
@@ -90,18 +107,34 @@ export function ModelCard({ agentId, canManage }: { agentId: string; canManage: 
         queryClient.invalidateQueries({ queryKey: trpc.llm.list.queryKey() }),
         queryClient.invalidateQueries({ queryKey: trpc.agents.list.queryKey() }),
       ])
+      if (editVersion.current === pendingVersion.current) setDirty(false)
     },
     onError: (err: unknown) => { setSaved(null); setError(saveErrorCopy(err)) },
   }))
 
+  // A card that silently vanished on a failed read left the agent screen with no model section and no
+  // reason for it — the sibling screens all surface a read failure instead. Only when there is nothing
+  // to show, though: a BACKGROUND refetch that fails (the one a save kicks off, say) leaves the last
+  // good config in `data`, and replacing a working form with an error banner would be the worse lie.
+  if ((current.isError && !current.data) || (list.isError && !list.data)) {
+    return (
+      <Card testID="model-card">
+        <Heading>Model</Heading>
+        <Banner tone="error" testID="model-load-error">Couldn&apos;t load this agent&apos;s model settings. Pull to refresh or try again.</Banner>
+      </Card>
+    )
+  }
   if (!draft || !triage || !list.data) return null
   const credentials = list.data.credentials
   const byok = mode === 'byok' && credentialId !== null
+  const customEndpoint = byok && credentials.find((cred) => cred.id === credentialId)?.provider === 'custom'
 
   function change(apply: () => void) {
     if (!canManage) return
     setSaved(null)
     setError(null)
+    editVersion.current += 1
+    dirtyRef.current = true
     setDirty(true)
     apply()
   }
@@ -130,6 +163,7 @@ export function ModelCard({ agentId, canManage }: { agentId: string; canManage: 
   function submit() {
     if (!canManage || !dirty || !complete || save.isPending) return
     setError(null)
+    pendingVersion.current = editVersion.current
     save.mutate(byok
       ? { agentId, mode: 'byok' as const, credentialId, draftModel: draftModel.trim(), triageModel: triageModel.trim(), effort, fallbackToManaged }
       : { agentId, mode: 'managed' as const, credentialId: null, draftModel: null, triageModel: null, effort: null, fallbackToManaged: false })
@@ -180,12 +214,14 @@ export function ModelCard({ agentId, canManage }: { agentId: string; canManage: 
         <>
           <TextField
             label="Drafting model" value={draftModel} onChangeText={(v) => change(() => setDraftModel(v))}
-            editable={canManage} autoCapitalize="none" autoCorrect={false} maxLength={120} testID="draft-model"
+            editable={canManage} autoCapitalize="none" autoCorrect={false} maxLength={120}
+            hint={customEndpoint && draftModel.trim().length === 0 ? CUSTOM_MODEL_HINT : undefined} testID="draft-model"
           />
           <TextField
             label="Triage model" value={triageModel} onChangeText={(v) => change(() => setTriageModel(v))}
             editable={canManage} autoCapitalize="none" autoCorrect={false} maxLength={120}
-            hint="The cheap model that sorts incoming mail." testID="triage-model"
+            hint={customEndpoint && triageModel.trim().length === 0 ? CUSTOM_MODEL_HINT : 'The cheap model that sorts incoming mail.'}
+            testID="triage-model"
           />
 
           <View style={styles.field}>

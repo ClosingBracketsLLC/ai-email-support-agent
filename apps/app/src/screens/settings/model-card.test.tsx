@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider, notifyManager } from '@tanstack/react-query'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react-native'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native'
 import type { ReactNode } from 'react'
 import { MANAGED_MODELS } from '@aesa/contracts'
 import { ModelCard } from './model-card'
@@ -30,6 +30,7 @@ interface Resolved {
 // babel-plugin-jest-hoist hoists jest.mock() above these declarations (see agents.test.tsx).
 let mockCredentials: Credential[] = []
 let mockAgentModel: { draft: Resolved; triage: Resolved } | null = null
+let mockAgentModelImpl: () => Promise<unknown> = () => Promise.resolve(mockAgentModel)
 const mockSetCalls: unknown[] = []
 let mockSetImpl: (input: unknown) => Promise<unknown> = () => Promise.resolve({ ok: true, generationBumped: true, demoted: 0 })
 
@@ -42,7 +43,7 @@ jest.mock('@/lib/trpc', () => ({
         queryKey: () => ['llm', 'list'],
       },
       agentModel: {
-        queryOptions: (input: { agentId: string }) => ({ queryKey: ['llm', 'agentModel', input.agentId], queryFn: () => Promise.resolve(mockAgentModel) }),
+        queryOptions: (input: { agentId: string }) => ({ queryKey: ['llm', 'agentModel', input.agentId], queryFn: () => mockAgentModelImpl() }),
         queryKey: (input: { agentId: string }) => ['llm', 'agentModel', input.agentId],
       },
       setAgentModel: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => { mockSetCalls.push(v); return mockSetImpl(v) }, ...o }) },
@@ -76,6 +77,31 @@ function credential(overrides: Partial<Credential> = {}): Credential {
   }
 }
 
+/** A promise this test resolves by hand, so a refetch can be held open across assertions — the same
+ * trick `agent-edit.test.tsx` uses. */
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (err: unknown) => void
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej })
+  return { promise, resolve, reject }
+}
+
+/** The initial load resolves at once; every refetch after it is handed to the caller to settle. */
+function heldRefetch() {
+  const held = deferred<{ draft: Resolved; triage: Resolved }>()
+  let calls = 0
+  mockAgentModelImpl = () => {
+    calls += 1
+    return calls === 1 ? Promise.resolve(mockAgentModel) : held.promise
+  }
+  return held
+}
+
+const SAVED_BYOK = () => ({
+  draft: byok('gpt-5-pro', { effort: 'high', fallbackToManaged: true }),
+  triage: byok('gpt-5-mini', { effort: 'high', fallbackToManaged: true }),
+})
+
 const teardowns: Array<() => Promise<void> | void> = []
 async function setup(canManage = true) {
   const queryClient = new QueryClient({
@@ -92,6 +118,7 @@ async function setup(canManage = true) {
 beforeEach(() => {
   mockCredentials = []
   mockAgentModel = { draft: managed('draft'), triage: managed('triage') }
+  mockAgentModelImpl = () => Promise.resolve(mockAgentModel)
   mockSetCalls.length = 0
   mockSetImpl = () => Promise.resolve({ ok: true, generationBumped: true, demoted: 0 })
 })
@@ -149,6 +176,9 @@ test('a rejected key is listed but cannot be chosen', async () => {
 test('Save sends exactly what the form holds, and reports the categories that went back to Review', async () => {
   mockCredentials = [credential()]
   mockSetImpl = () => Promise.resolve({ ok: true, generationBumped: true, demoted: 2 })
+  // The invalidation's refetch is held open, which is where the regression lived: the fields must keep
+  // showing what was saved for as long as the server has not answered.
+  const refetch = heldRefetch()
   await setup()
   await waitFor(() => expect(screen.getByTestId(`model-credential-${CRED_ID}`)).toBeTruthy())
 
@@ -164,6 +194,62 @@ test('Save sends exactly what the form holds, and reports the categories that we
     draftModel: 'gpt-5-pro', triageModel: 'gpt-5-mini', effort: 'high', fallbackToManaged: true,
   })
   await waitFor(() => expect(screen.getByText('Saved — 2 Autopilot categories went back to Review.')).toBeTruthy())
+
+  // STILL showing what was saved while the refetch is in flight. Clearing `dirty` first re-ran the
+  // seeding effect against the PRE-save config, which snapped the card back to Managed AI — the byok
+  // fields would not even be mounted here — under the green banner.
+  expect(screen.getByTestId('draft-model').props.value).toBe('gpt-5-pro')
+  expect(screen.getByTestId('triage-model').props.value).toBe('gpt-5-mini')
+  expect(screen.getByTestId(`model-credential-${CRED_ID}`).props.accessibilityState.checked).toBe(true)
+  expect(screen.getByTestId('model-managed').props.accessibilityState.checked).toBe(false)
+  expect(screen.getByTestId('effort-high').props.accessibilityState.checked).toBe(true)
+  expect(screen.getByTestId('model-fallback').props.value).toBe(true)
+
+  await act(async () => { refetch.resolve(SAVED_BYOK()) })
+
+  // And once the server has answered, the same values — now nothing is dirty, so Save is disabled.
+  expect(screen.getByTestId('draft-model').props.value).toBe('gpt-5-pro')
+  expect(screen.getByTestId(`model-credential-${CRED_ID}`).props.accessibilityState.checked).toBe(true)
+  expect(screen.getByTestId('model-save').props.accessibilityState.disabled).toBe(true)
+})
+
+test('a save whose refetch then FAILS still shows what was saved, not the config it replaced', async () => {
+  mockCredentials = [credential()]
+  const refetch = heldRefetch()
+  await setup()
+  await waitFor(() => expect(screen.getByTestId(`model-credential-${CRED_ID}`)).toBeTruthy())
+
+  await fireEvent.press(screen.getByTestId(`model-credential-${CRED_ID}`))
+  await fireEvent.changeText(screen.getByTestId('draft-model'), 'gpt-5-pro')
+  await fireEvent.press(screen.getByTestId('model-save'))
+  await waitFor(() => expect(mockSetCalls).toHaveLength(1))
+
+  await act(async () => { refetch.reject(new Error('network down')) })
+
+  // The save landed; only the read-back failed. Reverting the form would claim the save did not happen.
+  expect(screen.getByTestId('draft-model').props.value).toBe('gpt-5-pro')
+  expect(screen.getByTestId(`model-credential-${CRED_ID}`).props.accessibilityState.checked).toBe(true)
+  expect(screen.getByTestId('model-save').props.accessibilityState.disabled).toBe(true)
+})
+
+test('an edit made while a save was in flight survives the refetch that follows it', async () => {
+  mockCredentials = [credential()]
+  mockAgentModel = { draft: byok('gpt-5'), triage: byok('gpt-5-mini') }
+  const refetch = heldRefetch()
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('draft-model')).toBeTruthy())
+
+  await fireEvent.changeText(screen.getByTestId('draft-model'), 'gpt-5-pro')
+  await fireEvent.press(screen.getByTestId('model-save'))
+  await waitFor(() => expect(mockSetCalls).toHaveLength(1))
+
+  // The owner kept typing while the save was in flight; the config the server then returns is the one
+  // that was SENT, and must not overwrite what is on screen now.
+  await fireEvent.changeText(screen.getByTestId('triage-model'), 'gpt-5-nano')
+  await act(async () => { refetch.resolve({ draft: byok('gpt-5-pro'), triage: byok('gpt-5-mini') }) })
+
+  expect(screen.getByTestId('triage-model').props.value).toBe('gpt-5-nano')
+  expect(screen.getByTestId('model-save').props.accessibilityState.disabled).toBe(false)
 })
 
 test('going back to Managed AI sends the managed shape', async () => {
@@ -208,6 +294,35 @@ test('a plain member sees the choice, disabled, and no Save', async () => {
   expect(screen.getByTestId('effort-low').props.accessibilityState.disabled).toBe(true)
   expect(screen.getByTestId('model-fallback').props.accessibilityState.disabled).toBe(true)
   expect(screen.queryByTestId('model-save')).toBeNull()
+})
+
+test('a model choice that cannot be read says so instead of vanishing', async () => {
+  mockAgentModelImpl = () => Promise.reject(new Error('network down'))
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('model-load-error')).toBeTruthy())
+
+  expect(screen.getByText("Couldn't load this agent's model settings. Pull to refresh or try again.")).toBeTruthy()
+  expect(screen.queryByTestId('model-managed')).toBeNull()
+})
+
+test('a custom endpoint has nothing to prefill, so both fields say what to put in them', async () => {
+  mockCredentials = [credential({ provider: 'custom', label: 'On-prem', baseUrl: 'https://llm.example.com/v1' })]
+  await setup()
+  await waitFor(() => expect(screen.getByTestId(`model-credential-${CRED_ID}`)).toBeTruthy())
+
+  await fireEvent.press(screen.getByTestId(`model-credential-${CRED_ID}`))
+  expect(screen.getByTestId('draft-model').props.value).toBe('')
+  expect(screen.getByTestId('triage-model').props.value).toBe('')
+  expect(screen.getAllByText('Enter the model id this endpoint serves (for example qwen3:32b).')).toHaveLength(2)
+  expect(screen.getByTestId('model-save').props.accessibilityState.disabled).toBe(true)
+
+  // Naming the draft model retires that field's hint; the triage field still asks for its own.
+  await fireEvent.changeText(screen.getByTestId('draft-model'), 'qwen3:32b')
+  expect(screen.getAllByText('Enter the model id this endpoint serves (for example qwen3:32b).')).toHaveLength(1)
+  expect(screen.getByTestId('model-save').props.accessibilityState.disabled).toBe(true)
+
+  await fireEvent.changeText(screen.getByTestId('triage-model'), 'qwen3:8b')
+  expect(screen.getByTestId('model-save').props.accessibilityState.disabled).toBe(false)
 })
 
 test('a refused save says what to do about it', async () => {

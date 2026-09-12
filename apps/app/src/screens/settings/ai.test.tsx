@@ -1,8 +1,9 @@
 import { QueryClient, QueryClientProvider, notifyManager } from '@tanstack/react-query'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react-native'
 import type { ReactNode } from 'react'
+import type { CredentialHealth } from '@aesa/contracts'
 import { MANAGED_MODELS } from '@aesa/contracts'
-import { AiSettingsScreen } from './ai'
+import { AiSettingsScreen, PROBE_WAIT_CAP_MS, awaitingProbe } from './ai'
 
 // See inbox.test.tsx: TanStack's default scheduler defers notifications through a real setTimeout(0),
 // outside RNTL's act() window. Running it synchronously keeps every update inside the triggering act().
@@ -167,7 +168,9 @@ test('Add stays disabled until the form is complete, and a preset is submitted w
   await waitFor(() => expect(mockAddCalls).toHaveLength(1))
   expect(mockAddCalls[0]).toEqual({ provider: 'openai', label: 'Production key', apiKey: 'sk-test-0123456789' })
   expect(Object.keys(mockAddCalls[0] as object)).not.toContain('baseUrl')
-  // The pasted key never survives the add — it lived in component state and nowhere else.
+  // The pasted key never survives the add: the field is cleared and the form closes, and the only
+  // other place it existed — this mutation's in-flight `variables` — is dropped on settle by the
+  // `gcTime: 0` the add mutation declares. It is never a query key, a URL, a log or a persisted store.
   await waitFor(() => expect(screen.queryByTestId('add-provider-form')).toBeNull())
 })
 
@@ -273,9 +276,49 @@ test('calls whose price we do not know say so instead of showing a wrong total',
 })
 
 test('a probe the workspace is still waiting on says the page will update itself', async () => {
-  mockCredentials = [credential({ healthStatus: 'unknown', lastProbe: null, lastProbedAt: null })]
+  // `createdAt` is the add that armed the wait, so a just-added key is inside the cap.
+  mockCredentials = [credential({ healthStatus: 'unknown', lastProbe: null, lastProbedAt: null, createdAt: new Date() })]
   await setup()
   await waitFor(() => expect(screen.getByTestId('ai-testing')).toBeTruthy())
+  expect(screen.queryByTestId('ai-probe-timeout')).toBeNull()
+})
+
+test('a probe that never came back stops promising an update and says what to do', async () => {
+  mockCredentials = [credential({
+    healthStatus: 'unknown', lastProbe: null, lastProbedAt: null,
+    createdAt: new Date(Date.now() - PROBE_WAIT_CAP_MS - 1_000),
+  })]
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('ai-probe-timeout')).toBeTruthy())
+  expect(screen.getByText("We haven't heard back from the provider yet — try Test connection again in a minute.")).toBeTruthy()
+  expect(screen.queryByTestId('ai-testing')).toBeNull()
+})
+
+/** The poll's stop condition, decided purely — no timers, real or fake: `now` is an argument. */
+describe('awaitingProbe (what keeps the poll running)', () => {
+  interface WatchRow { id: string; healthStatus: CredentialHealth; lastProbedAt: Date | null; createdAt: Date }
+  const row = (over: Partial<WatchRow> = {}): WatchRow =>
+    ({ id: CRED_ID, healthStatus: 'healthy', lastProbedAt: null, createdAt: new Date(0), ...over })
+
+  const NOW = 1_000_000_000_000
+  const cases: [string, WatchRow[], boolean][] = [
+    ['no connection is waiting on a first answer', [row({ healthStatus: 'healthy' })], false],
+    ['unknown, but past the cap — stuck, not late', [row({ healthStatus: 'unknown', createdAt: new Date(NOW - PROBE_WAIT_CAP_MS - 1) })], false],
+    ['unknown and within the cap', [row({ healthStatus: 'unknown', createdAt: new Date(NOW - 1_000) })], true],
+  ]
+  test.each(cases)('%s', (_name, credentials, expected) => {
+    expect(awaitingProbe(credentials, null, NOW)).toBe(expected)
+  })
+
+  test('a manual test keeps it running until lastProbedAt moves, and no longer than the cap', () => {
+    const credentials = [row({ healthStatus: 'healthy', lastProbedAt: new Date(NOW - 60_000) })]
+    const testing = { credentialId: CRED_ID, probedAt: NOW - 60_000, armedAt: NOW }
+    expect(awaitingProbe(credentials, testing, NOW)).toBe(true)
+    // the worker answered: the row's own probe stamp moved
+    expect(awaitingProbe([row({ healthStatus: 'healthy', lastProbedAt: new Date(NOW) })], testing, NOW)).toBe(false)
+    // it never answered: the cap ends the wait anyway
+    expect(awaitingProbe(credentials, testing, NOW + PROBE_WAIT_CAP_MS)).toBe(false)
+  })
 })
 
 test('a settled connection is quiet until its key is tested again', async () => {
@@ -300,4 +343,26 @@ test('Remove asks first, and says how many agents fall back to Managed AI', asyn
 
   await fireEvent.press(screen.getByTestId(`credential-remove-${CRED_ID}`))
   await waitFor(() => expect(mockRemoveCalls).toEqual([{ credentialId: CRED_ID }]))
+})
+
+test('an armed Remove can be backed out of — by Cancel, and by testing the key instead', async () => {
+  mockCredentials = [credential({ agentsUsing: 2 })]
+  await setup()
+  await waitFor(() => expect(screen.getByTestId(`credential-remove-${CRED_ID}`)).toBeTruthy())
+
+  await fireEvent.press(screen.getByTestId(`credential-remove-${CRED_ID}`))
+  await fireEvent.press(screen.getByTestId(`credential-remove-cancel-${CRED_ID}`))
+  expect(screen.queryByTestId(`credential-remove-warning-${CRED_ID}`)).toBeNull()
+  expect(screen.queryByTestId(`credential-remove-cancel-${CRED_ID}`)).toBeNull()
+
+  // Disarmed, the next Remove press only re-arms — it never removes on one press.
+  await fireEvent.press(screen.getByTestId(`credential-remove-${CRED_ID}`))
+  expect(screen.getByTestId(`credential-remove-warning-${CRED_ID}`)).toBeTruthy()
+  expect(mockRemoveCalls).toHaveLength(0)
+
+  // Testing the key is the opposite intent, so it disarms the confirmation too.
+  await fireEvent.press(screen.getByTestId(`credential-test-${CRED_ID}`))
+  await waitFor(() => expect(mockProbeCalls).toHaveLength(1))
+  expect(screen.queryByTestId(`credential-remove-warning-${CRED_ID}`)).toBeNull()
+  expect(mockRemoveCalls).toHaveLength(0)
 })
