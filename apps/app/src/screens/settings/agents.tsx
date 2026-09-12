@@ -28,6 +28,13 @@ function toPersonaPreset(value: string): PersonaPreset {
   return (PERSONA_PRESETS as readonly string[]).includes(value) ? (value as PersonaPreset) : 'support'
 }
 
+/** Which model writes this agent's replies, in one word on the row: the connection's own name once
+ * it is on a provider key, else Managed AI. A `byok` row whose credential has since been removed
+ * resolves as managed on the api side (`resolveModelConfig`), so a null label reads that way too. */
+function modelLabel(model: { mode: string; credentialLabel: string | null }): string {
+  return model.mode === 'byok' && model.credentialLabel ? model.credentialLabel : 'Managed AI'
+}
+
 export function AgentsScreen() {
   const trpc = useTRPC()
   const router = useRouter()
@@ -83,7 +90,7 @@ export function AgentsScreen() {
               <Card key={a.id} testID={`agent-row-${a.id}`}>
                 <ListRow
                   title={a.address}
-                  subtitle={PERSONA_LABEL[toPersonaPreset(a.personaPreset)]}
+                  subtitle={`${PERSONA_LABEL[toPersonaPreset(a.personaPreset)]} · ${modelLabel(a.model)}`}
                   badge={label(AGENT_STATUS_LABEL, a.status)}
                   onPress={() => router.push(`/settings/agents/${a.id}`)}
                   testID={`agent-${a.id}`}

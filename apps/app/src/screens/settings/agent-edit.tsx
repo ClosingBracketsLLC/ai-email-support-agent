@@ -3,7 +3,7 @@ import { useLocalSearchParams, useRouter } from 'expo-router'
 import { useEffect, useRef, useState } from 'react'
 import { Pressable, StyleSheet, Text, View } from 'react-native'
 import type { AgentStatus, PersonaPreset } from '@aesa/contracts'
-import { PERSONA_PRESETS, UpdateAgentInput } from '@aesa/contracts'
+import { PERSONA_PRESETS, UpdateAgentInput, canManageWorkspace } from '@aesa/contracts'
 import { Banner } from '@/components/banner'
 import { Button } from '@/components/button'
 import { Card } from '@/components/card'
@@ -14,6 +14,7 @@ import { TextField } from '@/components/text-field'
 import { Heading, Muted } from '@/components/typography'
 import { useTRPC } from '@/lib/trpc'
 import { font, radius, spacing, typeScale, useColors } from '@/theme'
+import { ModelCard } from './model-card'
 import { SandboxCard } from './sandbox-card'
 
 const PERSONA_LABEL: Record<PersonaPreset, string> = { support: 'Support', sales: 'Sales', concierge: 'Concierge', billing: 'Billing' }
@@ -49,6 +50,7 @@ export function AgentEditScreen() {
   const trpc = useTRPC()
   const queryClient = useQueryClient()
   const list = useQuery(trpc.agents.list.queryOptions())
+  const ws = useQuery(trpc.workspace.get.queryOptions())
   const categoriesQuery = useQuery(trpc.agents.categories.queryOptions({ agentId: id }))
   const agent = list.data?.agents.find((a) => a.id === id)
 
@@ -218,6 +220,12 @@ export function AgentEditScreen() {
           </View>
         </Card>
       ) : null}
+
+      {/* Its own query, its own Save (`llm.setAgentModel` is a managerProcedure, and saving it drops
+          every Autopilot category back to Review) — deliberately NOT part of this screen's dirty-keys
+          save. `canManage` is false until the workspace query lands, so the card never renders
+          briefly enabled for a plain member. */}
+      <ModelCard agentId={agent.id} canManage={ws.data ? canManageWorkspace(ws.data.role) : false} />
 
       {error ? <Banner tone="error">{error}</Banner> : null}
       {saved ? <Banner tone="success">Saved.</Banner> : null}
