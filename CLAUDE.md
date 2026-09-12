@@ -352,8 +352,10 @@ instruction from him in the session.
   Phase 4's `knowledge.ingest`, `knowledge.crawl`, `knowledge.embed-batch`, Phase 5's
   `memory.capture` (produced by the WORKER alone, from `send.execute`'s post-commit `onSent` seam)
   and `guidance.suggest` (produced by the API alone, from `approveDraft` after an edited
-  approval), and Phase 6's `llm.probe` (the FIRST queue with a producer on BOTH sides — the api's
-  `addCredential`/`probeCredential` and the worker's own `llm.reprobe-sweep` cron) — declare
+  approval), and Phase 6's `llm.probe` (a producer on BOTH sides, like `ticket.draft`,
+  `send.execute` and `notify.dispatch` before it — the api's `addCredential`/`probeCredential` AND
+  the worker's own `llm.reprobe-sweep` cron, so it sits in both pre-create lists with its
+  policy) — declare
   `policy: 'short'` in `defineJob`'s `queue` options, which collapses a duplicate only while the
   first job is still `created` (a job that has gone `active`, or that is sitting in `retry`, never
   swallows a newer event; `enqueue` returns `null` when a duplicate was collapsed).

@@ -23,7 +23,7 @@ the `vector` extension) first if either is not done. Phase 6 assumes both.
 | New third-party account | **none** (the customer brings theirs) |
 | New environment variable | **none** — `AESA_KEK_V<n>`/`AESA_KEK_ACTIVE` already existed; what changed is **which roles need it** (§2) |
 | New runtime dependency | `openai@7.15.0`, pinned exactly, `packages/llm` only — `pnpm install` on deploy |
-| New queue | `llm.probe` (`policy: 'short'`), pre-created at boot by BOTH `apps/worker/src/index.ts` and `apps/api/src/boss.ts` — the first queue with a producer on both sides (the api's *Test connection*, the worker's own re-probe sweep) |
+| New queue | `llm.probe` (`policy: 'short'`), pre-created at boot by BOTH `apps/worker/src/index.ts` and `apps/api/src/boss.ts` — it has a producer on both sides (the api's *Test connection*, the worker's own re-probe sweep), as `ticket.draft`, `send.execute` and `notify.dispatch` already do |
 | New cron | `llm.reprobe-sweep`, `15 */6 * * *`, registered by the **`cron`** role |
 | New migrations | `0018_crawl_url_uidx.sql`, `0019_polite_phil_sheldon.sql` (generated), `0020_provider_hardening.sql` (hand-written) |
 
