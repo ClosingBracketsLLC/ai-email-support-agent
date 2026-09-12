@@ -12,23 +12,19 @@ export function jsonResponse(body: unknown, init?: { status?: number; headers?: 
 /**
  * A `fetch` stub that records every request body it is handed and answers with `handler`'s
  * response. Every adapter test drives the adapter through THIS — never a mock of the adapter
- * itself — so what is asserted is the wire request the SDK actually built.
- *
- * A GET (the models list) carries no body; `bodies` records only the requests that had one, while
- * `urls` records every call.
+ * itself — so what is asserted is the wire request the SDK actually built. A GET (the models list)
+ * carries no body, and only a request that had one is recorded in `bodies`.
  */
 export function capturingFetch(handler: (body: Record<string, unknown>) => Response): {
   fetchFn: typeof fetch
   bodies: Record<string, unknown>[]
-  urls: string[]
 } {
   const bodies: Record<string, unknown>[] = []
-  const urls: string[] = []
-  const fetchFn = vi.fn(async (url: string | URL, init?: RequestInit) => {
-    urls.push(String(url))
-    const body = init?.body === undefined || init.body === null ? {} : (JSON.parse(String(init.body)) as Record<string, unknown>)
-    if (init?.body !== undefined && init?.body !== null) bodies.push(body)
+  const fetchFn = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+    const raw = init?.body
+    const body = raw === undefined || raw === null ? {} : (JSON.parse(String(raw)) as Record<string, unknown>)
+    if (raw !== undefined && raw !== null) bodies.push(body)
     return handler(body)
   }) as unknown as typeof fetch
-  return { fetchFn, bodies, urls }
+  return { fetchFn, bodies }
 }

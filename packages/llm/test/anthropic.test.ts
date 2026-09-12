@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { createAnthropicProvider } from '../src/adapters/anthropic/index.ts'
 import { LlmError } from '../src/core/errors.ts'
 import type { ChatRequest } from '../src/core/types.ts'
+import { capturingFetch, jsonResponse } from './helpers/fetch-stub.ts'
 import { z } from 'zod'
 
 const OUTPUT_SCHEMA = z.object({
@@ -35,13 +36,6 @@ function baseRequest(overrides: Partial<ChatRequest<Verdict>> = {}): ChatRequest
   }
 }
 
-function jsonResponse(body: unknown, init?: { status?: number; headers?: Record<string, string> }): Response {
-  return new Response(JSON.stringify(body), {
-    status: init?.status ?? 200,
-    headers: { 'content-type': 'application/json', ...init?.headers },
-  })
-}
-
 function anthropicMessage(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     id: 'msg_123',
@@ -61,16 +55,6 @@ function anthropicMessage(overrides: Record<string, unknown> = {}): Record<strin
 
 function errorResponse(type: string, message: string, init: { status: number; headers?: Record<string, string> }): Response {
   return jsonResponse({ type: 'error', error: { type, message } }, init)
-}
-
-function capturingFetch(handler: (body: Record<string, unknown>) => Response): { fetchFn: typeof fetch; bodies: Record<string, unknown>[] } {
-  const bodies: Record<string, unknown>[] = []
-  const fetchFn = vi.fn(async (_url: string | URL, init?: RequestInit) => {
-    const body = JSON.parse(String(init?.body)) as Record<string, unknown>
-    bodies.push(body)
-    return handler(body)
-  }) as unknown as typeof fetch
-  return { fetchFn, bodies }
 }
 
 describe('createAnthropicProvider', () => {
