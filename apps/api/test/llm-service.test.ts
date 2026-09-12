@@ -22,7 +22,7 @@ import {
   notifications, openSealedForOrg, provisionOrgKeys, withPlatform,
 } from '@aesa/db'
 import { JOB_NAMES } from '@aesa/queue'
-import type { EnqueueFn } from '../src/deps.ts'
+import type { ApiFacade, EnqueueFn } from '../src/deps.ts'
 import {
   addCredential, getAgentModel, listCredentials, probeCredential, removeCredential, setAgentModel,
   type LlmActor, type LlmServiceDeps,
@@ -49,6 +49,25 @@ const PRIVATE_IP = '10.1.2.3'
 
 /** A resolver that must never be called: a preset's base URL is the platform's own, not the owner's. */
 const forbiddenResolver: Resolver = async (hostname) => { throw new Error(`resolver must not be called (${hostname})`) }
+
+/**
+ * The real facade, with one seam the interleaving case needs: the transaction is held OPEN (every row
+ * lock it took still held, nothing committed) once the service's body finishes, until the test
+ * releases it — the same shape `drafts-service.test.ts` uses.
+ */
+function pausingApi(api: ApiFacade, gate: { reached: () => void; release: Promise<void> }): ApiFacade {
+  return {
+    ...api,
+    withOrg: (orgId, fn) => api.withOrg(orgId, async (tx) => {
+      const out = await fn(tx)
+      gate.reached()
+      await gate.release
+      return out
+    }),
+  }
+}
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms) })
 
 describe('llm service', () => {
   let t: Awaited<ReturnType<typeof createTestApi>>
@@ -383,5 +402,38 @@ describe('llm service', () => {
     expect(json).not.toContain('apiKey')
     expect(json).not.toContain('keyCiphertext')
     expect(json).not.toContain('sk-openai-busy-abcd')
+  })
+
+  /**
+   * The one interleaving that matters here: an owner moving an agent onto a connection while another
+   * manager disconnects it. `removeCredential` FOR UPDATEs the credential row and `setAgentModel`
+   * FOR SHAREs it, so the second waits; when the disconnect wins, the move finds nothing rather than
+   * stranding an agent on `byok` with a null credential, no generation bump and no demotion.
+   */
+  it('removeCredential and a concurrent setAgentModel onto the same credential serialize: the move loses cleanly with credential_not_found', async () => {
+    const org = await seedOrg()
+    const added = await addCredential(deps, org.orgId, { provider: 'openai', label: 'Contested', apiKey: 'sk-openai-race-ab12' }, org.actor)
+    if (!added.ok) throw new Error('unreachable')
+
+    let release = (): void => {}
+    let reached = (): void => {}
+    const gate = {
+      reached: () => reached(),
+      release: new Promise<void>((r) => { release = () => r() }),
+      arrived: new Promise<void>((r) => { reached = () => r() }),
+    }
+
+    const removing = removeCredential({ ...deps, api: pausingApi(t.api, gate) }, org.orgId, added.credentialId, org.actor)
+    await gate.arrived
+
+    const moving = setAgentModel(deps, org.orgId, byok(org.agentId, added.credentialId), org.actor)
+    await delay(150)          // let the move reach the FOR SHARE that must block on the disconnect
+    release()
+
+    const [removed, moved] = await Promise.all([removing, moving])
+    expect(removed).toEqual({ ok: true, agentsReset: 0 })
+    expect(moved).toEqual({ ok: false, code: 'credential_not_found' })
+    expect(await configOf(org.orgId, org.agentId)).toEqual([])
+    expect(await credentialsOf(org.orgId)).toEqual([])
   })
 })

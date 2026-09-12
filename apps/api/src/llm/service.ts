@@ -23,7 +23,7 @@
  * `agent_category_policies` → `notifications`, the same in `setAgentModel` and `removeCredential`.
  */
 import { createHash } from 'node:crypto'
-import { and, count, desc, eq, gte, isNotNull, sql } from 'drizzle-orm'
+import { and, count, desc, eq, gte, isNotNull, isNull, sql } from 'drizzle-orm'
 import type pino from 'pino'
 import {
   LLM_MAX_CREDENTIALS, PROVIDER_PRESETS, ProbeResult, presetModel,
@@ -91,7 +91,7 @@ export interface CredentialView {
   agentsUsing: number
 }
 
-const EMPTY_USAGE: CredentialUsage30d = { calls: 0, errors: 0, costMicros: 0, costUnknownCalls: 0, lastErrorCode: null }
+const noUsage = (): CredentialUsage30d => ({ calls: 0, errors: 0, costMicros: 0, costUnknownCalls: 0, lastErrorCode: null })
 
 export async function listCredentials(deps: LlmServiceDeps, orgId: string): Promise<{ credentials: CredentialView[] }> {
   const since = new Date(clock(deps).getTime() - USAGE_WINDOW_DAYS * 86_400_000)
@@ -136,7 +136,7 @@ export async function listCredentials(deps: LlmServiceDeps, orgId: string): Prom
         createdAt: row.createdAt,
         usage30d: u
           ? { calls: u.calls, errors: u.errors, costMicros: u.costMicros, costUnknownCalls: u.costUnknownCalls, lastErrorCode: lastErrorBy.get(row.id) ?? null }
-          : EMPTY_USAGE,
+          : noUsage(),
         agentsUsing: usingBy.get(row.id) ?? 0,
       }
     })
@@ -267,9 +267,15 @@ export async function removeCredential(
 ): Promise<RemoveCredentialResult> {
   const now = clock(deps)
   const outcome = await deps.api.withOrg(orgId, async (tx) => {
+    // Locked for the whole read-modify-write: `setAgentModel` takes a SHARE lock on this same row
+    // before it points an agent at it, so without this an agent could be moved onto the credential
+    // between the config read below and the DELETE — and the FK's ON DELETE SET NULL would then
+    // quietly strand that agent on `byok` with no credential, no generation bump and no demotion.
     const [row] = await tx.select({ id: llmCredentials.id, label: llmCredentials.label, provider: llmCredentials.provider })
       .from(llmCredentials)
       .where(and(eq(llmCredentials.orgId, orgId), eq(llmCredentials.id, credentialId)))
+      .limit(1)
+      .for('update')
     if (!row) return null
 
     const reset = await resetAgentsToManaged(tx, orgId, credentialId, now, actor)
@@ -326,6 +332,16 @@ async function resetAgentsToManaged(
     const demoted = await demoteAutoCategories(tx, { orgId, agentId, now, actor })
     notificationIds.push(...demoted.notificationIds)
   }
+  // The workspace-default row (`agent_id IS NULL`) is admitted by the schema but unwritten in v1.
+  // If one ever sat on this credential, the FK's ON DELETE SET NULL alone would leave it `byok` with
+  // no credential; there is no agent to bump a generation for or to demote, so it just goes managed.
+  await tx.update(agentModelConfig)
+    .set({ mode: 'managed', credentialId: null, model: null, updatedAt: now })
+    .where(and(
+      eq(agentModelConfig.orgId, orgId), eq(agentModelConfig.credentialId, credentialId),
+      isNull(agentModelConfig.agentId),
+    ))
+
   return { agentsReset: agentIds.length, notificationIds }
 }
 
@@ -380,6 +396,11 @@ export async function setAgentModel(
         healthStatus: llmCredentials.healthStatus, probeModel: llmCredentials.probeModel,
       }).from(llmCredentials)
         .where(and(eq(llmCredentials.orgId, orgId), eq(llmCredentials.id, input.credentialId!)))
+        .limit(1)
+        // Pairs with `removeCredential`'s FOR UPDATE on the same row: a disconnect running
+        // concurrently either waits for this to commit (and then sees the rows it must reset), or
+        // wins and this re-read finds nothing — `credential_not_found`, never a half-moved agent.
+        .for('share')
       if (!credential) return { ok: false as const, code: 'credential_not_found' as const }
       // A key the probe found rejected outright cannot be chosen: it would fail every call the
       // moment it was saved, and (without `fallbackToManaged`) strand the agent entirely.
