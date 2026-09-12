@@ -101,6 +101,16 @@ describe('computeCostMicros', () => {
     expect(micros).toBe(22_500)
   })
 
+  it('resolves each BYOK seed row, and gpt-5-mini BEFORE gpt-5 (whose pattern would swallow it)', () => {
+    expect(findPricing('gpt-5-mini')!.id).toBe('gpt-5-mini')
+    expect(findPricing('gpt-5-mini-2026-01-01')!.id).toBe('gpt-5-mini')
+    expect(findPricing('gpt-5')!.id).toBe('gpt-5')
+    expect(findPricing('deepseek-reasoner')!.id).toBe('deepseek-reasoner')
+    expect(findPricing('llama-3.3-70b-versatile')!.id).toBe('llama-3.3-70b-versatile')
+    // The dot in a llama id is escaped, so it matches a literal '.' and not any character.
+    expect(findPricing('llama-3x3-70b-versatile')).toBeNull()
+  })
+
   it('prices cache-write tokens the provider did not attribute to a TTL at the configured ttl', () => {
     const opus5 = findPricing('claude-opus-5')!
     const base = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, apiCalls: 1 }
