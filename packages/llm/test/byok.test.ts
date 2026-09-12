@@ -121,6 +121,21 @@ describe('createByokProvider', () => {
     expect(jsonFetch.bodies[0]!.response_format).toEqual({ type: 'json_object' })
   })
 
+  /** The other direction of the same rule (spec §LLM provider adapter: "presets are overridden by
+   *  the stored probe result"): a `custom` endpoint's unlisted model seeds as json_mode-only, and a
+   *  probe that PROVED `json_schema` raises it, so the ladder asks for the rung the endpoint honours
+   *  instead of starting one below it for the life of the credential. */
+  it('structuredOverride native RAISES an unlisted custom model the preset only guessed at json_mode', async () => {
+    const { fetchFn, bodies } = capturingFetch(() => jsonResponse(completion('{"decision":{"category":"toys","is_spam":false}}')))
+    const provider = byok(fetchFn, { provider: 'custom', structuredOverride: 'native' })
+    expect(provider.capabilities('qwen3:32b').structuredOutput).toBe('native')
+
+    const res = await provider.chat(req({ model: 'qwen3:32b' }))
+    expect(res.parseStrategy).toBe('native')
+    expect(bodies).toHaveLength(1)
+    expect((bodies[0]!.response_format as { type: string }).type).toBe('json_schema')
+  })
+
   it('an anthropic BYOK key uses the Anthropic adapter and keeps its own capability table, override or not', () => {
     const provider = createByokProvider({
       provider: 'anthropic',

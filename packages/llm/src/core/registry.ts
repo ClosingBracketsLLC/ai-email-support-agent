@@ -73,24 +73,26 @@ export interface ByokProviderOptions {
 }
 
 /**
- * One org's own key, composed the same way the managed provider is. The probe's stored verdict can
- * only ever narrow what the preset claimed (`native` -> `json_mode` -> `none`), never widen it —
- * an endpoint that has been SEEN to reject `response_format` must not be asked again every draft.
+ * One org's own key, composed the same way the managed provider is. The probe's stored verdict
+ * REPLACES what the preset claimed, in BOTH directions (spec §LLM provider adapter: "presets are
+ * overridden by the stored probe result"): `native` RAISES a model the preset only guessed at
+ * json_mode — an endpoint that has been SEEN to honour `json_schema` should be asked for it — and
+ * `json_mode`/`none` narrow, because an endpoint SEEN to reject `response_format` must not be asked
+ * again on every draft. A preset already at `none` stays there: there is nothing below it to raise
+ * from that the probe could have proven.
  *
  * The override reaches the OpenAI-COMPATIBLE adapter only: for those presets the capability table
  * is a guess about someone else's endpoint, whereas the Anthropic adapter's table is a fact about
  * models we ship against, and a BYOK Anthropic key talks to the same API the managed one does.
  */
 export function createByokProvider(o: ByokProviderOptions): LlmProvider {
-  const narrowed = o.structuredOverride
-  const override =
-    narrowed && narrowed !== 'native'
-      ? (_model: string, preset: Capabilities): Capabilities => ({
-          ...preset,
-          // Already 'none' stays 'none': the probe can narrow, never widen.
-          structuredOutput: preset.structuredOutput === 'none' ? 'none' : narrowed,
-        })
-      : undefined
+  const verdict = o.structuredOverride
+  const override = verdict
+    ? (_model: string, preset: Capabilities): Capabilities => ({
+        ...preset,
+        structuredOutput: verdict === 'native' ? 'native' : preset.structuredOutput === 'none' ? 'none' : verdict,
+      })
+    : undefined
   // A BYOK base URL is customer-supplied, so the SSRF pin is the DEFAULT transport on BOTH branches,
   // never something each caller has to remember to pass: `validateOutboundUrl` + a re-resolve on every
   // call + no redirects. `allowNonstandardPort` because a self-hosted OpenAI-compatible endpoint often

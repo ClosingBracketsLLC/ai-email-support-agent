@@ -81,7 +81,6 @@ export async function probeProvider(
     }
   }
 
-  const caps = provider.capabilities(model)
   const ask = (mode: 'native' | 'json_mode') =>
     provider.chat({
       model,
@@ -94,8 +93,23 @@ export async function probeProvider(
     })
 
   let structured: 'native' | 'json_mode' | 'none' = 'none'
-  // A model the preset already calls json_mode-only never spends a call proving `native` fails.
-  const rungs: ('native' | 'json_mode')[] = caps.structuredOutput === 'native' ? ['native', 'json_mode'] : ['json_mode']
+  /**
+   * Spec §LLM provider adapter: an OpenAI-compatible or local server's `json_schema` support is
+   * "treated as json_mode UNLESS PROBE PASSES", and "presets are overridden by the stored probe
+   * result". So for every one of those kinds the native rung is ALWAYS attempted, whatever the
+   * preset guessed — the preset is a guess about someone else's endpoint, and this is the one call
+   * that can replace it with a fact. A server without `json_schema` 400s on the attempt, which the
+   * catch below turns into a failed rung and the json_mode rung then answers; that one wasted call,
+   * once per probe, is the price of DISCOVERING the capability instead of assuming it forever.
+   *
+   * Anthropic is the exception, and keeps the capability-gated order: its table is a fact about the
+   * models this platform ships against, not a guess, so a model it calls json_mode-only never spends
+   * a call proving `native` fails.
+   */
+  const rungs: ('native' | 'json_mode')[] =
+    provider.kind !== 'anthropic' || provider.capabilities(model).structuredOutput === 'native'
+      ? ['native', 'json_mode']
+      : ['json_mode']
   for (const mode of rungs) {
     try {
       const r = await ask(mode)

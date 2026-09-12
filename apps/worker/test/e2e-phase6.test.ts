@@ -48,21 +48,20 @@
  *     retrieval: `e2e-phase4.test.ts` owns the real one. Scenario 6 needs ONE grounded citation
  *     scoring 0.9 and nothing else, so the stub hands back exactly that when a scenario asks for it.
  *
- * TWO deviations from the task brief's expected values, both forced by the shipped capability seed
- * and both pinned deliberately below rather than worked around:
+ * TWO things about the capability model this file leans on, both spec rules (§LLM provider adapter,
+ * "presets are overridden by the stored probe result") and both worth stating because a reader will
+ * otherwise expect the preset to decide:
  *
- *  - **A `custom` endpoint can never probe `native`.** `OPENAI_COMPATIBLE_MODELS.custom` is empty,
- *    so every model on a `custom` credential falls to `UNKNOWN_OPENAI_COMPATIBLE_MODEL`
- *    (`json_mode`, no tools, no effort) — and `probeProvider` never spends a call proving a rung the
- *    seed already says is not there. Scenario 1's credential therefore lands `structured:
- *    'json_mode'` and TWO `llm_calls` rows (chat + `structured:json_mode`), not three. The brief's
- *    "native" belongs to a preset model, which is what scenario 3 uses.
- *  - **`tier: 'limited'` and a `native` rung are mutually exclusive by construction.** A tier is
- *    `limited` exactly when the model is not in its provider's `suggestedModels`, and an unlisted
- *    model's capability seed is always `JSON_ONLY`. Scenario 2 (the `custom` credential's own
- *    unlisted `qwen3:32b`) is therefore `limited` + `json_mode`; scenario 3 proves the `native` rung
- *    on a listed `gpt-5`, where it is reachable — and its json_mode step then proves the probe's
- *    stored verdict really narrows a provider that HAD asked for native a moment earlier.
+ *  - **The PRESET never decides which rung a BYOK credential runs.** An unlisted model on a `custom`
+ *    endpoint seeds as json_mode-only, but that seed is a guess about someone else's server, so
+ *    `probeProvider` attempts `native` anyway on every OpenAI-compatible kind and stores what the
+ *    endpoint actually did; `createByokProvider` then applies that verdict in BOTH directions. That
+ *    is why scenario 1's `custom` credential lands `structured: 'native'` and scenario 2's draft
+ *    runs the native rung on a model no catalog has ever heard of.
+ *  - **The quality TIER is a different question, and the rung does not move it.** A tier is
+ *    `limited` exactly when the model is absent from its provider's `suggestedModels`
+ *    (`qualityTierFor`), and only a probe verdict of `none` downgrades it further. So scenario 2 is
+ *    `limited` (cap 0.6) while running the native rung, and scenario 6 is what that cap costs.
  */
 import { randomBytes } from 'node:crypto'
 import { and, eq } from 'drizzle-orm'
@@ -121,11 +120,11 @@ const MOCK_MODELS = [CUSTOM_MODEL, 'qwen3:8b', OPENAI_MODEL]
 
 /**
  * What the endpoint honours unless a scenario says otherwise, and what `afterEach` puts it back to:
- * `json_object` but not `json_schema`, which is exactly the verdict scenario 1's probe stores for
- * credential A. Every scenario therefore starts against an endpoint its agent's stored capabilities
- * agree with.
+ * everything, `json_schema` included — which is the verdict scenario 1's probe stores for credential
+ * A. Every scenario therefore starts against an endpoint its agent's stored capabilities agree with,
+ * and a scenario that wants a weaker server degrades it deliberately.
  */
-const DEFAULT_MODE = 'json_mode' as const
+const DEFAULT_MODE = 'native' as const
 
 /** The hostname scenario 7's DNS stub resolves to loopback; every other host resolves public. */
 const LOOPBACK_HOST = 'metadata.internal.example.test'
@@ -670,9 +669,9 @@ describe('Phase 6 close-out E2E (the real llm service, the real llm.probe job, t
 
   // ---- 1: connect + probe ----------------------------------------------------
 
-  it('1. addCredential seals the owner’s key onto the llm.probe payload and nothing else: the row lands unknown beside a sealed secret, and the REAL probe job turns it into healthy + the endpoint’s model list + the rung it honours, re-wrapped under the org DEK', async () => {
+  it('1. addCredential seals the owner’s key onto the llm.probe payload and nothing else: the row lands unknown with no secret anywhere, and the REAL probe job turns it into healthy + the endpoint’s model list + the native rung it turns out to honour, re-wrapped under the org DEK', async () => {
     org = await createOrg()
-    mock.setMode('json_mode')
+    mock.setMode(DEFAULT_MODE)
 
     // The probe's send is held so the PRE-probe state is observable at all (seam 3).
     const held = holdProbes()
@@ -719,10 +718,10 @@ describe('Phase 6 close-out E2E (the real llm service, the real llm.probe job, t
     expect(probe.chat).toBe('ok')
     expect(probe.models).toEqual(MOCK_MODELS)
     expect(probe.error).toBeNull()
-    // `json_mode`, not `native`: `OPENAI_COMPATIBLE_MODELS.custom` is empty, so every model on a
-    // `custom` credential seeds as `UNKNOWN_OPENAI_COMPATIBLE_MODEL` (json_object only) and
-    // `probeProvider` never spends a call proving a rung the seed already rules out (file header).
-    expect(probe.structured).toBe('json_mode')
+    // `native` on a model no catalog has ever heard of: the preset's json_mode-only seed is a GUESS
+    // about someone else's server, so the probe asks for `json_schema` anyway and records what this
+    // endpoint actually did (spec §LLM provider adapter; file header).
+    expect(probe.structured).toBe('native')
     expect(probed.consecutiveFailures).toBe(0)
     expect(probed.lastError).toBeNull()
     expect(probed.lastProbedAt).not.toBeNull()
@@ -736,14 +735,16 @@ describe('Phase 6 close-out E2E (the real llm service, the real llm.probe job, t
     expect(stored[0]!.dataKeyVersion).toBe(1)
     expect(stored[0]!.keyCiphertext.toString('utf8')).not.toContain(CUSTOM_KEY)
 
-    // TWO calls, not three: the chat step plus the ONE structured rung the seed admits. Both are
-    // the tenant's own spend, both name the credential.
+    // TWO calls: the chat step plus the FIRST structured rung, which this endpoint honoured — the
+    // json_mode rung is never reached (the loop breaks on the first rung that parses), so a probe
+    // costs three calls only against a server that refuses `json_schema`. Both are the tenant's own
+    // spend, and both name the credential.
     const probeCalls = (await callsFor(org)).filter((r) => r.role === 'probe')
     expect(probeCalls).toHaveLength(2)
     expect(probeCalls.every((r) => r.idempotencyKey.startsWith(`probe:${credA}:`))).toBe(true)
     expect(probeCalls.some((r) => r.idempotencyKey.endsWith(':chat'))).toBe(true)
-    expect(probeCalls.some((r) => r.idempotencyKey.endsWith(':structured:json_mode'))).toBe(true)
-    expect(probeCalls.some((r) => r.idempotencyKey.endsWith(':structured:native'))).toBe(false)
+    expect(probeCalls.some((r) => r.idempotencyKey.endsWith(':structured:native'))).toBe(true)
+    expect(probeCalls.some((r) => r.idempotencyKey.endsWith(':structured:json_mode'))).toBe(false)
     for (const row of probeCalls) {
       expect(row.mode).toBe('byok')
       expect(row.credentialId).toBe(credA)
@@ -753,12 +754,12 @@ describe('Phase 6 close-out E2E (the real llm service, the real llm.probe job, t
     const audits = await auditRowsFor(org, credA, 'llm.credential_probed')
     expect(audits).toHaveLength(1)
     expect(audits[0]!.actor).toBe('system:llm.probe')
-    expect(audits[0]!.detail).toMatchObject({ reason: 'connect', ok: true, structured: 'json_mode', health: 'healthy' })
+    expect(audits[0]!.detail).toMatchObject({ reason: 'connect', ok: true, structured: 'native', health: 'healthy' })
   }, 240_000)
 
   // ---- 2: the agent drafts on the owner's own endpoint ------------------------
 
-  it('2. setAgentModel points the agent at that credential and the whole chain runs on it: triage and draft both on qwen3:32b, the run rows and every llm_calls row byok + credential-scoped, the quality cap on the breakdown, and the spend in the BYOK meter alone', async () => {
+  it('2. setAgentModel points the agent at that credential and the whole chain runs on it: triage and draft both on qwen3:32b at the NATIVE rung the probe proved, the run rows and every llm_calls row byok + credential-scoped, the quality cap still 0.6 on the breakdown, and the spend in the BYOK meter alone', async () => {
     const chosen = await chooseModel(org, { credentialId: credA, draftModel: CUSTOM_MODEL, triageModel: CUSTOM_MODEL })
     expect(chosen).toEqual({ ok: true, generationBumped: true, demoted: 0 })
 
@@ -801,16 +802,29 @@ describe('Phase 6 close-out E2E (the real llm service, the real llm.probe job, t
     expect(breakdown.modelRaw).toBeCloseTo(0.95, 10)
     expect(breakdown.modelGeneration).toBe(1)
 
-    // Every call of the run is the tenant's own, on the rung the probe found.
+    // Every call of the run is the tenant's own, on the rung the PROBE found — `native`, on a model
+    // whose preset only ever guessed json_mode. One call: the ladder's first rung parsed.
     const { run, rows } = await draftRunOf(org, ticketId)
     expect(rows).toHaveLength(1)
-    expect(rungOf(rows[0]!)).toBe('json_mode')
-    expect(rows[0]!.parseStrategy).toBe('json_mode')
+    expect(rungOf(rows[0]!)).toBe('native')
+    expect(rows[0]!.parseStrategy).toBe('native')
     for (const row of await callsForRun(org, run.id)) {
       expect(row.mode).toBe('byok')
       expect(row.credentialId).toBe(credA)
       expect(row.provider).toBe('custom')
       expect(row.errorCode).toBeNull()
+    }
+
+    // …and so is the TRIAGE call, which resolves the agent's model through the same reader: a
+    // workspace on its own key triages on its own key, and that spend is the owner's too.
+    const triageRun = (await runsForTicket(org, ticketId)).find((r) => r.kind === 'triage')!
+    const triageRows = await callsForRun(org, triageRun.id)
+    expect(triageRows.length).toBeGreaterThan(0)
+    for (const row of triageRows) {
+      expect(row.role).toBe('triage')
+      expect(row.mode).toBe('byok')
+      expect(row.credentialId).toBe(credA)
+      expect(row.provider).toBe('custom')
     }
 
     // The owner's spend is the owner's: the managed meter has not been touched at all.
@@ -822,8 +836,11 @@ describe('Phase 6 close-out E2E (the real llm service, the real llm.probe job, t
 
   // ---- 3: every rung of the structured-output ladder --------------------------
 
-  it('3. the ladder lands on whatever rung the probe found: native on a preset model, then json_mode with NO native attempt once the probe has narrowed it, then the plain rung, then prose → repair → extract, and a refusal short-circuits the whole ladder', async () => {
-    // --- (a) native. A catalog model is the only place the rung exists at all (file header).
+  it('3. the ladder lands on whatever rung the probe found, and walks down as the endpoint does: a preset credential on native (its own standard tier), then json_mode with NO native attempt once the probe has narrowed it, then the plain rung, then prose → repair → extract, and a refusal short-circuits the whole ladder', async () => {
+    // --- (a) a PRESET credential, on a catalog model. Two things only this shape can show: the
+    // adapter reaching the preset's own base URL (the row carries no `base_url` at all), and a
+    // catalog TIER — `standard`, cap 0.9 — beside scenario 2's unlisted `limited` one. The native
+    // rung itself is scenario 2's subject now; here it is the baseline the next steps walk down from.
     mock.setMode('native')
     const added = await connect(org, { provider: 'openai', label: 'OpenAI key', apiKey: OPENAI_KEY })
     expect(added.ok).toBe(true)
@@ -831,6 +848,9 @@ describe('Phase 6 close-out E2E (the real llm service, the real llm.probe job, t
     const healthy = await waitForProbe(org, credB, 'native')
     expect(healthy.healthStatus).toBe('healthy')
     expect(healthy.probeModel).toBe(OPENAI_MODEL)
+    // A preset carries no endpoint of its own on the row; the adapter fills in `PROVIDER_PRESETS`'
+    // base URL, and the mock serves only the two it was told about — so `healthy` IS that assertion.
+    expect(healthy.baseUrl).toBeNull()
 
     expect(await chooseModel(org, { credentialId: credB, draftModel: OPENAI_MODEL, triageModel: OPENAI_MODEL }))
       .toEqual({ ok: true, generationBumped: true, demoted: 0 })
@@ -846,7 +866,8 @@ describe('Phase 6 close-out E2E (the real llm service, the real llm.probe job, t
     expect(breakdownOf(native.draft).modelCap).toBe(QUALITY_CAPS.standard)
     expect(breakdownOf(native.draft).model).toBeCloseTo(0.9, 10)
 
-    // --- (b) json_mode. The endpoint stops honouring json_schema; a re-probe records that, and the
+    // --- (b) json_mode. The endpoint stops honouring json_schema; a re-probe records that (at the
+    // cost of one refused native attempt, which is what discovering the change costs), and the
     // resolver's cached provider is invalidated, so the NEXT draft never asks for native again.
     mock.setMode('json_mode')
     expect(await probeCredential(llmDeps, org.orgId, credB, actor(org))).toEqual({ ok: true })
@@ -966,8 +987,19 @@ describe('Phase 6 close-out E2E (the real llm service, the real llm.probe job, t
       .toEqual({ ok: true, generationBumped: true, demoted: 0 })
 
     const before = await metersFor(org)
+    // Armed between the triage call and the draft call (seam 4), so TRIAGE lands on the tenant's own
+    // provider and the managed meter below moves by exactly one call: the draft's fallback. A
+    // globally-armed 500 would have triage fall back too, and "the platform paid for this one" would
+    // then be an assertion about two calls at once.
+    const release = gateDrafts()
+    const ticketId = await inboundToTriaged(org, { subject: `${QUESTION} (fallback)` })
     mock.setStatus(500)
-    const { ticketId, draft } = await inboundToDraft(org, { subject: `${QUESTION} (fallback)` })
+    release()
+    const draft = await waitFor(async () => {
+      const rows = await draftsForTicket(org, ticketId)
+      if (rows.length === 1) return rows[0]!
+      throw new Error(await whyNoDraft(org, ticketId, rows.length))
+    })
     mock.setStatus(null)
 
     expect(draft.status).toBe('pending')
@@ -979,6 +1011,11 @@ describe('Phase 6 close-out E2E (the real llm service, the real llm.probe job, t
     expect(breakdown.provider).toBe('anthropic')
     expect(breakdown.modelId).toBe(MANAGED_MODELS.draft)
     expect(breakdown.tier).toBe('limited')            // the AGENT's tier is still its own choice's
+
+    // The triage run really did go out on the tenant's key — it ran before the outage was armed.
+    const triageRun = (await runsForTicket(org, ticketId)).find((r) => r.kind === 'triage')!
+    expect(triageRun.provider).toBe('custom')
+    expect((await callsForRun(org, triageRun.id)).every((r) => r.mode === 'byok' && r.errorCode === null)).toBe(true)
 
     const { run, rows } = await draftRunOf(org, ticketId)
     const fallbackEvents = (await eventsForRun(org, run.id))
@@ -998,9 +1035,12 @@ describe('Phase 6 close-out E2E (the real llm service, the real llm.probe job, t
     expect(answered.errorCode).toBeNull()
     expect(rungOf(answered)).toBe('fallback')
 
-    // The platform paid for this one, and the owner did not.
+    // The platform paid for this ONE call, and the owner did not: the managed meter moved by exactly
+    // the fallback draft's cost, and the owner's is untouched (their failed call cost 0 and their
+    // triage model has no seeded price).
     const after = await metersFor(org)
-    expect(after[LLM_METERS.costMicros]).toBeGreaterThan(before[LLM_METERS.costMicros] ?? 0)
+    expect(after[LLM_METERS.costMicros]).toBe(answered.costMicros)
+    expect(answered.costMicros).toBeGreaterThan(0)
     expect(after[LLM_METERS.costMicrosByok]).toBe(before[LLM_METERS.costMicrosByok])
   }, 240_000)
 

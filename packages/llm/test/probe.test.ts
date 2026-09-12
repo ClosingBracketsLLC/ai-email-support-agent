@@ -15,12 +15,28 @@ describe('probeProvider', () => {
     expect(fake.calls.every((c) => c.meta.role === 'probe')).toBe(true)
   })
 
-  it('a json_mode-only model reports json_mode; a model that parses nothing reports none but ok', async () => {
+  it('a model that parses nothing at either rung reports none, but ok', async () => {
     const fake = createFakeProvider([{ text: 'OK' }, { text: 'nope' }, { text: 'nope' }], { capabilities: { structuredOutput: 'json_mode' } })
     const r = await probeProvider(fake, 'm', meta) // the RAW fake: the probe drives the rungs itself
     expect(r).toMatchObject({ ok: true, chat: 'ok', structured: 'none', models: null })
+  })
 
-    const jsonOnly = createFakeProvider([{ text: 'OK' }, good], { capabilities: { structuredOutput: 'json_mode' } })
+  /**
+   * Spec §LLM provider adapter: an OpenAI-compatible server's `json_schema` support is "treated as
+   * json_mode unless probe passes". The preset for an unlisted model on one of those kinds is a
+   * GUESS, and the probe is the one call allowed to replace it — so `native` is attempted even
+   * though the preset says json_mode, and a server that honours it is recorded as native.
+   */
+  it('an OpenAI-compatible kind is always asked for native first, whatever its preset guessed', async () => {
+    const custom = createFakeProvider([{ text: 'OK' }, good], { kind: 'custom', capabilities: { structuredOutput: 'json_mode' } })
+    expect(await probeProvider(custom, 'm', meta)).toMatchObject({ ok: true, structured: 'native' })
+    expect(custom.calls.map((c) => c.meta.idempotencyKey)).toEqual(['probe:cred:1:chat', 'probe:cred:1:structured:native'])
+  })
+
+  /** …and Anthropic is the exception: its capability table is a fact about the models this platform
+   *  ships against, so a json_mode-only one never spends a call proving `native` fails. */
+  it('an anthropic-kind model the table calls json_mode-only skips the native rung entirely', async () => {
+    const jsonOnly = createFakeProvider([{ text: 'OK' }, good], { kind: 'anthropic', capabilities: { structuredOutput: 'json_mode' } })
     expect(await probeProvider(jsonOnly, 'm', meta)).toMatchObject({ ok: true, structured: 'json_mode' })
     expect(jsonOnly.calls.map((c) => c.meta.idempotencyKey)).toEqual(['probe:cred:1:chat', 'probe:cred:1:structured:json_mode'])
   })
