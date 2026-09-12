@@ -21,13 +21,13 @@ import type pino from 'pino'
 import { z } from 'zod'
 import {
   createUsageAccumulator, guidanceBlock, personaBlock, platformRulesBlock, runDraftCall,
-  THREAD_BODY_MAX_CHARS, withWatchdog, workspaceProfileBlock, DRAFT_MODEL,
+  THREAD_BODY_MAX_CHARS, withWatchdog, workspaceProfileBlock,
   type DraftCallResult, type DraftDecision, type DraftPromptInput, type EscalateReason,
   type RetrievedAnswer, type RetrievedChunk, type Retriever, type ThreadMessage, type WorkspaceProfile,
 } from '@aesa/agent'
-import { DEFAULT_AUTO_SEND_THRESHOLD } from '@aesa/contracts'
+import { DEFAULT_AUTO_SEND_THRESHOLD, MANAGED_MODELS, type LlmEffort } from '@aesa/contracts'
 import {
-  COLD_START_DECISIONS, collectGroundedNumbers, decide, evidenceScore, INVARIANTS, memoryScore,
+  COLD_START_DECISIONS, collectGroundedNumbers, decide, INVARIANTS, QUALITY_CAPS,
   resolveSetting, THREAD_MAX_MESSAGES_FOR_AUTO, validateReplyBody, type GuardrailResult, type SettingKey,
 } from '@aesa/core'
 import {
@@ -35,7 +35,7 @@ import {
   messages, notifications, orgSettings, platformState, SEND_METERS, tickets, usageCounters, withOrg,
   type Db, type OrgTx,
 } from '@aesa/db'
-import { computeCostMicros, findPricing, LlmError, type ChatMeta, type LlmProvider } from '@aesa/llm'
+import { computeCostMicros, findPricing, LlmError, type ChatMeta } from '@aesa/llm'
 // type-only: the base `Retriever` is what this job depends on; this is the shape of the richer one.
 import type { DetailedRetriever } from '@aesa/knowledge'
 import { defineJob, enqueue, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
@@ -48,8 +48,10 @@ import {
   type DraftLanding, type OutcomeContext,
 } from '../drafting/outcomes.ts'
 import { buildReplyPolicy, personaFor } from '../drafting/policy.ts'
+import { computeEvidence } from '../drafting/evidence.ts'
 import { appendRunEvent, finishRun } from '../drafting/runs.ts'
-import type { ProviderResolver } from '../provider-resolver.ts'
+import { notifyProviderHealth } from '../provider-health-notify.ts'
+import { markCredentialDead, type ProviderResolver, type ResolvedProvider } from '../provider-resolver.ts'
 
 /**
  * Spec §Budgets: $0.40 of managed spend per run. Past it the automatic redraft after a guardrail
@@ -93,6 +95,15 @@ export const AGENT_ESCALATE_REASON_DETAIL: Record<EscalateReason, string> = {
 /** Rule 10: a provider refusal is `content_filtered`, and with no body there is nothing to review. */
 const CONTENT_FILTERED_DETAIL = 'content_filtered'
 
+/**
+ * Phase 6 (`fallback_to_managed`): the `LlmError` codes one managed retry is allowed to cover when
+ * the agent opted in. Deliberately NOT `permanent`/`context_too_long`/`content_filter` — those say
+ * something about the REQUEST, and re-sending it to another provider would only spend the platform's
+ * allowance to fail the same way. `auth` is here because a dead tenant key is exactly the case the
+ * opt-in exists for.
+ */
+export const FALLBACK_CODES = ['auth', 'rate_limit', 'transient'] as const
+
 export const TicketDraftPayload = z.object({ orgId: z.string(), ticketId: z.string() })
 export type TicketDraftPayload = z.infer<typeof TicketDraftPayload>
 
@@ -121,9 +132,8 @@ export const ticketDraftJob: RegisteredJobDefinition<TicketDraftPayload> = defin
 
 export interface TicketDraftDeps {
   db: Db
-  provider: LlmProvider
-  /** Phase 6: the per-tenant provider resolver. Task 6 moves this job's model call onto it and drops
-   *  `provider` above; until then it rides alongside, wired but unread. */
+  /** Phase 6: the ONE way this job gets a model. Every call resolves the agent's own configuration
+   *  — Managed AI or the tenant's own key — and a refusal lands `provider_unavailable`. */
   providers: ProviderResolver
   retriever: Retriever
   logger: pino.Logger
@@ -240,6 +250,46 @@ async function escalateRunCapped(deps: TicketDraftDeps, orgId: string, ticketId:
 }
 
 /**
+ * Phase 6: the agent's configured provider cannot be produced at all — a dead credential, no KEK
+ * ring, a secret row the probe has not written yet, or a managed config on a replica with no
+ * platform key. Same discipline as `no_agent`: this happens BEFORE the claim, so there is no stamp,
+ * no run row and no spend; the owner gets one page per ticket per UTC day (reason-scoped, because a
+ * key that stopped working is materially different from whatever else escalated this ticket today).
+ */
+async function escalateProviderUnavailable(
+  deps: TicketDraftDeps, orgId: string, ticketId: string, day: string, now: Date, refusal: string,
+): Promise<void> {
+  deps.logger.warn({ orgId, ticketId, refusal }, 'ticket.draft: no model provider for this agent; escalating provider_unavailable')
+  const notificationId = await withOrg(deps.db, orgId, async (tx) => {
+    const { notificationId } = await escalateTicket(tx, {
+      orgId, ticketId, fromStatus: 'triaged', reason: 'provider_unavailable', day, now,
+      dedupeKey: `provider_unavailable:${ticketId}:${day}`, actor: DRAFT_ACTOR, auditAction: 'ticket.escalated',
+      detail: { refusal },
+    })
+    return notificationId
+  })
+  if (notificationId) await deps.enqueueNotify(orgId, notificationId)
+}
+
+/**
+ * Phase 6: the provider rejected the tenant's own key mid-run. `markCredentialDead` is guarded on
+ * `health_status <> 'dead'`, so a probe (or another draft) that got there first simply wins and this
+ * writes nothing at all — including the page, which belongs to whoever actually flipped the row.
+ * Its own short transaction: `notifyProviderHealth` opens another, and neither may span the model call.
+ */
+async function killCredential(
+  deps: TicketDraftDeps, orgId: string, config: ResolvedProvider['config'], error: string, now: Date,
+): Promise<void> {
+  const credentialId = config.credentialId
+  if (!credentialId || !config.credential) return
+  const flipped = await withOrg(deps.db, orgId, (tx) => markCredentialDead(tx, orgId, credentialId, error, DRAFT_ACTOR))
+  if (!flipped) return
+  await notifyProviderHealth(
+    { db: deps.db, enqueueNotify: deps.enqueueNotify }, orgId, credentialId, config.credential.label, config.provider, now,
+  )
+}
+
+/**
  * The org-wide daily budget. The ticket is left completely untouched — no stamp, no status change —
  * so it is selectable again after UTC midnight; the owner gets ONE page per org per day, keyed on
  * the day, with an empty payload (there is no one ticket to deep-link to).
@@ -286,7 +336,7 @@ interface DraftContext {
   cacheAgentBlocks: boolean
   mailboxHealthy: boolean
   /** The `prompt` trace event's context-derived half; the knowledge half is added after retrieval. */
-  promptEvent: { blocks: { id: string; chars: number }[]; effort: 'medium' | 'high'; cacheAgentBlocks: boolean; threadMessages: number }
+  promptEvent: { blocks: { id: string; chars: number }[]; effort: LlmEffort; cacheAgentBlocks: boolean; threadMessages: number }
 }
 
 async function loadContext(
@@ -296,7 +346,7 @@ async function loadContext(
   agent: AgentRow,
   now: Date,
   runId: string,
-  effort: 'medium' | 'high',
+  effort: LlmEffort,
 ): Promise<DraftContext> {
   return withOrg(deps.db, orgId, async (tx) => {
     const shared = await loadSharedDraftContext(tx, orgId)
@@ -440,6 +490,16 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
   }
   const agent = pre.agent
 
+  // --- Phase 6: WHICH model this run uses, resolved from the agent's own configuration. Before the
+  // caps and before the claim on purpose: a workspace whose key is dead must not burn a cap slot, a
+  // claim stamp or a run row to discover it. `resolve` only reads — the call happens far below.
+  const resolved = await deps.providers.resolve(orgId, agent.id, 'draft')
+  if (!resolved.ok) {
+    await escalateProviderUnavailable(deps, orgId, ticketId, day, now, resolved.reason)
+    return
+  }
+  const config = resolved.config
+
   // --- Rule 3: pre-claim cap checks. Plain SELECT counts already read above: no lock, no insert
   // and above all NO STAMP — a capped ticket must never be touched before it is refused, or the
   // claim's stuck branch would charge it a failure 20 minutes later for a run that never happened.
@@ -475,7 +535,7 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
   const gate = await withOrg(deps.db, orgId, (tx) =>
     gateAndRecordRun(tx, {
       orgId, ticketId, agentId: agent.id, kind: 'draft',
-      provider: deps.provider.kind, model: DRAFT_MODEL,
+      provider: config.provider, model: config.model,
       input: { redraft: isRedraft, feedbackChars: (ticket.ownerRedraftFeedback ?? '').length },
       settings: pre.settings, now,
     }))
@@ -528,7 +588,9 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
   }
 
   // --- Rule 6: the run context, one read tx, ending in the `prompt` trace event.
-  const firstEffort: 'medium' | 'high' = ownerFeedbackPending ? 'high' : 'medium'
+  // A BYOK agent may pin its own effort (a small local model that reasons badly at `high`, say);
+  // absent that, owner feedback still buys `high`. The guardrail retry below is always `high`.
+  const firstEffort: LlmEffort = config.effort ?? (ownerFeedbackPending ? 'high' : 'medium')
   const ctx = await loadContext(deps, orgId, ticket, agent, now, runId, firstEffort)
   const categoryKey = ctx.cats.find((c) => c.id === ticket.categoryId)?.key ?? null
 
@@ -572,7 +634,7 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
 
   await writePromptEvent(knowledge.chunks.length)
 
-  const promptInput = (guardrailRetry: { codes: string[] } | null, effort: 'medium' | 'high'): DraftPromptInput => ({
+  const promptInput = (guardrailRetry: { codes: string[] } | null, effort: LlmEffort): DraftPromptInput => ({
     ticket: {
       subject: ticket.subject, categoryKey, sentiment: ticket.sentiment, language: ticket.language,
       triageQuestions: ticket.triageQuestions, dmarcPass: ctx.dmarcPass,
@@ -588,19 +650,50 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
     knowledge,
     cacheAgentBlocks: ctx.cacheAgentBlocks,
     effort,
+    model: config.model,
   })
 
-  /** One model attempt plus its accounting: usage, cost and the `call` trace event. */
+  /**
+   * One model attempt plus its accounting: usage, cost and the `call` trace event.
+   *
+   * Phase 6's `fallback_to_managed` lives here: when the agent opted in AND the resolver produced a
+   * managed provider beside the tenant's own, ONE of the three `FALLBACK_CODES` buys a single retry
+   * on Managed AI (billable to the platform allowance — the spec's "opt-in billable"). It is
+   * deliberately not a loop and not a second budget: the same watchdog governs both calls, an
+   * already-aborted run never retries, and a fallback that fails propagates like any other failure.
+   */
   let pricingWarned = false
-  const callModel = async (attempt: number, guardrailRetry: { codes: string[] } | null, effort: 'medium' | 'high'): Promise<DraftCallResult> => {
+  /** A fallback was ATTEMPTED — so the error the catch below sees may be the MANAGED provider's, and
+   *  must not be blamed on (or kill) the tenant's credential. */
+  let triedFallback = false
+  /** A fallback call actually RETURNED the body that landed — what the breakdown's provenance says. */
+  let usedFallback = false
+  const callModel = async (attempt: number, guardrailRetry: { codes: string[] } | null, effort: LlmEffort): Promise<DraftCallResult> => {
     const meta: ChatMeta = { orgId, agentId: agent.id, runId, role: 'draft', idempotencyKey: `draft:${runId}:${attempt}` }
-    const call = await runDraftCall(deps.provider, promptInput(guardrailRetry, effort), meta, watchdog)
+    let call: DraftCallResult
+    try {
+      call = await runDraftCall(resolved.provider, promptInput(guardrailRetry, effort), meta, watchdog)
+    } catch (err) {
+      if (resolved.fallback && err instanceof LlmError && (FALLBACK_CODES as readonly string[]).includes(err.code) && !watchdog.aborted) {
+        deps.logger.warn({ runId, code: err.code }, 'ticket.draft: the agent\'s own provider failed; falling back to Managed AI')
+        await withOrg(deps.db, orgId, (tx) =>
+          appendRunEvent(tx, runId, 'call', { attempt, fallback: true, from: config.provider, code: err.code }))
+        triedFallback = true
+        call = await runDraftCall(
+          resolved.fallback,
+          { ...promptInput(guardrailRetry, effort), model: MANAGED_MODELS.draft },
+          { ...meta, mode: 'managed', credentialId: undefined },
+          watchdog,
+        )
+        usedFallback = true
+      } else throw err
+    }
     const pricing = findPricing(call.result.model)
     // A model with no seeded pricing row costs 0 here, which silently disables BOTH the stop-loss
     // and this run's contribution to the org's daily spend cap — say so out loud, once per run.
     if (!pricing && !pricingWarned) {
       pricingWarned = true
-      deps.logger.warn({ runId, provider: deps.provider.kind, model: call.result.model }, 'ticket.draft: no pricing for model; cost recorded as 0')
+      deps.logger.warn({ runId, provider: config.provider, model: call.result.model }, 'ticket.draft: no pricing for model; cost recorded as 0')
     }
     const costMicros = pricing ? computeCostMicros(call.result.usage, pricing, '1h') : 0
     usage.add(call.result.usage, costMicros)
@@ -620,6 +713,21 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
     // Rule 9. The watchdog check comes FIRST: a timeout surfaces as a transient provider error, and
     // `llm_transient` would hide the real cause.
     const aborted = watchdog.aborted
+
+    // Phase 6: a tenant key the provider REJECTED is not a transient failure — retrying it spends
+    // the ticket's remaining attempts on a key that will keep saying no. The credential goes `dead`
+    // (guarded: a probe that got there first wins), the owner gets one `provider_health` page, and
+    // the ticket lands `provider_unavailable` rather than `agent_failed`. The job does not rethrow:
+    // there is nothing for pg-boss to retry.
+    if (!aborted && err instanceof LlmError && err.code === 'auth' && config.mode === 'byok' && !triedFallback) {
+      await killCredential(deps, orgId, config, err.message, now)
+      // `fail` returning true means the failure ceiling already escalated the ticket (`agent_failed`
+      // — an owner-facing landing this must not clobber); otherwise this reason is the better one.
+      const alreadyEscalated = await fail('llm_auth', errorToDetail(err), 'failed')
+      if (!alreadyEscalated) await escalateProviderUnavailable(deps, orgId, ticketId, day, now, 'llm_auth')
+      return
+    }
+
     const code = aborted ? 'watchdog' : err instanceof LlmError ? `llm_${err.code}` : 'llm_unknown'
     if (await fail(code, errorToDetail(err), aborted ? 'aborted' : 'failed')) return
     throw err
@@ -677,34 +785,13 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
 
   // --- Rules 13/14's shared inputs. They are computed HERE, before `decide()`, because the evidence
   // score is one of its inputs now — everything below is pure, and the non-reply outcomes simply
-  // have no citations, no memory and no threshold.
-  const retrievedChunkIds = knowledge.chunks.map((c) => c.id)
-  const retrievedAnswerIds = knowledge.answers.map((a) => a.id)
+  // have no citations, no memory and no threshold. `computeEvidence` (drafting/evidence.ts) is the
+  // ONE implementation; `agent.sandbox` reads the same one so the number the owner sees on a "Try
+  // it" run is the number this gate would actually have used. The tier is the resolved model's.
   const replyDecision = decision.outcome === 'reply' ? decision : null
-  // An id retrieval never returned cannot be a citation — a model that invents one must not be able
-  // to make a draft look grounded (spec §Tenancy: re-check every id that crosses a prompt boundary).
-  const citedChunkIds = replyDecision ? replyDecision.citedChunkIds.filter((id) => retrievedChunkIds.includes(id)) : []
-  const usedAnswerIds = replyDecision ? replyDecision.usedAnswerIds.filter((id) => retrievedAnswerIds.includes(id)) : []
-  const memoryConflictIds = replyDecision
-    ? replyDecision.memoryConflictIds.filter((id) => retrievedChunkIds.includes(id) || retrievedAnswerIds.includes(id))
-    : []
-  const citedScores = knowledge.chunks.filter((c) => citedChunkIds.includes(c.id)).map((c) => c.score)
-  const groundingScore = citedScores.length > 0 ? Math.max(...citedScores) : null
-
-  // The memory half of the evidence score: the best answer the model actually USED, banded by its
-  // retrieval cosine and scaled by how many times a human has approved it (spec §Learning loop).
-  // An answer that was retrieved but not cited lends phrasing, never confidence.
-  const usedAnswers = knowledge.answers.filter((a) => usedAnswerIds.includes(a.id))
-  const bestUsed = usedAnswers.reduce<{ answer: RetrievedAnswer; score: number } | null>((best, a) => {
-    const score = memoryScore(a.score, a.approvals)
-    return best === null || score > best.score ? { answer: a, score } : best
-  }, null)
-  const memory = bestUsed
-    ? { score: bestUsed.score, answerId: bestUsed.answer.id, cosine: bestUsed.answer.score, approvals: bestUsed.answer.approvals }
-    : null
-  const evidence = replyDecision
-    ? evidenceScore({ memory: memory?.score ?? 0, grounding: groundingScore, model: replyDecision.confidence })
-    : null
+  const ev = computeEvidence({ knowledge, reply: replyDecision, tier: config.tier })
+  const { retrievedChunkIds, retrievedAnswerIds, citedChunkIds, usedAnswerIds, memoryConflictIds } = ev
+  const evidence = ev.evidence
   // The bar the evidence has to clear, as a fraction. Only an `auto` category has one at all —
   // `decide()` reads a null threshold as `below_threshold`, which is the safe direction.
   const threshold =
@@ -815,13 +902,24 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
           threadTooLong: ctx.threadLength > THREAD_MAX_MESSAGES_FOR_AUTO,
           autoSendCap: ctx.autoSendsToday >= resolveSetting('autonomy.daily_auto_send_cap', { org: pre.settings }),
         },
-        model: decision.confidence,
+        // The CAPPED model term — what the evidence score was actually built from (Phase 6). The
+        // model's own uncapped number is `modelRaw` beside it, and `drafts.confidence` above.
+        model: ev.modelCapped,
+        modelRaw: ev.modelRaw,
+        modelCap: QUALITY_CAPS[config.tier],
+        tier: config.tier,
+        // WHICH model produced this body. A fallback ran on Managed AI, so it must not be recorded
+        // as the tenant's own provider — `stats.rollup`'s model-generation window reads these.
+        provider: usedFallback ? 'anthropic' : config.provider,
+        modelId: usedFallback ? MANAGED_MODELS.draft : config.model,
+        mode: usedFallback ? 'managed' : config.mode,
+        modelGeneration: config.modelGeneration,
         // The best USED answer and what it scored — the owner's "why did it auto-send?" answer.
-        memory,
+        memory: ev.memory,
         grounding: {
           // The best VALIDATED citation's retrieval score — an id the model invented was already
           // filtered out above, so it can never raise this. Null when nothing was cited at all.
-          score: groundingScore,
+          score: ev.groundingScore,
           mode: knowledgeMode,
           knowledgeVersion,
           retrieved: retrievedChunkIds.length,
