@@ -5,6 +5,7 @@ import { devicesRouter } from './routers/devices.ts'
 import { draftsRouter } from './routers/drafts.ts'
 import { inboxRouter } from './routers/inbox.ts'
 import { knowledgeRouter } from './routers/knowledge.ts'
+import { llmRouter } from './routers/llm.ts'
 import { mailboxesRouter } from './routers/mailboxes.ts'
 import { memoryRouter } from './routers/memory.ts'
 import { teamRouter } from './routers/team.ts'
@@ -21,5 +22,6 @@ export const appRouter = router({
   activity: activityRouter,
   memory: memoryRouter,
   knowledge: knowledgeRouter,
+  llm: llmRouter,
 })
 export type AppRouter = typeof appRouter
