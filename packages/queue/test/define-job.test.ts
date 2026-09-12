@@ -1,8 +1,9 @@
 import type PgBoss from 'pg-boss'
+import { DrizzleQueryError } from 'drizzle-orm/errors'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import { JOB_SIGNAL_MARGIN_SECONDS } from '@aesa/core'
-import { defineJob, registerJob } from '../src/define-job.ts'
+import { defineJob, registerJob, scrubJobError } from '../src/define-job.ts'
 import { enqueue } from '../src/enqueue.ts'
 import { deleteAllJobs, queryJobs, startTestBoss, uniqueName } from './helpers/boss.ts'
 
@@ -15,6 +16,14 @@ describe('defineJob / enqueue', () => {
   it('refuses expireInSeconds at or below the signal margin', () => {
     expect(() => defineJob({ name: 'x', schema: z.object({ orgId: z.uuid() }), queue: { expireInSeconds: JOB_SIGNAL_MARGIN_SECONDS }, handler: async () => {} }))
       .toThrow(/expireInSeconds/)
+  })
+
+  it('registerJob scrubs a DrizzleQueryError before pg-boss records it', () => {
+    const err = new DrizzleQueryError('insert into "t" ("secret") values ($1)', ['customer text'], Object.assign(new Error('dup'), { code: '23505' }))
+    const scrubbed = scrubJobError(err) as Error
+    expect(scrubbed.message).toBe('Failed query: [redacted] (pg 23505)')
+    expect(scrubbed.message).not.toContain('customer text')
+    expect(scrubJobError(new Error('plain'))).toEqual(new Error('plain'))
   })
 
   it('enqueue validates the payload and sets the org-scoped singletonKey', async () => {

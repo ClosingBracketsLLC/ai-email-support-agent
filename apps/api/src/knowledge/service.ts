@@ -33,6 +33,7 @@ import { normalizeUrl } from '@aesa/knowledge/url'
 import { JOB_NAMES } from '@aesa/queue'
 import type { ApiFacade, EnqueueFn } from '../deps.ts'
 import { loadOrgSettings } from '../org-settings.ts'
+import { isUniqueViolation } from '../pg-error.ts'
 import { computeGaps, type GapsView } from './gaps.ts'
 
 /** Who is acting — the same shape as `drafts/service.ts`'s `DraftActor`, minus `source` (knowledge
@@ -357,11 +358,13 @@ export type StartCrawlResult = { ok: true; sourceId: string } | SoftFailure
  * else done — a crawl is already pending. Only a URL with no live match ever inserts a new row,
  * which is the only branch the `max_sources` cap applies to.
  *
- * No unique index backs the dedupe match: two concurrent `startCrawl` calls for the same brand-new
- * URL can both miss the `existing` read and both insert — accepted, not guarded, because a `failed`
- * crawl must stay re-addable (the dedupe query's `status <> 'failed'` is exactly what makes a retry
- * after a failure insert fresh rather than resurrecting the dead row), and a unique index over
- * `(org_id, kind, url)` would have to special-case `failed` out of it to keep that possible.
+ * `knowledge_sources_org_crawl_url_uidx` (`org_id, url WHERE kind = 'crawl' AND status <> 'failed'`,
+ * migration 0018) is the backstop for the race the `existing` read above cannot see: two concurrent
+ * `startCrawl` calls for the same brand-new URL can both miss it and both attempt the insert below.
+ * The index lets exactly one land; the loser's insert raises pg 23505, caught here and turned into
+ * the SAME "already pending" outcome the `queued`/`processing` branch above returns — never a 500.
+ * The index still excludes `failed` (same reason the dedupe query does): a failed crawl must stay
+ * re-addable rather than colliding with its own dead row.
  */
 export async function startCrawl(
   deps: KnowledgeServiceDeps, orgId: string, actor: KnowledgeActor, input: StartCrawlInput,
@@ -395,9 +398,27 @@ export async function startCrawl(
     if (!capCheck.ok) return capCheck
 
     const maxPages = Math.min(input.maxPages, pageCap)
-    const [row] = await tx.insert(knowledgeSources).values({
-      orgId, kind: 'crawl', status: 'queued', title: url, url, crawlConfig: { maxPages }, createdBy: actor.userId,
-    }).returning({ id: knowledgeSources.id })
+    // The insert runs inside its own SAVEPOINT (connect/routes.ts's pattern): a unique_violation on
+    // `knowledge_sources_org_crawl_url_uidx` otherwise leaves the WHOLE `withOrg` transaction
+    // aborted, and the re-read just below (needed to report the row that won the race) would fail
+    // with "current transaction is aborted" rather than running.
+    let row: { id: string } | undefined
+    try {
+      ;[row] = await tx.transaction((tx2) => tx2.insert(knowledgeSources).values({
+        orgId, kind: 'crawl', status: 'queued', title: url, url, crawlConfig: { maxPages }, createdBy: actor.userId,
+      }).returning({ id: knowledgeSources.id }))
+    } catch (err) {
+      if (!isUniqueViolation(err)) throw err
+      // Lost the race: a concurrent startCrawl for the same URL landed first and already enqueued
+      // its own knowledge.crawl job for that row — report it exactly like the queued/processing
+      // branch above, with no new enqueue and no audit row for an insert that never happened.
+      const [race] = await tx.select({ id: knowledgeSources.id })
+        .from(knowledgeSources)
+        .where(and(eq(knowledgeSources.orgId, orgId), eq(knowledgeSources.kind, 'crawl'), eq(knowledgeSources.url, url), ne(knowledgeSources.status, 'failed')))
+        .limit(1)
+      if (!race) throw err   // the unique violation guarantees a matching row exists; defensive only
+      return { ok: true as const, sourceId: race.id, shouldEnqueue: false }
+    }
     await audit(tx, {
       actor: actor.actor, action: 'knowledge.source.created', entityType: 'knowledge_source', entityId: row!.id,
       detail: { kind: 'crawl', url, maxPages }, ip: actor.ip, userAgent: actor.userAgent,

@@ -48,7 +48,6 @@ export type TicketTriagePayload = z.infer<typeof TicketTriagePayload>
 export const ticketTriageJob: JobDefinition<TicketTriagePayload> = defineJob({
   name: JOB_NAMES.ticketTriage,
   schema: TicketTriagePayload,
-  queue: { expireInSeconds: 120, retryLimit: 2, retryBackoff: true },
   handler: async () => {
     throw new Error('ticket.triage: this definition has no bound deps — register it through registerTicketTriage(boss, deps)')
   },

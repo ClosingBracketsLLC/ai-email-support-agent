@@ -29,7 +29,7 @@ import {
 } from '@aesa/agent'
 import { DEFAULT_AUTO_SEND_THRESHOLD, type DecisionAction, type DecisionReason } from '@aesa/contracts'
 import {
-  collectGroundedNumbers, decide, evidenceScore, INVARIANTS, memoryScore, validateReplyBody,
+  collectGroundedNumbers, decide, evidenceScore, memoryScore, validateReplyBody,
   type GuardrailFinding, type GuardrailResult,
 } from '@aesa/core'
 import { agentCategoryPolicies, agentRuns, agents, drafts, mailboxConnections, platformState, withOrg, type Db } from '@aesa/db'
@@ -47,9 +47,9 @@ export type AgentSandboxPayload = z.infer<typeof AgentSandboxPayload>
 export const agentSandboxJob: JobDefinition<AgentSandboxPayload> = defineJob({
   name: JOB_NAMES.agentSandbox,
   schema: AgentSandboxPayload,
-  // `short`, so the `singletonKey` on `${orgId}:${runId}` actually collapses a double-tap of
-  // "Try it" while the first job is still `created` (fix wave W8: it is inert on `standard`).
-  queue: { policy: 'short', expireInSeconds: INVARIANTS.DRAFT_JOB_EXPIRE_SECONDS, retryLimit: 0 },
+  // policy: 'short' (QUEUE_OPTIONS), so the `singletonKey` on `${orgId}:${runId}` actually collapses
+  // a double-tap of "Try it" while the first job is still `created` (fix wave W8: it is inert on
+  // `standard`).
   handler: async () => {
     throw new Error('agent.sandbox: this definition has no bound deps — register it through registerAgentSandbox(boss, deps)')
   },

@@ -55,11 +55,11 @@ const ACTOR = 'system:knowledge.embed-batch' as const
 export const knowledgeEmbedBatchJob: JobDefinition<KnowledgeEmbedBatchPayload> = defineJob({
   name: JOB_NAMES.knowledgeEmbedBatch,
   schema: KnowledgeEmbedBatchPayload,
-  // retryLimit 5 with backoff: Voyage's 429s are the expected failure here, and every retry starts
-  // from whatever is still unembedded rather than redoing work. `retryDelay: 30` is what makes that
-  // budget worth having — pg-boss's default base of 1 s put the five retries at ~1/2/4/8/16 s, one
-  // minute of outage in total; 30 s of base with backoff spans ~15 minutes instead (final-B1).
-  queue: { expireInSeconds: 300, retryLimit: 5, retryDelay: 30, retryBackoff: true, policy: 'short' },
+  // retryLimit 5 with backoff (QUEUE_OPTIONS): Voyage's 429s are the expected failure here, and
+  // every retry starts from whatever is still unembedded rather than redoing work. `retryDelay: 30`
+  // is what makes that budget worth having — pg-boss's default base of 1 s put the five retries at
+  // ~1/2/4/8/16 s, one minute of outage in total; 30 s of base with backoff spans ~15 minutes
+  // instead (final-B1).
   handler: async () => {
     throw new Error('knowledge.embed-batch: this definition has no bound deps — register it through registerKnowledgeEmbedBatch(boss, deps)')
   },

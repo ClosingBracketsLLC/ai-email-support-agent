@@ -63,11 +63,11 @@ const FIRST_BATCH = 20
 export const knowledgeCrawlJob: JobDefinition<KnowledgeCrawlPayload> = defineJob({
   name: JOB_NAMES.knowledgeCrawl,
   schema: KnowledgeCrawlPayload,
-  // retryLimit 1 with a FIXED 300 s delay (no backoff): the one retry must land after
-  // `CRAWL_LEASE_SECONDS` has lapsed, otherwise it finds the source still `processing`, cannot
-  // claim, and quietly does nothing. Past that one retry the owner sees a failed source rather than
-  // a site being re-walked over and over.
-  queue: { expireInSeconds: 1800, retryLimit: 1, retryDelay: CRAWL_LEASE_SECONDS, retryBackoff: false, policy: 'short' },
+  // retryLimit 1 with a FIXED 300 s delay (no backoff) in QUEUE_OPTIONS — hardcoded there to
+  // `CRAWL_LEASE_SECONDS`'s value (`@aesa/queue` cannot import this file): the one retry must land
+  // after `CRAWL_LEASE_SECONDS` has lapsed, otherwise it finds the source still `processing`,
+  // cannot claim, and quietly does nothing. Past that one retry the owner sees a failed source
+  // rather than a site being re-walked over and over. Keep the two numbers in sync if either changes.
   handler: async () => {
     throw new Error('knowledge.crawl: this definition has no bound deps — register it through registerKnowledgeCrawl(boss, deps)')
   },

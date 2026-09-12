@@ -150,12 +150,10 @@ export type SendExecutePayload = z.infer<typeof SendExecutePayload>
 export const sendExecuteJob: JobDefinition<SendExecutePayload> = defineJob({
   name: JOB_NAMES.sendExecute,
   schema: SendExecutePayload,
-  // `policy: 'short'` — pg-boss's default `standard` ignores `singletonKey` outright (fix wave W8),
-  // so the backstop sweep's every-minute re-enqueue of a due send piled up duplicate jobs.
-  queue: {
-    policy: 'short', expireInSeconds: INVARIANTS.SEND_QUEUE_EXPIRE_SECONDS, retryLimit: 5,
-    retryDelay: INVARIANTS.SEND_RETRY_DELAY_SECONDS, retryBackoff: true,
-  },
+  // policy: 'short' (QUEUE_OPTIONS) — pg-boss's default `standard` ignores `singletonKey` outright
+  // (fix wave W8), so the backstop sweep's every-minute re-enqueue of a due send piled up duplicate
+  // jobs. expireInSeconds/retryDelay there are `INVARIANTS.SEND_QUEUE_EXPIRE_SECONDS`/
+  // `INVARIANTS.SEND_RETRY_DELAY_SECONDS`.
   handler: async () => {
     throw new Error('send.execute: this definition has no bound deps — register it through registerSendExecute(boss, deps)')
   },
@@ -195,7 +193,7 @@ export async function registerSendExecute(boss: PgBoss, deps: SendExecuteDeps): 
     ...sendExecuteJob,
     handler: async (ctx) => {
       const retryCount = ctx.job.retryCount ?? 0
-      const retryLimit = ctx.job.retryLimit ?? (sendExecuteJob.queue.retryLimit ?? 0)
+      const retryLimit = ctx.job.retryLimit ?? (sendExecuteJob.queue!.retryLimit ?? 0)   // defineJob always resolves .queue
       await runSendExecute(deps, ctx.data, { signal: ctx.signal, attempt: retryCount + 1, lastAttempt: retryCount >= retryLimit })
     },
   }

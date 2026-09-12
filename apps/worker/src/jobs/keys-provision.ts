@@ -23,7 +23,6 @@ export type KeysProvisionPayload = z.infer<typeof KeysProvisionPayload>
 export const keysProvisionJob: JobDefinition<KeysProvisionPayload> = defineJob({
   name: JOB_NAMES.keysProvision,
   schema: KeysProvisionPayload,
-  queue: { expireInSeconds: 60, retryLimit: 3, retryBackoff: true },
   handler: async () => {
     throw new Error('keys.provision: this definition has no bound deps — register it through registerKeysProvision(boss, deps)')
   },

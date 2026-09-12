@@ -38,10 +38,9 @@ export type GuidanceSuggestPayload = z.infer<typeof GuidanceSuggestPayload>
 
 export const guidanceSuggestJob: JobDefinition<GuidanceSuggestPayload> = defineJob({
   name: JOB_NAMES.guidanceSuggest, schema: GuidanceSuggestPayload,
-  // retryLimit 1: a redelivery re-reads the same draft and the sourceDraftId gate in step 1 makes a
-  // successful first attempt's retry a no-op anyway; there is no transient-failure budget worth
-  // spending an extra Haiku call on.
-  queue: { policy: 'short', expireInSeconds: 120, retryLimit: 1 },
+  // retryLimit 1 (QUEUE_OPTIONS): a redelivery re-reads the same draft and the sourceDraftId gate in
+  // step 1 makes a successful first attempt's retry a no-op anyway; there is no transient-failure
+  // budget worth spending an extra Haiku call on.
   handler: async () => { throw new Error('guidance.suggest: register it through registerGuidanceSuggest(boss, deps)') },
 })
 

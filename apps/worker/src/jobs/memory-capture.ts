@@ -17,7 +17,6 @@ export type MemoryCapturePayload = z.infer<typeof MemoryCapturePayload>
 
 export const memoryCaptureJob: JobDefinition<MemoryCapturePayload> = defineJob({
   name: JOB_NAMES.memoryCapture, schema: MemoryCapturePayload,
-  queue: { policy: 'short', expireInSeconds: 120, retryLimit: 3, retryDelay: 30, retryBackoff: true },
   handler: async () => { throw new Error('memory.capture: register it through registerMemoryCapture(boss, deps)') },
 })
 

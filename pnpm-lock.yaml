@@ -641,6 +641,9 @@ importers:
       '@aesa/core':
         specifier: workspace:*
         version: link:../core
+      drizzle-orm:
+        specifier: ^0.44.0
+        version: 0.44.7(@types/pg@8.23.1)(kysely@0.29.5)(pg@8.23.0)
       pg-boss:
         specifier: ^10.4.2
         version: 10.4.2

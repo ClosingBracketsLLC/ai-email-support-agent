@@ -52,9 +52,9 @@ const ACTOR = 'system:knowledge.ingest' as const
 export const knowledgeIngestJob: JobDefinition<KnowledgeIngestPayload> = defineJob({
   name: JOB_NAMES.knowledgeIngest,
   schema: KnowledgeIngestPayload,
-  // `short`: the owner can re-trigger the same source (a second completeUpload, a re-paste) while
-  // the first job is still `created`; those collapse. Once it goes active a newer event is its own job.
-  queue: { expireInSeconds: 600, retryLimit: 2, retryBackoff: true, policy: 'short' },
+  // policy: 'short' (QUEUE_OPTIONS): the owner can re-trigger the same source (a second
+  // completeUpload, a re-paste) while the first job is still `created`; those collapse. Once it
+  // goes active a newer event is its own job.
   handler: async () => {
     throw new Error('knowledge.ingest: this definition has no bound deps — register it through registerKnowledgeIngest(boss, deps)')
   },

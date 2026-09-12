@@ -42,7 +42,6 @@ export type StoreCredentialsPayload = z.infer<typeof StoreCredentialsPayload>
 export const storeCredentialsJob: JobDefinition<StoreCredentialsPayload> = defineJob({
   name: JOB_NAMES.storeCredentials,
   schema: StoreCredentialsPayload,
-  queue: { expireInSeconds: 60, retryLimit: 5, retryBackoff: true },
   handler: async () => {
     throw new Error('mailbox.store-credentials: this definition has no bound deps — register it through registerStoreCredentials(boss, deps)')
   },
@@ -88,7 +87,6 @@ export type RevokeMailboxPayload = z.infer<typeof RevokeMailboxPayload>
 export const revokeMailboxJob: JobDefinition<RevokeMailboxPayload> = defineJob({
   name: JOB_NAMES.revokeMailbox,
   schema: RevokeMailboxPayload,
-  queue: { expireInSeconds: 120, retryLimit: 3, retryBackoff: true },
   handler: async () => {
     throw new Error('mailbox.revoke: this definition has no bound deps — register it through registerRevokeMailbox(boss, deps)')
   },

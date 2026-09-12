@@ -1,7 +1,10 @@
 import type PgBoss from 'pg-boss'
+import { DrizzleQueryError } from 'drizzle-orm/errors'
 import { ZodError, type z } from 'zod'
 import { JOB_SIGNAL_MARGIN_SECONDS } from '@aesa/core'
+import type { JobName } from './names.ts'
 import { createQueueRetrying } from './pg-boss.ts'
+import { QUEUE_OPTIONS } from './queue-options.ts'
 
 export interface JobQueueOptions {
   /**
@@ -26,15 +29,35 @@ export interface JobContext<T> { data: T; signal: AbortSignal; job: PgBoss.JobWi
 export interface JobDefinition<T extends { orgId: string }> {
   name: string
   schema: z.ZodType<T>
-  queue: JobQueueOptions
+  /**
+   * Optional: a name that is one of `JOB_NAMES` resolves its options from `QUEUE_OPTIONS` when
+   * omitted here. An explicit value always wins over the table — this is how throwaway definitions
+   * (tests, `apps/api/src/deps.ts`'s `createEnqueue`) built with names outside `JOB_NAMES` keep working.
+   */
+  queue?: JobQueueOptions
   handler: (ctx: JobContext<T>) => Promise<void>
 }
 
 export function defineJob<T extends { orgId: string }>(def: JobDefinition<T>): JobDefinition<T> {
   const shape = (def.schema as unknown as { shape?: Record<string, unknown> }).shape
   if (!shape || !('orgId' in shape)) throw new Error(`job ${def.name}: payload schema must be a z.object with an orgId field`)
-  if (def.queue.expireInSeconds <= JOB_SIGNAL_MARGIN_SECONDS) throw new Error(`job ${def.name}: expireInSeconds must exceed ${JOB_SIGNAL_MARGIN_SECONDS}`)
-  return def
+  const resolved = def.queue ?? QUEUE_OPTIONS[def.name as JobName]
+  if (!resolved) throw new Error(`job ${def.name}: no queue options — add a row to QUEUE_OPTIONS or pass queue`)
+  if (resolved.expireInSeconds <= JOB_SIGNAL_MARGIN_SECONDS) throw new Error(`job ${def.name}: expireInSeconds must exceed ${JOB_SIGNAL_MARGIN_SECONDS}`)
+  return { ...def, queue: resolved }
+}
+
+/**
+ * A thrown `DrizzleQueryError` carries the failed SQL and its PARAMETERS on `.query`/`.params`,
+ * and pg-boss writes a failed job's error into `pgboss.job.output` — which for a knowledge or memory
+ * job can mean customer text. Replace it with a bare Error (message + pg code) before pg-boss sees
+ * it; the original still went to the worker's pino logger through the job's own catch/log, where
+ * `logging.ts`'s redaction applies.
+ */
+export function scrubJobError(err: unknown): unknown {
+  if (!(err instanceof DrizzleQueryError)) return err
+  const code = (err.cause as { code?: string } | undefined)?.code
+  return new Error(`Failed query: [redacted]${code ? ` (pg ${code})` : ''}`)
 }
 
 export interface RegisterJobOptions {
@@ -50,7 +73,8 @@ export interface RegisterJobOptions {
 
 /** Creates/updates the queue with the definition's options and registers a worker that validates, times and aborts. */
 export async function registerJob<T extends { orgId: string }>(boss: PgBoss, def: JobDefinition<T>, opts: RegisterJobOptions = {}): Promise<void> {
-  const { policy = 'standard', ...queueOpts } = def.queue
+  const queue = def.queue!   // defineJob always resolves this before returning a definition
+  const { policy = 'standard', ...queueOpts } = queue
   await createQueueRetrying(boss, def.name, { name: def.name, policy, ...queueOpts })
   await boss.updateQueue(def.name, { name: def.name, policy, ...queueOpts })   // createQueue is a no-op on an existing queue
   const workOptions: PgBoss.WorkOptions & { includeMetadata: true } = { batchSize: opts.batchSize ?? 1, includeMetadata: true }
@@ -74,10 +98,12 @@ export async function registerJob<T extends { orgId: string }>(boss: PgBoss, def
         continue
       }
       const controller = new AbortController()
-      const deadlineMs = (def.queue.expireInSeconds - JOB_SIGNAL_MARGIN_SECONDS) * 1000
+      const deadlineMs = (queue.expireInSeconds - JOB_SIGNAL_MARGIN_SECONDS) * 1000
       const timer = setTimeout(() => controller.abort(new Error(`job ${def.name} ${job.id} hit its deadline`)), deadlineMs)
       try {
         await def.handler({ data, signal: controller.signal, job: job as PgBoss.JobWithMetadata<T> })
+      } catch (err) {
+        throw scrubJobError(err)
       } finally {
         clearTimeout(timer)
       }

@@ -30,10 +30,9 @@ export type NotifyDispatchPayload = z.infer<typeof NotifyDispatchPayload>
 export const notifyDispatchJob: JobDefinition<NotifyDispatchPayload> = defineJob({
   name: JOB_NAMES.notifyDispatch,
   schema: NotifyDispatchPayload,
-  // `short`: one delivery per notification id while the job is still `created` — the producers'
-  // dedupe-keyed re-insert and the poll sweep's stuck-pending retry both re-enqueue the same id
-  // (fix wave W8: `singletonKey` dedupes nothing on `standard`).
-  queue: { policy: 'short', expireInSeconds: 60, retryLimit: 2 },
+  // policy: 'short' (QUEUE_OPTIONS): one delivery per notification id while the job is still
+  // `created` — the producers' dedupe-keyed re-insert and the poll sweep's stuck-pending retry both
+  // re-enqueue the same id (fix wave W8: `singletonKey` dedupes nothing on `standard`).
   handler: async () => {
     throw new Error('notify.dispatch: this definition has no bound deps — register it through registerNotifyDispatch(boss, deps)')
   },

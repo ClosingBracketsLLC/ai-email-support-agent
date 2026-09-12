@@ -241,7 +241,7 @@ describe('knowledge.crawl', () => {
     // cannot claim, and silently does nothing — the delay and the lease are one mechanism.
     expect(knowledgeCrawlJob.queue).toEqual({ expireInSeconds: 1800, retryLimit: 1, retryDelay: 300, retryBackoff: false, policy: 'short' })
     expect(CRAWL_LEASE_SECONDS).toBe(300)
-    expect(knowledgeCrawlJob.queue.retryDelay).toBe(CRAWL_LEASE_SECONDS)
+    expect(knowledgeCrawlJob.queue!.retryDelay).toBe(CRAWL_LEASE_SECONDS)   // defineJob always resolves .queue
   })
 
   it('an abort mid-walk re-queues the source and FAILS the job — a partial site is never `ready`', async () => {
