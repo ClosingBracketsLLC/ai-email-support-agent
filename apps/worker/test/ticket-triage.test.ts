@@ -20,6 +20,7 @@ import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
 import { createFakeProvider, LlmError, type Capabilities, type ChatRequest, type ChatResult, type LlmProvider } from '@aesa/llm'
 import { runTicketTriage, type TicketTriageDeps } from '../src/jobs/ticket-triage.ts'
+import { staticResolver } from '../src/provider-resolver.ts'
 
 const rand = () => randomBytes(4).toString('hex')
 const NOW = new Date('2026-09-09T12:00:00Z')
@@ -136,6 +137,7 @@ function makeDeps(provider: LlmProvider): {
   const deps: TicketTriageDeps = {
     db: app.db,
     provider,
+    providers: staticResolver(provider),
     logger: pino({ level: 'silent' }),
     enqueueNotify: async (org, notificationId) => {
       notified.push({ orgId: org, notificationId })

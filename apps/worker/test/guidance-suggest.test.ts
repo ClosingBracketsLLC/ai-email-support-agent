@@ -15,6 +15,7 @@ import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
 import { createFakeProvider } from '@aesa/llm'
 import { runGuidanceSuggest, type GuidanceSuggestDeps } from '../src/jobs/guidance-suggest.ts'
+import { staticResolver } from '../src/provider-resolver.ts'
 import { utcDayString } from '../src/date-utils.ts'
 
 const rand = () => randomBytes(4).toString('hex')
@@ -105,7 +106,7 @@ const auditRows = async (entityId: string, action: string) =>
   withOrg(app.db, fx.orgId, (tx) => tx.select().from(auditLog).where(and(eq(auditLog.entityId, entityId), eq(auditLog.action, action))))
 
 function makeDeps(provider: GuidanceSuggestDeps['provider'], over: Partial<GuidanceSuggestDeps> = {}): GuidanceSuggestDeps {
-  return { db: app.db, provider, logger: pino({ level: 'silent' }), now: () => NOW, ...over }
+  return { db: app.db, provider, providers: staticResolver(provider), logger: pino({ level: 'silent' }), now: () => NOW, ...over }
 }
 
 const run = (deps: GuidanceSuggestDeps, draftId: string) =>

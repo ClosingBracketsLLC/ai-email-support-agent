@@ -40,6 +40,7 @@ import { mailboxSyncJob, registerMailboxSync, type MailboxSyncDeps } from '../sr
 import { enqueueNotifyDispatch, registerNotifyDispatch, type NotifyDispatchDeps } from '../src/jobs/notify-dispatch.ts'
 import { registerTicketTriage, ticketTriageJob, type TicketTriageDeps } from '../src/jobs/ticket-triage.ts'
 import type { PushMessage, SendPush } from '../src/push.ts'
+import { staticResolver } from '../src/provider-resolver.ts'
 
 const rand = () => randomBytes(4).toString('hex')
 const DB_URL = process.env.DATABASE_URL ?? 'postgres://aesa:aesa@localhost:5434/aesa_dev'
@@ -119,6 +120,7 @@ describe('Phase 2 close-out E2E (real pg-boss)', () => {
     const triageDeps: TicketTriageDeps = {
       db: app.db,
       provider: llmProvider,
+      providers: staticResolver(llmProvider),
       logger: pino({ level: 'silent' }),
       enqueueNotify: (orgId, notificationId) => enqueueNotifyDispatch(boss, orgId, notificationId),
     }

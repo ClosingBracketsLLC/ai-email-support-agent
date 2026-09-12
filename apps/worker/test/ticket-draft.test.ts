@@ -30,6 +30,7 @@ import {
   type Capabilities, type ChatRequest, type ChatResult, type LlmProvider,
 } from '@aesa/llm'
 import { runTicketDraft, STOP_LOSS_MICROS, type TicketDraftDeps } from '../src/jobs/ticket-draft.ts'
+import { staticResolver } from '../src/provider-resolver.ts'
 
 const rand = () => randomBytes(4).toString('hex')
 const NOW = new Date('2026-09-09T12:00:00Z')
@@ -291,6 +292,7 @@ function makeDeps(provider: LlmProvider, over: Partial<TicketDraftDeps> = {}): H
   const deps: TicketDraftDeps = {
     db: app.db,
     provider,
+    providers: staticResolver(provider),
     retriever: emptyRetriever,
     logger: pino({ level: 'silent' }),
     enqueueNotify: async (_orgId, notificationId) => void notified.push(notificationId),

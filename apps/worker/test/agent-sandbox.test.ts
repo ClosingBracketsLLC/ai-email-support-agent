@@ -21,6 +21,7 @@ import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
 import type { Retriever } from '@aesa/agent'
 import { createFakeProvider, LlmError, type LlmProvider } from '@aesa/llm'
 import { runAgentSandbox, type AgentSandboxDeps, type SandboxOutput } from '../src/jobs/agent-sandbox.ts'
+import { staticResolver } from '../src/provider-resolver.ts'
 import { createWorkerLogger } from '../src/logging.ts'
 
 const rand = () => randomBytes(4).toString('hex')
@@ -132,6 +133,7 @@ function makeDeps(provider: LlmProvider, over: Partial<AgentSandboxDeps> = {}): 
   return {
     db: app.db,
     provider,
+    providers: staticResolver(provider),
     retriever: emptyRetriever,
     logger: pino({ level: 'silent' }),
     now: () => NOW,

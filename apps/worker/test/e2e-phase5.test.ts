@@ -83,6 +83,7 @@ import { enqueueTicketDraft, registerTicketDraft } from '../src/jobs/ticket-draf
 import { registerTicketTriage } from '../src/jobs/ticket-triage.ts'
 import { maybeRegisterSendRole } from '../src/send-role.ts'
 import type { PushMessage, SendPush } from '../src/push.ts'
+import { staticResolver } from '../src/provider-resolver.ts'
 
 const rand = () => randomBytes(4).toString('hex')
 const DB_URL = process.env.DATABASE_URL ?? 'postgres://aesa:aesa@localhost:5434/aesa_dev'
@@ -340,12 +341,12 @@ describe('Phase 5 close-out E2E (real pg-boss autonomy + learning jobs, the real
 
     await registerMailboxSync(boss, { db: app.db, ring, config: workerConfig(), limiter, logger, clientFactory })
     await registerTicketTriage(boss, {
-      db: app.db, provider, logger,
+      db: app.db, provider, providers: staticResolver(provider), logger,
       enqueueNotify: (orgId, notificationId) => enqueueNotifyDispatch(boss, orgId, notificationId),
       enqueueDraft: (orgId, ticketId) => enqueueTicketDraft(boss, orgId, ticketId),
     })
     await registerTicketDraft(boss, {
-      db: app.db, provider, retriever, logger,
+      db: app.db, provider, providers: staticResolver(provider), retriever, logger,
       enqueueNotify: (orgId, notificationId) => enqueueNotifyDispatch(boss, orgId, notificationId),
       enqueueDraft: (orgId, ticketId, opts) => enqueueTicketDraft(boss, orgId, ticketId, opts),
       enqueueSend: enqueueSendSeam,

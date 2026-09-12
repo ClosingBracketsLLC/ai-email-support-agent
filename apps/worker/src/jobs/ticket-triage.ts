@@ -30,6 +30,7 @@ import {
 } from '@aesa/db'
 import type { LlmProvider } from '@aesa/llm'
 import { defineJob, registerJob, JOB_NAMES, type RegisteredJobDefinition } from '@aesa/queue'
+import type { ProviderResolver } from '../provider-resolver.ts'
 
 /** The usage_counters meter this job's spend guard reads and writes. */
 const TRIAGE_METER = 'triage_calls'
@@ -56,6 +57,9 @@ export const ticketTriageJob: RegisteredJobDefinition<TicketTriagePayload> = def
 export interface TicketTriageDeps {
   db: Db
   provider: LlmProvider
+  /** Phase 6: the per-tenant provider resolver. Task 6 moves this job's model call onto it and drops
+   *  `provider` above; until then it rides alongside, wired but unread. */
+  providers: ProviderResolver
   logger: pino.Logger
   /** index.ts wires this to `enqueueNotifyDispatch` (`notify-dispatch.ts`, Task 16). */
   enqueueNotify: (orgId: string, notificationId: string) => Promise<void>

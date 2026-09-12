@@ -43,6 +43,7 @@ import { utcDayString } from '../date-utils.ts'
 import { gateAndRecordRun, readCapsUnlocked } from '../drafting/caps.ts'
 import { claimTicket, recordFailure, unwindClaimStamp, type ClaimedTicket } from '../drafting/claim.ts'
 import { loadSharedDraftContext } from '../drafting/context.ts'
+import type { ProviderResolver } from '../provider-resolver.ts'
 import {
   applyDraftOutcome, applyEscalateOutcome, applyNoReplyOutcome, DRAFT_ACTOR, LostRaceError, recordLostRace,
   type DraftLanding, type OutcomeContext,
@@ -121,6 +122,9 @@ export const ticketDraftJob: RegisteredJobDefinition<TicketDraftPayload> = defin
 export interface TicketDraftDeps {
   db: Db
   provider: LlmProvider
+  /** Phase 6: the per-tenant provider resolver. Task 6 moves this job's model call onto it and drops
+   *  `provider` above; until then it rides alongside, wired but unread. */
+  providers: ProviderResolver
   retriever: Retriever
   logger: pino.Logger
   /** index.ts wires this to `enqueueNotifyDispatch`. */

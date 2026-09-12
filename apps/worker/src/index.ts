@@ -1,4 +1,5 @@
 import { assertInvariants, loadDotEnv } from '@aesa/core'
+import { loadModelPricing } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createMailLimiter } from '@aesa/mail'
 import { createMailTransport } from '@aesa/platform-mail'
@@ -7,6 +8,8 @@ import { maybeRegisterAgentRole } from './agent-role.ts'
 import { loadConfig } from './config.ts'
 import { registerKeysProvision } from './jobs/keys-provision.ts'
 import { enqueueKnowledgeEmbedBatch } from './jobs/knowledge-embed-batch.ts'
+import { enqueueLlmProbe } from './jobs/llm-probe.ts'
+import { registerLlmReprobeSweep } from './jobs/llm-reprobe-sweep.ts'
 import { enqueueMemoryCapture } from './jobs/memory-capture.ts'
 import { registerRevokeMailbox, registerStoreCredentials } from './jobs/mailbox-credentials.ts'
 import { registerMailboxPollSweep } from './jobs/mailbox-poll-sweep.ts'
@@ -30,6 +33,10 @@ const config = loadConfig(process.env)
 assertInvariants()
 const logger = createWorkerLogger(config.logLevel)
 const { db, pool } = createDb(config.databaseUrl, { role: 'app' })
+// The platform price table, read ONCE at boot and handed to every metered provider. An empty table
+// (nothing seeded, or a database that predates 0020) is passed as `undefined` so `withMetering`
+// stays on its code-seeded `PRICING_SEED` rather than costing every call at zero.
+const pricing = await loadModelPricing(db)
 const boss = await startBoss(config.databaseUrl)
 logger.info({ roles: [...config.roles], kekActive: config.kekRing?.active ?? null }, 'worker up')
 
@@ -89,6 +96,11 @@ if (config.roles.has('cron')) {
   await registerTicketBackstopSweep(boss, { db, logger })
   await registerSweepsDaily(boss, { db, logger })
   await registerStatsRollup(boss, { db, logger })
+  // Phase 6: every six hours, re-ask each live BYOK credential whether it still works — a key can be
+  // revoked or rotated at any time, and without this the workspace finds out from a failed draft.
+  await registerLlmReprobeSweep(boss, {
+    db, logger, enqueueProbe: (orgId, credentialId, opts) => enqueueLlmProbe(boss, orgId, credentialId, opts),
+  })
 }
 
 await maybeRegisterAgentRole({
@@ -98,6 +110,7 @@ await maybeRegisterAgentRole({
   // The auto landing's send. `enqueueSendExecute` resolves the pg-boss job id (or null when the
   // `short` queue collapsed a duplicate); the draft job only needs "it was handed over".
   enqueueSend: (orgId, sendId, opts) => enqueueSendExecute(boss, orgId, sendId, opts).then(() => undefined),
+  ...(pricing.length > 0 ? { pricing } : {}),
 })
 
 await maybeRegisterKnowledgeRole({

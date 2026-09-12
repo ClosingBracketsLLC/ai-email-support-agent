@@ -36,6 +36,7 @@ import { agentCategoryPolicies, agentRuns, agents, drafts, mailboxConnections, p
 import { computeCostMicros, findPricing, LlmError, type ChatMeta, type LlmProvider } from '@aesa/llm'
 import { defineJob, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
 import { loadSharedDraftContext, type SharedDraftContext } from '../drafting/context.ts'
+import type { ProviderResolver } from '../provider-resolver.ts'
 import { errorMessage } from '../err-message.ts'
 import { buildReplyPolicy, personaFor } from '../drafting/policy.ts'
 import { appendRunEvent, finishRun } from '../drafting/runs.ts'
@@ -58,6 +59,9 @@ export const agentSandboxJob: RegisteredJobDefinition<AgentSandboxPayload> = def
 export interface AgentSandboxDeps {
   db: Db
   provider: LlmProvider
+  /** Phase 6: the per-tenant provider resolver. Task 6 moves this job's model call onto it and drops
+   *  `provider` above; until then it rides alongside, wired but unread. */
+  providers: ProviderResolver
   retriever: Retriever
   logger: pino.Logger
   now?: () => Date

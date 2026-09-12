@@ -82,6 +82,7 @@ import { mailboxSyncJob, registerMailboxSync } from '../src/jobs/mailbox-sync.ts
 import { enqueueTicketDraft, registerTicketDraft } from '../src/jobs/ticket-draft.ts'
 import { registerTicketTriage } from '../src/jobs/ticket-triage.ts'
 import type { KnowledgeDeps } from '../src/knowledge-deps.ts'
+import { staticResolver } from '../src/provider-resolver.ts'
 
 const rand = () => randomBytes(4).toString('hex')
 const DB_URL = process.env.DATABASE_URL ?? 'postgres://aesa:aesa@localhost:5434/aesa_dev'
@@ -333,12 +334,12 @@ describe('Phase 4 close-out E2E (real pg-boss knowledge jobs + the real api know
 
     await registerMailboxSync(boss, { db: app.db, ring, config: workerConfig(), limiter, logger, clientFactory })
     await registerTicketTriage(boss, {
-      db: app.db, provider, logger,
+      db: app.db, provider, providers: staticResolver(provider), logger,
       enqueueNotify: async () => {},
       enqueueDraft: (orgId, ticketId) => enqueueTicketDraft(boss, orgId, ticketId),
     })
     await registerTicketDraft(boss, {
-      db: app.db, provider, retriever, logger,
+      db: app.db, provider, providers: staticResolver(provider), retriever, logger,
       enqueueNotify: async () => {},
       enqueueDraft: (orgId, ticketId, opts) => enqueueTicketDraft(boss, orgId, ticketId, opts),
       // Phase 4's scenarios never reach the auto landing (every category is `review`).

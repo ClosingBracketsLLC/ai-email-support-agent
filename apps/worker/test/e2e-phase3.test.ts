@@ -72,6 +72,7 @@ import { enqueueTicketDraft, registerTicketDraft, ticketDraftJob } from '../src/
 import { registerTicketTriage } from '../src/jobs/ticket-triage.ts'
 import { maybeRegisterSendRole } from '../src/send-role.ts'
 import type { PushMessage, SendPush } from '../src/push.ts'
+import { staticResolver } from '../src/provider-resolver.ts'
 
 const rand = () => randomBytes(4).toString('hex')
 /**
@@ -221,19 +222,19 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
       db: app.db, ring, config: sendConfig(), limiter, logger, clientFactory,
     })
     await registerTicketTriage(boss, {
-      db: app.db, provider, logger,
+      db: app.db, provider, providers: staticResolver(provider), logger,
       enqueueNotify: (orgId, notificationId) => enqueueNotifyDispatch(boss, orgId, notificationId),
       enqueueDraft: (orgId, ticketId) => enqueueTicketDraft(boss, orgId, ticketId),
     })
     await registerTicketDraft(boss, {
-      db: app.db, provider, retriever: emptyRetriever, logger,
+      db: app.db, provider, providers: staticResolver(provider), retriever: emptyRetriever, logger,
       enqueueNotify: (orgId, notificationId) => enqueueNotifyDispatch(boss, orgId, notificationId),
       enqueueDraft: (orgId, ticketId, opts) => enqueueTicketDraft(boss, orgId, ticketId, opts),
       // Phase 3's scenarios never reach the auto landing (every category is `review`), so this seam
       // is only here to satisfy the deps contract — Phase 5's own E2E is what exercises it.
       enqueueSend: async () => {},
     })
-    await registerAgentSandbox(boss, { db: app.db, provider, retriever: emptyRetriever, logger })
+    await registerAgentSandbox(boss, { db: app.db, provider, providers: staticResolver(provider), retriever: emptyRetriever, logger })
     await registerNotifyDispatch(boss, { db: app.db, push, logger })
     // The production role gate, with only the client/provider/clock seams swapped in through its
     // own `register` argument — `maybeRegisterSendRole`'s ring/OAuth checks still run for real.

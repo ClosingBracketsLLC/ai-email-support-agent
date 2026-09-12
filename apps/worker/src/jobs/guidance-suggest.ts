@@ -32,6 +32,7 @@ import {
 import type { LlmProvider } from '@aesa/llm'
 import { defineJob, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
 import { utcDayString } from '../date-utils.ts'
+import type { ProviderResolver } from '../provider-resolver.ts'
 
 export const GuidanceSuggestPayload = z.object({ orgId: z.string(), draftId: z.string() })
 export type GuidanceSuggestPayload = z.infer<typeof GuidanceSuggestPayload>
@@ -44,7 +45,9 @@ export const guidanceSuggestJob: RegisteredJobDefinition<GuidanceSuggestPayload>
   handler: async () => { throw new Error('guidance.suggest: register it through registerGuidanceSuggest(boss, deps)') },
 })
 
-export interface GuidanceSuggestDeps { db: Db; provider: LlmProvider; logger: pino.Logger; now?: () => Date }
+/** `providers` is Phase 6's per-tenant resolver: Task 6 moves the model call onto it and drops
+ *  `provider`; until then it rides alongside, wired but unread. */
+export interface GuidanceSuggestDeps { db: Db; provider: LlmProvider; providers: ProviderResolver; logger: pino.Logger; now?: () => Date }
 const ACTOR = `system:${JOB_NAMES.guidanceSuggest}` as const
 /** Below this edit-distance ratio, an edit is tone/wording/punctuation only — never worth a model call. */
 const COSMETIC_RATIO_MIN = 0.05
