@@ -26,6 +26,25 @@ import {
 
 export type ProviderUnavailableReason = 'credential_dead' | 'no_kek' | 'no_secret' | 'no_managed_key'
 
+/**
+ * Provider-failure policy, shared by every job that calls a model (`ticket.draft`, `ticket.triage`).
+ * These are the `LlmError` codes an agent's opt-in `fallback_to_managed` may cover with ONE managed
+ * retry. Deliberately NOT `permanent` / `context_too_long` / `content_filter`: those say something
+ * about the REQUEST, and re-sending it to another provider would only spend the platform's allowance
+ * to fail the same way. `auth` is here because a dead tenant key is exactly what the opt-in is for.
+ */
+export const FALLBACK_CODES = ['auth', 'rate_limit', 'transient'] as const
+
+/**
+ * Which cache-write rate a call's cost is priced at. It must match the TTL the metering wrapper that
+ * actually served the call was built with: `createManagedProvider` uses `'1h'` (the Anthropic
+ * adapter puts the static prefix on the 1-hour breakpoint), `createByokProvider` uses `'5m'`. Takes
+ * the mode of the provider that SERVED the call — a managed fallback on a byok agent is `'managed'`.
+ */
+export function cacheTtlFor(mode: 'managed' | 'byok'): '5m' | '1h' {
+  return mode === 'byok' ? '5m' : '1h'
+}
+
 export type ResolvedProvider =
   | { ok: true; provider: LlmProvider; fallback: LlmProvider | null; config: ResolvedModelConfig }
   | { ok: false; reason: ProviderUnavailableReason; config: ResolvedModelConfig }

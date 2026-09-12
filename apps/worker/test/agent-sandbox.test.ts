@@ -501,4 +501,16 @@ describe('runAgentSandbox', () => {
     expect(provider.calls).toHaveLength(0)
     expect((await eventsFor(runId)).map((e) => e.kind)).toEqual(['error'])
   })
+
+  it('P6 the agent\'s configured effort reaches the call and the prompt event — a "Try it" run is what the real first attempt would do', async () => {
+    const runId = await seedSandboxRun()
+    const provider = createFakeProvider([{ parsed: REPLY }])
+    const deps = makeDeps(provider, { providers: staticResolver(provider, { effort: 'low' }) })
+
+    await run(deps, runId)
+
+    expect(provider.calls[0]!.effort).toBe('low')
+    const prompt = (await eventsFor(runId)).find((e) => e.kind === 'prompt')
+    expect(prompt!.payload).toMatchObject({ effort: 'low' })
+  })
 })

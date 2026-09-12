@@ -13,12 +13,15 @@ import pino from 'pino'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import type { TriageVerdict } from '@aesa/contracts'
 import {
-  agentRuns, auditLog, categories, ensureDefaultCategories, mailboxConnections, messages, notifications,
-  orgSettings, tickets, usageCounters, user, withOrg, workspaces,
+  agentRunEvents, agentRuns, auditLog, categories, createMeterSink, ensureDefaultCategories, llmCalls,
+  mailboxConnections, messages, notifications, orgSettings, tickets, usageCounters, user, withOrg, workspaces,
 } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
-import { createFakeProvider, LlmError, type Capabilities, type ChatRequest, type ChatResult, type LlmProvider } from '@aesa/llm'
+import {
+  createFakeProvider, LlmError, withMeta, withMetering,
+  type Capabilities, type ChatRequest, type ChatResult, type LlmProvider,
+} from '@aesa/llm'
 import { runTicketTriage, type TicketTriageDeps } from '../src/jobs/ticket-triage.ts'
 import { staticRefusal, staticResolver } from '../src/provider-resolver.ts'
 
@@ -152,6 +155,16 @@ function makeDeps(provider: LlmProvider, over: Partial<TicketTriageDeps> = {}): 
 
 async function runsFor(ticketId: string) {
   return withOrg(app.db, orgId, (tx) => tx.select().from(agentRuns).where(eq(agentRuns.ticketId, ticketId)))
+}
+
+async function eventsFor(runId: string) {
+  return withOrg(app.db, orgId, (tx) =>
+    tx.select().from(agentRunEvents).where(eq(agentRunEvents.runId, runId)).orderBy(agentRunEvents.seq))
+}
+
+async function llmCallsFor(runId: string) {
+  return withOrg(app.db, orgId, (tx) =>
+    tx.select().from(llmCalls).where(eq(llmCalls.runId, runId)).orderBy(llmCalls.createdAt))
 }
 
 function verdictProvider(verdict: TriageVerdict): ReturnType<typeof createFakeProvider> {
@@ -630,5 +643,56 @@ describe('runTicketTriage', () => {
     expect((await getTicket(ticketId)).status).toBe('triaged')
     const [run] = await runsFor(ticketId)
     expect(run!.status).toBe('succeeded')
+  })
+
+  it('8e. a successful fallback leaves a trace: a `call` run event and the run row restamped to the managed pair', async () => {
+    const ticketId = await seedTicket()
+    await seedInboundMessage(ticketId, 'Where is my order?', new Date('2026-09-09T11:00:00Z'))
+    const byok = createFakeProvider([{ error: new LlmError('502', 'transient', true) }])
+    const managed = createFakeProvider([{ parsed: BASE_VERDICT }])
+    const { deps } = makeDeps(byok, {
+      providers: staticResolver(
+        byok,
+        { mode: 'byok', credentialId: crypto.randomUUID(), provider: 'openai', model: 'gpt-5-mini', fallbackToManaged: true },
+        managed,
+      ),
+    })
+
+    await runTicketTriage(deps, { orgId, ticketId }, new AbortController().signal)
+
+    const [run] = await runsFor(ticketId)
+    // The run row must say which model actually produced the verdict, not which one was asked first.
+    expect(run!.provider).toBe('anthropic')
+    expect(run!.model).toBe('claude-haiku-4-5')
+    const fallbackEvents = (await eventsFor(run!.id)).filter((e) => (e.payload as { fallback?: boolean }).fallback === true)
+    expect(fallbackEvents).toHaveLength(1)
+    expect(fallbackEvents[0]!.kind).toBe('call')
+    expect(fallbackEvents[0]!.payload).toMatchObject({ from: 'openai', code: 'transient' })
+  })
+
+  it('8f. the fallback call is METERED under its own idempotency key: two llm_calls rows for the run', async () => {
+    const ticketId = await seedTicket()
+    await seedInboundMessage(ticketId, 'Where is my order?', new Date('2026-09-09T11:00:00Z'))
+    const credentialId = crypto.randomUUID()
+    const sink = createMeterSink(app.db, { onError: (err) => { throw err } })
+    const byokRaw = createFakeProvider([{ error: new LlmError('502 bad gateway', 'transient', true) }])
+    const byok = withMeta(withMetering(byokRaw, sink, { cacheTtl: '5m' }), { mode: 'byok', credentialId })
+    const managed = withMetering(createFakeProvider([{ parsed: BASE_VERDICT, usage: { inputTokens: 500, outputTokens: 20 } }]), sink, { cacheTtl: '1h' })
+    const { deps } = makeDeps(byok, {
+      providers: staticResolver(
+        byok,
+        { mode: 'byok', credentialId, provider: 'openai', model: 'gpt-5-mini', fallbackToManaged: true },
+        managed,
+      ),
+    })
+
+    await runTicketTriage(deps, { orgId, ticketId }, new AbortController().signal)
+
+    const [run] = await runsFor(ticketId)
+    const calls = await llmCallsFor(run!.id)
+    expect(calls).toHaveLength(2)
+    expect(calls[0]).toMatchObject({ mode: 'byok', credentialId, errorCode: 'transient', finish: 'error' })
+    expect(calls[1]).toMatchObject({ mode: 'managed', credentialId: null, errorCode: null, model: 'claude-haiku-4-5' })
+    expect(calls[1]!.idempotencyKey).toBe(`${calls[0]!.idempotencyKey}:fallback`)
   })
 })

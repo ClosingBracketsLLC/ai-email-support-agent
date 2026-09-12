@@ -51,7 +51,9 @@ import { buildReplyPolicy, personaFor } from '../drafting/policy.ts'
 import { computeEvidence } from '../drafting/evidence.ts'
 import { appendRunEvent, finishRun } from '../drafting/runs.ts'
 import { notifyProviderHealth } from '../provider-health-notify.ts'
-import { markCredentialDead, type ProviderResolver, type ResolvedProvider } from '../provider-resolver.ts'
+import {
+  cacheTtlFor, FALLBACK_CODES, markCredentialDead, type ProviderResolver, type ResolvedProvider,
+} from '../provider-resolver.ts'
 
 /**
  * Spec §Budgets: $0.40 of managed spend per run. Past it the automatic redraft after a guardrail
@@ -95,14 +97,12 @@ export const AGENT_ESCALATE_REASON_DETAIL: Record<EscalateReason, string> = {
 /** Rule 10: a provider refusal is `content_filtered`, and with no body there is nothing to review. */
 const CONTENT_FILTERED_DETAIL = 'content_filtered'
 
-/**
- * Phase 6 (`fallback_to_managed`): the `LlmError` codes one managed retry is allowed to cover when
- * the agent opted in. Deliberately NOT `permanent`/`context_too_long`/`content_filter` — those say
- * something about the REQUEST, and re-sending it to another provider would only spend the platform's
- * allowance to fail the same way. `auth` is here because a dead tenant key is exactly the case the
- * opt-in exists for.
- */
-export const FALLBACK_CODES = ['auth', 'rate_limit', 'transient'] as const
+/** One model attempt and WHICH provider served it — `fellBack` is per attempt, never per run
+ *  (Phase 6 review 1, finding 2): the breakdown's provenance describes the attempt that landed. */
+interface DraftAttempt {
+  call: DraftCallResult
+  fellBack: boolean
+}
 
 export const TicketDraftPayload = z.object({ orgId: z.string(), ticketId: z.string() })
 export type TicketDraftPayload = z.infer<typeof TicketDraftPayload>
@@ -663,14 +663,17 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
    * already-aborted run never retries, and a fallback that fails propagates like any other failure.
    */
   let pricingWarned = false
-  /** A fallback was ATTEMPTED — so the error the catch below sees may be the MANAGED provider's, and
-   *  must not be blamed on (or kill) the tenant's credential. */
+  /** A fallback was ATTEMPTED — so the error the attempt-1 catch below sees may be the MANAGED
+   *  provider's, and must not be blamed on (or kill) the tenant's credential. Run-scoped on purpose:
+   *  only attempt 1's catch reads it, and only attempt 1 can have set it by then. */
   let triedFallback = false
-  /** A fallback call actually RETURNED the body that landed — what the breakdown's provenance says. */
-  let usedFallback = false
-  const callModel = async (attempt: number, guardrailRetry: { codes: string[] } | null, effort: LlmEffort): Promise<DraftCallResult> => {
+  const callModel = async (attempt: number, guardrailRetry: { codes: string[] } | null, effort: LlmEffort): Promise<DraftAttempt> => {
     const meta: ChatMeta = { orgId, agentId: agent.id, runId, role: 'draft', idempotencyKey: `draft:${runId}:${attempt}` }
     let call: DraftCallResult
+    // PER ATTEMPT, never run-scoped: attempt 1 can fall back and attempt 2 (the guardrail redraft)
+    // still succeed on the tenant's own provider, and the breakdown's provenance has to describe the
+    // attempt whose body was actually stored.
+    let fellBack = false
     try {
       call = await runDraftCall(resolved.provider, promptInput(guardrailRetry, effort), meta, watchdog)
     } catch (err) {
@@ -682,10 +685,14 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
         call = await runDraftCall(
           resolved.fallback,
           { ...promptInput(guardrailRetry, effort), model: MANAGED_MODELS.draft },
-          { ...meta, mode: 'managed', credentialId: undefined },
+          // A DISTINCT idempotency key. `llm_calls.idempotency_key` is globally unique and
+          // `withMetering`'s catch already wrote the primary's ERROR row under this attempt's key,
+          // so reusing it would have the sink's ON CONFLICT DO NOTHING silently drop the managed
+          // row — the fallback's spend invisible to the org's daily cap and every cost screen.
+          { ...meta, idempotencyKey: `${meta.idempotencyKey}:fallback`, mode: 'managed', credentialId: undefined },
           watchdog,
         )
-        usedFallback = true
+        fellBack = true
       } else throw err
     }
     const pricing = findPricing(call.result.model)
@@ -695,20 +702,22 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
       pricingWarned = true
       deps.logger.warn({ runId, provider: config.provider, model: call.result.model }, 'ticket.draft: no pricing for model; cost recorded as 0')
     }
-    const costMicros = pricing ? computeCostMicros(call.result.usage, pricing, '1h') : 0
+    // Priced at the TTL of the wrapper that actually SERVED this call: a fallback ran on the managed
+    // stack (`'1h'`), everything else on whatever the agent's own mode implies.
+    const costMicros = pricing ? computeCostMicros(call.result.usage, pricing, cacheTtlFor(fellBack ? 'managed' : config.mode)) : 0
     usage.add(call.result.usage, costMicros)
     await withOrg(deps.db, orgId, (tx) =>
       appendRunEvent(tx, runId, 'call', {
         attempt, finish: call.result.finish, parseStrategy: call.result.parseStrategy,
         model: call.result.model, latencyMs: call.result.latencyMs, costMicros, usage: call.result.usage,
       }))
-    return call
+    return { call, fellBack }
   }
 
   // --- Rule 8: model call #1.
-  let first: DraftCallResult
+  let firstAttempt: DraftAttempt
   try {
-    first = await callModel(1, null, firstEffort)
+    firstAttempt = await callModel(1, null, firstEffort)
   } catch (err) {
     // Rule 9. The watchdog check comes FIRST: a timeout surfaces as a transient provider error, and
     // `llm_transient` would hide the real cause.
@@ -732,6 +741,11 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
     if (await fail(code, errorToDetail(err), aborted ? 'aborted' : 'failed')) return
     throw err
   }
+
+  const first = firstAttempt.call
+  /** The attempt whose body is the one being stored — attempt 2 only when its decision replaces
+   *  attempt 1's below. This is what `confidence_breakdown`'s provider/modelId/mode describe. */
+  let landedFallback = firstAttempt.fellBack
 
   // Rule 9 again: an unparsable envelope. The structured-output ladder has already spent its rungs.
   if (first.decision === null && first.result.finish !== 'refusal') {
@@ -757,7 +771,7 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
         deps.logger.warn({ runId, ticketId, stopLoss }, 'ticket.draft: skipping the automatic redraft')
       } else {
         const codes = guardrail.findings.filter((f) => f.severity === 'fail').map((f) => f.code)
-        let second: DraftCallResult | null = null
+        let second: DraftAttempt | null = null
         try {
           second = await callModel(2, { codes }, 'high')
         } catch (err) {
@@ -772,9 +786,11 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
           await withOrg(deps.db, orgId, (tx) => appendRunEvent(tx, runId, 'error', { attempt: 2, code, message: errorToDetail(err) }))
           deps.logger.warn({ runId, ticketId, code }, 'ticket.draft: the automatic redraft failed')
         }
-        if (second?.decision) {
-          const next = second.decision
+        if (second?.call.decision) {
+          const next = second.call.decision
           decision = next
+          // The stored body is now attempt 2's, so the provenance is attempt 2's too.
+          landedFallback = second.fellBack
           guardrail = next.outcome === 'reply'
             ? await screen(deps, orgId, runId, 2, next, ctx, agent, ticket.language, knowledge)
             : null
@@ -910,9 +926,9 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
         tier: config.tier,
         // WHICH model produced this body. A fallback ran on Managed AI, so it must not be recorded
         // as the tenant's own provider — `stats.rollup`'s model-generation window reads these.
-        provider: usedFallback ? 'anthropic' : config.provider,
-        modelId: usedFallback ? MANAGED_MODELS.draft : config.model,
-        mode: usedFallback ? 'managed' : config.mode,
+        provider: landedFallback ? 'anthropic' : config.provider,
+        modelId: landedFallback ? MANAGED_MODELS.draft : config.model,
+        mode: landedFallback ? 'managed' : config.mode,
         modelGeneration: config.modelGeneration,
         // The best USED answer and what it scored — the owner's "why did it auto-send?" answer.
         memory: ev.memory,

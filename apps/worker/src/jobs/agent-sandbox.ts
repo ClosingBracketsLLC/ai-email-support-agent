@@ -27,7 +27,10 @@ import {
   type DraftCallResult, type DraftDecision, type DraftPromptInput, type RetrievedAnswer,
   type RetrievedChunk, type Retriever, type ThreadMessage, type UsageTotals,
 } from '@aesa/agent'
-import { DEFAULT_AUTO_SEND_THRESHOLD, type DecisionAction, type DecisionReason, type QualityTier } from '@aesa/contracts'
+import {
+  DEFAULT_AUTO_SEND_THRESHOLD,
+  type DecisionAction, type DecisionReason, type LlmEffort, type QualityTier,
+} from '@aesa/contracts'
 import {
   collectGroundedNumbers, decide, validateReplyBody,
   type GuardrailFinding, type GuardrailResult,
@@ -40,7 +43,7 @@ import { errorMessage } from '../err-message.ts'
 import { buildReplyPolicy, personaFor } from '../drafting/policy.ts'
 import { computeEvidence } from '../drafting/evidence.ts'
 import { appendRunEvent, finishRun } from '../drafting/runs.ts'
-import type { ProviderResolver } from '../provider-resolver.ts'
+import { cacheTtlFor, type ProviderResolver } from '../provider-resolver.ts'
 
 export const AgentSandboxPayload = z.object({ orgId: z.string(), runId: z.string() })
 export type AgentSandboxPayload = z.infer<typeof AgentSandboxPayload>
@@ -325,6 +328,10 @@ async function runAgentSandboxUnsafe(
     return
   }
   const config = resolved.config
+  // The sandbox's contract is "what the real pipeline would do on the FIRST attempt", and the real
+  // first attempt honours the agent's configured effort (`ticket.draft`'s `firstEffort`). There is
+  // no owner feedback on a "Try it" run, so `medium` is the only other input.
+  const effort: LlmEffort = config.effort ?? 'medium'
 
   const blocks = [
     platformRulesBlock(),
@@ -340,7 +347,7 @@ async function runAgentSandboxUnsafe(
       .where(and(eq(agentRuns.id, runId), eq(agentRuns.status, 'running')))
     await appendRunEvent(tx, runId, 'prompt', {
       blocks: blocks.map((b) => ({ id: b.id, chars: b.text.length })),
-      effort: 'medium',
+      effort,
       cacheAgentBlocks: false,
       threadMessages: thread.length,
     })
@@ -370,7 +377,7 @@ async function runAgentSandboxUnsafe(
     guidance: { workspaceGuidance: shared.workspaceGuidance, agentGuidance: agent.guidanceExtra },
     knowledge,
     cacheAgentBlocks: false,
-    effort: 'medium',
+    effort,
     model: config.model,
   }
 
@@ -390,7 +397,7 @@ async function runAgentSandboxUnsafe(
   if (!pricing) {
     deps.logger.warn({ runId, provider: config.provider, model: call.result.model }, 'agent.sandbox: no pricing for model; cost recorded as 0')
   }
-  const costMicros = pricing ? computeCostMicros(call.result.usage, pricing, '1h') : 0
+  const costMicros = pricing ? computeCostMicros(call.result.usage, pricing, cacheTtlFor(config.mode)) : 0
   usage.add(call.result.usage, costMicros)
   await withOrg(deps.db, orgId, (tx) =>
     appendRunEvent(tx, runId, 'call', {

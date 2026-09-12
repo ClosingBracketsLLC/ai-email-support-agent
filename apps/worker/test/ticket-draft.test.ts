@@ -17,17 +17,17 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { emptyRetriever, type DraftDecision } from '@aesa/agent'
 import { DRAFT_EXPIRE_DAYS } from '@aesa/contracts'
 import {
-  agentCategoryPolicies, agentRunEvents, agentRuns, agents, auditLog, categories, drafts,
-  ensureDefaultCategories, llmCredentials, mailboxConnections, messages, notifications, orgSettings,
-  outboundSends, platformState, resolvedAnswers, SEND_METERS, tickets, usageCounters, user, withOrg,
-  withPlatform, workspaces,
+  agentCategoryPolicies, agentRunEvents, agentRuns, agents, auditLog, categories, createMeterSink,
+  drafts, ensureDefaultCategories, llmCalls, llmCredentials, mailboxConnections, messages,
+  notifications, orgSettings, outboundSends, platformState, resolvedAnswers, SEND_METERS, tickets,
+  usageCounters, user, withOrg, withPlatform, workspaces,
 } from '@aesa/db'
 import type { ResolvedModelConfig } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
 import type { DetailedRetriever } from '@aesa/knowledge'
 import {
-  createFakeProvider, LlmError,
+  createFakeProvider, LlmError, withMeta, withMetering,
   type Capabilities, type ChatRequest, type ChatResult, type LlmProvider,
 } from '@aesa/llm'
 import { runTicketDraft, STOP_LOSS_MICROS, type TicketDraftDeps } from '../src/jobs/ticket-draft.ts'
@@ -289,6 +289,11 @@ function byokConfig(credentialId: string, over: Partial<ResolvedModelConfig> = {
     credential: { label: 'Acme local LLM', baseUrl: 'https://llm.acme.test/v1', healthStatus: 'healthy', lastProbe: null },
     ...over,
   }
+}
+
+async function llmCallsFor(runId: string) {
+  return withOrg(app.db, fx.orgId, (tx) =>
+    tx.select().from(llmCalls).where(eq(llmCalls.runId, runId)).orderBy(llmCalls.createdAt))
 }
 
 async function credentialRow(credentialId: string) {
@@ -1446,5 +1451,51 @@ describe('runTicketDraft', () => {
     const [run2] = await runsFor(plainTicket)
     expect(run2!.errorCode).toBe('llm_rate_limit')
     expect((await getTicket(plainTicket)).agentFailureCount).toBe(1)
+  })
+
+  it('17g. the fallback call is METERED under its own idempotency key: two llm_calls rows for the run — the tenant\'s error row and the managed success row', async () => {
+    const credentialId = await seedCredential()
+    const ticketId = await seedDraftableTicket()
+    // The real stack: metering innermost, and `withMeta` is what `createByokProvider` uses to stamp
+    // `mode`/`credentialId` on the tenant's calls. Without the `:fallback` suffix on the second
+    // call's key, the sink's ON CONFLICT DO NOTHING silently drops the managed row (the primary's
+    // ERROR row already claimed the key), and the managed spend is invisible to every cap and screen.
+    const sink = createMeterSink(app.db, { onError: (err) => { throw err } })
+    const byokRaw = createFakeProvider([{ error: new LlmError('502 bad gateway', 'transient', true) }])
+    const byok = withMeta(withMetering(byokRaw, sink, { cacheTtl: '5m' }), { mode: 'byok', credentialId })
+    const managedRaw = createFakeProvider([{ parsed: REPLY, usage: { inputTokens: 1000, outputTokens: 100 } }])
+    const managed = withMetering(managedRaw, sink, { cacheTtl: '1h' })
+    const { deps } = makeDeps(byok, { providers: staticResolver(byok, byokConfig(credentialId, { fallbackToManaged: true }), managed) })
+
+    await run(deps, ticketId)
+
+    const [run1] = await runsFor(ticketId)
+    const calls = await llmCallsFor(run1!.id)
+    expect(calls).toHaveLength(2)
+    expect(calls[0]).toMatchObject({ mode: 'byok', credentialId, errorCode: 'transient', finish: 'error' })
+    expect(calls[1]).toMatchObject({ mode: 'managed', credentialId: null, errorCode: null, model: 'claude-opus-5' })
+    expect(calls[1]!.inputTokens).toBe(1000)
+    // Two DIFFERENT keys — that is the whole point.
+    expect(new Set(calls.map((c) => c.idempotencyKey)).size).toBe(2)
+    expect(calls[1]!.idempotencyKey).toBe(`${calls[0]!.idempotencyKey}:fallback`)
+  })
+
+  it('17h. the breakdown\'s provenance is the ATTEMPT whose body landed: a fallback on attempt 1 and a tenant success on attempt 2 reads byok', async () => {
+    const credentialId = await seedCredential()
+    const ticketId = await seedDraftableTicket()
+    // Attempt 1: the tenant's provider throws, the managed fallback answers with a body the
+    // guardrails hard-fail. Attempt 2 (the automatic redraft) goes back to the tenant's own
+    // provider and comes back clean — so the STORED body is the tenant's, not Managed AI's.
+    const byok = createFakeProvider([{ error: new LlmError('502', 'transient', true) }, { parsed: REPLY }])
+    const managed = createFakeProvider([{ parsed: reply({ body: HTML_BODY }) }])
+    const { deps } = makeDeps(byok, { providers: staticResolver(byok, byokConfig(credentialId, { fallbackToManaged: true }), managed) })
+
+    await run(deps, ticketId)
+
+    expect(byok.calls).toHaveLength(2)
+    expect(managed.calls).toHaveLength(1)
+    const [draft] = await draftsFor(ticketId)
+    expect(draft!.body).toBe(CLEAN_BODY)
+    expect(draft!.confidenceBreakdown).toMatchObject({ provider: 'custom', modelId: 'qwen3:32b', mode: 'byok' })
   })
 })

@@ -33,9 +33,8 @@ import {
 } from '@aesa/db'
 import { computeCostMicros, findPricing, LlmError, type ChatMeta } from '@aesa/llm'
 import { defineJob, registerJob, JOB_NAMES, type RegisteredJobDefinition } from '@aesa/queue'
-import { FALLBACK_CODES } from './ticket-draft.ts'
-import { finishRun } from '../drafting/runs.ts'
-import type { ProviderResolver } from '../provider-resolver.ts'
+import { appendRunEvent, finishRun } from '../drafting/runs.ts'
+import { cacheTtlFor, FALLBACK_CODES, type ProviderResolver } from '../provider-resolver.ts'
 
 /** The usage_counters meter this job's spend guard reads and writes. */
 const TRIAGE_METER = 'triage_calls'
@@ -232,12 +231,13 @@ function resolveCategoryId(cats: { id: string; key: string }[], categoryKey: str
 }
 
 /** `finishRun`, with this job's "already settled" warning spelled once. Guarded on `running`, so a
- *  backstop sweep that got there first simply wins. */
+ *  backstop sweep that got there first simply wins. The clock is `deps.now` like every other read in
+ *  this file, so a test that freezes time gets a deterministic `finished_at`. */
 async function settleRun(
   tx: OrgTx, runId: string, status: 'succeeded' | 'failed', usage: { totals(): UsageTotals },
   deps: TicketTriageDeps, extra: { output?: unknown; errorCode?: string; errorMessage?: string },
 ): Promise<void> {
-  const settled = await finishRun(tx, { runId, status, usage: usage.totals(), now: new Date(), ...extra })
+  const settled = await finishRun(tx, { runId, status, usage: usage.totals(), now: deps.now?.() ?? new Date(), ...extra })
   if (!settled) deps.logger.warn({ runId }, 'ticket.triage: run was already settled')
 }
 
@@ -364,6 +364,8 @@ export async function runTicketTriage(deps: TicketTriageDeps, payload: TicketTri
   // retry when the agent opted in and a managed provider exists. Triage is cheap, so one retry is
   // the whole budget — anything past it is the ordinary failure path below.
   let call: TriageCallResult
+  /** Set only by a fallback that RETURNED: the verdict transaction records it and restamps the run. */
+  let fellBack: { from: string; code: string } | null = null
   try {
     try {
       call = await runTriageCallDetailed(resolved.provider, input, meta, signal, config.model)
@@ -371,8 +373,16 @@ export async function runTicketTriage(deps: TicketTriageDeps, payload: TicketTri
       if (resolved.fallback && err instanceof LlmError && (FALLBACK_CODES as readonly string[]).includes(err.code)) {
         deps.logger.warn({ runId, code: err.code }, 'ticket.triage: the agent\'s own provider failed; falling back to Managed AI')
         call = await runTriageCallDetailed(
-          resolved.fallback, input, { ...meta, mode: 'managed', credentialId: undefined }, signal, MANAGED_MODELS.triage,
+          resolved.fallback,
+          input,
+          // A DISTINCT idempotency key: `llm_calls.idempotency_key` is globally unique and
+          // `withMetering` already wrote the primary's ERROR row under this one, so reusing it would
+          // have the sink drop the managed row and hide the fallback's spend entirely.
+          { ...meta, idempotencyKey: `${meta.idempotencyKey}:fallback`, mode: 'managed', credentialId: undefined },
+          signal,
+          MANAGED_MODELS.triage,
         )
+        fellBack = { from: config.provider, code: err.code }
       } else throw err
     }
   } catch (err) {
@@ -404,11 +414,11 @@ export async function runTicketTriage(deps: TicketTriageDeps, payload: TicketTri
     return
   }
   const verdict: TriageVerdict = call.verdict
-  // A BYOK call's cache writes are billed at the 5-minute rate (`createByokProvider` meters at
-  // `'5m'` too); the managed path writes its static prefix on the 1-hour breakpoint.
+  // Priced at the TTL of the wrapper that actually SERVED the call: `createByokProvider` meters at
+  // `'5m'`, the managed stack (and therefore any fallback) at `'1h'`.
   const pricing = findPricing(call.result.model)
   if (!pricing) deps.logger.warn({ runId, provider: config.provider, model: call.result.model }, 'ticket.triage: no pricing for model; cost recorded as 0')
-  usage.add(call.result.usage, pricing ? computeCostMicros(call.result.usage, pricing, config.mode === 'byok' ? '5m' : '1h') : 0)
+  usage.add(call.result.usage, pricing ? computeCostMicros(call.result.usage, pricing, cacheTtlFor(fellBack ? 'managed' : config.mode)) : 0)
 
   // Rule 6: apply the verdict under the pinned precedence, in one final guarded tx.
   const outcome = computeOutcome(verdict)
@@ -434,6 +444,16 @@ export async function runTicketTriage(deps: TicketTriageDeps, payload: TicketTri
     if (outcome.status === 'needs_owner') patch.escalationNotifiedAt = null
 
     const written = await guardedWrite(tx, ticketId, ticket.status, patch)
+    // A fallback has to leave a trace, or the run row claims a verdict the tenant's model never
+    // produced: one `call` event saying what failed, and the run's provider/model restamped to the
+    // pair that actually answered. Guarded on `running` so a swept run is left alone.
+    if (fellBack) {
+      await appendRunEvent(tx, runId, 'call', { attempt: 1, fallback: true, from: fellBack.from, code: fellBack.code })
+      await tx
+        .update(agentRuns)
+        .set({ provider: 'anthropic', model: MANAGED_MODELS.triage })
+        .where(and(eq(agentRuns.id, runId), eq(agentRuns.status, 'running')))
+    }
     // Settled unconditionally, and AFTER the ticket (see the failure branch's note): the call
     // happened and cost money whether or not a concurrent owner won the guarded write above.
     await settleRun(tx, runId, 'succeeded', usage, deps, { output: { outcome: outcome.status, categoryKey: verdict.categoryKey } })
