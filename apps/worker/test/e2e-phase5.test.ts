@@ -58,9 +58,9 @@ import pino from 'pino'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import type { DraftDecision } from '@aesa/agent'
 import { createApiFacade, createEnqueue } from '@aesa/api/deps'
-import { approveDraft, holdDraft, markViewed, rejectDraft, type DraftActor, type DraftServiceDeps } from '@aesa/api/drafts'
+import { approveDraft, flagAutoSent, holdDraft, markViewed, rejectDraft, type DraftActor, type DraftServiceDeps } from '@aesa/api/drafts'
 import { confirmCandidate, deleteByCustomer, type MemoryActor, type MemoryServiceDeps } from '@aesa/api/memory'
-import { INVARIANTS } from '@aesa/core'
+import { INVARIANTS, MEMORY_EXPIRY_DAYS } from '@aesa/core'
 import { encrypt, hashToken, loadKekRing, Secret, type KekRing } from '@aesa/crypto'
 import {
   agentCategoryPolicies, agents, auditLog, categories, countHumanDecisions, createMeterSink, drafts,
@@ -590,6 +590,26 @@ describe('Phase 5 close-out E2E (real pg-boss autonomy + learning jobs, the real
         .where(and(eq(agentCategoryPolicies.agentId, org.agentId), eq(agentCategoryPolicies.categoryId, org.categoryId))))
   }
 
+  /**
+   * ONE active answer, written in exactly the shape `memory.capture` writes it — the same embedder,
+   * the same `embedding_model` (the answers leg filters on it), three approvals, a year's life.
+   * Scenario 1 is what proves that write end to end; scenario 9 only needs the answer to EXIST, so
+   * seeding it costs two rounds there instead of five.
+   */
+  async function seedActiveAnswer(org: Org): Promise<string> {
+    const { vectors } = await embedder.embed([QUESTION], 'document')
+    return withOrg(app.db, org.orgId, async (tx) => {
+      const [row] = await tx.insert(resolvedAnswers).values({
+        orgId: org.orgId, agentId: org.agentId, categoryId: org.categoryId,
+        questionText: QUESTION, answerBody: CLEAN_BODY,
+        questionEmbedding: vectors[0]!, embeddingModel: embedder.model, embeddingVersion: embedder.version,
+        status: 'active', approvals: 3, lastApprovedAt: new Date(),
+        expiresAt: new Date(Date.now() + MEMORY_EXPIRY_DAYS * 86_400_000),
+      }).returning({ id: resolvedAnswers.id })
+      return row!.id
+    })
+  }
+
   /** The knowledge block of the draft call at `index`, as the model saw it. */
   function knowledgeBlockOf(index: number): string {
     const call = fake.callsFor('draft')[index]!
@@ -1000,5 +1020,96 @@ describe('Phase 5 close-out E2E (real pg-boss autonomy + learning jobs, the real
     expect(meters[SEND_METERS.reviewSends]).toBe(3)
     expect(meters[SEND_METERS.autoSends]).toBe(1)
     expect(pushCalls.length).toBeGreaterThan(0)
+  }, 240_000)
+
+  // ---- 9: two flags in 30 days demote the category ---------------------------
+
+  it('9. two "should not have sent" flags inside 30 days take the category off Autopilot — mode review, demoted_reason flags, ONE demotion notification — and each flag retires the candidate its own auto-send produced while the answer both leant on is struck twice and retired', async () => {
+    // A FRESH workspace, deliberately. `evaluateDemotion` answers in the spec's order and tries
+    // rejections FIRST, and the org above already carries scenario 6's two of them inside the
+    // 7-day window: there, any number of flags would still demote as `rejections` and the rule
+    // under test would never be the one that fired.
+    const flagged = await createOrg()
+
+    // One plain round: it proves the fresh workspace really drafts, and gives the seeded human
+    // decisions a ticket of their own to hang on (`sent` is outside the one-live-draft partial
+    // unique, so one ticket may carry any number of them).
+    scriptDraft({ parsed: reply() })
+    const seedRound = await inboundToDraft(flagged, { from: `customer-seed-${rand()}@${CUSTOMER_DOMAIN}`, subject: QUESTION })
+    expect(seedRound.status).toBe('pending')
+    await seedHumanDecisions(flagged, seedRound.ticketId, 10)
+    expect(await withOrg(app.db, flagged.orgId, (tx) => countHumanDecisions(tx, flagged.agentId, flagged.categoryId))).toBe(10)
+
+    const seededAnswerId = await seedActiveAnswer(flagged)
+    await setPolicy(flagged, { mode: 'auto', autoSendMinConfidence: 80, graduatedAt: new Date() })
+
+    // Two auto-sends, the scenario-2 path twice: memory 1.0 (three approvals, cosine ≈ 1) × the
+    // model's 0.9 clears the 80% bar, so each lands `approved`/`auto` and goes out.
+    const autoDraftIds: string[] = []
+    for (const round of [1, 2] as const) {
+      scriptDraft({ parsed: reply({ usedAnswerIds: [`${USE}${ANSWER_NEEDLE}`] }) })
+      const draft = await inboundToDraft(flagged, {
+        from: `customer-flag-${round}-${rand()}@${CUSTOMER_DOMAIN}`, subject: `${QUESTION} (flag ${round})`,
+      })
+      // The AGENT decided this one, and the marks that say so are durable. `status` deliberately is
+      // NOT asserted here: this scenario does not gate the `enqueueSend` seam, so the row may
+      // already have run `approved → sending → sent` by the time this read lands — the auto
+      // LANDING's exact shape is scenario 2's subject, asserted there under the gate.
+      expect(draft.decisionSource).toBe('auto')
+      expect(draft.decidedBy).toBeNull()
+      expect(draft.autoDecidedAt).not.toBeNull()
+      expect(draft.usedAnswerIds).toEqual([seededAnswerId])
+      await waitFor(async () => {
+        expect((await sendFor(flagged, draft.id)).status).toBe('sent')
+      })
+      expect((await getDraft(flagged, draft.id)).status).toBe('sent')
+      // The candidate its own delivery produced has to exist before the flag, or the retire below
+      // would be asserting about a row `memory.capture` had not written yet.
+      await waitFor(async () => {
+        expect((await answersFor(flagged)).some((a) => a.sourceDraftId === draft.id)).toBe(true)
+      })
+      autoDraftIds.push(draft.id)
+    }
+    expect((await metersFor(flagged))[SEND_METERS.autoSends]).toBe(2)
+
+    // --- flag one: a strike and a retired candidate, but one flag is not a pattern.
+    expect(await flagAutoSent(service, flagged.orgId, autoDraftIds[0]!, actorFor(flagged))).toEqual({ ok: true })
+    expect((await policyFor(flagged)).mode).toBe('auto')
+    expect((await notificationsFor(flagged)).filter((n) => n.kind === 'demotion')).toHaveLength(0)
+    expect((await getDraft(flagged, autoDraftIds[0]!)).flaggedAt).not.toBeNull()
+    const onceStruck = await getAnswer(flagged, seededAnswerId)
+    expect(onceStruck.strikes).toBe(1)
+    expect(onceStruck.status).toBe('active')
+    const firstCandidate = (await answersFor(flagged)).find((a) => a.sourceDraftId === autoDraftIds[0])!
+    expect(firstCandidate.status).toBe('retired')
+    expect(firstCandidate.retiredReason).toBe('sampled_bad')
+
+    // --- flag two: the category comes off Autopilot INLINE, in the flagging transaction.
+    expect(await flagAutoSent(service, flagged.orgId, autoDraftIds[1]!, actorFor(flagged))).toEqual({ ok: true })
+    const policy = await policyFor(flagged)
+    expect(policy.mode).toBe('review')
+    expect(policy.demotedReason).toBe('flags')
+    expect(policy.demotedAt).not.toBeNull()
+    const demotions = (await notificationsFor(flagged)).filter((n) => n.kind === 'demotion')
+    expect(demotions).toHaveLength(1)
+    expect(demotions[0]!.title).toMatch(/^Autopilot paused for /)
+    expect(demotions[0]!.body).toContain('Two auto-sent replies were flagged')
+    expect(await auditRowsFor(flagged, flagged.agentId, 'autonomy.demoted')).toHaveLength(1)
+    expect(await auditRowsFor(flagged, autoDraftIds[1]!, 'draft.flagged')).toHaveLength(1)
+
+    // Two strikes is the retirement ceiling: the answer both replies leant on is gone…
+    const twiceStruck = await getAnswer(flagged, seededAnswerId)
+    expect(twiceStruck.strikes).toBe(2)
+    expect(twiceStruck.status).toBe('retired')
+    expect(twiceStruck.retiredReason).toBe('strikes')
+    // …and so is the candidate the second auto-send produced.
+    const secondCandidate = (await answersFor(flagged)).find((a) => a.sourceDraftId === autoDraftIds[1])!
+    expect(secondCandidate.status).toBe('retired')
+    expect(secondCandidate.retiredReason).toBe('sampled_bad')
+
+    // `flagged_at` is set once: the same reply cannot be flagged into a second demotion signal.
+    expect(await flagAutoSent(service, flagged.orgId, autoDraftIds[1]!, actorFor(flagged)))
+      .toEqual({ ok: false, code: 'not_flaggable' })
+    expect((await notificationsFor(flagged)).filter((n) => n.kind === 'demotion')).toHaveLength(1)
   }, 240_000)
 })
