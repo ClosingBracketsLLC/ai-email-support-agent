@@ -2,11 +2,10 @@
 
 Updated 2026-09-11. The spec (`docs/superpowers/specs/2026-09-07-ai-email-support-agent-design.md`)
 defines Phase 0 (rails and tenancy) plus seven build phases, Phases 1–7; this file records where the
-build stands against them. As of 2026-09-11: Phases 0–4 and the brand are on `main` (Phase 4 via PR #5,
-merge commit `ef81169`); Phase 5 (autonomy and learning) is complete on branch `phase-5` and lands on
-`main` through a GitHub PR on Robert's go-ahead; Phases 6 (provider choice / BYOK) and 7 (billing,
-caps, launch hardening) remain, each starting at `superpowers:writing-plans` from the spec's *Build
-phases* paragraph for that phase.
+build stands against them. As of 2026-09-11: Phases 0–5 and the brand are on `main` (Phase 4 via PR #5,
+merge commit `ef81169`; Phase 5 via PR #6, merge commit `99a852d`); Phases 6 (provider choice / BYOK)
+and 7 (billing, caps, launch hardening) remain, each starting at `superpowers:writing-plans` from the
+spec's *Build phases* paragraph for that phase.
 
 ## Done
 
@@ -1178,16 +1177,17 @@ the record)</summary>
     static routes**; the Playwright signup smoke passes. The `e2e-phase3` case-10 timing flake did
     not fire.
 
-### Phase 5 — autonomy and learning (complete on branch `phase-5`; PR not yet opened)
+### Phase 5 — autonomy and learning (complete; merged into `main` via PR #6 on 2026-09-11, merge commit `99a852d`)
 
 - Review: `docs/superpowers/reviews/2026-09-11-phase-5-final-review.md` — the whole-branch review
   (0 Critical, 6 Important, one fix wave `03d2d2a` + `add8ad3`, the scoped re-review clean), the
   parked residuals with their rulings, and what the review verified holds.
 - Plan: `docs/superpowers/plans/2026-09-11-phase-5-autonomy-and-learning.md` (11 tasks, executed with
-  subagent-driven development). Commits **`ef81169..HEAD`** on `phase-5`, branched from `main` at
-  `ef81169` — the plan commit, a carry-over task, nine implementation tasks with their per-task fix
-  commits, and the Task 11 close-out (the E2E, the external-setup runbook and the docs). The per-task
-  list, newest last:
+  subagent-driven development). Commits **`93bc1d0..fb95d3b`** (22) on `phase-5`, branched from
+  `main` at `ef81169` and merged as `99a852d` — the plan commit, a carry-over task, nine
+  implementation tasks with their per-task fix commits, the Task 11 close-out (the E2E, the
+  external-setup runbook and the docs), the whole-branch fix wave and its docs, the folded-in Phase 4
+  hand-off correction, and the review record. The per-task list, newest last:
   `93bc1d0` plan · `ea7c4cc` T1 carries (the inbox keyset cursor as a row comparison; Gmail's
   `Authentication-Results` trusted only with its own authserv-id) · `8e0da6b` T2 contracts+core
   (autonomy/memory vocabulary, the evidence maths, three new `decide()` blockers) ·
@@ -1497,13 +1497,19 @@ the record)</summary>
 
 ## Next: Phase 6 — provider choice
 
-**Where to start.** `phase-5` is complete on its branch and lands on `main` through a GitHub PR with
-a merge commit on Robert's go-ahead (the standing flow from his 2026-09-09 instruction). It was
-branched from `main` at `ef81169`, which is PR #5's merge commit, so `phase-4` is already on `main`.
-Once this one is merged, check out `main`, pull, and branch `phase-6` off it. Start with
-`superpowers:writing-plans` against the spec's *Build phases → Phase 6*. Run the local setup from
-`CLAUDE.md` — including `pnpm db:up && pnpm s3:init` and the `S3_*` exports, so the minio-gated
-storage suite actually runs — and confirm the 2,355-test baseline above before writing the plan. A
+**Where to start.** Phase 5 is on `main` (PR #6, merged 2026-09-11 with merge commit `99a852d`, the
+standing flow from Robert's 2026-09-09 instruction); `main` now carries Phases 0–5 and the brand.
+Check out `main`, pull, and branch `phase-6` off it. Start with `superpowers:writing-plans` against
+the spec's *Build phases → Phase 6* (and the seams listed under **The hand-off** below). Run the
+local setup from `CLAUDE.md` — including `pnpm db:up && pnpm s3:init` and the `S3_*` exports, so the
+minio-gated storage suite actually runs; a dev Postgres created before Phase 5 needs
+`DATABASE_URL=postgres://aesa:aesa@localhost:5434/aesa_dev pnpm --filter @aesa/db migrate` once for
+migrations 0016–0017 before `pnpm e2e` — and confirm the baseline (2,364 tests + 4 conditional
+test-kit skips with `S3_*` exported, 24 web routes, `db:check` clean, the Playwright smoke) before
+writing the plan. Two lessons from Phase 5's plan for the next `writing-plans`: walk any recipe that
+recomputes a table against one worked example (the rollup's instant cutoff and the scrub's sign-off
+window were both plan-level arithmetic defects caught only in review or by the E2E), and give the
+close-out task the whole-branch review record in `docs/superpowers/reviews/` explicitly. A
 dev Postgres volume created before Phase 4 still needs `pnpm db:down && pnpm db:up` once to pick up
 pgvector, and in production the `vector` extension must be installed by a superuser before Phase 4's
 migrations run (`docs/runbooks/2026-09-phase-4-external-setup.md`).
