@@ -15,18 +15,18 @@
  * `knowledge,agent` replica this call passes `warnOnFallback: false` and the dev fallback is
  * announced once, by the `knowledge` role. The optional reranker rides along under `KNOWLEDGE_RERANK=on`.
  *
- * ONE provider is built for the whole role and handed to every job that calls a model:
- * `createManagedProvider` wraps the raw Anthropic adapter in metering (every rung of the
- * structured-output ladder becomes its own `llm_calls` row), the shared per-model concurrency pool,
- * and the ladder itself. Triage's calls are therefore metered too now — a deliberate change from
- * Phase 2's bare adapter; triage keeps its own `usage_counters` spend guard on top, same as
- * `guidance.suggest`'s own `guidance.daily_suggest_cap` gate.
+ * ONE managed provider is built for the whole role: `createManagedProvider` wraps the raw Anthropic
+ * adapter in metering (every rung of the structured-output ladder becomes its own `llm_calls` row),
+ * the shared per-model concurrency pool, and the ladder itself. Triage's calls are therefore metered
+ * too now — a deliberate change from Phase 2's bare adapter; triage keeps its own `usage_counters`
+ * spend guard on top, same as `guidance.suggest`'s own `guidance.daily_suggest_cap` gate.
  *
- * ONE provider RESOLVER as well (Phase 6): `createProviderResolver` is what turns an agent's model
- * choice into a provider — the managed one above, or the tenant's own key opened under their DEK.
- * It caches a decrypted key per credential and keys that credential's rate budget, so a second
- * instance on the same replica would be a second copy of both; `llm.probe` is handed THIS one
- * precisely so the cache it invalidates is the cache every draft on this replica reads.
+ * No job receives that provider directly any more (Phase 6). They receive ONE provider RESOLVER:
+ * `createProviderResolver` is what turns an agent's model choice into a provider — the managed one
+ * above, or the tenant's own key opened under their DEK. It caches a decrypted key per credential
+ * and keys that credential's rate budget, so a second instance on the same replica would be a second
+ * copy of both; `llm.probe` is handed THIS one precisely so the cache it invalidates is the cache
+ * every draft on this replica reads.
  */
 import { createManagedProvider, type ModelPricing } from '@aesa/llm'
 import type PgBoss from 'pg-boss'
@@ -79,21 +79,18 @@ const DEFAULT_REGISTRARS: AgentRoleRegistrars = {
 }
 
 /**
- * Registers `ticket.triage`, `ticket.draft`, `agent.sandbox`, `memory.capture`, `guidance.suggest`
- * and `llm.probe` when `WORKER_ROLES` includes `agent`. Two INDEPENDENT gates decide which of them
- * actually register, because the two keys buy different things:
+ * Registers all six jobs when `WORKER_ROLES` includes `agent`. Two INDEPENDENT gates decide what
+ * each of the two keys buys — and neither of them SKIPS a job any more (Phase 6):
  *
- *  - `ANTHROPIC_API_KEY` (the platform's managed key) gates the FIVE model-calling jobs. Missing in
- *    production is a hard refusal — a replica with no model access would sit there looking healthy
- *    while silently never drafting. Outside production it is one warning and `managed = null`: the
- *    resolver still answers BYOK configs and simply refuses managed ones with `no_managed_key`.
+ *  - `ANTHROPIC_API_KEY` (the platform's managed key) is what Managed AI runs on. Missing in
+ *    production is still a hard refusal: a replica with no model access would sit there looking
+ *    healthy while silently never drafting for the tenants that chose Managed AI. Outside production
+ *    it is ONE warning and `managed = null`, and every job still registers — the resolver answers a
+ *    BYOK agent normally and refuses a managed one with `no_managed_key`, which each job lands as
+ *    `provider_unavailable`. A dev box with only a tenant key is therefore fully functional.
  *  - The KEK ring gates `llm.probe` alone, which opens a tenant's key under the org DEK and needs no
  *    managed provider at all — so a dev box with a ring and no Anthropic key still adds, probes and
  *    re-wraps BYOK credentials.
- *
- * The five jobs are skipped rather than registered on a null provider only because they still carry
- * the transitional `deps.provider: LlmProvider`; Task 6 drops it and registers them unconditionally
- * on the resolver.
  */
 export async function maybeRegisterAgentRole(deps: AgentRoleDeps, register: AgentRoleRegistrars = DEFAULT_REGISTRARS): Promise<void> {
   if (!deps.config.roles.has('agent')) return
@@ -130,8 +127,7 @@ export async function maybeRegisterAgentRole(deps: AgentRoleDeps, register: Agen
   }
 
   if (!provider) {
-    deps.logger.warn('ANTHROPIC_API_KEY missing; skipping ticket.triage/ticket.draft/agent.sandbox/memory.capture/guidance.suggest registration')
-    return
+    deps.logger.warn('ANTHROPIC_API_KEY missing: Managed AI is unavailable on this replica; an agent configured for it lands provider_unavailable (BYOK agents are unaffected)')
   }
 
   // Built ONCE, shared by the retriever AND `memory.capture`: two instances would be two per-model
@@ -142,13 +138,13 @@ export async function maybeRegisterAgentRole(deps: AgentRoleDeps, register: Agen
     db: deps.db, embedder, reranker: createKnowledgeReranker(deps.config), logger: deps.logger,
   })
   await register.registerTriage(deps.boss, {
-    db: deps.db, provider, providers, logger: deps.logger, enqueueNotify: deps.enqueueNotify, enqueueDraft: deps.enqueueDraft,
+    db: deps.db, providers, logger: deps.logger, enqueueNotify: deps.enqueueNotify, enqueueDraft: deps.enqueueDraft,
   })
   await register.registerDraft(deps.boss, {
-    db: deps.db, provider, providers, retriever, logger: deps.logger,
+    db: deps.db, providers, retriever, logger: deps.logger,
     enqueueNotify: deps.enqueueNotify, enqueueDraft: deps.enqueueDraft, enqueueSend: deps.enqueueSend,
   })
-  await register.registerSandbox(deps.boss, { db: deps.db, provider, providers, retriever, logger: deps.logger })
+  await register.registerSandbox(deps.boss, { db: deps.db, providers, retriever, logger: deps.logger })
   await register.registerMemoryCapture(deps.boss, { db: deps.db, embedder, logger: deps.logger })
-  await register.registerGuidanceSuggest(deps.boss, { db: deps.db, provider, providers, logger: deps.logger })
+  await register.registerGuidanceSuggest(deps.boss, { db: deps.db, providers, logger: deps.logger })
 }

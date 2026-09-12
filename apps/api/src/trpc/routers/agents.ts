@@ -8,13 +8,13 @@
 import { TRPCError } from '@trpc/server'
 import { and, asc, count, eq, gte, isNotNull, sql, sum } from 'drizzle-orm'
 import {
-  AgentIdInput, DEFAULT_AUTO_SEND_THRESHOLD, DRAFT_MODEL_ID, SandboxOutputView, SandboxRunInput, SandboxStartInput,
+  AgentIdInput, DEFAULT_AUTO_SEND_THRESHOLD, SandboxOutputView, SandboxRunInput, SandboxStartInput,
   SetCategoryPolicyInput, UpdateAgentInput,
 } from '@aesa/contracts'
 import { COLD_START_DECISIONS, resolveSetting } from '@aesa/core'
 import {
   agentCategoryPolicies, agentRuns, agents, audit, bumpMeter, categories, countHumanDecisions, drafts, mailboxConnections,
-  categoryStatsDaily, SANDBOX_METERS, usageCounters,
+  categoryStatsDaily, resolveModelConfig, SANDBOX_METERS, usageCounters,
 } from '@aesa/db'
 import { JOB_NAMES } from '@aesa/queue'
 import { loadOrgSettings } from '../../org-settings.ts'
@@ -292,8 +292,12 @@ export const agentsRouter = router({
         throw new TRPCError({ code: 'TOO_MANY_REQUESTS', message: 'sandbox.daily_cap reached for today' })
       }
 
+      // Phase 6: the agent's own choice, through the SAME reader the worker resolves with. The job
+      // re-resolves and restamps these before it calls — an owner can change the model between the
+      // click and the run — but the row must never claim Managed AI for a BYOK agent even for a moment.
+      const cfg = await resolveModelConfig(tx, input.agentId, 'draft')
       const [run] = await tx.insert(agentRuns).values({
-        orgId: ctx.orgId, kind: 'sandbox', agentId: input.agentId, provider: 'anthropic', model: DRAFT_MODEL_ID,
+        orgId: ctx.orgId, kind: 'sandbox', agentId: input.agentId, provider: cfg.provider, model: cfg.model,
         status: 'running', input: { subject: input.subject, question: input.question },
       }).returning({ id: agentRuns.id })
 

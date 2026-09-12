@@ -79,23 +79,26 @@ describe('maybeRegisterAgentRole', () => {
     expect(registered).toBe(false)
   })
 
-  it('logs a warning and skips registration in development when ANTHROPIC_API_KEY is missing (and there is no ring either)', async () => {
+  it('in development with NEITHER key nor ring: the five model jobs still register, llm.probe does not, and both sentences are logged once', async () => {
     const { logger, lines } = testLogger()
-    let registered = false
+    let registered = 0
     await maybeRegisterAgentRole(
       { boss: fakeBoss, db: fakeDb, logger, config: baseConfig({ env: 'development' }), enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {} },
-      spyRegistrars(() => { registered = true }),
+      spyRegistrars(() => { registered += 1 }),
     )
-    expect(registered).toBe(false)
-    // Two independent gates, two sentences: no ring (so no llm.probe) and no key (so no model jobs).
+    // Phase 6: a null managed provider is a real state the RESOLVER handles (`no_managed_key` →
+    // `provider_unavailable`), not a reason to leave queues unconsumed.
+    expect(registered).toBe(5)
+    // Two independent gates, two sentences: no ring (so no llm.probe) and no key (so no Managed AI).
     const msgs = lines.map((l) => JSON.parse(l).msg as string)
     expect(msgs.filter((m) => m.includes('ANTHROPIC_API_KEY'))).toHaveLength(1)
+    expect(msgs.filter((m) => m.includes('Managed AI is unavailable'))).toHaveLength(1)
     expect(msgs.filter((m) => m.includes('BYOK disabled'))).toHaveLength(1)
   })
 
-  /** The gate the two keys buy different things: `llm.probe` only ever calls the TENANT's endpoint,
-   *  so a dev box with a ring and no Anthropic key must still be able to add and probe a BYOK key. */
-  it('no ANTHROPIC_API_KEY but a ring, in dev: llm.probe registers, the five model jobs do not, one warn', async () => {
+  /** The two keys buy different things: `llm.probe` only ever calls the TENANT's endpoint, so a dev
+   *  box with a ring and no Anthropic key is a fully working BYOK-only worker. */
+  it('no ANTHROPIC_API_KEY but a ring, in dev: ALL SIX register and the one warn says Managed AI is unavailable', async () => {
     const { logger, lines } = testLogger()
     let probeDeps: LlmProbeDeps | undefined
     let modelJobs = 0
@@ -111,23 +114,23 @@ describe('maybeRegisterAgentRole', () => {
       },
     )
     expect(probeDeps?.ring).toBe(ring)
-    expect(modelJobs).toBe(0)
+    expect(modelJobs).toBe(5)
     const msgs = lines.map((l) => JSON.parse(l).msg as string)
-    expect(msgs.filter((m) => m.includes('ANTHROPIC_API_KEY'))).toHaveLength(1)
+    expect(msgs.filter((m) => m.includes('Managed AI is unavailable'))).toHaveLength(1)
     expect(msgs.filter((m) => m.includes('BYOK disabled'))).toHaveLength(0)
   })
 
   it('same in test env — boots without the key rather than crashing', async () => {
     const { logger } = testLogger()
-    let registered = false
+    let registered = 0
     await maybeRegisterAgentRole(
       { boss: fakeBoss, db: fakeDb, logger, config: baseConfig({ env: 'test' }), enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {} },
-      spyRegistrars(() => { registered = true }),
+      spyRegistrars(() => { registered += 1 }),
     )
-    expect(registered).toBe(false)
+    expect(registered).toBe(5)
   })
 
-  it('registers ticket.triage, ticket.draft, agent.sandbox, memory.capture AND guidance.suggest on ONE managed provider once the key is present', async () => {
+  it('registers ticket.triage, ticket.draft, agent.sandbox, memory.capture AND guidance.suggest on ONE shared resolver once the key is present', async () => {
     const { logger } = testLogger()
     let triageDeps: TicketTriageDeps | undefined
     let draftDeps: TicketDraftDeps | undefined
@@ -159,12 +162,6 @@ describe('maybeRegisterAgentRole', () => {
     expect(sandboxDeps?.db).toBe(fakeDb)
     expect(memoryDeps?.db).toBe(fakeDb)
     expect(guidanceDeps?.db).toBe(fakeDb)
-    expect(triageDeps?.provider.kind).toBe('anthropic')
-    // ONE provider for the role: triage's, the sandbox's AND guidance.suggest's calls are metered
-    // through the same managed stack the draft job uses (deviation 8), not a second bare adapter.
-    expect(draftDeps?.provider).toBe(triageDeps?.provider)
-    expect(sandboxDeps?.provider).toBe(triageDeps?.provider)
-    expect(guidanceDeps?.provider).toBe(triageDeps?.provider)
     expect(draftDeps?.retriever).toBeDefined()
     expect(sandboxDeps?.retriever).toBeDefined()
     expect(triageDeps?.enqueueDraft).toBeDefined()
@@ -174,8 +171,9 @@ describe('maybeRegisterAgentRole', () => {
     // ONE embedder for the role: the retriever's answers leg and memory.capture's write must never
     // disagree about which model wrote a resolved_answers vector.
     expect(memoryDeps?.embedder).toBeDefined()
-    // Phase 6: ONE resolver too — a second would be a second per-credential cache and a second
-    // per-credential rate budget for the same tenant key.
+    // Phase 6: ONE resolver, and it is the ONLY model seam a job gets — triage's, the sandbox's AND
+    // guidance.suggest's calls all go through the same stack the draft job uses (deviation 8). A
+    // second resolver would be a second per-credential cache and a second per-credential rate budget.
     expect(triageDeps?.providers).toBeDefined()
     expect(draftDeps?.providers).toBe(triageDeps?.providers)
     expect(sandboxDeps?.providers).toBe(triageDeps?.providers)

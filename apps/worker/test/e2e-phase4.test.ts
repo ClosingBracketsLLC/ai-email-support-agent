@@ -334,12 +334,12 @@ describe('Phase 4 close-out E2E (real pg-boss knowledge jobs + the real api know
 
     await registerMailboxSync(boss, { db: app.db, ring, config: workerConfig(), limiter, logger, clientFactory })
     await registerTicketTriage(boss, {
-      db: app.db, provider, providers: staticResolver(provider), logger,
+      db: app.db, providers: staticResolver(provider), logger,
       enqueueNotify: async () => {},
       enqueueDraft: (orgId, ticketId) => enqueueTicketDraft(boss, orgId, ticketId),
     })
     await registerTicketDraft(boss, {
-      db: app.db, provider, providers: staticResolver(provider), retriever, logger,
+      db: app.db, providers: staticResolver(provider), retriever, logger,
       enqueueNotify: async () => {},
       enqueueDraft: (orgId, ticketId, opts) => enqueueTicketDraft(boss, orgId, ticketId, opts),
       // Phase 4's scenarios never reach the auto landing (every category is `review`).

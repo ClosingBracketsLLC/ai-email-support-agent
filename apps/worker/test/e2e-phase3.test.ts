@@ -222,19 +222,19 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
       db: app.db, ring, config: sendConfig(), limiter, logger, clientFactory,
     })
     await registerTicketTriage(boss, {
-      db: app.db, provider, providers: staticResolver(provider), logger,
+      db: app.db, providers: staticResolver(provider), logger,
       enqueueNotify: (orgId, notificationId) => enqueueNotifyDispatch(boss, orgId, notificationId),
       enqueueDraft: (orgId, ticketId) => enqueueTicketDraft(boss, orgId, ticketId),
     })
     await registerTicketDraft(boss, {
-      db: app.db, provider, providers: staticResolver(provider), retriever: emptyRetriever, logger,
+      db: app.db, providers: staticResolver(provider), retriever: emptyRetriever, logger,
       enqueueNotify: (orgId, notificationId) => enqueueNotifyDispatch(boss, orgId, notificationId),
       enqueueDraft: (orgId, ticketId, opts) => enqueueTicketDraft(boss, orgId, ticketId, opts),
       // Phase 3's scenarios never reach the auto landing (every category is `review`), so this seam
       // is only here to satisfy the deps contract — Phase 5's own E2E is what exercises it.
       enqueueSend: async () => {},
     })
-    await registerAgentSandbox(boss, { db: app.db, provider, providers: staticResolver(provider), retriever: emptyRetriever, logger })
+    await registerAgentSandbox(boss, { db: app.db, providers: staticResolver(provider), retriever: emptyRetriever, logger })
     await registerNotifyDispatch(boss, { db: app.db, push, logger })
     // The production role gate, with only the client/provider/clock seams swapped in through its
     // own `register` argument — `maybeRegisterSendRole`'s ring/OAuth checks still run for real.
@@ -375,8 +375,11 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
     const [row] = await withOrg(app.db, org.orgId, (tx) => tx.select().from(outboundSends).where(eq(outboundSends.draftId, draftId)))
     return row!
   }
+  /** DRAFT runs only. Phase 6 gave `ticket.triage` an `agent_runs` row of its own on the same
+   *  ticket, and every assertion in this Phase 3 file is about the drafting pipeline. */
   async function runsFor(org: Org, ticketId: string) {
-    return withOrg(app.db, org.orgId, (tx) => tx.select().from(agentRuns).where(eq(agentRuns.ticketId, ticketId)).orderBy(agentRuns.startedAt))
+    return withOrg(app.db, org.orgId, (tx) =>
+      tx.select().from(agentRuns).where(and(eq(agentRuns.ticketId, ticketId), eq(agentRuns.kind, 'draft'))).orderBy(agentRuns.startedAt))
   }
   async function messagesFor(org: Org, ticketId: string, direction?: 'inbound' | 'outbound') {
     return withOrg(app.db, org.orgId, (tx) =>

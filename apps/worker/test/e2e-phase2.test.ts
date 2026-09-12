@@ -119,7 +119,6 @@ describe('Phase 2 close-out E2E (real pg-boss)', () => {
 
     const triageDeps: TicketTriageDeps = {
       db: app.db,
-      provider: llmProvider,
       providers: staticResolver(llmProvider),
       logger: pino({ level: 'silent' }),
       enqueueNotify: (orgId, notificationId) => enqueueNotifyDispatch(boss, orgId, notificationId),
