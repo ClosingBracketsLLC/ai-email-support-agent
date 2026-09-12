@@ -1,11 +1,13 @@
 # Project status
 
-Updated 2026-09-11. The spec (`docs/superpowers/specs/2026-09-07-ai-email-support-agent-design.md`)
+Updated 2026-09-12. The spec (`docs/superpowers/specs/2026-09-07-ai-email-support-agent-design.md`)
 defines Phase 0 (rails and tenancy) plus seven build phases, Phases 1–7; this file records where the
-build stands against them. As of 2026-09-11: Phases 0–5 and the brand are on `main` (Phase 4 via PR #5,
-merge commit `ef81169`; Phase 5 via PR #6, merge commit `99a852d`); Phases 6 (provider choice / BYOK)
-and 7 (billing, caps, launch hardening) remain, each starting at `superpowers:writing-plans` from the
-spec's *Build phases* paragraph for that phase.
+build stands against them. As of 2026-09-12: Phases 0–5 and the brand are on `main` (Phase 4 via PR #5,
+merge commit `ef81169`; Phase 5 via PR #6, merge commit `99a852d`). **Phase 6 (provider choice / BYOK)
+is COMPLETE on branch `phase-6`** — gate green, whole-branch review done and its fix wave landed — and
+lands on `main` through a GitHub PR merged with a merge commit, on Robert's go-ahead. Only Phase 7
+(billing, caps, launch hardening) remains, starting at `superpowers:writing-plans` from the spec's
+*Build phases → Phase 7* paragraph.
 
 ## Done
 
@@ -1211,7 +1213,8 @@ the record)</summary>
   `apps/api` 285, `apps/worker` 501 [including the four E2E files], `apps/app` 421 jest across 56
   suites — no database); `db:check` reports no drift; the
   Expo web export produces **24 static routes** (up from 22 — `(app)/settings/autopilot` and
-  `(app)/settings/memory` are the two new route files); the Playwright signup smoke passed at the
+  `(app)/settings/memory` are the two new route files; **25 since Phase 6**, which is the current
+  baseline — this line records the Phase 5 gate); the Playwright signup smoke passed at the
   close-out commit and is untouched by the fix wave (still ending at the gated mailbox step, per
   Phase 2's Task 20 ruling — it runs against the SHARED dev database, so
   `DATABASE_URL=… pnpm --filter @aesa/db migrate` has to be run once after this phase's 0016/0017
@@ -1327,7 +1330,8 @@ the record)</summary>
   7. `drafts.edit_distance_ratio` is always a number on approve (0 or the levenshtein ratio), and
      rejected and auto drafts are excluded from the human-decision counters — so the rollup's `?? 0`
      cannot inflate graduation.
-  8. `expo export --platform web` prints **Static routes (24)**; `inbox.test.tsx`'s four `act()`
+  8. `expo export --platform web` prints **Static routes (24)** at this phase's close (Phase 6 took
+     it to 25); `inbox.test.tsx`'s four `act()`
      warnings are pre-existing on `main` (verified with `git stash -u`).
   Deviations the task reviews accepted: `MockMailbox`'s default `Authentication-Results` became
   `mx.google.com; dmarc=pass` (T1); the CHECK-violation assertion uses
@@ -1408,7 +1412,10 @@ the record)</summary>
       "N replies went out on their own in the last 24 hours.", counted in the same short read
       transaction as the digest's items and omitted at zero. It never decides whether a digest is
       sent — a workspace fully on Autopilot with nothing pending still gets no mail.
-- **Carries still open**, grouped:
+- **Carries still open** *as of Phase 5's close* — this list is a record of that moment, not the
+  current one. **The live list is the Phase 6 record's own "Carries still open" below**, which is this
+  list with what Phase 6 closed removed. Everything below that points at "Phase 6" has since been
+  either closed or re-pointed there. Grouped:
   - **From Phase 4, unchanged:** the stuck-source sweep (a `queued` crawl with no job, a `processing`
     source with unembedded chunks, an abandoned `queued` upload) → **Phase 7**; the source cap's
     read-then-insert race and two concurrent `startCrawl` calls for one new URL (both accepted and
@@ -1495,90 +1502,494 @@ the record)</summary>
     has no NaN guard; `autopilot.tsx` writes `AUTONOMY_THRESHOLD_PRESETS.balanced` where
     `DEFAULT_AUTO_SEND_THRESHOLD` would say why.
 
-## Next: Phase 6 — provider choice
+### Phase 6 — provider choice (BYOK) (complete on branch `phase-6`; PR pending Robert)
 
-**Where to start.** Phase 5 is on `main` (PR #6, merged 2026-09-11 with merge commit `99a852d`, the
-standing flow from Robert's 2026-09-09 instruction); `main` now carries Phases 0–5 and the brand.
-Check out `main`, pull, and branch `phase-6` off it. Start with `superpowers:writing-plans` against
-the spec's *Build phases → Phase 6* (and the seams listed under **The hand-off** below). Run the
-local setup from `CLAUDE.md` — including `pnpm db:up && pnpm s3:init` and the `S3_*` exports, so the
-minio-gated storage suite actually runs; a dev Postgres created before Phase 5 needs
+- Review: `docs/superpowers/reviews/2026-09-12-phase-6-final-review.md` — the whole-branch review
+  (four area reviewers, 0 Critical, 12 Important, one fix wave `f5df280`+`a079dde`+`7a3b77f`, the
+  scoped re-review clean with four Low residuals), the parked residuals with their rulings, and what
+  the review verified holds.
+- Plan: `docs/superpowers/plans/2026-09-12-phase-6-provider-choice.md` (11 tasks, executed with
+  subagent-driven development). Commits **`0449596..`** (43) on `phase-6`, branched from `main` at
+  `99a852d`, the last of them this close-out's docs commit — the Phase 5 hand-off cherry-pick, the
+  plan commit, ten implementation tasks with their
+  per-task fix rounds, the whole-branch fix wave, and the Task 11 close-out. The per-task list,
+  newest last:
+  `0449596` the Phase 5 hand-off cherry-pick · `266532f` plan ·
+  `41d78c1`+`985cadc`+`fd7bb6b` T1 the three Phase-4 carries (the crawl partial unique index 0018;
+  `QUEUE_OPTIONS` as the ONE source of queue options read by `defineJob` and both pre-create lists;
+  `registerJob`'s `DrizzleQueryError` scrub) ·
+  `7775535`+`3bb21e8` T2 contracts+core (the LLM vocabulary and provider catalog, quality tiers and
+  their caps, `provider_unavailable` / `provider_health` / `model_changed`) ·
+  `1fb72a6`+`797ef34` T3 the four tables (migrations 0019–0020), `resolveModelConfig`,
+  `loadModelPricing`, the BYOK cost meter ·
+  `5567762`+`15649a8`+`c5cf3a4`+`253488d`+`335c450` T4 `createPinnedFetch`, the port's `listModels`
+  and `'plain'` rung, the OpenAI-compatible adapter, `probeProvider` / `createByokProvider`, the
+  two-adapter contract suite ·
+  `6e7db0e`+`9c98b39`+`8bb13b2`+`8bcfc45`+`b5bfaaf`+`0513b25` T5 `provider-resolver.ts`, the
+  `llm.probe` job and the `llm.reprobe-sweep` cron, the agent role's KEK gate, `provider_health`
+  push routing ·
+  `0321a79`+`543fc22`+`0db1dd3`+`509e16d`+`9b10465`+`29e1e2e` T6 the model in the prompt input,
+  `drafting/evidence.ts`, `ticket.draft` on the resolver (`provider_unavailable`,
+  `fallback_to_managed`, the tier-capped breakdown), the sandbox/triage/`guidance.suggest` on it,
+  `agent_runs.kind='triage'`, `memory.capture`'s embed metered and capped ·
+  `bb1b491`+`d147d1f` T7 graduation by quality tier and the `model_generation_at` window ·
+  `fae00ad`+`69bf221`+`e007d31`+`9c223e5` T8 the api's `llm` service and router, `agents.list`'s
+  Model line ·
+  `0870066`+`a7d54a8`+`6bb827f` T9 Settings → AI (**route 25**), the agent's Model card, the model
+  in the agent list row ·
+  `799cefa`+`30bc655`+`3018e71` T10 the Phase 6 E2E and the Phase 5 `flags` scenario, then the late
+  ruling that the probe may RAISE a preset ·
+  `f5df280`+`a079dde`+`7a3b77f` the FINAL FIX WAVE (the whole-branch review's twelve Important
+  findings, deduplicated to ten changes, plus two ledger minors) · `024ff65` the re-review's two
+  one-line Low residuals · the Task 11 close-out commit (this record, the runbook, CLAUDE.md, the
+  env examples, the plan's execution rulings, the review record). The per-task execution ledger was
+  an ephemeral SDD artifact; everything load-bearing from it is distilled below, and the git history
+  is the durable account.
+  Gate at the close-out commit (minio up, the dev `S3_*` exported so the storage suite runs):
+  typecheck and lint clean across all **15** packages/apps; `pnpm test` green with **2,599 tests**
+  plus 4 conditional skips (`@aesa/contracts` 36, `@aesa/crypto` 52, `@aesa/platform-mail` 19,
+  `brand` 110, `@aesa/core` 247, `@aesa/llm` 158, `@aesa/agent` 71, `@aesa/db` 95, `@aesa/queue` 23,
+  `@aesa/mail` 242, `@aesa/knowledge` 162, `@aesa/test-kit` 43 [39 run + 4 conditional skips],
+  `apps/api` 301, `apps/worker` 586 [including the five E2E files], `apps/app` 458 jest across 58
+  suites — no database); `db:check` reports no drift; the Expo web export produces **25 static
+  routes** (up from 24 — `(app)/settings/ai` is the one new route file); the Playwright signup smoke
+  passes (still ending at the gated mailbox step, per Phase 2's Task 20 ruling — it runs against the
+  SHARED dev database, so `DATABASE_URL=… pnpm --filter @aesa/db migrate` has to be run once after
+  this phase's 0018–0020 land or it fails). The pre-existing `e2e-phase3.test.ts` case-10 timing
+  flake did NOT fire in the close-out run.
+- What exists now:
+  - `packages/contracts` — `llm.ts`: `LLM_PROVIDERS` (anthropic, openai, deepseek, groq, together,
+    openrouter, custom) and `PROVIDER_PRESETS` (base URL, consent name, key hint, suggested models
+    with their tiers), `MANAGED_MODELS` — now the ONE source `DRAFT_MODEL_ID` aliases —
+    `QUALITY_TIERS` / `qualityTierFor` / `presetModel`, `AddCredentialInput` / `SetAgentModelInput` /
+    `CredentialIdInput`, `ProbeResult` / `ProbeResultView`, `LLM_MAX_CREDENTIALS` (5), and
+    `LLM_ERROR_MESSAGES` (the ONE source of Settings → AI's soft-refusal sentences, thrown by the
+    router and keyed on by both screens). Plus the new `provider_unavailable` needs-owner reason, the
+    `provider_health` notification kind and the `model_changed` demotion reason.
+  - `packages/core` — `quality.ts`: `QUALITY_CAPS` (calibrated 1.0 / standard 0.9 / limited 0.6),
+    `cappedModelConfidence`, `graduationRulesFor` (20 / 40 / never); `evaluateGraduation` takes an
+    optional rules override. `decide()` itself is untouched.
+  - `packages/crypto` — `createPinnedFetch`: a `fetch`-shaped transport an SDK accepts for its
+    `fetch` option, re-validating and re-resolving on EVERY call (so a rebinding hostname is refused
+    on the second request) and refusing a redirect rather than following it.
+  - `packages/queue` — `QUEUE_OPTIONS` / `queueOptionsFor` (`queue-options.ts`), the ONE source of
+    every queue's policy/retry/backoff/expiry, read by `defineJob` AND both pre-create lists;
+    `RegisteredJobDefinition` (so a hand-built definition without queue options is a compile error);
+    `scrubJobError`, keeping a `DrizzleQueryError`'s `query`/`params` out of `pgboss.job.output` for
+    every job at once.
+  - `packages/db` — `llm_credentials` (api-visible metadata: health, `key_fingerprint`,
+    `last_probe`, `consecutive_failures`, `last_error`), `llm_credential_secrets` (platform-role-only,
+    `REVOKE`d from `aesa_app` outright), `agent_model_config` (per agent × role, `NULLS NOT DISTINCT`
+    unique) and the platform table `model_pricing`; `resolveModelConfig` / `managedConfig` /
+    `ResolvedModelConfig` (`model-config.ts` — the ONE reader of an agent's model choice, api AND
+    worker), `loadModelPricing` (`pricing.ts`), `LLM_METERS.costMicrosByok`, `llm_calls`'s
+    `mode` / `credential_id` / `cost_unknown`, `DEMOTION_COPY.model_changed`,
+    `escalationCopy.provider_unavailable`. Migrations 0018–0020.
+  - `packages/llm` — a SECOND adapter (`adapters/openai-compatible/`: one dialect, six presets, a
+    per-model capability seed), the port's optional `listModels` and `ChatMeta.mode`/`.credentialId`,
+    the ladder's missing `'plain'` rung (the `'none'` capability, carried since Phase 3),
+    `core/shared.ts` as the ONE scrub/envelope implementation, `probeProvider` (models list, one tiny
+    chat, a structured probe driving the RAW adapter's rungs), `createByokProvider` + `withMeta`
+    (pinned fetch by default, the limiter keyed `byok:${orgId}:${credentialId}`), the BYOK pricing
+    rows, and `runProviderContract` on the `@aesa/llm/testing` sub-path run against BOTH adapters.
+    `openai@7.15.0`, pinned exactly, is the phase's one new runtime dependency.
+  - `packages/agent` — the MODEL moved out of the package: `DraftPromptInput.model` (and `effort`
+    widened to include `'low'`), `runGuidanceSuggestCall`'s `model` parameter, and
+    `runTriageCallDetailed` (+ `TriageCallResult`) so the worker can record which provider answered.
+  - `apps/worker` — `provider-resolver.ts`, the ONE way a worker gets a provider
+    (`createProviderResolver` with its freshness-keyed per-credential cache, `staticResolver` /
+    `staticRefusal`, `openCredentialKey`, `secretAad`, `markCredentialDead`, `FALLBACK_CODES`,
+    `cacheTtlFor`); the `llm.probe` job (store the sealed key, probe, land the verdict, re-wrap under
+    the org DEK) and the `llm.reprobe-sweep` cron (`15 */6 * * *`, `cron` role);
+    `provider-health-notify.ts`; `drafting/evidence.ts` as the ONE home of the evidence maths, where
+    the tier cap bites; `ticket.draft` / `ticket.triage` / `agent.sandbox` / `guidance.suggest` all on
+    the resolver, with `provider_unavailable` landings and the opt-in `fallback_to_managed`;
+    `ticket.triage` writing its own `agent_runs.kind = 'triage'` rows; `memory.capture`'s embed
+    metered on `KNOWLEDGE_METERS.embedTokens` and gated by `knowledge.daily_embed_tokens_cap`;
+    `stats.rollup` graduating by tier and windowing on `model_generation_at`; the KEK ring now gating
+    the `agent` role at boot.
+  - `apps/api` — an `llm` router over `src/llm/service.ts` (`@aesa/api/llm`): add a connection (seal
+    the pasted key, enqueue `llm.probe`), probe, remove, per-agent model get/set with the
+    `model_changed` demotion in the same transaction as the generation bump, and per-credential
+    30-day usage from `llm_calls`; a `model` line on `agents.list`; a `sandboxStart` that stamps the
+    agent's RESOLVED provider/model; Activity's cost tile carrying the BYOK half.
+  - `apps/app` — **Settings → AI** (route 25: Managed AI vs provider connections, add/probe/remove,
+    health chips, the models list and structured verdict, per-credential 30-day usage, the BYOK
+    consent sentence), the agent edit screen's **Model** card (provider, model, effort, fall back to
+    Managed AI, with the pre-save "this demotes your Autopilot categories" banner), the model each
+    agent runs on in the agent list row, and `provider_health` push routing to `/settings/ai`.
+- Deviations from the spec's Phase 6 list, as recorded in the plan (the spec wins on everything
+  else):
+  1. **`org_data_keys` is reused unchanged** (Phase 0): a BYOK key is sealed to the org's box public
+     key, rides the `llm.probe` payload and is re-wrapped under the org DEK by the worker — the exact
+     `mailbox.store-credentials` shape. The spec's `key_ciphertext`/`key_nonce`/`data_key_version`
+     collapse to `key_ciphertext` + `encryption` (`sealed`|`dek`) + `data_key_version`.
+  2. **`agent_model_config` is per agent × role (`draft`, `triage`) in v1.** `guidance_suggest`
+     follows the agent's `triage` row; `probe` has no config row. The `agent_id IS NULL`
+     workspace-default row the spec admits is allowed by the schema but written by no v1 surface.
+  3. **`model_generation` semantics.** Changing an agent's draft provider, model or mode bumps it,
+     stamps `model_generation_at`, demotes every `auto` category of that agent to `review` with the
+     reason `model_changed` and clears pending graduation suggestions, all in one transaction;
+     `stats.rollup` evaluates graduation only over decisions at or after `model_generation_at`.
+  4. **No `echo` tool probe** (tools are off in v1). The probe is: models list, one tiny chat, and a
+     2-field structured probe. *Amended during execution* — see ruling 16 below: the probe tries
+     `native` first for every non-Anthropic provider regardless of the preset, and the stored verdict
+     overrides in BOTH directions.
+  5. **`egress_allowlist[]` is cut.** A credential's `base_url` host IS its allowlist — validated at
+     write and pinned at every call. `transport` lands as a `text` column (`direct` only, CHECK) as
+     the spec's on-prem seam; no bridge, no `extra_headers`.
+  6. **Tier numbers and rules are fixed here** (the spec gives "capped at 0.6" and "scale with a
+     model-quality tier" without numbers): three tiers, caps 1.0 / 0.9 / 0.6, graduation
+     `minDecisions` 20 / 40 / never, all in `QUALITY_CAPS` and `graduationRulesFor`.
+  7. **Error policy, narrowed to what lands.** `auth` on a BYOK credential → `dead`, ONE
+     `provider_health` notification (day-deduped per credential), the ticket to `needs_owner` with
+     `provider_unavailable` and no retry. `rate_limit`/`transient` keep the existing job retry.
+     **`context_too_long`'s "halve retrieval, retry once" is NOT implemented** (carried).
+     `fallback_to_managed` is one managed retry on `auth`/`rate_limit`/`transient` when the flag is on
+     AND the replica has `ANTHROPIC_API_KEY`, metered as `mode = 'managed'`.
+  8. **Re-probe cadence is a `cron`-role cron** `llm.reprobe-sweep` every 6 hours for every credential
+     not `dead` and not probed in the last 6 hours; `degraded` after 2 consecutive failures, `dead`
+     only on `auth` (and sticky); a `dead` credential is re-probed only by the owner's Test connection.
+  9. **`model_pricing` is a platform table seeded by migration** (RLS_EXEMPT), loaded once at worker
+     boot, falling back to `PRICING_SEED` when empty. No admin UI; a price change is a migration.
+     BYOK cost lands in the separate meter `llm_cost_micros_byok`.
+  10. **Settings → AI is ONE new route** (24 → 25); the per-agent override is a Model card on the
+      existing agent edit screen, not a route. Onboarding is untouched.
+  11. **Local endpoints need https and a public address in v1** (non-standard ports allowed):
+      `http://localhost:11434` Ollama is unreachable until the spec's bridge lands, and Ollama/vLLM/
+      LM Studio are ONE catalog entry, `custom`, not three presets.
+  12. **OpenAI `json_schema` is sent non-strict** (strict mode would rewrite the draft schema's
+      optional fields); the ladder's lower rungs cover a non-strict miss. Recorded as the preset quirk
+      `strictJsonSchema: false`.
+  13. **Carries folded in.** T1: `QUEUE_OPTIONS`, the `registerJob`-level drizzle scrub, the crawl
+      partial unique index. T6/T7: `agent_runs.kind = 'triage'` rows, `memory.capture`'s embed metered
+      AND capped, the shared evidence helper. T10: the `flags` demotion E2E scenario.
+- Execution-time rulings recorded during the build, in order (one line each):
+  1. Task 4's probe test drives the RAW fake, not `withStructuredLadder` — the probe's contract is
+     "drive the raw adapter's rungs itself"; through the ladder it would test the ladder.
+  2. `push-routing.ts`'s `provider_health` entry is Task 5's edit and Task 9 asserts it, so one task
+     owns each file edit.
+  3. The brief's "label map" IS `REASON_CHIP` (1–2 word labels), so `'AI provider unavailable'` stays
+     there and `REASON_SENTENCE` gets a sentence in its siblings' voice.
+  4. Keep the `deepseek-chat`/`deepseek-reasoner` catalog ids and pricing rows for now — an unverified
+     web claim should not drive a mid-phase catalog churn; the probe on a real key shows the truth,
+     and the runbook (ruling 23) tells Robert to re-verify before DeepSeek is offered.
+  5. Task 4's shape ratified: `runProviderContract` on the `@aesa/llm/testing` sub-path (the root
+     would drag vitest into production graphs), `withCauseMessage` lifted to `core/shared.ts`, the
+     brief's non-existent "none makes zero calls" case replaced by `structured-none.test.ts`.
+  6. **`createByokProvider` must DEFAULT `fetchFn` to `createPinnedFetch`** — "SSRF at every call"
+     must not depend on every caller remembering to pass it.
+  7. Task 5's four-deps shape, `runLlmProbe`'s `'unknown'` fifth return and the `fetchFn?` seam stand:
+     `memory.capture` never chats, `'unknown'` is the honest health for a never-probed credential that
+     500s, and a fetch seam keeps the real composition under test.
+  8. Task 5's fix round promoted two minors: a re-wrap guarded on `encryption = 'sealed'` alone would
+     silently revert a key after a double rotation (correctness), and `JSON.parse` on decrypted
+     plaintext can echo the key into an unscrubbed error (secrets discipline).
+  9. `managed = anthropicApiKey ? createManagedProvider(...) : null`; when null (dev/test only —
+     production still throws) `llm.probe` IS still registered, while the five model-calling jobs keep
+     their transitional warn-and-skip until Task 6 puts them all on the resolver.
+  10. Task 6's fix round carried the fallback call's own idempotency key (it was colliding with the
+      primary's error row, so the fallback call was unmetered) plus per-attempt provenance, the triage
+      fallback's trace, the sandbox's effort, `cacheTtlFor`, `FALLBACK_CODES`' home and the run clock.
+  11. `confidence_breakdown.modelGeneration` identifies the **agent's** configured generation — a
+      fallback is an event inside it, recorded by `mode`/`provider`/`modelId`; the rollup's window keys
+      on `resolveModelConfig(...).modelGenerationAt`, which is authoritative.
+  12. The in-transaction `llm.probe` enqueue stands: pg-boss `send` is one INSERT on the boss pool, not
+      external network I/O, and it is the transaction's last statement — a throwing enqueue takes the
+      credential row with it, which is the property that matters.
+  13. `agentsUsing` = `countDistinct(agent_id)` — the plan's "config rows" wording was wrong; the
+      screen says "N agents" and `agentsReset` already counts agents.
+  14. Task 9's fix round took six UX/secrets items: the save that reverted itself, a 2-minute cap on
+      the probe wait with its own copy, an error state for the card, `gcTime: 0` on the add mutation, a
+      required-field hint for a custom connection, and a Cancel beside Confirm remove.
+  15. `probeTimedOut`'s banner may greet an owner whose connection sat `unknown` since before the
+      screen opened — kept: it is accurate and actionable.
+  16. **The spec wins over plan deviation 4.** `probeProvider` tries `native` first for every
+      non-Anthropic provider regardless of the preset, and `createByokProvider`'s override applies the
+      stored verdict to the OpenAI-compatible adapter in BOTH directions (`native` raises an unknown
+      model, `json_mode`/`none` narrow); the Anthropic adapter is never overridden and the quality tier
+      is untouched by it. The spec says `json_schema` is "treated as `json_mode` unless probe passes"
+      and that "presets are overridden by the stored probe result".
+  17. The whole-branch fix wave carries all twelve Important findings (deduplicated to ten changes)
+      plus two ledger minors, in one wave of three commits grouped by package.
+  18. Activity's headline cost = managed + BYOK, with the subtitle "$X of this on your own provider
+      keys" when BYOK spend is non-zero — the owner asks "what is this costing me" and the answer is
+      the total; the METER separation stays, because the managed daily cap must never charge a tenant's
+      own spend.
+  19. The ladder catches a `permanent` `LlmError` on the NATIVE rung only and falls through to
+      `json_mode`, so a probe verdict that is wrong for one model on a credential costs one call, never
+      a draft.
+  20. An `auth` failure on a BYOK primary ALWAYS marks the credential dead and pages once, whether or
+      not the fallback then lands the draft; only the ticket escalation is skipped when the fallback
+      succeeded.
+  21. `credential_dead` is refused only when a save SELECTS a *different* credential than the agent's
+      current one — re-saving the current (dead) credential to flip fallback or effort is allowed,
+      because that is the one remedy the product offers for a dead key.
+  22. No second fix wave: of the re-review's four Low residuals, `keyByCredential`'s LRU trim and
+      triage's docblock folded into Task 11's own commit; the rest are carried below.
+  23. The Phase 6 runbook names the DeepSeek model-id/pricing re-verification as its own line item
+      (D's condition on ruling 4).
+- The E2E: `apps/worker/test/e2e-phase6.test.ts`, **8 scenarios** against a real OpenAI-compatible
+  mock server, one throwaway database, the REAL api `llm` service, the REAL `llm.probe` job, the REAL
+  resolver and the REAL adapter — connect/probe (the models list, the structured verdict, the tier),
+  BYOK drafting end to end, the ladder landing on whatever rung the probe found and walking down as
+  the endpoint does (native → json_mode with no native attempt after a narrowing → `plain` → prose →
+  repair → extract → refusal), a dead key (credential `dead`, one `provider_health` page, the ticket
+  on `provider_unavailable`, and the NEXT inbound refused by the resolver before any run row or model
+  call), `fallback_to_managed`, the tier cap keeping a 0.9-grounding draft off Autopilot
+  (0.9 × 0.6 = 0.54 < Eager 0.70), hostile base URLs refused at write time with no row, no secret and
+  no request, and credential removal resetting its agents. `e2e-phase5.test.ts` gained scenario 9, the
+  **`flags`** demotion trigger the phase list had carried since Phase 5.
+- **Carries CLOSED by this phase:**
+  - **The three Phase 4 residuals that named Phase 5 and did not land** (Task 1): `QUEUE_OPTIONS` in
+    `@aesa/queue` is now the ONE source of queue options, read by `defineJob` and BOTH pre-create
+    lists, so a queue's policy can no longer depend on which process booted first; the
+    `registerJob`-level `DrizzleQueryError` scrub keeps every job's `query`/`params` out of
+    `pgboss.job.output`; and migration 0018's partial unique index
+    `(org_id, url) WHERE kind = 'crawl' AND status <> 'failed'` makes the source cap's
+    read-then-insert and `refreshCrawl`'s resurrect consistent (`startCrawl` catches the race).
+  - **`agent_runs.kind = 'triage'` rows** (deferred from Phase 3 to Phase 6): `ticket.triage` now
+    opens and settles its own run row, so the dashboards see triage as well as drafting.
+  - **`memory.capture`'s embed spend** (Phase 5 residual): metered on `KNOWLEDGE_METERS.embedTokens`
+    and gated by `knowledge.daily_embed_tokens_cap` like every other embed.
+  - **The shared evidence helper** (Phase 5 structural residual): `apps/worker/src/drafting/evidence.ts`
+    is now the ONE `computeEvidence`, imported by both `ticket.draft` and `agent.sandbox`, so sandbox
+    parity is structural — and it is where the quality-tier cap is applied, in one place.
+  - **The `flags` demotion E2E** (Phase 5 coverage gap): `e2e-phase5.test.ts` scenario 9.
+  - **The whole-branch final review's twelve Important findings**, all in the fix wave
+    (`f5df280` llm/crypto/queue, `a079dde` contracts/api/app, `7a3b77f` worker/db):
+    - **A probe-raised `native` rung that the endpoint rejects hard-failed the draft.** Rung 1 had no
+      `try`, so a server answering 400 to `json_schema` threw `permanent` — not retryable, not in
+      `FALLBACK_CODES` — and every draft and triage on that credential landed `agent_failed`. The
+      ladder now catches a `permanent` error on the NATIVE rung only and continues to `json_mode`.
+    - **The probe's one unscrubbed error path.** `new LlmError(String(err), …)` bypassed
+      `scrubSecrets` and that string is persisted into `llm_credentials.last_probe`, which the api
+      returns. Scrubbed.
+    - **`createPinnedFetch` dropped a non-string body silently** and still sent the request. It throws
+      `PinnedFetchError('unsupported_body')` now.
+    - **`ticket.triage` had no `auth` landing at all**: a rejected key parked the ticket as
+      `triage_failed`, never paged, and left the credential `healthy` until the 6-hourly sweep. It now
+      kills the credential, pages once and escalates `provider_unavailable` — **through
+      `escalateTicket`**, with the same reason-scoped dedupe key `ticket.draft` uses (the landing
+      writes no verdict columns, so the grandfathered carve-out does not apply and CLAUDE.md's
+      Escalation rule stays at three).
+    - **With `fallback_to_managed` on, an `auth` failure was swallowed** — the one configuration where
+      the symptom is invisible: the draft lands, and every later ticket costs a failed BYOK call plus
+      a full managed draft on the platform's allowance for up to six hours. The kill-and-page now runs
+      regardless of the fallback.
+    - **The provider cache had no freshness in its key and `invalidate` is process-local.** On the
+      shipped multi-replica topology the replica that probes is usually not the one that drafts. The
+      cache is keyed `${credentialId}:${lastProbedAt}` with a 15-minute ceiling, so any replica's
+      probe retires every replica's entry — which is what makes a future key-rotate surface safe.
+    - **The spec's BYOK stop-loss was unimplemented and unflagged.** `STOP_LOSS_BYOK_OUTPUT_TOKENS`
+      (30,000) sits beside the managed `$0.40`, which matters because a model with no `model_pricing`
+      row records cost 0 and makes the dollar stop-loss inert for exactly those models.
+    - **A first "Managed AI" save demoted every Autopilot category.** `changed` compared against
+      `!existing`, but an agent that has only ever run Managed AI HAS no config row — so a no-op save
+      bumped the generation, moved the graduation window and demoted everything with the (untrue)
+      reason "the agent's model was changed". It now compares against the RESOLVED current config.
+    - **A dead credential was refused for every BYOK save**, blocking the one remedy the product
+      offers (turning on Fall back to Managed AI on that very connection). Refused only when the save
+      selects a different credential.
+    - **Owner-facing copy was keyed on the api's exact English sentences** in three files with nothing
+      holding them together — and the app's tests mock tRPC, so a reword broke nothing in CI and
+      silently collapsed the SSRF refusal (the one message an owner can act on) to "try again".
+      `LLM_ERROR_MESSAGES` in `@aesa/contracts` is now the one source.
+    - **Activity read "$0.00" for a workspace spending real money on BYOK.** The headline sums both
+      meters with a BYOK subtitle; the meter separation (the cap rule) is untouched.
+    - Two ledger minors rode along: the missing `defineJob` `QUEUE_OPTIONS` unit tests, and the
+      pinned-fetch body throw above.
+  - **NOT closed: the `src/drafts/learning.ts` split.** Phase 5's review named it "Phase 6 cleanup";
+    Phase 6 did not do it. `apps/api/src/drafts/service.ts` is still one file, and
+    `apps/worker/src/jobs/ticket-draft.ts` joined it at ~1,021 lines. Both are carried below.
+- **Carries still open**, grouped:
+  - **From Phase 4, unchanged:** the stuck-source sweep (a `queued` crawl with no job, a `processing`
+    source with unembedded chunks, an abandoned `queued` upload) → **Phase 7**; the source cap's
+    read-then-insert race (the crawl half is closed by 0018; the cap itself is still cap ± 1); a crawl
+    does not resume, so a re-entry re-walks from the start URL.
+  - **Long-standing, unchanged:** the api's three in-memory rate limiters (per-replica since Phase 1);
+    `platform.access` audit retention → **Phase 7**; the Better Auth 1.7.3 ↔ `drizzle-orm` peer bump;
+    `packages/db/test/keys.test.ts`'s order-dependence; the `apps/app` accessibility minors including
+    the draft panel's "Blocked: …" lines rendering as plain `Text`; the three-pane review layout,
+    J/K navigation, multi-select and the stubbed-provider Playwright walk → **Phase 7**; the
+    `pg_try_advisory_lock` slot pool → **Phase 7**; the `workspaces.kill_switch` Settings toggle →
+    **Phase 7**; `notify.digest`'s email pass scanning every workspace on each 5-minute tick; the
+    org-cap arm of the backstop busy loop; emoji presentation flattening; `blocks.ts` still telling
+    the model bidi controls are "rejected"; a re-approve inside the undo window landing up to
+    ~2 minutes late; `sweeps.daily` holding write locks across every expiring draft for the whole
+    pass; the hand-authored cache-hit fixture; `sendFailureLabel`'s untested coupling to worker-owned
+    literals; and Phase 3's list of smaller review minors, unchanged.
+  - **Structure (named again, still open):** `apps/api/src/drafts/service.ts` is one file with
+    `src/drafts/learning.ts` the named split seam — ruled "Phase 6 cleanup" by Phase 5's review and
+    NOT done; `apps/worker/src/jobs/ticket-draft.ts` is ~1,021 lines and
+    `escalateProviderUnavailable`/`killCredential` belong in `drafting/outcomes.ts`;
+    `relativeTime` still exists in four app files and `lookup()` in two; `ticket.draft` still
+    re-implements `caps.ts`'s private `meterValue`.
+  - **From Phase 5, untouched by Phase 6:** `context_too_long`'s "halve retrieval, retry once" (also
+    Phase 6 deviation 7); the `KNOWLEDGE_EMBED_MODEL` re-embed job → **Phase 7**; the reinforce
+    UPDATE not re-guarded on `status = 'active'`; `memory.skipped` auditing `empty_after_scrub` even
+    when the embedder returned nothing; `sweeps.daily` arm (f) joining without an `org_id` predicate
+    and scanning unbounded; `stats.rollup` bumping counters and queuing notification ids before
+    `maybeNudge` in the same SAVEPOINT; `category_stats_daily`'s PK not leading with `org_id`;
+    `activity.summary` leaning on `edit_distance_ratio IS NULL` rather than `decision_source`;
+    `guidance.suggest` reading the platform killswitch but not the workspace's;
+    `SandboxOutputView.evidence` required, so a pre-Phase-5 stored output parses to null; the daily
+    auto-send cap reading the DELIVERED-count meter; `auto_sent_flagged` on `flagged_at` alone; the
+    `held` counter gated on `auto_decided_at`'s window; `ensureCustomerHashSalt` minting a salt with
+    no customer email; `memoryScore` flooring approvals; and the Phase 5 coverage gaps (the three new
+    `decide()` branches' precedence, `readDemotionSignals`'s `decisionWindowDays` boundary, the
+    graduation sample's ordering, the `&& !auto` reinforce gate, `guidance.suggest`'s two skips).
+    Its knowledge/mail minors are unchanged too: the scrub's sign-off window is the back HALF (with
+    the two further bounds the Phase 5 fix wave added); the keyset test spaces rows 100 µs apart so
+    the id-tiebreaker path itself is uncovered; the cursor predicate checks both halves though
+    `parseCursor` returns them together; the DMARC re-examination note sits on `parseAuthResults`'
+    JSDoc rather than the `DMARC_METHOD_RE` block; `MockMailbox`'s Gmail authserv-id default is inert
+    in graph mode. And the contracts/core/db ones: no test pins precedence among the three new
+    `decide()` branches themselves; `GUIDANCE_SUGGESTION_STATUSES` has no companion type alias;
+    `ticket.draft` re-implements `caps.ts`'s private `meterValue`; a stale "Guarded on
+    awaiting_review" comment in `send-execute.ts`; `sweeps.daily` expires a `held` draft without
+    escalating (arm (c) compensates on a delayed clock); the 8-blocker `it.each` asserts the reason
+    but not the matching `blockers.*` flag; two definitions of "edited" (`memory.capture` strikes
+    above ratio 0, `guidance.suggest` skips under 0.05); `rejectCandidate` returns ok for a candidate
+    retired mid-call; `retireAnswer`'s `returning({ status })` is unused.
+    The Phase 5 app-polish list is unchanged: no in-flight feedback on the mode/delay/auto-graduate
+    radios; the suggestion CTA not disabled under the cold-start lock; one screen-level error banner
+    for every category; "Deleted 1 answers"; the delete-by-customer armed state surviving a tab
+    switch; `formatCountdown` with no NaN guard; `autopilot.tsx` writing
+    `AUTONOMY_THRESHOLD_PRESETS.balanced` where `DEFAULT_AUTO_SEND_THRESHOLD` would say why.
+  - **Phase 6's own deferred minors**, one line per area. *queue/contracts/core:*
+    `define-job.test.ts`'s "registerJob scrubs" test calls `scrubJobError` directly, never the catch
+    wiring; `scrubJobError` replaces the whole error, so a failed job's output loses the stack and the
+    pg `constraint`/`table`; `err instanceof DrizzleQueryError` depends on one resolved copy of
+    `drizzle-orm` across the workspace; `SetAgentModelInput`'s byok + real-credentialId happy path is
+    untested; `ProbeResult.probedAt`/`error.code` are free strings rather than an ISO check and the
+    `LlmErrorCode` union; `QUALITY_CAPS[tier]` yields `NaN` for a tier value outside the union (the
+    tier arrives from a DB column — `?? QUALITY_CAPS.limited` would fail safe);
+    `DEMOTION_COPY.model_changed` and `REASON_TONE.provider_unavailable = 'danger'` are unreviewed
+    product copy. *crypto/llm:* `scrubSecrets`' unanchored `sk-` over-redacts ordinary words
+    ("risk-assessment"); `structured.ts` computes the JSON schema twice on the plain→repair path and
+    leaves zod's `$schema` key in the prompt; `openai-compatible/index.ts`'s `if (refusal)` treats an
+    empty-string refusal as absent; `probe.ts` reports chat ok on a refusal or an empty reply;
+    `registry.ts`'s `preset.structuredOutput === 'none'` arm is unreachable; the shared contract suite
+    only ever exercises the `json_mode` rung and never `listModels`; the OpenAI SDK would read
+    `OPENAI_ORG_ID`/`OPENAI_PROJECT_ID` from the process env and send them to a CUSTOMER endpoint
+    (none is set today; `organization: null, project: null` would make that independent of a future
+    environment); `pinned-fetch.ts`'s `transport` option is a documented "TEST-ONLY seam" nothing
+    enforces; Together and OpenRouter have no seeded pricing rows, so their BYOK calls write
+    `cost_unknown` and a zero cost column (runbook §5). *db:* `loadModelPricing`'s dedupe picks by
+    pattern length before `effective_from`, so a re-pricing that also changes a pattern's length could
+    pick a stale row. *worker:* `provider-resolver.ts`'s `baseUrlFor` throws where the header promises
+    a typed refusal; `llm.probe` builds its own limiter instead of sharing the resolver's
+    per-credential slots; the probe's connect-store runs before the credential read, so a credential
+    deleted in that window is an FK violation and a failed job after retries (same shape as
+    `mailbox.store-credentials`); `memory.capture`'s embed tokens are still unmetered when the
+    idempotency gate loses; **`agent_runs` now gains one row per inbound (triage) and nothing sweeps
+    it → Phase 7 retention**; `llm-reprobe-sweep.ts`'s due-credential select has no `LIMIT` and
+    enqueues serially; the backstop's arm (b) sweeps triage run rows at the DRAFT expiry threshold
+    (660 s) though `ticket.triage`'s queue expires at 120 s (bookkeeping only);
+    `guidance.suggest` ignores `resolved.fallback`, so `fallback_to_managed` does not cover
+    suggestions; `stats-rollup.ts`'s local `unchangedApprovals` shadows the `CategorySignals` field it
+    filters; a probe against a server that refuses `json_schema` now costs three calls and lands one
+    error row in `llm_calls` that the card's "last error code" could show. *api:* the credential cap's
+    count-then-insert is not atomic (soft cap, manager-only); two concurrent first saves of an agent's
+    model both compute generation 1 (cosmetic); `agents.list` issues two extra queries per agent via
+    `resolveModelConfig` (an N+1 on a hot list, documented and bounded); `createEnqueue`'s throwaway
+    definition still carries a dead `queue` option; `error-surface.test.ts` does not walk
+    `./src/llm/service.ts` as its own entry point; `packages/llm` declares `@aesa/contracts` in
+    `dependencies` though it imports it type-only. *app:* `busy` disables Test/Remove on every card
+    while one probe runs; the key field's `maxLength` 512 truncates silently; Test on card B disarms
+    card A's Remove; with two never-probed connections the within-cap banner masks the timed-out one.
+  - **From the fix wave's re-review, the residuals ruled not worth a second wave** (two of the four
+    were folded into the close-out commit `024ff65`): the draft job's credential kill no longer
+    carries the `!aborted` guard, so an abort maps to transient (implausible — an abort during an
+    `auth` failure); the token stop-loss keys off `config.mode` even when attempt 1 fell back to
+    managed, which only costs "no free redraft"; and, out of scope under ruling 21, an agent sitting
+    on a dead credential may also change its MODEL on that key, bumping the generation and demoting
+    while the key is still rejected — the resolver refuses it at run time regardless.
+
+## Next: Phase 7 — billing, caps, launch hardening
+
+**Where to start.** Phase 6 is complete on branch `phase-6` and lands on `main` through a GitHub PR
+merged with a merge commit, on Robert's go-ahead (the standing flow from his 2026-09-09 instruction);
+until that merge, `main` carries Phases 0–5 and the brand. Once it lands, check out `main`, pull, and
+branch `phase-7` off it. Start with `superpowers:writing-plans` against the spec's *Build phases →
+Phase 7* (and the seams listed under **The hand-off** below). Run the local setup from `CLAUDE.md` —
+including `pnpm db:up && pnpm s3:init` and the `S3_*` exports, so the minio-gated storage suite
+actually runs; a dev Postgres created before Phase 6 needs
 `DATABASE_URL=postgres://aesa:aesa@localhost:5434/aesa_dev pnpm --filter @aesa/db migrate` once for
-migrations 0016–0017 before `pnpm e2e` — and confirm the baseline (2,364 tests + 4 conditional
-test-kit skips with `S3_*` exported, 24 web routes, `db:check` clean, the Playwright smoke) before
-writing the plan. Two lessons from Phase 5's plan for the next `writing-plans`: walk any recipe that
-recomputes a table against one worked example (the rollup's instant cutoff and the scrub's sign-off
-window were both plan-level arithmetic defects caught only in review or by the E2E), and give the
-close-out task the whole-branch review record in `docs/superpowers/reviews/` explicitly. A
-dev Postgres volume created before Phase 4 still needs `pnpm db:down && pnpm db:up` once to pick up
+migrations **0018–0020** before `pnpm e2e` — and confirm the baseline before writing the plan:
+
+- **2,599 tests** plus 4 conditional test-kit skips with `S3_*` exported (`@aesa/contracts` 36,
+  `@aesa/crypto` 52, `@aesa/platform-mail` 19, `brand` 110, `@aesa/core` 247, `@aesa/llm` 158,
+  `@aesa/agent` 71, `@aesa/db` 95, `@aesa/queue` 23, `@aesa/mail` 242, `@aesa/knowledge` 162,
+  `@aesa/test-kit` 43, `apps/api` 301, `apps/worker` 586, `apps/app` 458 jest across 58 suites);
+- **25 web routes** from `pnpm --filter @aesa/app export:web`;
+- `db:check` clean;
+- the Playwright signup smoke green (still ending at the gated mailbox step).
+
+A dev Postgres volume created before Phase 4 still needs `pnpm db:down && pnpm db:up` once to pick up
 pgvector, and in production the `vector` extension must be installed by a superuser before Phase 4's
-migrations run (`docs/runbooks/2026-09-phase-4-external-setup.md`).
+migrations run (`docs/runbooks/2026-09-phase-4-external-setup.md`). Two lessons carried forward from
+Phase 5 and re-earned in Phase 6: walk any recipe that recomputes a table against one worked example,
+and give the close-out task the whole-branch review record explicitly. Phase 6 adds a third — **when
+a plan narrows a behaviour the spec states twice, the spec wins**: deviation 4's "the probe overrides
+downward only" survived nine tasks before the E2E made it visible, and reversing it late cost a fix
+round (ruling 16).
 
-**The hand-off.** Phase 6 is provider choice (BYOK): the OpenAI-compatible adapter and its presets,
-`llm_credentials` + `agent_model_config` + `model_pricing`, the `llm.probe` job with capability
-probes and quality tiers, pinned-fetch SSRF at every call, Settings → AI, quality-tier confidence
-caps and graduation bars, and BYOK dashboards from `llm_calls`. Five seams are already in place and
-waiting for it:
+**The hand-off.** Phase 7 is billing, caps and launch hardening: `billing_subscriptions` + Stripe
+Checkout/Portal/webhooks + `billing.report-usage` (domain quantity, automatic overage, blocked mode);
+the trial policy (14 days from `agent_enabled_at`, no card; at trial end or `past_due` decisions
+become `review` with a banner — drafts continue, nothing sends automatically); per-org caps from
+`usage_counters` everywhere including the daily LLM USD cap and trial budgets; the retention sweep;
+workspace export/delete with a 30-day grace; the `keys.rotate` runbook; Sentry + a log drain + alerts
+with org attribution; the CASA evidence package finalized; store submissions (EAS Build);
+`scripts/smoke-tenant.ts`; native share-sheet intake and "Remember this reply" (the backfill of past
+conversations arrives here, not at connect). Load testing is deferred until the first paying
+customers. The seams already in place and waiting for it:
 
-- **`LlmProvider` is already the port.** `packages/llm` holds the interface, the Anthropic adapter as
-  ONE implementation, the structured-output ladder, the per-model limiter, the metering wrapper, the
-  code-seeded price table and `createManagedProvider` (which composes those three around one
-  adapter). A second adapter slots in beside the first; nothing above `packages/llm` knows which one
-  it is holding, and `createFakeProvider` already stands in for both in every test.
-- **`agent_model_config` is the missing table.** Today `agents` carries persona, guidance and the
-  autonomy knobs but no model choice: `ticket.draft` uses `DRAFT_MODEL` and `guidance.suggest` uses
-  `GUIDANCE_SUGGEST_MODEL`, both module constants. The per-agent override is a new table plus one
-  read in each job's context load — `agent_runs.provider`/`.model` and `llm_calls` already record
-  what actually ran, so the dashboards have their rows from day one.
-- **`structuredOutput: 'none'` needs a real rung** (carried since Phase 3, ruling ledger 74). A
-  provider declaring `'none'` makes zero calls today — Anthropic models are native and unknown models
-  take `json_mode` — so the branch is unreachable and untested. An OpenAI-compatible endpoint with no
-  JSON mode is the first caller that needs it: a plain call with a JSON instruction, then
-  repair/extract.
-- **Quality-tier confidence caps hook `evidenceScore`'s `model` term.** `evidenceScore({ memory,
-  grounding, model })` multiplies by the model's own self-assessed confidence, so a tier cap is a
-  clamp on that one input — no new maths, no new column on `drafts`, and the auto gate keeps
-  comparing exactly one number against `auto_send_min_confidence / 100`. The graduation bar in
-  `GRADUATION_RULES` is the second place a tier would bite.
-- **`llm.probe` is a NEW queue**, and the four-places rule applies to it literally: `JOB_NAMES`, the
-  worker's pre-create list, the api's pre-create list and `queue-preflight.test.ts`'s `it.each`. It
-  is also the first Phase 6 job the api itself produces (Settings → AI's "test this connection"), so
-  its `policy` has to be decided in `defineJob` and carried in BOTH pre-create lists — see the
-  residual below about queue options only landing at a queue's first-ever registration, which is
-  worth fixing in the same phase.
+- **The `plan` column and the `{ plan }` argument at every `resolveSetting` site.** `PLANS` and
+  `planSettingDefaults` exist in `@aesa/core` and have had no caller since Phase 4: every org sits on
+  the catalog defaults (100 sources, 200 crawl pages, 5,000,000 daily embed tokens, 50 guidance
+  suggestions a day) and `PLANS.trial` is inert. Billing is the phase that makes them real, and
+  `list.caps` already reports what the api actually enforces rather than a tier.
+- **`billing_subscriptions` is the missing table**; `usage_counters` is already the meter store every
+  cap reads, and `SEND_METERS` / `LLM_METERS` / `SANDBOX_METERS` / `KNOWLEDGE_METERS` /
+  `GUIDANCE_METERS` already carry the quantities an invoice would price.
+- **The daily USD cap now reads only MANAGED spend.** Phase 6 split BYOK cost into
+  `llm_cost_micros_byok` precisely so a tenant's own key can never trip the platform's allowance —
+  which means the cap Phase 7 turns into a billing control is already the right number, and the
+  screens that answer "what is this costing me" already sum both. A per-plan managed budget is a
+  `resolveSetting` away.
+- **`agent_runs` retention is now due.** Phase 6 made `ticket.triage` write its own run row, so the
+  table gains **one row per inbound email** and nothing sweeps it. `sweeps.daily` already owns
+  run-event and action-token retention; triage rows are the next arm, beside the
+  `platform.access` audit retention that has been carried since Phase 1.
+- **The stuck-source sweep** (carried since Phase 4) has exactly three customers waiting: a `queued`
+  crawl with no job, a `processing` source whose embed retries are exhausted, and an abandoned
+  `queued` upload. `refreshCrawl` accepts `queued` so the owner has a manual path out in the meantime.
+- **The `keys.rotate` runbook has a new tenant.** Phase 6's provider cache is deliberately
+  **freshness-keyed** (`${credentialId}:${lastProbedAt}`, 15-minute ceiling) so that any replica's
+  probe retires every replica's cached provider — the property a rotate surface needs and the reason
+  it was fixed before one existed. The rotate story now covers the KEK ring, `mailbox_credentials`
+  AND `llm_credential_secrets`, and the ring must be identical on every `sync`, `send` and `agent`
+  replica.
+- **Workspace delete must cascade the learning and provider tables.** `resolved_answers` was named in
+  Phase 5; Phase 6 adds `llm_credentials`, `llm_credential_secrets` and `agent_model_config`.
+  Delete-by-customer is still the interim erasure route for a single customer's answers.
 
-**Carries still open.** The Phase 5 record above groups all of them — Phase 4's three, the
-long-standing list, the ledger's deferred minors, and what the whole-branch final review left
-standing. The two findings this phase's close-out made (the scrub erasing a short reply, the
-unrendered `autoSent` count) are CLOSED, with five more, by the final fix wave `03d2d2a`.
-Three of Phase 4's residuals explicitly named "Phase 5" and did NOT land, and are the ones most worth
-folding into Phase 6's first task because they touch the same files it will open anyway:
-
-- **Queue options reach `pgboss.queue` only at a queue's FIRST-EVER registration.** `createQueue`
-  inserts NULLs and ignores a second call, so a job sent before the first registration carries
-  `retry_limit` 2, delay 0 and a 15-minute expiry. The fix is a `QUEUE_OPTIONS` table in
-  `@aesa/queue` consumed by `defineJob` and both pre-create lists — and `llm.probe` is a new queue
-  landing straight into that hazard.
-- **The `registerJob`-level drizzle-error scrub.** Every job that rethrows a `DrizzleQueryError` puts
-  its `query` and `params` into `pgboss.job.output`; the knowledge paths that could carry customer
-  text are fixed at the call site, and the general fix is a `@aesa/queue` change worth doing once.
-- **The partial unique index `(org_id, url) WHERE kind = 'crawl' AND status <> 'failed'`**, which
-  would make the source cap's read-then-insert and `refreshCrawl`'s resurrect consistent.
-
-And two Phase 5 items belong on Phase 6's own list rather than a later one:
-
-- **`memory.capture`'s embed spend is neither metered nor capped.** One short question per delivered
-  reply, so the volume is bounded by the send volume — but it does not count against
-  `knowledge.daily_embed_tokens_cap` and shows in no meter. BYOK makes "whose key paid for this?" a
-  question with a real answer, which is the moment to fix it.
-- **`agent_runs.kind = 'triage'` rows** (deferred from Phase 3 to Phase 6): the enum admits the value
-  for Phase 6's dashboards, but only draft and sandbox runs create rows today. Triage calls do get
-  `llm_calls` rows, since the agent role wraps its one provider with the metering sink.
+**Carries still open.** The Phase 6 record above groups all of them — Phase 4's remainder, the
+long-standing list, the structure carries (the `src/drafts/learning.ts` split, now named for a third
+time, and `ticket-draft.ts` at ~1,021 lines), Phase 5's untouched list, Phase 6's own deferred minors
+and the fix wave's residuals. Four items are explicitly addressed to **Phase 7** and are the ones
+most worth folding into its first task: **`agent_runs` retention** (new, and growing per inbound),
+the **stuck-source sweep**, **`platform.access` audit retention**, and the
+**`KNOWLEDGE_EMBED_MODEL` re-embed job** without which that value can never be changed on a live
+workspace. Robert's manual list for Phase 6 is
+`docs/runbooks/2026-09-phase-6-external-setup.md`.
 
 ## Later phases (see the spec for scope and verification)
 
-- Phase 6 — provider choice (BYOK adapters, probes, per-agent model config).
-- Phase 7 — billing, caps, launch hardening. Owes the `plan` column and the `{ plan }` argument at every `resolveSetting` site: until then every org sits on the catalog defaults (100 sources, 200 crawl pages, 5,000,000 daily embed tokens) and `PLANS.trial` is inert (Phase 4 final review, seams D1).
+- Phase 7 — billing, caps, launch hardening, and the last phase in the spec. Owes the `plan` column and the `{ plan }` argument at every `resolveSetting` site: until then every org sits on the catalog defaults (100 sources, 200 crawl pages, 5,000,000 daily embed tokens, 50 guidance suggestions a day) and `PLANS.trial` is inert (Phase 4 final review, seams D1). It also owes `agent_runs` retention, which Phase 6 made urgent by writing one triage run row per inbound email. See **Next: Phase 7** above for the full hand-off.
 
 ## Open items for Robert
 
@@ -1632,6 +2043,32 @@ sent" twice to see the category demote itself — plus one privacy edit: `resolv
 scrubbed customer question and the business's reply for up to 365 days, keyed by a salted customer
 hash, and the retention section of the privacy policy has to say so. Phase 7's org-delete path must
 cascade that table; delete-by-customer is the interim erasure route.
+
+The Phase 6 external-setup runbook (`docs/runbooks/2026-09-phase-6-external-setup.md`) adds **no new
+vendor and no new environment variable** — but it has the one deployment change of the phase and the
+one legal one. The deployment change: **`AESA_KEK_V<n>`/`AESA_KEK_ACTIVE` are now required in
+production on any replica whose `WORKER_ROLES` includes `agent`**, and it must be the SAME ring
+everywhere (a key sealed under one ring cannot be opened by a replica holding another, and the only
+symptom is `provider_unavailable`); the boot refusal catches the missing case loudly, not the drifted
+one. The legal change: under BYOK, a customer's email content goes to **the provider that customer
+chose, under that provider's terms, on that customer's own account** — the product already says so at
+the moment of choosing, and **the privacy policy and DPA have to say the same thing**, as a structural
+clause (a customer connecting their own key thereby appoints that provider as their own
+sub-processor), not a per-vendor list. The rest is the live walk that no gate can stand in for: add a
+real key, watch the probe land `healthy` with a models list and a structured verdict, point an agent
+at it, send a real customer email from BOTH a Gmail and an outlook.com sender, approve from the phone,
+confirm the `llm_calls` rows say `byok` — then **revoke the key in the provider's console** and
+confirm the `provider_health` push, the `dead` chip and the `needs_owner`/`provider_unavailable`
+ticket. Three named chores ride with it: **re-verify DeepSeek's live model ids and prices** (the
+catalog names `deepseek-chat`/`deepseek-reasoner` and migration 0020 seeds their prices UNVERIFIED —
+a probe on a real key shows the live list, and two catalog ids plus two pricing rows follow if they
+have moved), pre-check `knowledge_sources` for duplicate live crawl rows before migration 0018's
+non-concurrent unique index takes `ACCESS EXCLUSIVE`, and tell any self-hosting customer that a local
+Ollama/vLLM needs a **public https hostname** in v1. Like every screen before them, **Settings → AI**
+(route 25) and the agent edit screen's **Model** card have never rendered outside jest — open both
+signed in, at wide and phone widths and on a real phone, and check the key paste, the two-minute probe
+wait and its copy, Remove's armed confirm *and* its Cancel, the `provider_health` push deep-linking to
+`/settings/ai` from the notification shade, and dark mode on both.
 
 Open the Knowledge screen in a browser once, signed in, and once on a phone. No gate renders it: the
 Playwright smoke still ends at the gated mailbox step, and jest-expo exercises the components but

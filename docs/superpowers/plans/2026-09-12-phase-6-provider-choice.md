@@ -43,6 +43,36 @@
 12. **OpenAI `json_schema` is sent non-strict.** Strict mode demands `additionalProperties: false` and every property required, which would rewrite the draft schema's optional fields; the ladder's `json_mode` → repair → extract rungs already cover a non-strict miss. Recorded as the preset quirk `strictJsonSchema: false`.
 13. **Carries folded in.** Task 1: `QUEUE_OPTIONS`, the `registerJob`-level drizzle-error scrub, the crawl partial unique index. Task 7: `agent_runs.kind = 'triage'` rows, `memory.capture`'s embed metered AND capped, the shared evidence helper. Task 11: the `flags` demotion E2E scenario. **Carried again** (record at close): the `src/drafts/learning.ts` split, `context_too_long` retrieval halving, and the rest of Phase 5's list.
 
+### Rulings during execution (appended at close-out, 2026-09-12)
+
+The controller's decisions on Robert's behalf while this plan was executed, in order. Where one amends a Deviation above, it says so — the ruling wins. STATUS.md's Phase 6 record carries the same list.
+
+1. Task 4's probe test drives the RAW fake, not `withStructuredLadder` — the probe's contract is "drive the raw adapter's rungs itself"; through the ladder it would test the ladder.
+2. `push-routing.ts`'s `provider_health` entry is Task 5's edit and Task 9 asserts it — one task owns each file edit.
+3. The brief's "label map" IS `REASON_CHIP` (1–2 word labels), so `'AI provider unavailable'` stays there; `REASON_SENTENCE` gets a sentence in its siblings' voice.
+4. Keep the `deepseek-chat`/`deepseek-reasoner` catalog ids and pricing rows: an unverified web claim should not drive a mid-phase catalog churn, and a probe on a real key shows the truth. **Conditioned by ruling 23.**
+5. Task 4's shape ratified: `runProviderContract` on the `@aesa/llm/testing` sub-path (the root would drag vitest into production graphs), `withCauseMessage` lifted to `core/shared.ts`, the brief's non-existent "none makes zero calls" case replaced by `structured-none.test.ts`.
+6. **`createByokProvider` must DEFAULT `fetchFn` to `createPinnedFetch`** — "SSRF at every call" must not depend on every caller remembering to pass it.
+7. Task 5's four-deps shape, `runLlmProbe`'s `'unknown'` fifth return and the `fetchFn?` seam stand.
+8. Task 5's fix round promoted two minors to correctness: a re-wrap guarded on `encryption = 'sealed'` alone would silently revert a key after a double rotation, and `JSON.parse` on decrypted plaintext can echo the key into an unscrubbed error.
+9. `managed = anthropicApiKey ? createManagedProvider(...) : null`; when null (dev/test only — production still throws) `llm.probe` is still registered, while the five model-calling jobs keep their transitional warn-and-skip until Task 6 puts them all on the resolver.
+10. Task 6's fix round carried the fallback call's own idempotency key (it collided with the primary's error row, leaving the fallback call unmetered) plus per-attempt provenance, the triage fallback's trace, the sandbox's effort, `cacheTtlFor`, `FALLBACK_CODES`' home and the run clock.
+11. `confidence_breakdown.modelGeneration` identifies the **agent's** configured generation — a fallback is an event inside it, recorded by `mode`/`provider`/`modelId`; the rollup's window keys on `resolveModelConfig(...).modelGenerationAt`, which is authoritative. (Amplifies Deviation 3.)
+12. The in-transaction `llm.probe` enqueue stands: pg-boss `send` is one INSERT on the boss pool, not external network I/O, and it is the transaction's last statement.
+13. `agentsUsing` = `countDistinct(agent_id)` — Task 8's brief said "config rows", which would double-count every BYOK agent.
+14. Task 9's fix round took six UX/secrets items: the save that reverted itself, a 2-minute cap on the probe wait, an error state for the card, `gcTime: 0` on the add mutation, a required-field hint for a custom connection, a Cancel beside Confirm remove.
+15. `probeTimedOut`'s banner may greet an owner whose connection sat `unknown` since before the screen opened — kept: accurate and actionable.
+16. **AMENDS DEVIATION 4 — the spec wins.** `probeProvider` tries `native` first for every non-Anthropic provider regardless of the preset, and `createByokProvider`'s override applies the stored verdict to the OpenAI-compatible adapter in BOTH directions (`native` raises an unknown model, `json_mode`/`none` narrow); the Anthropic adapter is never overridden and the quality tier is untouched. The spec says `json_schema` is "treated as `json_mode` unless probe passes" and that "presets are overridden by the stored probe result". Deviation 4's downward-only narrowing would have fossilized a guess about someone else's endpoint.
+17. The whole-branch fix wave carries all twelve Important findings (deduplicated to ten changes) plus two ledger minors, in one wave of three commits grouped by package.
+18. Activity's headline cost = managed + BYOK with a "$X of this on your own provider keys" subtitle; the METER separation stays, because the managed daily cap must never charge a tenant's own spend.
+19. The ladder catches a `permanent` `LlmError` on the NATIVE rung only and falls through to `json_mode`, so a wrong probe verdict for one model on a credential costs one call, never a draft.
+20. An `auth` failure on a BYOK primary ALWAYS marks the credential dead and pages once, whether or not the fallback then lands the draft; only the ticket escalation is skipped when the fallback succeeded. (Resolves the tension inside Deviation 7.)
+21. `credential_dead` is refused only when a save SELECTS a *different* credential than the agent's current one — re-saving the current (dead) credential to flip fallback or effort is the one remedy the product offers.
+22. No second fix wave: of the re-review's four Low residuals, `keyByCredential`'s LRU trim and `ticket.triage`'s docblock folded into Task 11's own commit; the other two are carried in STATUS.
+23. **Deviation 4's DeepSeek carry gets a named runbook line item** (D's condition on ruling 4): `docs/runbooks/2026-09-phase-6-external-setup.md` §4 tells Robert to re-verify DeepSeek's live model ids and prices against a real key before DeepSeek is offered.
+
+**One spec item this phase activated and closed late:** the BYOK stop-loss (spec §Budgets, "30k output tokens BYOK") was missing from Deviations 1–13 and from the code; the whole-branch review caught it and the fix wave implemented it (`STOP_LOSS_BYOK_OUTPUT_TOKENS`). **One structural carry this plan named and did NOT deliver:** Deviation 13's "carried again" list still stands in full — the `src/drafts/learning.ts` split was not done, and `ticket-draft.ts` grew to ~1,021 lines beside it.
+
 ## File structure
 
 ```
