@@ -297,6 +297,17 @@ describe('llm.probe', () => {
     expect(lines.map((l) => JSON.parse(l).msg as string)).toContain('llm.probe: no probe model')
   })
 
+  it('a custom credential with no base URL returns skipped with a warn — never the SDK\'s default host', async () => {
+    const credentialId = await createCredential({ provider: 'custom', baseUrl: null, probeModel: 'local-7b' })
+    await seedDekSecret(credentialId)
+    const { fetchFn, urls } = probeFetch()
+    const { deps } = makeDeps({ fetchFn })
+
+    expect(await runLlmProbe(deps, { orgId, credentialId, reason: 'manual' }, AbortSignal.timeout(30_000))).toBe('skipped')
+    expect(lines.map((l) => JSON.parse(l).msg as string)).toContain('llm.probe: no base URL')
+    expect(urls).toHaveLength(0)
+  })
+
   it('every probe call is metered: llm_calls rows with role probe, mode byok and the credential id', async () => {
     const credentialId = await createCredential()
     await seedDekSecret(credentialId)

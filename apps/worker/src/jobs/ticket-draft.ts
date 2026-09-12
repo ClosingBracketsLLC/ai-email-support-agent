@@ -43,13 +43,13 @@ import { utcDayString } from '../date-utils.ts'
 import { gateAndRecordRun, readCapsUnlocked } from '../drafting/caps.ts'
 import { claimTicket, recordFailure, unwindClaimStamp, type ClaimedTicket } from '../drafting/claim.ts'
 import { loadSharedDraftContext } from '../drafting/context.ts'
-import type { ProviderResolver } from '../provider-resolver.ts'
 import {
   applyDraftOutcome, applyEscalateOutcome, applyNoReplyOutcome, DRAFT_ACTOR, LostRaceError, recordLostRace,
   type DraftLanding, type OutcomeContext,
 } from '../drafting/outcomes.ts'
 import { buildReplyPolicy, personaFor } from '../drafting/policy.ts'
 import { appendRunEvent, finishRun } from '../drafting/runs.ts'
+import type { ProviderResolver } from '../provider-resolver.ts'
 
 /**
  * Spec §Budgets: $0.40 of managed spend per run. Past it the automatic redraft after a guardrail

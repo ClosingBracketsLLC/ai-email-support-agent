@@ -116,13 +116,21 @@ export async function runLlmProbe(deps: LlmProbeDeps, p: LlmProbePayload, signal
     deps.logger.warn({ credentialId: p.credentialId }, 'llm.probe: no probe model')
     return 'skipped'
   }
+  // A preset always has one and the api validates a `custom` credential's own, so a row with
+  // neither is corrupt — and an EMPTY base URL is not a harmless default: the OpenAI SDK would
+  // quietly send this tenant's key to `api.openai.com` instead of the endpoint they configured.
+  const baseUrl = cred.baseUrl ?? PROVIDER_PRESETS[provider].baseUrl
+  if (!baseUrl) {
+    deps.logger.warn({ credentialId: p.credentialId }, 'llm.probe: no base URL')
+    return 'skipped'
+  }
 
   // 3. The probe itself — the RAW metered adapter, so `probeProvider` drives the rungs rather than
   //    the ladder silently climbing them and reporting whichever one happened to work.
   const raw = createByokProvider({
     provider,
     apiKey: opened.apiKey,
-    baseUrl: cred.baseUrl ?? PROVIDER_PRESETS[provider].baseUrl ?? '',
+    baseUrl,
     orgId: p.orgId,
     credentialId: p.credentialId,
     sink: deps.sink,

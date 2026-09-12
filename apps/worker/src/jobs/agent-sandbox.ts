@@ -36,10 +36,10 @@ import { agentCategoryPolicies, agentRuns, agents, drafts, mailboxConnections, p
 import { computeCostMicros, findPricing, LlmError, type ChatMeta, type LlmProvider } from '@aesa/llm'
 import { defineJob, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
 import { loadSharedDraftContext, type SharedDraftContext } from '../drafting/context.ts'
-import type { ProviderResolver } from '../provider-resolver.ts'
 import { errorMessage } from '../err-message.ts'
 import { buildReplyPolicy, personaFor } from '../drafting/policy.ts'
 import { appendRunEvent, finishRun } from '../drafting/runs.ts'
+import type { ProviderResolver } from '../provider-resolver.ts'
 
 export const AgentSandboxPayload = z.object({ orgId: z.string(), runId: z.string() })
 export type AgentSandboxPayload = z.infer<typeof AgentSandboxPayload>
