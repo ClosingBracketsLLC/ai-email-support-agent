@@ -229,6 +229,9 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
       db: app.db, provider, retriever: emptyRetriever, logger,
       enqueueNotify: (orgId, notificationId) => enqueueNotifyDispatch(boss, orgId, notificationId),
       enqueueDraft: (orgId, ticketId, opts) => enqueueTicketDraft(boss, orgId, ticketId, opts),
+      // Phase 3's scenarios never reach the auto landing (every category is `review`), so this seam
+      // is only here to satisfy the deps contract — Phase 5's own E2E is what exercises it.
+      enqueueSend: async () => {},
     })
     await registerAgentSandbox(boss, { db: app.db, provider, retriever: emptyRetriever, logger })
     await registerNotifyDispatch(boss, { db: app.db, push, logger })
@@ -562,8 +565,8 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
 
     const before = draftCallCount()
     scriptDraft({ parsed: reply({ body: `${CLEAN_BODY} The courier has it now.` }) })
-    const rejected = await rejectDraft(service, org.orgId, { draftId: first.draftId, action: 'redraft', reason: 'Say the parcel is with the courier, not shipped.' }, actorFor(org))
-    expect(rejected).toEqual({ ok: true, resolution: 'redraft' })
+    const rejected = await rejectDraft(service, org.orgId, { draftId: first.draftId, action: 'redraft', reason: 'Say the parcel is with the courier, not shipped.', addToGuidance: false }, actorFor(org))
+    expect(rejected).toEqual({ ok: true, resolution: 'redraft', guidanceAdded: false })
 
     const second = await waitFor(async () => {
       const rows = await draftsFor(org, first.ticketId)
@@ -592,8 +595,8 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
     let liveId = first.draftId
     for (const attempt of [1, 2]) {
       scriptDraft({ parsed: reply({ body: `${CLEAN_BODY} Attempt ${attempt === 1 ? 'two' : 'three'}.` }) })
-      const res = await rejectDraft(service, org.orgId, { draftId: liveId, action: 'redraft', reason: `Please be warmer, take ${attempt}.` }, actorFor(org))
-      expect(res).toEqual({ ok: true, resolution: 'redraft' })
+      const res = await rejectDraft(service, org.orgId, { draftId: liveId, action: 'redraft', reason: `Please be warmer, take ${attempt}.`, addToGuidance: false }, actorFor(org))
+      expect(res).toEqual({ ok: true, resolution: 'redraft', guidanceAdded: false })
       liveId = (await waitFor(async () => {
         const rows = await draftsFor(org, first.ticketId)
         expect(rows).toHaveLength(attempt + 1)
@@ -604,8 +607,8 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
     expect((await getTicket(org, first.ticketId)).redraftCount).toBe(2)
 
     const callsBefore = draftCallCount()
-    const res = await rejectDraft(service, org.orgId, { draftId: liveId, action: 'redraft', reason: 'Still not right.' }, actorFor(org))
-    expect(res).toEqual({ ok: true, resolution: 'escalate_limit' })
+    const res = await rejectDraft(service, org.orgId, { draftId: liveId, action: 'redraft', reason: 'Still not right.', addToGuidance: false }, actorFor(org))
+    expect(res).toEqual({ ok: true, resolution: 'escalate_limit', guidanceAdded: false })
 
     const ticket = await getTicket(org, first.ticketId)
     expect(ticket.status).toBe('needs_owner')
@@ -1082,8 +1085,8 @@ describe('Phase 3 close-out E2E (real pg-boss + the real api draft service)', ()
     const { ticketId, draftId } = await inboundToDraft(org)
 
     scriptDraft({ parsed: NO_REPLY })
-    const rejected = await rejectDraft(service, org.orgId, { draftId, action: 'redraft', reason: 'Mention the courier by name.' }, actorFor(org))
-    expect(rejected).toEqual({ ok: true, resolution: 'redraft' })
+    const rejected = await rejectDraft(service, org.orgId, { draftId, action: 'redraft', reason: 'Mention the courier by name.', addToGuidance: false }, actorFor(org))
+    expect(rejected).toEqual({ ok: true, resolution: 'redraft', guidanceAdded: false })
 
     await waitFor(async () => {
       const ticket = await getTicket(org, ticketId)

@@ -39,6 +39,7 @@ describe('row-level security', () => {
         'audit_log', 'notification_devices', 'org_data_keys', 'org_settings', 'usage_counters', 'workspaces',
         'oauth_flows', 'mailbox_connections', 'mailbox_credentials', 'gmail_access_requests',
         'agents', 'categories', 'agent_category_policies', 'tickets', 'messages', 'notifications',
+        'resolved_answers', 'category_stats_daily', 'guidance_suggestions',
       ]))
 
     for (const t of tables.rows) {

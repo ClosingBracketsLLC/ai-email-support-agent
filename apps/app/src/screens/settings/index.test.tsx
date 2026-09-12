@@ -71,3 +71,14 @@ test('a failed workspace switch shows an error and leaves the row pressable agai
   await fireEvent.press(screen.getByText('Beta'))
   expect(mockSetActive).toHaveBeenCalledTimes(2)
 })
+
+test('Autopilot and Learned answers are live rows now, each opening its own screen', async () => {
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('settings-autopilot')).toBeTruthy())
+
+  await fireEvent.press(screen.getByTestId('settings-autopilot'))
+  expect(mockPush).toHaveBeenCalledWith('/settings/autopilot')
+
+  await fireEvent.press(screen.getByTestId('settings-memory'))
+  expect(mockPush).toHaveBeenCalledWith('/settings/memory')
+})

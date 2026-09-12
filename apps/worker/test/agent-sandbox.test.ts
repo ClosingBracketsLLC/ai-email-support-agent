@@ -18,6 +18,7 @@ import {
 } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
+import type { Retriever } from '@aesa/agent'
 import { createFakeProvider, LlmError, type LlmProvider } from '@aesa/llm'
 import { runAgentSandbox, type AgentSandboxDeps, type SandboxOutput } from '../src/jobs/agent-sandbox.ts'
 import { createWorkerLogger } from '../src/logging.ts'
@@ -140,6 +141,16 @@ function makeDeps(provider: LlmProvider, over: Partial<AgentSandboxDeps> = {}): 
 }
 
 const run = (deps: AgentSandboxDeps, runId: string) => runAgentSandbox(deps, { orgId: fx.orgId, runId }, new AbortController().signal)
+
+/** A retriever whose answers leg returns exactly one active answer (Phase 5's memory). */
+function answerRetriever(answer: { id: string; score: number; approvals: number }): Retriever {
+  return {
+    retrieve: async () => ({
+      chunks: [],
+      answers: [{ id: answer.id, question: 'where is my order', answer: 'It ships tomorrow.', score: answer.score, approvals: answer.approvals }],
+    }),
+  }
+}
 
 /**
  * A `Db` that rejects the FIRST `.transaction()` call for which `shouldFail()` is true, then
@@ -417,5 +428,28 @@ describe('runAgentSandbox', () => {
     expect(emitted).toContain('duplicate key value violates unique constraint')
     expect(emitted).not.toContain(question)
     expect(emitted).not.toContain('Failing row contains')
+  })
+  it('P5 evidence rides on the output: the best USED answer\'s memory score × the model\'s confidence', async () => {
+    const answerId = crypto.randomUUID()
+    const runId = await seedSandboxRun()
+    const provider = createFakeProvider([{ parsed: reply({ confidence: 0.9, usedAnswerIds: [answerId] }) }])
+    const deps = makeDeps(provider, { retriever: answerRetriever({ id: answerId, score: 0.92, approvals: 3 }) })
+
+    await run(deps, runId)
+
+    const output = (await getRun(runId)).output as SandboxOutput
+    expect(output.evidence).toBeCloseTo(0.9, 6)
+  })
+
+  it('P5 an answer the model did not cite lends no evidence, and a non-reply outcome has none at all', async () => {
+    const answerId = crypto.randomUUID()
+    const uncited = await seedSandboxRun()
+    const provider = createFakeProvider([{ parsed: reply({ confidence: 0.9, usedAnswerIds: [] }) }])
+    await run(makeDeps(provider, { retriever: answerRetriever({ id: answerId, score: 0.92, approvals: 3 }) }), uncited)
+    expect(((await getRun(uncited)).output as SandboxOutput).evidence).toBe(0)
+
+    const escalated = await seedSandboxRun()
+    await run(makeDeps(createFakeProvider([{ parsed: ESCALATE }])), escalated)
+    expect(((await getRun(escalated)).output as SandboxOutput).evidence).toBeNull()
   })
 })

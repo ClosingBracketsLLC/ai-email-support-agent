@@ -36,6 +36,16 @@ export const drafts = pgTable('drafts', {
   decisionSource: text('decision_source'),                                 // app | email | auto (CHECK)
   rejectReason: text('reject_reason'), rejectAction: text('reject_action'),
   editDistanceRatio: real('edit_distance_ratio'),
+  /** Set once, by the auto landing, and never cleared — the durable "this was an auto-send" mark
+   * even after a Hold + re-approve turns `decision_source` into `app`. */
+  autoDecidedAt: timestamp('auto_decided_at', { withTimezone: true }),
+  /** The owner pulled an auto-send back inside its window (a demotion signal when followed by an edit/reject). */
+  autoHeldAt: timestamp('auto_held_at', { withTimezone: true }),
+  /** "Should not have sent", on a sent auto draft. */
+  flaggedAt: timestamp('flagged_at', { withTimezone: true }),
+  flaggedBy: uuid('flagged_by').references(() => user.id, { onDelete: 'set null' }),
+  /** `memory.capture`'s idempotency stamp. */
+  memoryCapturedAt: timestamp('memory_captured_at', { withTimezone: true }),
   expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
   createdAt: createdAt(), updatedAt: updatedAt(),
 }, (t) => [

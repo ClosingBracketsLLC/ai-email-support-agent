@@ -160,15 +160,24 @@ export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?:
   const reject = useMutation(trpc.drafts.reject.mutationOptions({
     onSuccess: (data) => {
       setApproveError(null)
-      setNote({
-        tone: 'info',
-        text: data.resolution === 'redraft'
-          ? 'The agent is re-drafting — a new draft will appear here.'
-          : 'Marked for you to handle.',
-      })
+      const resolution = data.resolution === 'redraft'
+        ? 'The agent is re-drafting — a new draft will appear here.'
+        : 'Marked for you to handle.'
+      // `guidanceAdded` is false when the owner did not ask — and also when they did but the
+      // guidance was already at its cap, so this claims it only when the api actually appended it.
+      setNote({ tone: 'info', text: data.guidanceAdded ? `${resolution} Added to your guidance.` : resolution })
       void invalidateAll()
     },
     onError: () => setNote({ tone: 'error', text: 'Could not reject this draft. Try again.' }),
+  }))
+  // The owner's last word on a reply that already went out: it strikes what the agent learned from
+  // it, retires the candidate it produced, and counts towards demoting the category.
+  const flag = useMutation(trpc.drafts.flagAutoSent.mutationOptions({
+    onSuccess: () => {
+      setNote({ tone: 'info', text: 'Flagged — the agent will not reuse what it learned here.' })
+      void invalidateAll()
+    },
+    onError: () => setNote({ tone: 'error', text: 'Could not flag this reply. Try again.' }),
   }))
   const resume = useMutation(trpc.drafts.resume.mutationOptions({
     // `resumed: false` is a race, not an error (the api soft-fails a draft that is no longer `held`).
@@ -244,7 +253,7 @@ export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?:
 
   const { ticket, messages } = query.data
   const sentence = reasonSentence(ticket.needsOwnerReason)
-  const busy = approve.isPending || hold.isPending || reject.isPending || resume.isPending
+  const busy = approve.isPending || hold.isPending || reject.isPending || resume.isPending || flag.isPending
 
   return (
     <SafeAreaView style={[styles.safe, { backgroundColor: c.bg }]} testID="ticket">
@@ -268,8 +277,9 @@ export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?:
             viewed={draft.viewedAt !== null || markedViewedId === draft.id}
             onApprove={(body) => approve.mutate(body === undefined ? { draftId: draft.id } : { draftId: draft.id, body })}
             onHold={() => hold.mutate({ draftId: draft.id })}
-            onReject={(action: RejectAction, reason: string) => reject.mutate({ draftId: draft.id, action, reason })}
+            onReject={(action: RejectAction, reason: string, addToGuidance: boolean) => reject.mutate({ draftId: draft.id, action, reason, addToGuidance })}
             onResume={() => resume.mutate({ draftId: draft.id })}
+            onFlag={() => flag.mutate({ draftId: draft.id })}
             busy={busy}
             approveError={approveError}
             undoUntil={undoUntil}

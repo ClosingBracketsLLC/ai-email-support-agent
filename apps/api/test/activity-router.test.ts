@@ -167,6 +167,44 @@ describe('activity router', () => {
     expect(otherWeek).toMatchObject({ drafted: 1, sent: 1, escalated: 1, costMicros: 1000, aiHandledConversations: 3 })
   })
 
+  // Phase 5: `autoSent` was a hard-coded literal 0 until `auto` mode became reachable. The two
+  // `autoSent: 0` expectations above are now real counts of a workspace that has never auto-sent.
+  it('autoSent counts the replies the agent sent on its own inside the window, and nothing a human decided', async () => {
+    const org = await seedOrg('activity-auto@example.com')
+    const other = await seedOrg('activity-auto-other@example.com')
+
+    const now = new Date()
+    const inWindow = new Date(now.getTime() - 2 * DAY_MS)
+    const outOfWindow = new Date(now.getTime() - 10 * DAY_MS)
+
+    const autoSent = async (o: Awaited<ReturnType<typeof seedOrg>>, at: Date, overrides: Partial<typeof drafts.$inferInsert> = {}) => {
+      const ticket = await insertTicket(t.api, o.orgId, { connectionId: o.connectionId, agentId: o.agentId, subject: 'Auto' })
+      const draft = await insertDraft(o.orgId, ticket.id, o.agentId, {
+        status: 'sent', decision: 'send', decisionSource: 'auto', decidedAt: at, autoDecidedAt: at, createdAt: at,
+        finalBody: 'Sent by the agent.', ...overrides,
+      })
+      await insertSend(o.orgId, draft.id, ticket.id, o.connectionId, o.agentId, at)
+      return draft
+    }
+
+    await autoSent(org, inWindow)
+    await autoSent(org, outOfWindow)
+    // Decided by the agent but never delivered (held, then held forever): not an auto-SEND.
+    await autoSent(org, inWindow, { status: 'held' })
+    // A human's own approval, however recent, is never an auto-send.
+    const tHuman = await insertTicket(t.api, org.orgId, { connectionId: org.connectionId, agentId: org.agentId, subject: 'Human' })
+    await insertDraft(org.orgId, tHuman.id, org.agentId, { status: 'sent', decisionSource: 'app', decidedAt: inWindow, createdAt: inWindow })
+    // Another workspace's auto-sends are not this one's.
+    await autoSent(other, inWindow)
+
+    expect((await org.c.activity.summary.query({ days: 7 })).autoSent).toBe(1)
+    expect((await org.c.activity.summary.query({ days: 30 })).autoSent).toBe(2)
+    expect((await other.c.activity.summary.query({ days: 7 })).autoSent).toBe(1)
+
+    const recent = await org.c.activity.summary.query({ days: 7 })
+    expect(recent.recent.some((r) => r.decisionSource === 'auto')).toBe(true)
+  })
+
   it('a fresh org with nothing seeded gets all-zero counts and an empty recent list', async () => {
     const org = await seedOrg('activity-empty@example.com')
     const res = await org.c.activity.summary.query({ days: 7 })

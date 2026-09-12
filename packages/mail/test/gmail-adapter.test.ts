@@ -1,6 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises'
 import { describe, expect, it, vi } from 'vitest'
 import { gmailProvider, METADATA_HEADERS } from '../src/adapters/gmail/index.ts'
+import { parseAuthResults } from '../src/auth-results.ts'
 import { CursorExpiredError, MailApiError, MessageGoneError, ProviderAuthError } from '../src/errors.ts'
 
 import historyPage1Fixture from './fixtures/gmail/history-page1.json' with { type: 'json' }
@@ -9,6 +10,7 @@ import historyPaged2Fixture from './fixtures/gmail/history-paged-2.json' with { 
 import historyEmptyFixture from './fixtures/gmail/history-empty.json' with { type: 'json' }
 import messageMetadataFixture from './fixtures/gmail/message-metadata.json' with { type: 'json' }
 import messageFullNestedFixture from './fixtures/gmail/message-full-nested.json' with { type: 'json' }
+import messageRelayOnlyFixture from './fixtures/gmail/message-relay-only.json' with { type: 'json' }
 import sendReplyFixture from './fixtures/gmail/send-reply.json' with { type: 'json' }
 import error404Fixture from './fixtures/gmail/error-404.json' with { type: 'json' }
 import error429Fixture from './fixtures/gmail/error-429.json' with { type: 'json' }
@@ -382,6 +384,7 @@ describe('gmailProvider', () => {
       expect(msg.authenticationResults).toMatch(/^mx\.google\.com/)
       expect(msg.authenticationResults).toContain('dmarc=pass')
       expect(msg.authenticationResults).not.toContain('relay.example.net')
+      expect(parseAuthResults(msg.authenticationResults, { authservId: 'mx.google.com' }).dmarcPass).toBe(true)
 
       // ISO-8859-1 leaf decoded correctly (café's é survives), and the Luhn-valid card scrubbed.
       expect(msg.bodyText).toBe(
@@ -394,6 +397,14 @@ describe('gmailProvider', () => {
       expect(msg.hasAttachments).toBe(true)
       expect(msg.attachments).toEqual([{ filename: 'receipt.pdf', mime: 'application/pdf', size: 45210 }])
       expect(msg.markerDraftId).toBeNull()
+    })
+
+    it("a message whose ONLY Authentication-Results header is NOT Gmail's own (a relay's, claiming dmarc=pass) is not trusted", async () => {
+      const client = gmailProvider(fixtureFetch({ msg: messageRelayOnlyFixture })).client('tok-1', SELF_ADDRESS)
+      const msg = await client.getMessage('msg-relay-1', { format: 'metadata' })
+
+      expect(msg.authenticationResults).toBe('relay.evil.test; dmarc=pass header.from=x.test')
+      expect(parseAuthResults(msg.authenticationResults, { authservId: 'mx.google.com' }).dmarcPass).toBe(false)
     })
 
     it('404 becomes MessageGoneError', async () => {

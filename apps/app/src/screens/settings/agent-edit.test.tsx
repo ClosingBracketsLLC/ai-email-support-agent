@@ -22,8 +22,10 @@ let mockCategories: { categoryId: string; key: string; label: string; mode: stri
 const mockUpdateCalls: unknown[] = []
 let mockUpdateImpl: (input: unknown) => Promise<unknown> = (input) => { mockUpdateCalls.push(input); return Promise.resolve({ ok: true }) }
 
+const mockPush = jest.fn()
 jest.mock('expo-router', () => ({
   useLocalSearchParams: () => ({ id: '11111111-1111-4111-8111-111111111111' }),
+  useRouter: () => ({ push: mockPush }),
 }))
 
 jest.mock('@/lib/trpc', () => ({
@@ -271,4 +273,14 @@ test('a pending-verification agent sees "Available once the address is verified"
   await waitFor(() => expect(screen.getByTestId('sandbox-pending')).toBeTruthy())
   expect(screen.getByText('Available once the address is verified.')).toBeTruthy()
   expect(screen.queryByTestId('sandbox-card')).toBeNull()
+})
+
+test('the Categories card hands per-category autonomy over to the Autopilot screen', async () => {
+  mockCategories = [{ categoryId: 'c1', key: 'order_status', label: 'Order status', mode: 'review' }]
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('categories-card')).toBeTruthy())
+
+  expect(screen.getByText('Order status · Review')).toBeTruthy()
+  await fireEvent.press(screen.getByTestId('manage-autopilot'))
+  expect(mockPush).toHaveBeenCalledWith('/settings/autopilot')
 })

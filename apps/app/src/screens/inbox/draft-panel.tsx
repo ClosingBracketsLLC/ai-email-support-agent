@@ -28,6 +28,12 @@ export interface DraftView {
   decisionReason: string
   confidence: number | null
   guardrailResult: unknown
+  /** `{ evidence, threshold, memory, grounding, … }` jsonb — narrowed by `evidenceLine`, never trusted. */
+  confidenceBreakdown: unknown
+  /** `auto` = the agent decided this one; `app`/`email` = a human did; null = nobody has yet. */
+  decisionSource: string | null
+  /** Stamped by `drafts.flagAutoSent` — "this should not have gone out". */
+  flaggedAt: Date | null
   send: { lastError: string | null } | null
 }
 
@@ -38,9 +44,11 @@ export interface DraftPanelProps {
   viewed: boolean
   onApprove: (body?: string) => void
   onHold: () => void
-  onReject: (action: RejectAction, reason: string) => void
+  onReject: (action: RejectAction, reason: string, addToGuidance: boolean) => void
   /** "Back to review" for a draft the send job parked on hold. */
   onResume: () => void
+  /** "Should not have sent" on an auto-sent reply (`drafts.flagAutoSent`). */
+  onFlag: () => void
   busy: boolean
   approveError: { code: string; findings?: string[] } | null
   undoUntil: Date | null
@@ -88,8 +96,23 @@ function guardrailFindings(raw: unknown): Finding[] {
 }
 const findingLine = (prefix: string, f: Finding) => `${prefix}: ${f.detail || f.code}`
 
+/**
+ * "How sure was it, and how sure did it have to be" — `confidence_breakdown.evidence` against the
+ * category's own `threshold`, both stored as fractions by `ticket.draft`. jsonb, so both are
+ * narrowed defensively; no evidence at all means no line rather than `Evidence NaN%`, and no
+ * threshold means the category is not on Autopilot, so there is no bar to name.
+ */
+function evidenceLine(raw: unknown): string | null {
+  const b = raw as { evidence?: unknown; threshold?: unknown } | null | undefined
+  const evidence = typeof b?.evidence === 'number' && Number.isFinite(b.evidence) ? b.evidence : null
+  if (evidence === null) return null
+  const threshold = typeof b?.threshold === 'number' && Number.isFinite(b.threshold) ? b.threshold : null
+  const pct = `Evidence ${Math.round(evidence * 100)}%`
+  return threshold === null ? pct : `${pct} · auto-sends at ${Math.round(threshold * 100)}%`
+}
+
 export function DraftPanel({
-  draft, ticket, viewed, onApprove, onHold, onReject, onResume, busy, approveError, undoUntil, undoTickMs, panelRef,
+  draft, ticket, viewed, onApprove, onHold, onReject, onResume, onFlag, busy, approveError, undoUntil, undoTickMs, panelRef,
 }: DraftPanelProps) {
   const c = useColors()
   const seed = draft.finalBody ?? draft.body
@@ -139,9 +162,9 @@ export function DraftPanel({
     setEditing(false)
     setEdited(seed)
   }
-  function submitReject(action: RejectAction, reason: string) {
+  function submitReject(action: RejectAction, reason: string, addToGuidance: boolean) {
     setRejecting(false)
-    onReject(action, reason)
+    onReject(action, reason, addToGuidance)
   }
 
   useImperativeHandle(panelRef, () => ({
@@ -152,6 +175,10 @@ export function DraftPanel({
 
   const pct = draft.confidence === null ? null : Math.round(draft.confidence * 100)
   const why = decisionReasonLabel(draft.decisionReason)
+  const evidence = evidenceLine(draft.confidenceBreakdown)
+  // An auto-sent reply nobody approved: the hold window is a Hold, and once it is out the owner's
+  // one remaining word about it is "that should not have gone out".
+  const auto = draft.decisionSource === 'auto'
 
   return (
     <Card testID="draft-panel">
@@ -160,6 +187,7 @@ export function DraftPanel({
         {pct === null ? null : <Chip tone="neutral" testID="draft-confidence">{`${pct}% confidence`}</Chip>}
       </View>
       {why ? <Muted testID="draft-why">{`Why: ${why}`}</Muted> : null}
+      {evidence !== null ? <Muted testID="draft-evidence">{evidence}</Muted> : null}
 
       {warnings.map((f, i) => (
         <Muted key={`warn-${i}`} testID={`draft-warning-${i}`}>{findingLine('Heads up', f)}</Muted>
@@ -197,7 +225,10 @@ export function DraftPanel({
       )}
 
       {undoUntil !== null && !undoExpired ? (
-        <UndoBar untilAt={undoUntil} onUndo={onHold} busy={busy} tickMs={undoTickMs} onExpired={() => setExpiredWindow(undoAt)} />
+        <UndoBar
+          untilAt={undoUntil} onUndo={onHold} busy={busy} tickMs={undoTickMs} onExpired={() => setExpiredWindow(undoAt)}
+          label={auto ? 'Hold' : 'Undo'} verb={auto ? 'Auto-sending' : 'Sending'}
+        />
       ) : draft.status === 'held' ? (
         <>
           <Banner tone="info" testID="draft-held">{`On hold — ${holdReasonLabel(draft.send?.lastError ?? null)}.`}</Banner>
@@ -220,7 +251,14 @@ export function DraftPanel({
           <Button label="Reject" variant="secondary" onPress={() => setRejecting(true)} disabled={busy} testID="reject" />
         </View>
       ) : (
-        <Muted testID="draft-decided">{DECIDED_COPY[draft.status] ?? 'This draft was already decided.'}</Muted>
+        <>
+          <Muted testID="draft-decided">{DECIDED_COPY[draft.status] ?? 'This draft was already decided.'}</Muted>
+          {draft.status === 'sent' && auto ? (
+            draft.flaggedAt === null
+              ? <Button label="Should not have sent" variant="secondary" onPress={onFlag} loading={busy} testID="flag-auto-sent" />
+              : <Muted testID="draft-flagged">Flagged — should not have sent</Muted>
+          ) : null}
+        </>
       )}
     </Card>
   )

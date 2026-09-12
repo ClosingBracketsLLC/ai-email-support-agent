@@ -2,8 +2,11 @@
  * `activity.summary` — Task 18's Activity v1. Every count below is over `withOrg` (org-scoped both by
  * RLS and by an explicit `orgId` predicate, the repo's usual belt-and-braces). Every count except
  * `recent` is windowed to `cutoff = now − days`; `recent` is simply the last 20 actually-sent replies,
- * unwindowed — a "what just happened" feed, not another report row. `autoSent` is the literal `0`:
- * autonomy's `auto` mode is unreachable until Phase 5, so nothing can ever have been auto-sent yet.
+ * unwindowed — a "what just happened" feed, not another report row. `autoSent` (Phase 5) counts the
+ * replies the agent both decided AND delivered on its own: `auto_decided_at` inside the window, the
+ * draft actually `sent`, and the decision still the agent's — a draft the owner held and re-approved
+ * carries `decision_source: 'app'` and is their reply, not an auto-send (`auto_decided_at` stays put
+ * as the durable mark, which is why both halves are tested).
  */
 import { and, count, desc, eq, gte, inArray, isNotNull, ne, sum } from 'drizzle-orm'
 import { ActivitySummaryInput } from '@aesa/contracts'
@@ -39,6 +42,11 @@ export const activityRouter = router({
       const [rejectedRow] = await tx.select({ value: count() }).from(drafts)
         .where(and(eq(drafts.orgId, orgId), gte(drafts.decidedAt, cutoff), eq(drafts.status, 'rejected')))
 
+      const [autoSentRow] = await tx.select({ value: count() }).from(drafts).where(and(
+        eq(drafts.orgId, orgId), gte(drafts.autoDecidedAt, cutoff),
+        eq(drafts.status, 'sent'), eq(drafts.decisionSource, 'auto'),
+      ))
+
       const [sentRow] = await tx.select({ value: count() }).from(outboundSends)
         .where(and(eq(outboundSends.orgId, orgId), gte(outboundSends.sentAt, cutoff)))
 
@@ -71,7 +79,7 @@ export const activityRouter = router({
         rejected: rejectedRow?.value ?? 0,
         sent: sentRow?.value ?? 0,
         escalated: escalatedRow?.value ?? 0,
-        autoSent: 0 as const,
+        autoSent: autoSentRow?.value ?? 0,
         costMicros: Number(costRow?.total ?? 0),
         aiHandledConversations: Number(aiHandledRow?.total ?? 0),
         recent,

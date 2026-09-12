@@ -13,6 +13,14 @@ export interface AuthResults {
   dmarcPass: boolean
 }
 
+export interface ParseAuthResultsOptions {
+  /** When set, the header is trusted only if its authserv-id (the token before the first `;`)
+   * equals this — Gmail always stamps `mx.google.com`. Microsoft's header has no authserv-id, so
+   * the Graph adapter passes nothing and the topmost-header rule alone applies (Phase 3 carry:
+   * the multi-header re-examination). */
+  authservId?: string
+}
+
 /**
  * Parses the topmost `Authentication-Results` header, per doge-buddy's `dmarcPasses`.
  *
@@ -33,12 +41,22 @@ export interface AuthResults {
  * than one clause matches (only reachable via injection), the LAST wins — Gmail appends the real
  * dmarc verdict as the FINAL method, after the dkim/spf clauses any mailfrom forgery lands in.
  * Missing header, dmarc=fail, dmarc=none and dmarc=bestguesspass are all non-pass.
+ *
+ * Re-examination conclusion (Phase 3 carry, DMARC authserv-id): each hop prepends, so the
+ * receiving MTA's stamp is topmost; Gmail's is additionally verified by authserv-id; Microsoft's
+ * carries none and is trusted as topmost.
  */
-export function parseAuthResults(header: string | null): AuthResults {
+export function parseAuthResults(header: string | null, opts: ParseAuthResultsOptions = {}): AuthResults {
   if (header === null) return { raw: header, dmarcPass: false }
-
+  const clauses = header.split(';')
+  if (opts.authservId !== undefined) {
+    const first = (clauses[0] ?? '').trim().toLowerCase()
+    // `mx.google.com` or `mx.google.com 1` (RFC 8601 allows a version after the authserv-id).
+    const authserv = first.split(/\s+/)[0] ?? ''
+    if (authserv !== opts.authservId.toLowerCase()) return { raw: header, dmarcPass: false }
+  }
   let result: string | null = null
-  for (const clause of header.split(';')) {
+  for (const clause of clauses) {
     const m = DMARC_METHOD_RE.exec(clause.trim())
     if (m) result = m[1]!.toLowerCase()
   }

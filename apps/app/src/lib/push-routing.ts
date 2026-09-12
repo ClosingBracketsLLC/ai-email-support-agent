@@ -5,8 +5,8 @@ import type { NotificationKind } from '@aesa/contracts'
 import { setNextPath } from './next-path'
 import { useTRPCClient } from './trpc'
 
-/** The Hold button `registerNotificationCategories` (push.ts) puts on a `draft_review` push — the
- * only one of its two actions that does anything beyond opening the ticket. */
+/** The Hold button `registerNotificationCategories` (push.ts) puts on an `auto_send` push — the only
+ * one of its two actions that does anything beyond opening the ticket. */
 const HOLD_ACTION = 'hold'
 
 /**
@@ -27,9 +27,13 @@ export function pathForNotification(data: Record<string, unknown> | undefined | 
   const ticketId = typeof data?.ticketId === 'string' && data.ticketId ? data.ticketId : undefined
   const connectionId = typeof data?.connectionId === 'string' && data.connectionId ? data.connectionId : undefined
 
-  if (kind === 'escalation' || kind === 'draft_review') return ticketId ? `/ticket/${ticketId}` : '/inbox'
+  if (kind === 'escalation' || kind === 'draft_review' || kind === 'auto_send') return ticketId ? `/ticket/${ticketId}` : '/inbox'
   if (kind === 'mailbox_reauth') return '/settings/mailboxes'
   if (kind === 'digest') return '/inbox'
+  // Phase 5's three learning-loop pushes are about a SETTING, not a ticket: a category that earned
+  // (or lost) Autopilot, and the weekly nudge to check what the agent has been remembering.
+  if (kind === 'graduation' || kind === 'demotion') return '/settings/autopilot'
+  if (kind === 'memory_sample') return '/settings/memory'
 
   // No `kind` on this payload (pre-fix push) — infer it from whichever field is present, ticketId first.
   if (ticketId) return `/ticket/${ticketId}`
@@ -40,10 +44,11 @@ export function pathForNotification(data: Record<string, unknown> | undefined | 
 /**
  * What one tap on a notification means: where it goes, and whether it also holds a draft.
  *
- * `Hold` is the second button on a `draft_review` push. It only ever succeeds on an approved,
- * not-yet-sent draft (the undo window) — a pending draft has nothing to hold, and the server answers
- * `not_holdable`, so that tap simply opens the ticket (plan deviation 12). `Review` and a plain tap
- * on the notification body carry no hold at all.
+ * `Hold` is the second button on an `auto_send` push — the reply is queued and still inside its hold
+ * window, so the tap cancels the send and returns the ticket to review. It only ever succeeds on an
+ * approved, not-yet-sent draft; anything else (a pending draft has nothing to hold) is answered
+ * `not_holdable` by the server and the tap simply opens the ticket (plan deviation 12). `Review` and
+ * a plain tap on the notification body carry no hold at all.
  */
 export function actionForResponse(r: {
   actionIdentifier?: string

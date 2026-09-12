@@ -200,6 +200,10 @@ describe('the api module graph', () => {
    * `../knowledge/service.ts`) are the two entry points that would otherwise drag the whole
    * knowledge graph into an api process.
    *
+   * Phase 5 adds `./src/memory/service.ts` (`@aesa/api/memory`), which imports the draft service for
+   * the shared flag path — so it inherits the same constraint and is walked as its own entry point:
+   * the memory surface must stay as free of the Anthropic SDK as the draft one.
+   *
    * `undici` gets a narrower check than the other four: `@aesa/crypto`'s root barrel (`index.ts`)
    * ALSO re-exports the SSRF-pinned fetch (`ssrf/pinned-fetch.ts`), which is undici's OTHER source
    * here — a real, pre-existing, sanctioned dependency (`mailboxes.ts`'s `hashToken` import pulls
@@ -210,6 +214,7 @@ describe('the api module graph', () => {
   it.each([
     ['./src/config.ts', 'loadConfig'],
     ['./src/trpc/router.ts', 'appRouter'],
+    ['./src/memory/service.ts', 'summary'],
   ])('importing %s never pulls in @anthropic-ai/sdk, @aesa/llm, pdfjs-dist or mammoth, and only reaches undici through @aesa/crypto', (modulePath, exportName) => {
     const probe = `
       import { registerHooks } from 'node:module'

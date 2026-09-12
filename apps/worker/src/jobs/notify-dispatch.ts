@@ -133,10 +133,14 @@ export async function runNotifyDispatch(deps: NotifyDispatchDeps, payload: Notif
     title: ready.title,
     body: ready.body,
     data: { kind: ready.kind, ...((ready.payload as Record<string, unknown> | null) ?? {}) },
-    // Only the review push is actionable from the notification shade — the app registers this
-    // category with a `Review` and a `Hold` button. Every other kind is informational, so it
-    // carries no category and the OS renders no action buttons.
-    ...(ready.kind === 'draft_review' ? { categoryId: 'draft_review' } : {}),
+    // Only the two reply pushes are actionable from the notification shade — the app registers a
+    // category per kind (apps/app/src/lib/push.ts): `draft_review` gets `Review` alone (a pending
+    // draft has nothing to hold), `auto_send` gets `Review` and `Hold`, because that reply is
+    // already queued and the hold window is the whole point of the push. Every other kind is
+    // informational, so it carries no category and the OS renders no action buttons.
+    ...(ready.kind === 'auto_send' ? { categoryId: 'auto_send' }
+      : ready.kind === 'draft_review' ? { categoryId: 'draft_review' }
+        : {}),
   })
 
   if (!result.ok) {

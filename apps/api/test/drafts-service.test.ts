@@ -8,11 +8,13 @@ import { createTRPCClient, httpBatchLink } from '@trpc/client'
 import { and, desc, eq, inArray } from 'drizzle-orm'
 import superjson from 'superjson'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
-import { APPROVE_UNDO_SECONDS } from '@aesa/contracts'
-import { auditLog, draftActionTokens, drafts, notifications, outboundSends, tickets, workspaces } from '@aesa/db'
+import { APPROVE_UNDO_SECONDS, OPERATING_GUIDANCE_MAX } from '@aesa/contracts'
+import {
+  agentCategoryPolicies, auditLog, categories, draftActionTokens, drafts, notifications, outboundSends, resolvedAnswers, tickets, workspaces,
+} from '@aesa/db'
 import { JOB_NAMES } from '@aesa/queue'
 import {
-  LIVE_DRAFT_STATUSES, approveDraft, holdDraft, levenshteinRatio, markViewed, rejectDraft, resolveTicket, resumeDraft, withDeadlockRetry,
+  LIVE_DRAFT_STATUSES, approveDraft, flagAutoSent, holdDraft, levenshteinRatio, markViewed, rejectDraft, resolveTicket, resumeDraft, withDeadlockRetry,
   type DraftActor, type DraftServiceDeps,
 } from '../src/drafts/service.ts'
 import type { ApiFacade, EnqueueFn } from '../src/deps.ts'
@@ -91,6 +93,66 @@ describe('draft service', () => {
     const draft = await seedPendingDraft(t.api, org.orgId, ticket.id, { agentId: org.agentId, viewedAt: new Date(), ...draftOpts })
     return { ticket, draft }
   }
+
+  /**
+   * The state Task 6's auto landing leaves behind: an `auto_sending` ticket, a draft already
+   * `approved` with `decision_source: 'auto'` and its `final_body` written, a `queued` send two
+   * minutes out (the agent's hold window), and the draft's category on Autopilot. `categoryId` is
+   * passed back in so a second auto-send can be seeded into the SAME (agent, category) — which is
+   * what every demotion signal is counted over.
+   */
+  async function seedAutoSending(
+    org: Awaited<ReturnType<typeof seedOrg>>,
+    opts: { categoryId?: string; usedAnswerIds?: string[]; status?: 'approved' | 'sent' } = {},
+  ) {
+    const now = new Date()
+    const categoryId = opts.categoryId ?? (await t.api.withOrg(org.orgId, async (tx) => {
+      const [row] = await tx.insert(categories)
+        .values({ orgId: org.orgId, key: `order_status-${randomUUID().slice(0, 8)}`, label: 'Order status' })
+        .returning({ id: categories.id })
+      await tx.insert(agentCategoryPolicies)
+        .values({ orgId: org.orgId, agentId: org.agentId, categoryId: row!.id, mode: 'auto', autoSendMinConfidence: 80, graduatedAt: now })
+      return row!.id
+    }))
+
+    const ticket = await insertTicket(t.api, org.orgId, {
+      connectionId: org.connectionId, agentId: org.agentId, status: 'auto_sending', categoryId,
+      customerEmail: 'casey@customer.test', subject: 'Where is my order?', lastInboundAt: now, inboundCount: 1,
+    })
+    const seeded = await seedPendingDraft(t.api, org.orgId, ticket.id, { agentId: org.agentId })
+    const status = opts.status ?? 'approved'
+    const [draft] = await t.api.withOrg(org.orgId, (tx) => tx.update(drafts).set({
+      status, finalBody: SEED_DRAFT_BODY, decisionSource: 'auto', decidedAt: now, autoDecidedAt: now,
+      categoryId, usedAnswerIds: opts.usedAnswerIds ?? [],
+    }).where(eq(drafts.id, seeded.id)).returning())
+    const [send] = await t.api.withOrg(org.orgId, (tx) => tx.insert(outboundSends).values({
+      orgId: org.orgId, draftId: seeded.id, ticketId: ticket.id, connectionId: org.connectionId, agentId: org.agentId,
+      status: status === 'sent' ? 'sent' : 'queued', sendAfter: new Date(now.getTime() + 2 * 60_000),
+      ...(status === 'sent' ? { sentAt: now } : {}),
+    }).returning())
+    return { ticket, draft: draft!, send: send!, categoryId }
+  }
+
+  /** One `resolved_answers` row, as `memory.capture` would have written it. */
+  async function seedAnswer(
+    orgId: string, values: Partial<typeof resolvedAnswers.$inferInsert> = {},
+  ): Promise<typeof resolvedAnswers.$inferSelect> {
+    const [row] = await t.api.withOrg(orgId, (tx) => tx.insert(resolvedAnswers).values({
+      orgId, questionText: 'When does my order ship?', answerBody: 'It ships the next working day.',
+      expiresAt: new Date(Date.now() + 365 * 86_400_000), ...values,
+    }).returning())
+    return row!
+  }
+
+  const readPolicy = (orgId: string, agentId: string, categoryId: string) =>
+    t.api.withOrg(orgId, async (tx) => (await tx.select().from(agentCategoryPolicies)
+      .where(and(eq(agentCategoryPolicies.agentId, agentId), eq(agentCategoryPolicies.categoryId, categoryId))))[0])
+  const readAnswer = (orgId: string, answerId: string) =>
+    t.api.withOrg(orgId, async (tx) => (await tx.select().from(resolvedAnswers).where(eq(resolvedAnswers.id, answerId)))[0])
+  const readWorkspace = (orgId: string) =>
+    t.api.withOrg(orgId, async (tx) => (await tx.select().from(workspaces).where(eq(workspaces.orgId, orgId)))[0])
+  const readNotifications = (orgId: string, kind: string) =>
+    t.api.withOrg(orgId, (tx) => tx.select().from(notifications).where(eq(notifications.kind, kind)))
 
   const readDraft = (orgId: string, draftId: string) =>
     t.api.withOrg(orgId, async (tx) => (await tx.select().from(drafts).where(eq(drafts.id, draftId)))[0])
@@ -510,8 +572,8 @@ describe('draft service', () => {
     })
     const draft = await seedPendingDraft(t.api, org.orgId, ticket.id, { agentId: org.agentId, viewedAt: new Date() })
 
-    const res = await rejectDraft(deps, org.orgId, { draftId: draft.id, action: 'redraft', reason: 'Mention the 30-day return window.' }, org.actor)
-    expect(res).toEqual({ ok: true, resolution: 'redraft' })
+    const res = await rejectDraft(deps, org.orgId, { draftId: draft.id, action: 'redraft', reason: 'Mention the 30-day return window.', addToGuidance: false }, org.actor)
+    expect(res).toEqual({ ok: true, resolution: 'redraft', guidanceAdded: false })
 
     expect(await readDraft(org.orgId, draft.id)).toMatchObject({
       status: 'rejected', rejectAction: 'redraft', rejectReason: 'Mention the 30-day return window.', decisionSource: 'app', decidedBy: org.userId,
@@ -536,8 +598,8 @@ describe('draft service', () => {
     })
     const draft = await seedPendingDraft(t.api, org.orgId, ticket.id, { agentId: org.agentId, viewedAt: new Date() })
 
-    const res = await rejectDraft(deps, org.orgId, { draftId: draft.id, action: 'redraft', reason: 'Still not right.' }, org.actor)
-    expect(res).toEqual({ ok: true, resolution: 'escalate_limit' })
+    const res = await rejectDraft(deps, org.orgId, { draftId: draft.id, action: 'redraft', reason: 'Still not right.', addToGuidance: false }, org.actor)
+    expect(res).toEqual({ ok: true, resolution: 'escalate_limit', guidanceAdded: false })
 
     expect(await readDraft(org.orgId, draft.id)).toMatchObject({ status: 'rejected' })
     const after = await readTicket(org.orgId, ticket.id)
@@ -556,8 +618,8 @@ describe('draft service', () => {
     const ticket = await insertTicket(t.api, org.orgId, { connectionId: org.connectionId, agentId: org.agentId, status: 'awaiting_review' })
     const draft = await seedPendingDraft(t.api, org.orgId, ticket.id, { agentId: org.agentId, viewedAt: new Date() })
 
-    const res = await rejectDraft(deps, org.orgId, { draftId: draft.id, action: 'handle', reason: '' }, org.actor)
-    expect(res).toEqual({ ok: true, resolution: 'escalate_terminal' })
+    const res = await rejectDraft(deps, org.orgId, { draftId: draft.id, action: 'handle', reason: '', addToGuidance: false }, org.actor)
+    expect(res).toEqual({ ok: true, resolution: 'escalate_terminal', guidanceAdded: false })
 
     const after = await readTicket(org.orgId, ticket.id)
     expect(after).toMatchObject({ status: 'needs_owner', needsOwnerReason: 'owner_handling' })
@@ -572,8 +634,8 @@ describe('draft service', () => {
     const ticket = await insertTicket(t.api, org.orgId, { connectionId: org.connectionId, agentId: org.agentId, status: 'needs_owner', needsOwnerReason: 'tripwire' })
     const draft = await seedPendingDraft(t.api, org.orgId, ticket.id, { agentId: org.agentId, viewedAt: new Date() })
 
-    const res = await rejectDraft(deps, org.orgId, { draftId: draft.id, action: 'redraft', reason: 'Try again please.' }, org.actor)
-    expect(res).toEqual({ ok: true, resolution: 'escalate_terminal' })
+    const res = await rejectDraft(deps, org.orgId, { draftId: draft.id, action: 'redraft', reason: 'Try again please.', addToGuidance: false }, org.actor)
+    expect(res).toEqual({ ok: true, resolution: 'escalate_terminal', guidanceAdded: false })
     expect(await readDraft(org.orgId, draft.id)).toMatchObject({ status: 'rejected' })
     // `awaiting_review` is the only status a reject escalates FROM: this ticket was already escalated
     // for another reason, and overwriting that with `owner_handling` would erase why it is waiting.
@@ -583,7 +645,7 @@ describe('draft service', () => {
     // actually happened: nothing was escalated, so it is never reported as `escalate_limit`.
     const audited = (await readAudit(org.orgId, 'draft.rejected'))[0]!.detail as { resolution: string; escalated: boolean }
     expect(audited).toMatchObject({ resolution: 'escalate_terminal', escalated: false })
-    expect(res).toEqual({ ok: true, resolution: audited.resolution })
+    expect(res).toEqual({ ok: true, resolution: audited.resolution, guidanceAdded: false })
     expect(sent).toEqual([])
   })
 
@@ -591,7 +653,301 @@ describe('draft service', () => {
     const org = await seedOrg()
     const { draft } = await seedReviewable(org)
     await approveDraft(deps, org.orgId, { draftId: draft.id }, org.actor)
-    expect(await rejectDraft(deps, org.orgId, { draftId: draft.id, action: 'handle', reason: '' }, org.actor)).toEqual({ ok: false, code: 'not_pending' })
+    expect(await rejectDraft(deps, org.orgId, { draftId: draft.id, action: 'handle', reason: '', addToGuidance: false }, org.actor)).toEqual({ ok: false, code: 'not_pending' })
+  })
+
+  // -- Phase 5: the auto-send loop (hold, resume, flag), reject-to-guidance and inline demotion --
+
+  it('holdDraft on an auto-send: send held, draft back to pending with auto_held_at, ticket auto_sending → awaiting_review, audit draft.held { auto: true }', async () => {
+    const org = await seedOrg()
+    const { ticket, draft, send } = await seedAutoSending(org)
+
+    expect(await holdDraft(deps, org.orgId, draft.id, org.actor)).toEqual({ ok: true })
+
+    const after = await readDraft(org.orgId, draft.id)
+    expect(after).toMatchObject({ status: 'pending', finalBody: SEED_DRAFT_BODY })
+    expect(after!.autoHeldAt).toBeInstanceOf(Date)
+    expect(after!.autoDecidedAt).toBeInstanceOf(Date)              // the durable auto mark survives
+    expect(await readSend(org.orgId, draft.id)).toMatchObject({ id: send.id, status: 'held' })
+    expect(await readTicket(org.orgId, ticket.id)).toMatchObject({ status: 'awaiting_review' })
+
+    const rows = await readAudit(org.orgId, 'draft.held')
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.detail).toMatchObject({ draftId: draft.id, ticketId: ticket.id, sendId: send.id, auto: true })
+  })
+
+  it('holdDraft on a HUMAN approval leaves auto_held_at null, the ticket alone, and audits auto: false', async () => {
+    const org = await seedOrg()
+    const { ticket, draft } = await seedReviewable(org)
+    await approveDraft(deps, org.orgId, { draftId: draft.id }, org.actor)
+
+    expect(await holdDraft(deps, org.orgId, draft.id, org.actor)).toEqual({ ok: true })
+    expect((await readDraft(org.orgId, draft.id))!.autoHeldAt).toBeNull()
+    expect(await readTicket(org.orgId, ticket.id)).toMatchObject({ status: 'awaiting_review' })
+    expect((await readAudit(org.orgId, 'draft.held'))[0]!.detail).toMatchObject({ auto: false })
+  })
+
+  it('resumeDraft on a held auto draft returns the ticket to awaiting_review as well', async () => {
+    const org = await seedOrg()
+    const { ticket, draft, send } = await seedAutoSending(org)
+    // What `send.execute`'s `landHeld` leaves on an auto-sending ticket: both rows held, the ticket
+    // still counting down in `auto_sending`.
+    await t.api.withOrg(org.orgId, (tx) => tx.update(drafts).set({ status: 'held' }).where(eq(drafts.id, draft.id)))
+    await t.api.withOrg(org.orgId, (tx) => tx.update(outboundSends)
+      .set({ status: 'held', lastError: 'held:workspace_kill_switch' }).where(eq(outboundSends.id, send.id)))
+
+    expect(await resumeDraft(deps, org.orgId, draft.id, org.actor)).toEqual({ ok: true })
+    expect(await readDraft(org.orgId, draft.id)).toMatchObject({ status: 'pending' })
+    expect(await readSend(org.orgId, draft.id)).toMatchObject({ status: 'held' })
+    expect(await readTicket(org.orgId, ticket.id)).toMatchObject({ status: 'awaiting_review' })
+    expect((await readAudit(org.orgId, 'draft.resumed'))[0]!.detail).toMatchObject({ from: 'held', ticketReturned: true })
+  })
+
+  it('an edited approve of a draft that was auto-held demotes the category (hold_then_edit) and enqueues guidance.suggest', async () => {
+    const org = await seedOrg()
+    const { draft, categoryId } = await seedAutoSending(org)
+    expect(await holdDraft(deps, org.orgId, draft.id, org.actor)).toEqual({ ok: true })
+    await markViewed(deps, org.orgId, draft.id, org.actor)
+    sent.length = 0
+
+    const edited = 'Hi Casey,\n\nYour order ships on Thursday and you will get tracking by email.\n\nThanks'
+    const res = await approveDraft(deps, org.orgId, { draftId: draft.id, body: edited }, org.actor)
+    expect(res).toMatchObject({ ok: true, edited: true })
+
+    const policy = await readPolicy(org.orgId, org.agentId, categoryId)
+    expect(policy).toMatchObject({ mode: 'review', demotedReason: 'hold_then_edit' })
+    expect(policy!.demotedAt).toBeInstanceOf(Date)
+
+    const [demotion] = await readNotifications(org.orgId, 'demotion')
+    expect(demotion).toBeDefined()
+    expect(sent.map((s) => s.name).sort()).toEqual([JOB_NAMES.guidanceSuggest, JOB_NAMES.notifyDispatch, JOB_NAMES.sendExecute].sort())
+    expect(sent.find((s) => s.name === JOB_NAMES.guidanceSuggest)).toMatchObject({
+      data: { orgId: org.orgId, draftId: draft.id }, opts: { entityId: draft.id },
+    })
+    expect(sent.find((s) => s.name === JOB_NAMES.notifyDispatch)).toMatchObject({
+      data: { orgId: org.orgId, notificationId: demotion!.id }, opts: { entityId: demotion!.id },
+    })
+    expect((await readAudit(org.orgId, 'autonomy.demoted'))[0]!.detail).toMatchObject({ categoryId, reason: 'hold_then_edit' })
+  })
+
+  it('an unchanged approve enqueues no guidance.suggest, and an edited approve of a draft that was never auto-held demotes nothing', async () => {
+    const org = await seedOrg()
+    const { draft } = await seedReviewable(org)
+    await approveDraft(deps, org.orgId, { draftId: draft.id }, org.actor)
+    expect(sent.map((s) => s.name)).toEqual([JOB_NAMES.sendExecute])
+
+    // The same auto-send, parked by `landHeld` (a kill lever) and brought back to review WITHOUT a
+    // Hold — so `auto_held_at` is null and the edit below is an ordinary review decision.
+    const auto = await seedAutoSending(org)
+    await t.api.withOrg(org.orgId, (tx) => tx.update(drafts).set({ status: 'pending', viewedAt: new Date() }).where(eq(drafts.id, auto.draft.id)))
+    await t.api.withOrg(org.orgId, (tx) => tx.update(outboundSends).set({ status: 'held' }).where(eq(outboundSends.id, auto.send.id)))
+    sent.length = 0
+    const edited = 'Hi Casey,\n\nYour order ships on Thursday and you will get tracking by email.\n\nThanks'
+    expect(await approveDraft(deps, org.orgId, { draftId: auto.draft.id, body: edited }, org.actor)).toMatchObject({ ok: true, edited: true })
+    expect(sent.map((s) => s.name).sort()).toEqual([JOB_NAMES.guidanceSuggest, JOB_NAMES.sendExecute].sort())
+    expect(await readPolicy(org.orgId, org.agentId, auto.categoryId)).toMatchObject({ mode: 'auto' })
+    expect(await readNotifications(org.orgId, 'demotion')).toHaveLength(0)
+  })
+
+  it('rejectDraft with addToGuidance appends "- <reason>" to operating_guidance (audited as a length) and returns guidanceAdded: true; over the 8,000 cap it appends nothing and returns false', async () => {
+    const org = await seedOrg()
+    const first = await seedReviewable(org)
+    const reason = 'Never promise a refund date.'
+
+    const res = await rejectDraft(deps, org.orgId, { draftId: first.draft.id, action: 'handle', reason, addToGuidance: true }, org.actor)
+    expect(res).toEqual({ ok: true, resolution: 'escalate_terminal', guidanceAdded: true })
+    expect((await readWorkspace(org.orgId))!.operatingGuidance).toBe(`- ${reason}`)
+
+    const appended = await readAudit(org.orgId, 'workspace.guidance.append')
+    expect(appended).toHaveLength(1)
+    expect(appended[0]!.detail).toMatchObject({ length: `- ${reason}`.length })
+    expect(JSON.stringify(appended[0]!.detail)).not.toContain('refund')
+
+    // A second append goes on its own line, under the cap.
+    const second = await seedReviewable(org)
+    const res2 = await rejectDraft(deps, org.orgId, { draftId: second.draft.id, action: 'handle', reason: 'Always give the order number.', addToGuidance: true }, org.actor)
+    expect(res2).toEqual({ ok: true, resolution: 'escalate_terminal', guidanceAdded: true })
+    expect((await readWorkspace(org.orgId))!.operatingGuidance).toBe(`- ${reason}\n- Always give the order number.`)
+
+    // At the cap nothing is appended and the owner is told so.
+    const full = 'x'.repeat(OPERATING_GUIDANCE_MAX)
+    await t.api.withOrg(org.orgId, (tx) => tx.update(workspaces).set({ operatingGuidance: full }).where(eq(workspaces.orgId, org.orgId)))
+    const third = await seedReviewable(org)
+    const res3 = await rejectDraft(deps, org.orgId, { draftId: third.draft.id, action: 'handle', reason: 'One rule too many.', addToGuidance: true }, org.actor)
+    expect(res3).toEqual({ ok: true, resolution: 'escalate_terminal', guidanceAdded: false })
+    expect((await readWorkspace(org.orgId))!.operatingGuidance).toBe(full)
+    expect(await readAudit(org.orgId, 'workspace.guidance.append')).toHaveLength(2)
+  })
+
+  it('rejectDraft strikes every answer the draft used (used_answer_ids); the second strike retires it', async () => {
+    const org = await seedOrg()
+    const fresh = await seedAnswer(org.orgId, { status: 'active', strikes: 0 })
+    const onStrikeOne = await seedAnswer(org.orgId, { status: 'active', strikes: 1 })
+    const flagged = await seedAnswer(org.orgId, { status: 'needs_review', strikes: 1, reviewReason: 'model_conflict' })
+    const untouched = await seedAnswer(org.orgId, { status: 'active', strikes: 0 })
+
+    const { draft } = await seedReviewable(org)
+    await t.api.withOrg(org.orgId, (tx) => tx.update(drafts)
+      .set({ usedAnswerIds: [fresh.id, onStrikeOne.id, flagged.id] }).where(eq(drafts.id, draft.id)))
+
+    await rejectDraft(deps, org.orgId, { draftId: draft.id, action: 'handle', reason: '', addToGuidance: false }, org.actor)
+
+    expect(await readAnswer(org.orgId, fresh.id)).toMatchObject({ status: 'active', strikes: 1, retiredReason: null })
+    expect(await readAnswer(org.orgId, onStrikeOne.id)).toMatchObject({ status: 'retired', strikes: 2, retiredReason: 'strikes' })
+    expect(await readAnswer(org.orgId, flagged.id)).toMatchObject({ status: 'retired', strikes: 2, retiredReason: 'strikes' })
+    expect(await readAnswer(org.orgId, untouched.id)).toMatchObject({ status: 'active', strikes: 0 })
+  })
+
+  it('two rejects in 7 days in an auto category demote it (rejections) — the second reject carries the notification', async () => {
+    const org = await seedOrg()
+    const { categoryId } = await seedAutoSending(org)
+
+    async function rejectOne() {
+      const ticket = await insertTicket(t.api, org.orgId, {
+        connectionId: org.connectionId, agentId: org.agentId, status: 'awaiting_review', categoryId,
+      })
+      const seeded = await seedPendingDraft(t.api, org.orgId, ticket.id, { agentId: org.agentId, viewedAt: new Date() })
+      await t.api.withOrg(org.orgId, (tx) => tx.update(drafts).set({ categoryId }).where(eq(drafts.id, seeded.id)))
+      return rejectDraft(deps, org.orgId, { draftId: seeded.id, action: 'handle', reason: '', addToGuidance: false }, org.actor)
+    }
+
+    sent.length = 0
+    expect(await rejectOne()).toEqual({ ok: true, resolution: 'escalate_terminal', guidanceAdded: false })
+    expect(await readPolicy(org.orgId, org.agentId, categoryId)).toMatchObject({ mode: 'auto' })
+    expect(sent).toEqual([])
+
+    expect(await rejectOne()).toEqual({ ok: true, resolution: 'escalate_terminal', guidanceAdded: false })
+    expect(await readPolicy(org.orgId, org.agentId, categoryId)).toMatchObject({ mode: 'review', demotedReason: 'rejections' })
+
+    const [demotion] = await readNotifications(org.orgId, 'demotion')
+    expect(demotion).toBeDefined()
+    expect(sent).toEqual([{ name: JOB_NAMES.notifyDispatch, data: { orgId: org.orgId, notificationId: demotion!.id }, opts: { entityId: demotion!.id } }])
+  })
+
+  it("flagAutoSent on a sent auto draft stamps flagged_at/by, strikes the used answers, retires this draft's own candidate (sampled_bad), and the second flag in 30 days demotes (flags)", async () => {
+    const org = await seedOrg()
+    const used = await seedAnswer(org.orgId, { status: 'active', strikes: 1 })
+    const first = await seedAutoSending(org, { status: 'sent', usedAnswerIds: [used.id] })
+    const candidate = await seedAnswer(org.orgId, { status: 'candidate', sourceDraftId: first.draft.id })
+    const otherCandidate = await seedAnswer(org.orgId, { status: 'candidate' })
+
+    sent.length = 0
+    expect(await flagAutoSent(deps, org.orgId, first.draft.id, org.actor)).toEqual({ ok: true })
+
+    const flaggedDraft = await readDraft(org.orgId, first.draft.id)
+    expect(flaggedDraft!.flaggedAt).toBeInstanceOf(Date)
+    expect(flaggedDraft).toMatchObject({ flaggedBy: org.userId, status: 'sent' })
+    expect(await readAnswer(org.orgId, used.id)).toMatchObject({ status: 'retired', strikes: 2, retiredReason: 'strikes' })
+    expect(await readAnswer(org.orgId, candidate.id)).toMatchObject({ status: 'retired', retiredReason: 'sampled_bad' })
+    expect(await readAnswer(org.orgId, otherCandidate.id)).toMatchObject({ status: 'candidate' })
+    expect((await readAudit(org.orgId, 'draft.flagged'))[0]!.detail).toMatchObject({ draftId: first.draft.id, ticketId: first.ticket.id, source: 'app' })
+    expect(await readPolicy(org.orgId, org.agentId, first.categoryId)).toMatchObject({ mode: 'auto' })
+    expect(sent).toEqual([])
+
+    // Two flags inside the 30-day window is a demotion, and it pages.
+    const second = await seedAutoSending(org, { categoryId: first.categoryId, status: 'sent' })
+    expect(await flagAutoSent(deps, org.orgId, second.draft.id, org.actor)).toEqual({ ok: true })
+    expect(await readPolicy(org.orgId, org.agentId, first.categoryId)).toMatchObject({ mode: 'review', demotedReason: 'flags' })
+    const [demotion] = await readNotifications(org.orgId, 'demotion')
+    expect(sent).toEqual([{ name: JOB_NAMES.notifyDispatch, data: { orgId: org.orgId, notificationId: demotion!.id }, opts: { entityId: demotion!.id } }])
+  })
+
+  it('flagAutoSent refuses a human-approved draft and a draft already flagged (not_flaggable), and an unknown draft (not_found)', async () => {
+    const org = await seedOrg()
+    const human = await seedReviewable(org)
+    await t.api.withOrg(org.orgId, (tx) => tx.update(drafts)
+      .set({ status: 'sent', decisionSource: 'app', decidedAt: new Date() }).where(eq(drafts.id, human.draft.id)))
+    expect(await flagAutoSent(deps, org.orgId, human.draft.id, org.actor)).toEqual({ ok: false, code: 'not_flaggable' })
+
+    const auto = await seedAutoSending(org, { status: 'sent' })
+    expect(await flagAutoSent(deps, org.orgId, auto.draft.id, org.actor)).toEqual({ ok: true })
+    expect(await flagAutoSent(deps, org.orgId, auto.draft.id, org.actor)).toEqual({ ok: false, code: 'not_flaggable' })
+
+    // Still counting down, not sent yet: nothing to flag.
+    const queued = await seedAutoSending(org)
+    expect(await flagAutoSent(deps, org.orgId, queued.draft.id, org.actor)).toEqual({ ok: false, code: 'not_flaggable' })
+
+    expect(await flagAutoSent(deps, org.orgId, randomUUID(), org.actor)).toEqual({ ok: false, code: 'not_found' })
+  })
+
+  // Task 9 review, Important 1: the learning writes (`resolved_answers`, `workspaces`,
+  // `agent_category_policies`) are the FOURTH position in the global lock order and must run AFTER
+  // the ticket work — the worker's `applyDraftOutcome` locks the ticket and THEN flags a conflicting
+  // answer `needs_review` in one transaction, so taking them first could deadlock a landing against a
+  // reject that shares one answer id. This pins the REDRAFT branch, the one that returns early: every
+  // write still lands, in one transaction, on the branch most at risk of skipping them.
+  it('a reject that re-drafts does its ticket work first and still lands every learning write: the ticket flip, the strike, the guidance line and the demotion', async () => {
+    const org = await seedOrg()
+    const { categoryId } = await seedAutoSending(org)
+    const used = await seedAnswer(org.orgId, { status: 'active', strikes: 1 })
+
+    /** A reviewable ticket + draft in the auto category. */
+    async function seedInCategory() {
+      const ticket = await insertTicket(t.api, org.orgId, {
+        connectionId: org.connectionId, agentId: org.agentId, status: 'awaiting_review', categoryId,
+      })
+      const seeded = await seedPendingDraft(t.api, org.orgId, ticket.id, { agentId: org.agentId, viewedAt: new Date() })
+      await t.api.withOrg(org.orgId, (tx) => tx.update(drafts).set({ categoryId }).where(eq(drafts.id, seeded.id)))
+      return { ticket, draft: seeded }
+    }
+
+    // One earlier rejection in the 7-day window, so THIS reject is the second and demotes.
+    const first = await seedInCategory()
+    await rejectDraft(deps, org.orgId, { draftId: first.draft.id, action: 'handle', reason: '', addToGuidance: false }, org.actor)
+    expect(await readPolicy(org.orgId, org.agentId, categoryId)).toMatchObject({ mode: 'auto' })
+
+    const second = await seedInCategory()
+    await t.api.withOrg(org.orgId, (tx) => tx.update(drafts).set({ usedAnswerIds: [used.id] }).where(eq(drafts.id, second.draft.id)))
+    sent.length = 0
+
+    const reason = 'Never quote a courier ETA.'
+    const res = await rejectDraft(deps, org.orgId, { draftId: second.draft.id, action: 'redraft', reason, addToGuidance: true }, org.actor)
+    expect(res).toEqual({ ok: true, resolution: 'redraft', guidanceAdded: true })
+
+    // The ticket work happened...
+    expect(await readTicket(org.orgId, second.ticket.id)).toMatchObject({ status: 'triaged', ownerRedraftFeedback: reason, redraftCount: 1 })
+    const redraftAudit = await readAudit(org.orgId, 'draft.rejected_for_redraft')
+    expect(redraftAudit).toHaveLength(1)
+    expect(redraftAudit[0]!.detail).toMatchObject({ draftId: second.draft.id, ticketId: second.ticket.id })
+
+    // ...and every learning write still landed, on the branch that returns early.
+    expect(await readAnswer(org.orgId, used.id)).toMatchObject({ status: 'retired', strikes: 2, retiredReason: 'strikes' })
+    expect((await readWorkspace(org.orgId))!.operatingGuidance).toBe(`- ${reason}`)
+    const appended = await readAudit(org.orgId, 'workspace.guidance.append')
+    expect(appended).toHaveLength(1)
+    expect(appended[0]!.detail).toMatchObject({ length: `- ${reason}`.length, draftId: second.draft.id })
+    expect(await readPolicy(org.orgId, org.agentId, categoryId)).toMatchObject({ mode: 'review', demotedReason: 'rejections' })
+
+    const [demotion] = await readNotifications(org.orgId, 'demotion')
+    expect(sent).toEqual([
+      { name: JOB_NAMES.ticketDraft, data: { orgId: org.orgId, ticketId: second.ticket.id }, opts: { entityId: second.ticket.id } },
+      { name: JOB_NAMES.notifyDispatch, data: { orgId: org.orgId, notificationId: demotion!.id }, opts: { entityId: demotion!.id } },
+    ])
+  })
+
+  it('a deadlocked reject retries with a FRESH clock, exactly as approve/hold/resolve do', async () => {
+    const org = await seedOrg()
+    const { ticket, draft } = await seedReviewable(org)
+    const t0 = new Date('2026-09-10T10:00:00.000Z')
+    const t1 = new Date('2026-09-10T10:00:05.000Z')
+    const stamps = [t0, t1]
+    let attempts = 0
+    const deadlock = (): Error => Object.assign(new Error('Failed query: update "drafts" …'), {
+      cause: Object.assign(new Error('deadlock detected'), { code: '40P01' }),
+    })
+    const api: ApiFacade = {
+      ...t.api,
+      withOrg: (id, fn) => { if (++attempts === 1) throw deadlock(); return t.api.withOrg(id, fn) },
+    }
+
+    const res = await rejectDraft(
+      { ...deps, api, now: () => stamps.shift() ?? t1 }, org.orgId,
+      { draftId: draft.id, action: 'handle', reason: '', addToGuidance: false }, org.actor,
+    )
+    expect(res).toEqual({ ok: true, resolution: 'escalate_terminal', guidanceAdded: false })
+    expect(attempts).toBe(2)
+    expect((await readDraft(org.orgId, draft.id))!.decidedAt!.toISOString()).toBe(t1.toISOString())
+    expect(await readTicket(org.orgId, ticket.id)).toMatchObject({ status: 'needs_owner', needsOwnerReason: 'owner_handling' })
   })
 
   // -- markViewed / resolveTicket --

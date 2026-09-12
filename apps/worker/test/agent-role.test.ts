@@ -7,6 +7,8 @@ import { maybeRegisterAgentRole, type AgentRoleRegistrars } from '../src/agent-r
 import type { WorkerConfig } from '../src/config.ts'
 import { createWorkerLogger } from '../src/logging.ts'
 import type { AgentSandboxDeps } from '../src/jobs/agent-sandbox.ts'
+import type { GuidanceSuggestDeps } from '../src/jobs/guidance-suggest.ts'
+import type { MemoryCaptureDeps } from '../src/jobs/memory-capture.ts'
 import type { TicketDraftDeps } from '../src/jobs/ticket-draft.ts'
 import type { TicketTriageDeps } from '../src/jobs/ticket-triage.ts'
 
@@ -37,9 +39,12 @@ function baseConfig(overrides: Partial<WorkerConfig> = {}): WorkerConfig {
   }
 }
 
-/** All three registrars share one flag: every gating test only asks "did anything register at all?". */
+/** All five registrars share one flag: every gating test only asks "did anything register at all?". */
 function spyRegistrars(mark: () => void): AgentRoleRegistrars {
-  return { registerTriage: async () => mark(), registerDraft: async () => mark(), registerSandbox: async () => mark() }
+  return {
+    registerTriage: async () => mark(), registerDraft: async () => mark(), registerSandbox: async () => mark(),
+    registerMemoryCapture: async () => mark(), registerGuidanceSuggest: async () => mark(),
+  }
 }
 
 function testLogger(): { logger: ReturnType<typeof createWorkerLogger>; lines: string[] } {
@@ -52,7 +57,7 @@ describe('maybeRegisterAgentRole', () => {
     const { logger, lines } = testLogger()
     let registered = false
     await maybeRegisterAgentRole(
-      { boss: fakeBoss, db: fakeDb, logger, config: baseConfig({ roles: new Set(['sync']) }), enqueueNotify: async () => {}, enqueueDraft: async () => {} },
+      { boss: fakeBoss, db: fakeDb, logger, config: baseConfig({ roles: new Set(['sync']) }), enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {} },
       spyRegistrars(() => { registered = true }),
     )
     expect(registered).toBe(false)
@@ -64,7 +69,7 @@ describe('maybeRegisterAgentRole', () => {
     let registered = false
     await expect(
       maybeRegisterAgentRole(
-        { boss: fakeBoss, db: fakeDb, logger, config: baseConfig({ env: 'production' }), enqueueNotify: async () => {}, enqueueDraft: async () => {} },
+        { boss: fakeBoss, db: fakeDb, logger, config: baseConfig({ env: 'production' }), enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {} },
         spyRegistrars(() => { registered = true }),
       ),
     ).rejects.toThrow(/ANTHROPIC_API_KEY/)
@@ -75,7 +80,7 @@ describe('maybeRegisterAgentRole', () => {
     const { logger, lines } = testLogger()
     let registered = false
     await maybeRegisterAgentRole(
-      { boss: fakeBoss, db: fakeDb, logger, config: baseConfig({ env: 'development' }), enqueueNotify: async () => {}, enqueueDraft: async () => {} },
+      { boss: fakeBoss, db: fakeDb, logger, config: baseConfig({ env: 'development' }), enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {} },
       spyRegistrars(() => { registered = true }),
     )
     expect(registered).toBe(false)
@@ -87,17 +92,20 @@ describe('maybeRegisterAgentRole', () => {
     const { logger } = testLogger()
     let registered = false
     await maybeRegisterAgentRole(
-      { boss: fakeBoss, db: fakeDb, logger, config: baseConfig({ env: 'test' }), enqueueNotify: async () => {}, enqueueDraft: async () => {} },
+      { boss: fakeBoss, db: fakeDb, logger, config: baseConfig({ env: 'test' }), enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {} },
       spyRegistrars(() => { registered = true }),
     )
     expect(registered).toBe(false)
   })
 
-  it('registers ticket.triage, ticket.draft AND agent.sandbox on ONE managed provider once the key is present', async () => {
+  it('registers ticket.triage, ticket.draft, agent.sandbox, memory.capture AND guidance.suggest on ONE managed provider once the key is present', async () => {
     const { logger } = testLogger()
     let triageDeps: TicketTriageDeps | undefined
     let draftDeps: TicketDraftDeps | undefined
     let sandboxDeps: AgentSandboxDeps | undefined
+    let memoryDeps: MemoryCaptureDeps | undefined
+    let guidanceDeps: GuidanceSuggestDeps | undefined
+    const enqueueSend: TicketDraftDeps['enqueueSend'] = async () => {}
     await maybeRegisterAgentRole(
       {
         boss: fakeBoss, db: fakeDb, logger,
@@ -106,24 +114,36 @@ describe('maybeRegisterAgentRole', () => {
         config: baseConfig({ env: 'production', anthropicApiKey: new Secret('sk-ant-test'), voyageApiKey: new Secret('pa-voyage') }),
         enqueueNotify: async () => {},
         enqueueDraft: async () => {},
+        enqueueSend,
       },
       {
         registerTriage: async (_boss, jobDeps) => { triageDeps = jobDeps },
         registerDraft: async (_boss, jobDeps) => { draftDeps = jobDeps },
         registerSandbox: async (_boss, jobDeps) => { sandboxDeps = jobDeps },
+        registerMemoryCapture: async (_boss, jobDeps) => { memoryDeps = jobDeps },
+        registerGuidanceSuggest: async (_boss, jobDeps) => { guidanceDeps = jobDeps },
       },
     )
     expect(triageDeps?.db).toBe(fakeDb)
     expect(draftDeps?.db).toBe(fakeDb)
     expect(sandboxDeps?.db).toBe(fakeDb)
+    expect(memoryDeps?.db).toBe(fakeDb)
+    expect(guidanceDeps?.db).toBe(fakeDb)
     expect(triageDeps?.provider.kind).toBe('anthropic')
-    // ONE provider for the role: triage's and the sandbox's calls are metered through the same
-    // managed stack the draft job uses (deviation 8), not a second bare adapter.
+    // ONE provider for the role: triage's, the sandbox's AND guidance.suggest's calls are metered
+    // through the same managed stack the draft job uses (deviation 8), not a second bare adapter.
     expect(draftDeps?.provider).toBe(triageDeps?.provider)
     expect(sandboxDeps?.provider).toBe(triageDeps?.provider)
+    expect(guidanceDeps?.provider).toBe(triageDeps?.provider)
     expect(draftDeps?.retriever).toBeDefined()
     expect(sandboxDeps?.retriever).toBeDefined()
     expect(triageDeps?.enqueueDraft).toBeDefined()
+    // Phase 5: without this seam the auto landing's send row would sit `queued` until the backstop
+    // sweep's due-send arm noticed it, a minute or more after the hold window elapsed.
+    expect(draftDeps?.enqueueSend).toBe(enqueueSend)
+    // ONE embedder for the role: the retriever's answers leg and memory.capture's write must never
+    // disagree about which model wrote a resolved_answers vector.
+    expect(memoryDeps?.embedder).toBeDefined()
   })
 
   it('hands draft AND sandbox the REAL retriever — one instance, with retrieveDetailed (not emptyRetriever)', async () => {
@@ -136,11 +156,14 @@ describe('maybeRegisterAgentRole', () => {
         config: baseConfig({ anthropicApiKey: new Secret('sk-ant-test') }),
         enqueueNotify: async () => {},
         enqueueDraft: async () => {},
+        enqueueSend: async () => {},
       },
       {
         registerTriage: async () => {},
         registerDraft: async (_boss, jobDeps) => { draftDeps = jobDeps },
         registerSandbox: async (_boss, jobDeps) => { sandboxDeps = jobDeps },
+        registerMemoryCapture: async () => {},
+        registerGuidanceSuggest: async () => {},
       },
     )
     expect(draftDeps?.retriever).not.toBe(emptyRetriever)
@@ -159,6 +182,7 @@ describe('maybeRegisterAgentRole', () => {
         config: baseConfig({ roles: new Set(['agent', 'knowledge']), anthropicApiKey: new Secret('sk-ant-test') }),
         enqueueNotify: async () => {},
         enqueueDraft: async () => {},
+        enqueueSend: async () => {},
       },
       spyRegistrars(() => {}),
     )

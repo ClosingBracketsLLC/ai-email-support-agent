@@ -67,8 +67,10 @@ export interface ReceiveInboundInput {
    * lands the message in spam, 'DRAFT'/'TRASH' likewise — a downstream sync walk skips those two and
    * spam-flags the ticket for 'JUNK'. Default `['INBOX']`. */
   labelIds?: string[]
-  /** Simulates the provider's own SPF/DKIM/DMARC stamp. Default `'mock; dmarc=pass'` — omit-to-fail
-   * would make every test have to opt in to the common case. */
+  /** Simulates the provider's own SPF/DKIM/DMARC stamp. Default `'mx.google.com; dmarc=pass'` —
+   * omit-to-fail would make every test have to opt in to the common case. The authserv-id is
+   * Gmail's real one so gmail-mode tests pass `parseAuthResults`'s authserv-id check by default;
+   * graph mode shares the same store but never passes `authservId`, so the literal is inert there. */
   authenticationResults?: string
   inReplyTo?: string
   references?: string
@@ -111,7 +113,7 @@ export interface MockMailbox extends MailboxClient {
 
 const DEFAULT_SELF_ADDRESS = 'me@mock.aesa'
 const DEFAULT_PAGE_SIZE = 3
-const DEFAULT_AUTH_RESULTS = 'mock; dmarc=pass'
+const DEFAULT_AUTH_RESULTS = 'mx.google.com; dmarc=pass'
 /** Arbitrary deterministic baseline so real wall-clock values never leak into test output. */
 const BASE_INTERNAL_DATE_MS = 1_700_000_000_000
 const GMAIL_SUBSCRIPTION_MS = 7 * 24 * 60 * 60 * 1000

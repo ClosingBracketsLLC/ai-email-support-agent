@@ -13,15 +13,22 @@
  *    worker's backstop sweep rescues a lost send.
  *
  * LOCK ORDER — one global order across the api AND the worker (controller ruling, task 17 review):
- * **`outbound_sends` → `drafts` → `tickets`**, which is what every `send.execute` path already takes
- * (claim, the pre-send flip, `completeSend`, the stale/terminal landings). So:
+ * **`outbound_sends` → `drafts` → `tickets` → `resolved_answers` / `workspaces`**, which is what every
+ * `send.execute` path already takes (claim, the pre-send flip, `completeSend`, the stale/terminal
+ * landings). So:
  *  - `approveDraft` locks the draft's existing send row (when there is one) BEFORE the draft — its
  *    `INSERT … ON CONFLICT (draft_id) DO UPDATE … WHERE` locks the conflicting tuple before it ever
  *    evaluates that `WHERE`, so taking it last would invert the order against `holdDraft` and
  *    deadlock a tap-Approve-then-Undo;
  *  - `holdDraft` takes the send row, then the draft;
  *  - `resolveTicket` takes the live draft's send row, then the draft, then the ticket;
- *  - `rejectDraft` takes the draft, then the ticket.
+ *  - `rejectDraft` takes the draft, then the ticket, and only THEN the learning writes.
+ * The FOURTH position is Phase 5's (task 9 review, Important 1): `resolved_answers` (the strikes a
+ * reject or a flag deals out) and `workspaces` (the guidance line a reject can append) are taken after
+ * the ticket, never before it — the worker's `applyDraftOutcome` locks the ticket's live drafts and
+ * then the ticket before it flags a conflicting answer `needs_review` in the SAME transaction, so a
+ * landing and a reject that share one answer id would otherwise deadlock on `40P01`. `maybeDemote`'s
+ * `agent_category_policies`/`notifications` writes ride in that same fourth position.
  * The worker's `applyDraftOutcome` locks the ticket's live drafts before its ticket flip for the
  * same reason.
  */
@@ -31,13 +38,18 @@ import type pino from 'pino'
 // package's prompt-TEXT modules only, so the Anthropic SDK never enters an api process (CLAUDE.md —
 // the api never calls a model). `error-surface.test.ts` walks the real module graph to hold that.
 import { buildReplyPolicy } from '@aesa/agent/policy'
-import { APPROVE_UNDO_SECONDS, OUTBOUND_SEND_STATUSES, type DraftStatus, type OutboundSendStatus, type RejectAction } from '@aesa/contracts'
 import {
-  clearRedraftCycle, draftTransitions, outboundSendTransitions, resolveRejectAction, ticketTransitions, validateReplyBody,
+  APPROVE_UNDO_SECONDS, OPERATING_GUIDANCE_MAX, OUTBOUND_SEND_STATUSES,
+  type DraftStatus, type OutboundSendStatus, type RejectAction,
+} from '@aesa/contracts'
+import {
+  DEMOTION_RULES, MEMORY_STRIKES_TO_RETIRE, clearRedraftCycle, draftTransitions, evaluateDemotion, outboundSendTransitions,
+  resolveRejectAction, ticketTransitions, validateReplyBody,
   type GuardrailFinding,
 } from '@aesa/core'
 import {
-  agents, audit, categories, draftActionTokens, drafts, escalateTicket, outboundSends, tickets, workspaces,
+  agentCategoryPolicies, agents, audit, categories, demoteCategory, draftActionTokens, drafts, escalateTicket, isUuid,
+  outboundSends, readDemotionSignals, resolvedAnswers, tickets, workspaces,
   type AuditActor, type OrgTx,
 } from '@aesa/db'
 import { JOB_NAMES } from '@aesa/queue'
@@ -61,7 +73,9 @@ export interface DraftServiceDeps {
 }
 
 export type ApproveResult =
-  | { ok: true; sendId: string; sendAfter: Date; edited: boolean }
+  /** `notificationId` is set only when this approve ALSO demoted the draft's category (an edited
+   * approve of a draft the owner had pulled back from an auto-send) — the caller wakes the dispatcher. */
+  | { ok: true; sendId: string; sendAfter: Date; edited: boolean; notificationId?: string }
   | { ok: false; code: 'not_found' | 'not_pending' | 'not_viewed' | 'agent_disabled' | 'kill_switch' | 'guardrail'; findings?: GuardrailFinding[] }
 
 export type RejectResolution = 'redraft' | 'escalate_terminal' | 'escalate_limit'
@@ -71,6 +85,9 @@ export interface RejectInput {
   draftId: string
   action: RejectAction
   reason: string
+  /** "Add this to the guidance" — the reason becomes one more `- <rule>` line in the workspace's
+   * operating guidance, which every guardrail gate then screens against (spec §Learning loop). */
+  addToGuidance: boolean
 }
 
 /** The draft statuses the one-live-draft partial unique covers (migration 0011). */
@@ -123,8 +140,10 @@ function isDeadlock(error: unknown): boolean {
 /**
  * Re-runs a whole transaction once when Postgres picks it as a deadlock victim.
  *
- * The three functions that touch two of the three row kinds all take them in the global order
- * (`outbound_sends` → `drafts` → `tickets`), which removes every ordinary inversion — but one narrow
+ * The four functions that touch more than one row kind (`approveDraft`, `holdDraft`, `rejectDraft`,
+ * `resolveTicket`) all take them in the global order
+ * (`outbound_sends` → `drafts` → `tickets` → `resolved_answers` / `workspaces`; see this file's
+ * header), which removes every ordinary inversion — but one narrow
  * three-way window survives it: a send row created by an approve that commits WHILE `resolveTicket`
  * waits on the draft lock cannot have been locked by resolve's first statement, so a `holdDraft` or a
  * second `approveDraft` that grabbed that send row and is now waiting on the draft can deadlock with
@@ -182,6 +201,8 @@ export interface DraftView {
   viewedAt: Date | null
   decidedAt: Date | null
   decisionSource: string | null
+  /** Stamped by `flagAutoSent` — the owner's "this should not have gone out" about an auto-send. */
+  flaggedAt: Date | null
   rejectReason: string | null
   editDistanceRatio: number | null
   expiresAt: Date
@@ -198,7 +219,8 @@ const draftViewColumns = {
   finalBody: drafts.finalBody, decision: drafts.decision, decisionReason: drafts.decisionReason, confidence: drafts.confidence,
   confidenceBreakdown: drafts.confidenceBreakdown, guardrailResult: drafts.guardrailResult, rationale: drafts.rationale,
   unresolvedQuestions: drafts.unresolvedQuestions, customerLanguage: drafts.customerLanguage, isRedraft: drafts.isRedraft,
-  viewedAt: drafts.viewedAt, decidedAt: drafts.decidedAt, decisionSource: drafts.decisionSource, rejectReason: drafts.rejectReason,
+  viewedAt: drafts.viewedAt, decidedAt: drafts.decidedAt, decisionSource: drafts.decisionSource, flaggedAt: drafts.flaggedAt,
+  rejectReason: drafts.rejectReason,
   editDistanceRatio: drafts.editDistanceRatio, expiresAt: drafts.expiresAt, createdAt: drafts.createdAt,
   agentAddress: agents.address, categoryLabel: categories.label,
   sendId: outboundSends.id, sendStatus: outboundSends.status, sendAfter: outboundSends.sendAfter,
@@ -230,6 +252,7 @@ function toDraftView(row: DraftViewRow): DraftView {
     guardrailResult: row.guardrailResult as Record<string, unknown>,
     rationale: row.rationale, unresolvedQuestions: row.unresolvedQuestions, customerLanguage: row.customerLanguage,
     isRedraft: row.isRedraft, viewedAt: row.viewedAt, decidedAt: row.decidedAt, decisionSource: row.decisionSource,
+    flaggedAt: row.flaggedAt,
     rejectReason: row.rejectReason, editDistanceRatio: row.editDistanceRatio, expiresAt: row.expiresAt, createdAt: row.createdAt,
     agentAddress: row.agentAddress, categoryLabel: row.categoryLabel, send,
     // The undo bar's clock: only an approved draft whose send is still queued can still be pulled back.
@@ -254,6 +277,14 @@ export async function loadDraftView(tx: OrgTx, orgId: string, draftId: string): 
  */
 const FAILED_DRAFT_TICKET_STATUSES = ['needs_owner', 'triaged'] as const
 
+/**
+ * The one ticket status on which a `sent` AUTO draft is still the owner's to see: the ticket the
+ * reply went out on, before the customer has written back. `send.execute`'s completion is what puts
+ * a ticket here, so it is where the owner lands from the auto-send push, the digest, or the inbox's
+ * recent list — and `flagAutoSent` is the only action it offers.
+ */
+const AUTO_SENT_DRAFT_TICKET_STATUS = 'waiting_on_customer'
+
 /** The read and the write agree: a `failed` draft is the owner's while the ticket is `triaged` (the
  * stale hand-back) or `needs_owner` FOR the send failure — not for a later, unrelated escalation
  * (`owner_handling`, `tripwire`, …) that happens to sit on a ticket still carrying one (final fix wave). */
@@ -263,26 +294,45 @@ function failedDraftIsOwners(ticket: { status: string; needsOwnerReason: string 
 }
 
 /**
- * The draft the ticket screen opens on: the one LIVE draft (at most one, by the partial unique) —
- * or, when there is none AND the ticket is still one of `FAILED_DRAFT_TICKET_STATUSES`, its most
- * recent `failed` one.
+ * The draft the ticket screen opens on: the one LIVE draft (at most one, by the partial unique) — or,
+ * when there is none, one of exactly TWO bounded fallbacks:
  *
- * The fallback exists because A3's return path is otherwise unreachable from the app (round 2,
- * re-review 2): a terminal send failure leaves the draft `failed`, which is outside
- * `drafts_live_per_ticket_uidx`, so "Not sent — … Back to review" had nothing to render against and
- * `drafts.resume` had no button. `failed` is the ONLY non-live status served this way — a `rejected`,
- * `superseded`, `expired` or `sent` draft is finished business and stays out of the panel — and the
- * ticket-status bound is what stops the banner from becoming permanent furniture on a resolved
- * ticket, where nothing polls it away and its button would be refused anyway (round 3).
+ *  - the ticket is `waiting_on_customer` and the newest `sent` draft on it was the AGENT's
+ *    (`decision_source = 'auto'`) — the auto-send the owner may want to flag. This is what makes
+ *    "Should not have sent" reachable from the ticket the reply went out on: `flagAutoSent` accepts
+ *    exactly a `sent` + `auto` + never-flagged draft, and until this fallback existed the panel that
+ *    renders the button had nothing to render against (final fix wave). An owner-approved `sent`
+ *    draft is NOT served: it has no flag path and is finished business;
+ *  - the ticket is one of `FAILED_DRAFT_TICKET_STATUSES` and it has a `failed` draft — A3's
+ *    "Not sent — … Back to review" return path, otherwise unreachable from the app (round 2,
+ *    re-review 2) because `failed` is outside `drafts_live_per_ticket_uidx`.
  *
- * `inbox.list`'s join is deliberately NOT widened: a `needs_owner/send_failed` row shows no draft
- * chip, which keeps the list's "a draft is waiting for you" chip honest.
+ * `failed` and `sent`+`auto` are the ONLY non-live statuses served this way — a `rejected`,
+ * `superseded`, `expired` or owner-`sent` draft stays out of the panel — and BOTH are bounded by the
+ * ticket's status for the same reason: it stops the banner from becoming permanent furniture on a
+ * ticket nothing polls, where its button would be refused anyway (round 3). A `resolved` (or
+ * reopened) ticket carrying either leftover shows nothing.
+ *
+ * `inbox.list`'s join is deliberately NOT widened: a `needs_owner/send_failed` or recently
+ * auto-sent row shows no draft chip, which keeps the list's "a draft is waiting for you" chip honest.
  */
 export async function loadLiveDraftView(
   tx: OrgTx, orgId: string, ticketId: string, ticket: { status: string; needsOwnerReason: string | null },
 ): Promise<DraftView | null> {
   const [live] = await draftViewQuery(tx, orgId, and(eq(drafts.ticketId, ticketId), inArray(drafts.status, [...LIVE_DRAFT_STATUSES]))!)
   if (live) return toDraftView(live)
+
+  // The auto-send fallback, ordered like the failed one below: `decided_at` is what an auto landing
+  // stamps, `created_at` breaks a same-instant tie, and NULLS LAST keeps the order total.
+  if (ticket.status === AUTO_SENT_DRAFT_TICKET_STATUS) {
+    const [autoSent] = await draftViewQuery(
+      tx, orgId,
+      and(eq(drafts.ticketId, ticketId), eq(drafts.status, 'sent'), eq(drafts.decisionSource, 'auto'))!,
+      [sql`${drafts.decidedAt} DESC NULLS LAST`, desc(drafts.createdAt)],
+    )
+    if (autoSent) return toDraftView(autoSent)
+  }
+
   if (!failedDraftIsOwners(ticket)) return null
 
   // `decided_at` is always set on a `failed` draft (both edges into it, `approved → failed` and
@@ -293,6 +343,76 @@ export async function loadLiveDraftView(
     [sql`${drafts.decidedAt} DESC NULLS LAST`, desc(drafts.createdAt)],
   )
   return failed ? toDraftView(failed) : null
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: the two writes every owner correction shares
+// ---------------------------------------------------------------------------
+
+/**
+ * The inline demotion check: after a correction the owner just made (a reject, a flag, or an edited
+ * approve of a draft they had pulled back), re-read the spec's four demotion signals for that
+ * (agent, category) and take Autopilot off it if any of them now fires.
+ *
+ * It runs in the SAME transaction as the correction, so the row this call just wrote is one of the
+ * signals it counts — "two rejects in 7 days" demotes ON the second reject, not a day later when the
+ * nightly backstop next looks. `demoteCategory` owns the guarded `auto → review` write, the audit
+ * row and the deduped notification; zero rows there (a concurrent demotion, or the owner switching
+ * the category themselves) simply returns no notification.
+ *
+ * Only a category actually on `auto` can be demoted — a `review`/`off` one has nothing to lose — and
+ * a draft with no agent or no category has no policy row to read at all.
+ */
+async function maybeDemote(
+  tx: OrgTx,
+  p: { orgId: string; agentId: string | null; categoryId: string | null; now: Date; day: string; actor: AuditActor },
+): Promise<string | undefined> {
+  if (!p.agentId || !p.categoryId) return undefined
+  const [policy] = await tx.select({ mode: agentCategoryPolicies.mode, label: categories.label })
+    .from(agentCategoryPolicies)
+    .innerJoin(categories, eq(categories.id, agentCategoryPolicies.categoryId))
+    .where(and(eq(agentCategoryPolicies.agentId, p.agentId), eq(agentCategoryPolicies.categoryId, p.categoryId)))
+  if (!policy || policy.mode !== 'auto') return undefined
+
+  const reason = evaluateDemotion(await readDemotionSignals(tx, {
+    orgId: p.orgId, agentId: p.agentId, categoryId: p.categoryId, now: p.now, windows: DEMOTION_RULES,
+  }))
+  if (!reason) return undefined
+
+  const { notificationId } = await demoteCategory(tx, {
+    orgId: p.orgId, agentId: p.agentId, categoryId: p.categoryId, categoryLabel: policy.label,
+    reason, now: p.now, day: p.day, actor: p.actor,
+  })
+  return notificationId
+}
+
+/**
+ * A reply the owner rejected or flagged used remembered answers: each of them takes a strike, and a
+ * second strike retires it (`MEMORY_STRIKES_TO_RETIRE`). Only `active` and `needs_review` answers can
+ * be struck — a `candidate` is not in evidence yet (the flag path retires it outright) and a
+ * `retired` one is already gone.
+ *
+ * `used_answer_ids` is a text[] the worker fills from what retrieval actually returned, so its
+ * entries are answer ids; the uuid filter is belt-and-braces against a malformed entry turning a
+ * button into a 500 (`invalid input syntax for type uuid`).
+ */
+async function strikeUsedAnswers(tx: OrgTx, orgId: string, usedAnswerIds: string[]): Promise<void> {
+  const ids = usedAnswerIds.filter((id) => isUuid(id))
+  if (ids.length === 0) return
+
+  const struck = await tx.update(resolvedAnswers)
+    .set({ strikes: sql`${resolvedAnswers.strikes} + 1` })
+    .where(and(
+      eq(resolvedAnswers.orgId, orgId), inArray(resolvedAnswers.id, ids),
+      inArray(resolvedAnswers.status, ['active', 'needs_review']),
+    ))
+    .returning({ id: resolvedAnswers.id, strikes: resolvedAnswers.strikes })
+
+  const spent = struck.filter((row) => row.strikes >= MEMORY_STRIKES_TO_RETIRE).map((row) => row.id)
+  if (spent.length === 0) return
+  await tx.update(resolvedAnswers)
+    .set({ status: 'retired', retiredReason: 'strikes' })
+    .where(and(eq(resolvedAnswers.orgId, orgId), inArray(resolvedAnswers.id, spent), ne(resolvedAnswers.status, 'retired')))
 }
 
 // ---------------------------------------------------------------------------
@@ -326,7 +446,7 @@ export async function approveDraft(
 
       const [draft] = await tx.select({
         id: drafts.id, ticketId: drafts.ticketId, agentId: drafts.agentId, status: drafts.status, body: drafts.body, viewedAt: drafts.viewedAt,
-        customerLanguage: drafts.customerLanguage,
+        customerLanguage: drafts.customerLanguage, categoryId: drafts.categoryId, autoHeldAt: drafts.autoHeldAt,
       }).from(drafts).where(and(eq(drafts.orgId, orgId), eq(drafts.id, input.draftId))).limit(1).for('update')
       if (!draft) return { ok: false, code: 'not_found' }
       if (draft.status !== 'pending') return { ok: false, code: 'not_pending' }
@@ -422,12 +542,19 @@ export async function approveDraft(
 
       await consumeActionToken(tx, opts?.consumeTokenId, now)
 
+      // The spec's `hold_then_edit` signal: the owner pulled an auto-send back and then CHANGED it
+      // before letting it go. An unchanged re-approve is the opposite evidence (the reply was fine),
+      // and a draft that was never auto-held is an ordinary review decision, so both skip the check.
+      const notificationId = edited && draft.autoHeldAt
+        ? await maybeDemote(tx, { orgId, agentId, categoryId: draft.categoryId, now, day: utcDay(now), actor: actor.actor })
+        : undefined
+
       await audit(tx, {
         actor: actor.actor, action: 'draft.approved', entityType: 'draft', entityId: draft.id,
         detail: { draftId: draft.id, ticketId: ticket.id, edited, editDistanceRatio, source: actor.source },
         ip: actor.ip, userAgent: actor.userAgent,
       })
-      return { ok: true, sendId: send.id, sendAfter, edited }
+      return { ok: true, sendId: send.id, sendAfter, edited, ...(notificationId ? { notificationId } : {}) }
     })
   })
 
@@ -437,6 +564,20 @@ export async function approveDraft(
     )
     if (jobId === null) {
       deps.logger.warn({ orgId, sendId: outcome.sendId }, 'send.execute enqueue returned no job id; the backstop due-send sweep will pick it up')
+    }
+    if (outcome.notificationId) {
+      const notifyId = await deps.enqueue(
+        JOB_NAMES.notifyDispatch, { orgId, notificationId: outcome.notificationId }, { entityId: outcome.notificationId },
+      )
+      if (notifyId === null) deps.logger.warn({ orgId, notificationId: outcome.notificationId }, 'notify.dispatch enqueue returned no job id; the digest will collapse it')
+    }
+    // One edit is one chance to learn a general rule (spec §Product step 7): the worker's capped
+    // Haiku call decides whether there is one, and writes a suggestion the owner can accept in a tap.
+    if (outcome.edited) {
+      const suggestId = await deps.enqueue(JOB_NAMES.guidanceSuggest, { orgId, draftId: input.draftId }, { entityId: input.draftId })
+      if (suggestId === null) {
+        deps.logger.warn({ orgId, draftId: input.draftId }, 'guidance.suggest enqueue returned no job id; this edit produces no suggestion')
+      }
     }
   }
   return outcome
@@ -479,7 +620,9 @@ export async function holdDraft(
       // exactly that claim — locking in the other order is how the two would deadlock.
       const [send] = await tx.select({ id: outboundSends.id, status: outboundSends.status })
         .from(outboundSends).where(and(eq(outboundSends.orgId, orgId), eq(outboundSends.draftId, draftId))).limit(1).for('update')
-      const [draft] = await tx.select({ id: drafts.id, ticketId: drafts.ticketId, status: drafts.status })
+      const [draft] = await tx.select({
+        id: drafts.id, ticketId: drafts.ticketId, status: drafts.status, decisionSource: drafts.decisionSource,
+      })
         .from(drafts).where(and(eq(drafts.orgId, orgId), eq(drafts.id, draftId))).limit(1).for('update')
       if (!draft) return { ok: false, code: 'not_found' }
       if (draft.status !== 'approved') return { ok: false, code: 'not_holdable' }
@@ -501,10 +644,23 @@ export async function holdDraft(
       draftTransitions.assert('held', 'pending')
       await tx.update(drafts).set({ status: 'pending' }).where(and(eq(drafts.id, draft.id), eq(drafts.status, 'held')))
 
+      // Phase 5's Hold button: the reply nobody had to approve is now a reply waiting for a decision.
+      // `auto_held_at` is the demotion signal an edit or a reject after this hold completes, and the
+      // ticket leaves the Auto-sending section for To review. The ticket is the THIRD row kind and is
+      // taken LAST, so the global lock order still holds.
+      const auto = draft.decisionSource === 'auto'
+      if (auto) {
+        await tx.update(drafts).set({ autoHeldAt: now }).where(and(eq(drafts.id, draft.id), eq(drafts.status, 'pending')))
+        ticketTransitions.assert('auto_sending', 'awaiting_review')
+        await tx.update(tickets)
+          .set({ status: 'awaiting_review' })
+          .where(and(eq(tickets.orgId, orgId), eq(tickets.id, draft.ticketId), eq(tickets.status, 'auto_sending')))
+      }
+
       await consumeActionToken(tx, opts?.consumeTokenId, now)
       await audit(tx, {
         actor: actor.actor, action: 'draft.held', entityType: 'draft', entityId: draft.id,
-        detail: { draftId: draft.id, ticketId: draft.ticketId, sendId: send.id, source: actor.source },
+        detail: { draftId: draft.id, ticketId: draft.ticketId, sendId: send.id, auto, source: actor.source },
         ip: actor.ip, userAgent: actor.userAgent,
       })
       return { ok: true }
@@ -609,6 +765,17 @@ export async function resumeDraft(
         ))
         .returning({ id: tickets.id })
       ticketReturned = moved.length > 0
+    } else {
+      // Phase 5: a held draft on an `auto_sending` ticket is what `landHeld` leaves when a kill lever
+      // (or a mailbox re-auth) catches an auto-send mid-window. Bringing it back makes it a REVIEW
+      // item — nothing will auto-send it now — so the ticket leaves the Auto-sending section with it.
+      // Guarded on `auto_sending`, so an ordinary held draft's `awaiting_review` ticket is untouched.
+      ticketTransitions.assert('auto_sending', 'awaiting_review')
+      const moved = await tx.update(tickets)
+        .set({ status: 'awaiting_review' })
+        .where(and(eq(tickets.orgId, orgId), eq(tickets.id, draft.ticketId), eq(tickets.status, 'auto_sending')))
+        .returning({ id: tickets.id })
+      ticketReturned = moved.length > 0
     }
 
     await audit(tx, {
@@ -631,93 +798,146 @@ export async function resumeDraft(
  */
 export async function rejectDraft(
   deps: DraftServiceDeps, orgId: string, input: RejectInput, actor: DraftActor,
-): Promise<{ ok: true; resolution: RejectResolution } | { ok: false; code: 'not_found' | 'not_pending' }> {
-  const now = clock(deps)
-  const day = utcDay(now)
+): Promise<{ ok: true; resolution: RejectResolution; guidanceAdded: boolean } | { ok: false; code: 'not_found' | 'not_pending' }> {
   type Outcome =
-    | { ok: true; resolution: RejectResolution; redraftTicketId?: string; notificationId?: string }
+    | { ok: true; resolution: RejectResolution; guidanceAdded: boolean; redraftTicketId?: string; notificationId?: string; demotionNotificationId?: string }
     | { ok: false; code: 'not_found' | 'not_pending' }
 
-  const outcome = await deps.api.withOrg(orgId, async (tx): Promise<Outcome> => {
-    const [draft] = await tx.select({ id: drafts.id, ticketId: drafts.ticketId, status: drafts.status })
-      .from(drafts).where(and(eq(drafts.orgId, orgId), eq(drafts.id, input.draftId))).limit(1).for('update')
-    if (!draft) return { ok: false, code: 'not_found' }
-    if (draft.status !== 'pending') return { ok: false, code: 'not_pending' }
-
-    const [ticket] = await tx.select({ id: tickets.id, status: tickets.status, redraftCount: tickets.redraftCount })
-      .from(tickets).where(and(eq(tickets.orgId, orgId), eq(tickets.id, draft.ticketId))).limit(1)
-    if (!ticket) return { ok: false, code: 'not_found' }
-
-    const resolution = resolveRejectAction({
-      reason: input.reason, action: input.action, redraftCount: ticket.redraftCount, ticketStatus: ticket.status,
-    })
-
-    draftTransitions.assert('pending', 'rejected')
-    const rejected = await tx.update(drafts)
-      .set({
-        status: 'rejected', rejectReason: input.reason, rejectAction: input.action,
-        decidedBy: actor.userId, decidedAt: now, decisionSource: actor.source,
+  const outcome = await withDeadlockRetry(async () => {
+    // A fresh clock per attempt, for the same reason `approveDraft` takes one (fix wave A5): a retry
+    // is a fresh set of reads, so `decided_at` and the escalation's day come from when THIS attempt
+    // ran. The enqueues stay outside, below.
+    const now = clock(deps)
+    const day = utcDay(now)
+    return deps.api.withOrg(orgId, async (tx): Promise<Outcome> => {
+      const [draft] = await tx.select({
+        id: drafts.id, ticketId: drafts.ticketId, status: drafts.status,
+        agentId: drafts.agentId, categoryId: drafts.categoryId, usedAnswerIds: drafts.usedAnswerIds,
       })
-      .where(and(eq(drafts.id, draft.id), eq(drafts.status, 'pending')))
-      .returning({ id: drafts.id })
-    if (rejected.length === 0) return { ok: false, code: 'not_pending' }
+        .from(drafts).where(and(eq(drafts.orgId, orgId), eq(drafts.id, input.draftId))).limit(1).for('update')
+      if (!draft) return { ok: false, code: 'not_found' }
+      if (draft.status !== 'pending') return { ok: false, code: 'not_pending' }
 
-    if (resolution.kind === 'redraft') {
-      // `last_agent_prompted_at` is deliberately kept: it is the per-day run cap's own stamp, and a
-      // re-draft must not buy the ticket a fresh day of model runs.
-      const moved = await tx.update(tickets)
+      const [ticket] = await tx.select({ id: tickets.id, status: tickets.status, redraftCount: tickets.redraftCount })
+        .from(tickets).where(and(eq(tickets.orgId, orgId), eq(tickets.id, draft.ticketId))).limit(1)
+      if (!ticket) return { ok: false, code: 'not_found' }
+
+      const resolution = resolveRejectAction({
+        reason: input.reason, action: input.action, redraftCount: ticket.redraftCount, ticketStatus: ticket.status,
+      })
+
+      draftTransitions.assert('pending', 'rejected')
+      const rejected = await tx.update(drafts)
         .set({
-          status: 'triaged', ownerRedraftFeedback: input.reason, redraftCount: sql`${tickets.redraftCount} + 1`,
-          agentFailureCount: 0, lastAgentRunAt: null, lastAgentFinishedAt: null,
+          status: 'rejected', rejectReason: input.reason, rejectAction: input.action,
+          decidedBy: actor.userId, decidedAt: now, decisionSource: actor.source,
         })
-        .where(and(eq(tickets.id, ticket.id), eq(tickets.status, 'awaiting_review')))
-        .returning({ redraftCount: tickets.redraftCount })
-      const flipped = moved[0]
-      if (flipped) {
-        await audit(tx, {
-          actor: actor.actor, action: 'draft.rejected_for_redraft', entityType: 'draft', entityId: draft.id,
-          detail: { draftId: draft.id, ticketId: ticket.id, reasonLen: input.reason.length, redraftCount: flipped.redraftCount },
-          ip: actor.ip, userAgent: actor.userAgent,
-        })
-        return { ok: true, resolution: 'redraft', redraftTicketId: ticket.id }
-      }
-      // Zero rows: the ticket left `awaiting_review` between the read and the flip. Fall through to
-      // the terminal escalation IN THIS TRANSACTION — a rejected draft may never be left dangling.
-    }
+        .where(and(eq(drafts.id, draft.id), eq(drafts.status, 'pending')))
+        .returning({ id: drafts.id })
+      if (rejected.length === 0) return { ok: false, code: 'not_pending' }
 
-    const atLimit = resolution.kind === 'escalate_limit'
-    // `awaiting_review` is the ONLY status a reject may escalate from: it is where a ticket with a
-    // live draft sits. Re-read under READ COMMITTED (a fresh snapshot per statement) — anything else
-    // means a concurrent writer already moved the ticket somewhere it owns (`resolved`, a fresh
-    // `triaged` cycle, an escalation of its own), and re-escalating that would undo their work, so
-    // the reject stops at the rejected draft (review Minor 5).
-    const [current] = await tx.select({ status: tickets.status })
-      .from(tickets).where(and(eq(tickets.orgId, orgId), eq(tickets.id, ticket.id))).limit(1)
-    const escalated = current?.status === 'awaiting_review'
-      ? await escalateTicket(tx, {
-        orgId, ticketId: ticket.id, fromStatus: 'awaiting_review',
-        reason: atLimit ? 'redraft_limit_reached' : 'owner_handling',
-        day, now,
-        // The owner is looking at the ticket when they take it over — escalate quietly. Hitting the
-        // re-draft cap is news, so that one pages, under its own reason-scoped dedupe key.
-        quiet: !atLimit,
-        ...(atLimit ? { dedupeKey: `redraft_limit:${ticket.id}:${day}` } : {}),
-        draftId: draft.id, actor: actor.actor, auditAction: 'ticket.escalated',
-        detail: { draftId: draft.id, rejectAction: input.action },
+      /**
+       * Everything a rejection TEACHES: the answers this reply leant on lose a strike each, the owner's
+       * reason can become a guidance rule, and the category may come off Autopilot for it.
+       *
+       * Called AFTER the ticket work on both branches below, never before it (task 9 review, Important
+       * 1): `resolved_answers` and `workspaces` are the FOURTH position in the global lock order (see
+       * this file's header), because the worker's `applyDraftOutcome` locks the ticket and then flags a
+       * conflicting answer `needs_review` in one transaction. Taking these first inverted that pair.
+       * Exactly once per call — the redraft branch returns straight after its own invocation, and the
+       * fall-through to the terminal branch happens BEFORE that invocation.
+       */
+      const learn = async (): Promise<{ guidanceAdded: boolean; demotionNotificationId?: string }> => {
+        await strikeUsedAnswers(tx, orgId, draft.usedAnswerIds)
+
+        let guidanceAdded = false
+        const rule = input.reason.trim()
+        if (input.addToGuidance && rule) {
+          // `FOR UPDATE`: this is a read-modify-write of ONE text column, and two rejections (or a
+          // reject racing `workspace.acceptSuggestion`) that both read the pre-append value would
+          // each write their own `current + rule` — the second silently erasing the first owner's
+          // rule. The workspace row is the LAST position in the global lock order (this file's
+          // header), so taking it here stays inside it.
+          const [workspace] = await tx.select({ operatingGuidance: workspaces.operatingGuidance })
+            .from(workspaces).where(eq(workspaces.orgId, orgId)).limit(1).for('update')
+          const current = workspace?.operatingGuidance ?? ''
+          const next = `${current.trimEnd()}${current.trim() ? '\n' : ''}- ${rule}`
+          // Past the cap nothing is appended and the caller is told so — the owner's rejection still
+          // stands, it just did not become a rule. (The guidance editor is where they make room.)
+          if (next.length <= OPERATING_GUIDANCE_MAX) {
+            await tx.update(workspaces).set({ operatingGuidance: next }).where(eq(workspaces.orgId, orgId))
+            await audit(tx, {
+              actor: actor.actor, action: 'workspace.guidance.append', entityType: 'workspace', entityId: orgId,
+              // Owner-authored free text is logged as a LENGTH, never as the text (CLAUDE.md).
+              detail: { length: next.length, draftId: draft.id }, ip: actor.ip, userAgent: actor.userAgent,
+            })
+            guidanceAdded = true
+          }
+        }
+
+        const demotionNotificationId = await maybeDemote(tx, {
+          orgId, agentId: draft.agentId, categoryId: draft.categoryId, now, day, actor: actor.actor,
+        })
+        return { guidanceAdded, ...(demotionNotificationId ? { demotionNotificationId } : {}) }
+      }
+
+      if (resolution.kind === 'redraft') {
+        // `last_agent_prompted_at` is deliberately kept: it is the per-day run cap's own stamp, and a
+        // re-draft must not buy the ticket a fresh day of model runs.
+        const moved = await tx.update(tickets)
+          .set({
+            status: 'triaged', ownerRedraftFeedback: input.reason, redraftCount: sql`${tickets.redraftCount} + 1`,
+            agentFailureCount: 0, lastAgentRunAt: null, lastAgentFinishedAt: null,
+          })
+          .where(and(eq(tickets.id, ticket.id), eq(tickets.status, 'awaiting_review')))
+          .returning({ redraftCount: tickets.redraftCount })
+        const flipped = moved[0]
+        if (flipped) {
+          const learned = await learn()
+          await audit(tx, {
+            actor: actor.actor, action: 'draft.rejected_for_redraft', entityType: 'draft', entityId: draft.id,
+            detail: { draftId: draft.id, ticketId: ticket.id, reasonLen: input.reason.length, redraftCount: flipped.redraftCount },
+            ip: actor.ip, userAgent: actor.userAgent,
+          })
+          return { ok: true, resolution: 'redraft', redraftTicketId: ticket.id, ...learned }
+        }
+        // Zero rows: the ticket left `awaiting_review` between the read and the flip. Fall through to
+        // the terminal escalation IN THIS TRANSACTION — a rejected draft may never be left dangling.
+      }
+
+      const atLimit = resolution.kind === 'escalate_limit'
+      // `awaiting_review` is the ONLY status a reject may escalate from: it is where a ticket with a
+      // live draft sits. Re-read under READ COMMITTED (a fresh snapshot per statement) — anything else
+      // means a concurrent writer already moved the ticket somewhere it owns (`resolved`, a fresh
+      // `triaged` cycle, an escalation of its own), and re-escalating that would undo their work, so
+      // the reject stops at the rejected draft (review Minor 5).
+      const [current] = await tx.select({ status: tickets.status })
+        .from(tickets).where(and(eq(tickets.orgId, orgId), eq(tickets.id, ticket.id))).limit(1)
+      const escalated = current?.status === 'awaiting_review'
+        ? await escalateTicket(tx, {
+          orgId, ticketId: ticket.id, fromStatus: 'awaiting_review',
+          reason: atLimit ? 'redraft_limit_reached' : 'owner_handling',
+          day, now,
+          // The owner is looking at the ticket when they take it over — escalate quietly. Hitting the
+          // re-draft cap is news, so that one pages, under its own reason-scoped dedupe key.
+          quiet: !atLimit,
+          ...(atLimit ? { dedupeKey: `redraft_limit:${ticket.id}:${day}` } : {}),
+          draftId: draft.id, actor: actor.actor, auditAction: 'ticket.escalated',
+          detail: { draftId: draft.id, rejectAction: input.action },
+        })
+        : { escalated: false, notificationId: undefined }
+      // `escalate_limit` is the caller's cue that the ticket was paged for hitting the re-draft cap —
+      // so it is only that when the escalation actually happened. A ticket a concurrent writer moved
+      // out of `awaiting_review` (the guard above) is reported as the terminal resolution it got.
+      const resolutionName: RejectResolution = atLimit && escalated.escalated ? 'escalate_limit' : 'escalate_terminal'
+      const learned = await learn()
+      await audit(tx, {
+        actor: actor.actor, action: 'draft.rejected', entityType: 'draft', entityId: draft.id,
+        detail: { draftId: draft.id, ticketId: ticket.id, resolution: resolutionName, reasonLen: input.reason.length, escalated: escalated.escalated },
+        ip: actor.ip, userAgent: actor.userAgent,
       })
-      : { escalated: false, notificationId: undefined }
-    // `escalate_limit` is the caller's cue that the ticket was paged for hitting the re-draft cap —
-    // so it is only that when the escalation actually happened. A ticket a concurrent writer moved
-    // out of `awaiting_review` (the guard above) is reported as the terminal resolution it got.
-    const resolutionName: RejectResolution = atLimit && escalated.escalated ? 'escalate_limit' : 'escalate_terminal'
-    await audit(tx, {
-      actor: actor.actor, action: 'draft.rejected', entityType: 'draft', entityId: draft.id,
-      detail: { draftId: draft.id, ticketId: ticket.id, resolution: resolutionName, reasonLen: input.reason.length, escalated: escalated.escalated },
-      ip: actor.ip, userAgent: actor.userAgent,
+      return { ok: true, resolution: resolutionName, ...learned, ...(escalated.notificationId === undefined ? {} : { notificationId: escalated.notificationId }) }
     })
-    return escalated.notificationId === undefined
-      ? { ok: true, resolution: resolutionName }
-      : { ok: true, resolution: resolutionName, notificationId: escalated.notificationId }
   })
 
   if (!outcome.ok) return outcome
@@ -727,11 +947,76 @@ export async function rejectDraft(
       deps.logger.warn({ orgId, ticketId: outcome.redraftTicketId }, 'ticket.draft enqueue returned no job id; the backstop missed-draft sweep will pick it up')
     }
   }
-  if (outcome.notificationId) {
-    const jobId = await deps.enqueue(JOB_NAMES.notifyDispatch, { orgId, notificationId: outcome.notificationId }, { entityId: outcome.notificationId })
+  for (const notificationId of [outcome.notificationId, outcome.demotionNotificationId]) {
+    if (!notificationId) continue
+    const jobId = await deps.enqueue(JOB_NAMES.notifyDispatch, { orgId, notificationId }, { entityId: notificationId })
+    if (jobId === null) deps.logger.warn({ orgId, notificationId }, 'notify.dispatch enqueue returned no job id; the digest will collapse it')
+  }
+  return { ok: true, resolution: outcome.resolution, guidanceAdded: outcome.guidanceAdded }
+}
+
+// ---------------------------------------------------------------------------
+// flag ("should not have sent")
+// ---------------------------------------------------------------------------
+
+/**
+ * The owner's verdict on a reply that went out on its own: this one was wrong. It is the ONLY signal
+ * an auto-send ever gets — nobody approved it, so nothing else says whether it was right.
+ *
+ * One transaction: stamp the draft (so the flag is idempotent and `stats.rollup` can count it), strike
+ * the answers it used, retire the candidate answer this very send produced (`sampled_bad` — an
+ * unsampled candidate is exactly the thing this flag is the sample FOR), and re-run the demotion
+ * check, on which two flags in 30 days take the category off Autopilot.
+ *
+ * `sent` + `decision_source = 'auto'` + never-flagged is the whole precondition: a human approval has
+ * its own reject/undo path, a still-queued auto-send is a Hold, and a second flag changes nothing.
+ * A draft the owner HELD and then re-approved carries `decision_source: 'app'` — it is their reply now.
+ */
+export async function flagAutoSent(
+  deps: DraftServiceDeps, orgId: string, draftId: string, actor: DraftActor,
+): Promise<{ ok: true } | { ok: false; code: 'not_found' | 'not_flaggable' }> {
+  const now = clock(deps)
+  const day = utcDay(now)
+
+  type Outcome = { ok: true; notificationId?: string } | { ok: false; code: 'not_found' | 'not_flaggable' }
+  const outcome = await deps.api.withOrg(orgId, async (tx): Promise<Outcome> => {
+    const [draft] = await tx.select({
+      id: drafts.id, ticketId: drafts.ticketId, agentId: drafts.agentId, categoryId: drafts.categoryId,
+      status: drafts.status, decisionSource: drafts.decisionSource, flaggedAt: drafts.flaggedAt, usedAnswerIds: drafts.usedAnswerIds,
+    }).from(drafts).where(and(eq(drafts.orgId, orgId), eq(drafts.id, draftId))).limit(1).for('update')
+    if (!draft) return { ok: false, code: 'not_found' }
+    if (draft.status !== 'sent' || draft.decisionSource !== 'auto' || draft.flaggedAt !== null) return { ok: false, code: 'not_flaggable' }
+
+    await tx.update(drafts).set({ flaggedAt: now, flaggedBy: actor.userId })
+      .where(and(eq(drafts.id, draft.id), isNull(drafts.flaggedAt)))
+
+    await strikeUsedAnswers(tx, orgId, draft.usedAnswerIds)
+    await tx.update(resolvedAnswers)
+      .set({ status: 'retired', retiredReason: 'sampled_bad' })
+      .where(and(
+        eq(resolvedAnswers.orgId, orgId), eq(resolvedAnswers.sourceDraftId, draft.id),
+        eq(resolvedAnswers.status, 'candidate'),
+      ))
+
+    const notificationId = await maybeDemote(tx, {
+      orgId, agentId: draft.agentId, categoryId: draft.categoryId, now, day, actor: actor.actor,
+    })
+
+    await audit(tx, {
+      actor: actor.actor, action: 'draft.flagged', entityType: 'draft', entityId: draft.id,
+      detail: { draftId: draft.id, ticketId: draft.ticketId, source: actor.source },
+      ip: actor.ip, userAgent: actor.userAgent,
+    })
+    return { ok: true, ...(notificationId ? { notificationId } : {}) }
+  })
+
+  if (outcome.ok && outcome.notificationId) {
+    const jobId = await deps.enqueue(
+      JOB_NAMES.notifyDispatch, { orgId, notificationId: outcome.notificationId }, { entityId: outcome.notificationId },
+    )
     if (jobId === null) deps.logger.warn({ orgId, notificationId: outcome.notificationId }, 'notify.dispatch enqueue returned no job id; the digest will collapse it')
   }
-  return { ok: true, resolution: outcome.resolution }
+  return outcome.ok ? { ok: true } : outcome
 }
 
 // ---------------------------------------------------------------------------

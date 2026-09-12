@@ -18,8 +18,9 @@ import { emptyRetriever, type DraftDecision } from '@aesa/agent'
 import { DRAFT_EXPIRE_DAYS } from '@aesa/contracts'
 import {
   agentCategoryPolicies, agentRunEvents, agentRuns, agents, auditLog, categories, drafts,
-  ensureDefaultCategories, mailboxConnections, messages, notifications, outboundSends, platformState,
-  tickets, usageCounters, user, withOrg, withPlatform, workspaces,
+  ensureDefaultCategories, mailboxConnections, messages, notifications, orgSettings, outboundSends,
+  platformState, resolvedAnswers, SEND_METERS, tickets, usageCounters, user, withOrg, withPlatform,
+  workspaces,
 } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
@@ -229,15 +230,64 @@ async function seedRuns(n: number, over: Partial<typeof agentRuns.$inferInsert> 
     ))
 }
 
+/** A `DetailedRetriever` whose answers leg returns exactly one active answer (Phase 5's memory). */
+function answerRetriever(answer: { id: string; score: number; approvals: number }): DetailedRetriever {
+  const answers = [{ id: answer.id, question: 'where is my order', answer: 'It ships tomorrow.', score: answer.score, approvals: answer.approvals }]
+  return {
+    retrieve: async () => ({ chunks: [], answers }),
+    retrieveDetailed: async () => ({ chunks: [], answers, knowledgeVersion: 3, mode: 'hybrid', degraded: false }),
+  }
+}
+
+async function setPolicy(categoryId: string, values: { mode: 'off' | 'review' | 'auto'; autoSendMinConfidence?: number }): Promise<void> {
+  await withOrg(app.db, fx.orgId, (tx) =>
+    tx.insert(agentCategoryPolicies).values({ orgId: fx.orgId, agentId: fx.agentId, categoryId, ...values }))
+}
+
+async function setOrgSetting(key: string, value: unknown): Promise<void> {
+  await withOrg(app.db, fx.orgId, (tx) =>
+    tx.insert(orgSettings).values({ orgId: fx.orgId, key, value })
+      .onConflictDoUpdate({ target: [orgSettings.orgId, orgSettings.key], set: { value } }))
+}
+
+/**
+ * `n` drafts this agent+category already had a HUMAN decision on — what the cold-start lock counts.
+ * They sit on their OWN resolved ticket in a non-live status, so they never occupy the one
+ * live-draft slot of the ticket under test.
+ */
+async function seedHumanDecisions(n: number): Promise<void> {
+  if (n === 0) return
+  const ticketId = await seedTicket({ status: 'resolved' })
+  await withOrg(app.db, fx.orgId, (tx) =>
+    tx.insert(drafts).values(
+      Array.from({ length: n }, (_, i) => ({
+        orgId: fx.orgId, ticketId, agentId: fx.agentId, categoryId: fx.categoryId, version: i + 1,
+        body: CLEAN_BODY, finalBody: CLEAN_BODY, decision: 'review', decisionReason: 'category_review',
+        status: 'sent', threadSnapshotAt: minutesAgo(30), expiresAt: new Date(NOW.getTime() + 86_400_000),
+        decidedBy: userId, decidedAt: minutesAgo(20), decisionSource: 'app',
+      })),
+    ))
+}
+
+async function allNotifications() {
+  return withOrg(app.db, fx.orgId, (tx) => tx.select().from(notifications))
+}
+
+async function sendsFor(draftId: string) {
+  return withOrg(app.db, fx.orgId, (tx) => tx.select().from(outboundSends).where(eq(outboundSends.draftId, draftId)))
+}
+
 interface Harness {
   deps: TicketDraftDeps
   notified: string[]
   drafted: { orgId: string; ticketId: string; startAfter?: Date }[]
+  sends: { orgId: string; sendId: string; startAfter: Date }[]
 }
 
 function makeDeps(provider: LlmProvider, over: Partial<TicketDraftDeps> = {}): Harness {
   const notified: string[] = []
   const drafted: { orgId: string; ticketId: string; startAfter?: Date }[] = []
+  const sends: Harness['sends'] = []
   const deps: TicketDraftDeps = {
     db: app.db,
     provider,
@@ -245,11 +295,12 @@ function makeDeps(provider: LlmProvider, over: Partial<TicketDraftDeps> = {}): H
     logger: pino({ level: 'silent' }),
     enqueueNotify: async (_orgId, notificationId) => void notified.push(notificationId),
     enqueueDraft: async (orgId, ticketId, opts) => void drafted.push({ orgId, ticketId, ...(opts?.startAfter ? { startAfter: opts.startAfter } : {}) }),
+    enqueueSend: async (orgId, sendId, opts) => void sends.push({ orgId, sendId, startAfter: opts.startAfter }),
     now: () => NOW,
     watchdogMs: 5_000,
     ...over,
   }
-  return { deps, notified, drafted }
+  return { deps, notified, drafted, sends }
 }
 
 const run = (deps: TicketDraftDeps, ticketId: string) => runTicketDraft(deps, { orgId: fx.orgId, ticketId }, new AbortController().signal)
@@ -429,8 +480,13 @@ describe('runTicketDraft', () => {
     expect(draft!.expiresAt.toISOString()).toBe(new Date(NOW.getTime() + DRAFT_EXPIRE_DAYS * 86_400_000).toISOString())
     expect(draft!.guardrailResult).toMatchObject({ ok: true })
     expect(draft!.confidenceBreakdown).toMatchObject({
-      blockers: { tripwire: false, guardrail: false, dmarcFail: false, attachments: false, redraft: false, categoryOff: false, coldStart: true },
-      model: 0.82, memory: null, evidence: null, warnings: [],
+      blockers: {
+        tripwire: false, guardrail: false, dmarcFail: false, attachments: false, redraft: false, categoryOff: false,
+        coldStart: true, memoryConflict: false, unresolvedQuestions: false, threadTooLong: false, autoSendCap: false,
+      },
+      // Nothing retrieved and nothing remembered: `max(0, 0) × 0.82` is 0, and a `review` category
+      // has no threshold to compare it against.
+      model: 0.82, memory: null, evidence: 0, threshold: null, warnings: [],
       // `emptyRetriever`: nothing retrieved, nothing cited, and no mode/version to record.
       grounding: { score: null, mode: null, knowledgeVersion: null, retrieved: 0, cited: 0 },
     })
@@ -1039,5 +1095,192 @@ describe('runTicketDraft', () => {
     expect(rows[0]!.decisionReason).toBe('dmarc_fail')
     expect(rows[0]!.confidenceBreakdown).toMatchObject({ blockers: { dmarcFail: true } })
     expect((await getTicket(ticketId)).status).toBe('awaiting_review')
+  })
+  // --- Phase 5: evidence, the new blockers and the auto landing -------------------------------
+
+  it('15. evidence = max(memory, grounding) × model — memory from the best USED active answer, recorded on the breakdown', async () => {
+    const answerId = crypto.randomUUID()
+    const ticketId = await seedDraftableTicket()
+    const provider = createFakeProvider([{ parsed: reply({ confidence: 0.9, usedAnswerIds: [answerId] }) }])
+    const { deps } = makeDeps(provider, { retriever: answerRetriever({ id: answerId, score: 0.92, approvals: 3 }) })
+
+    await run(deps, ticketId)
+
+    const [draft] = await draftsFor(ticketId)
+    // Deviation 1: `confidence` still means the model's own self-assessment; evidence is a breakdown field.
+    expect(draft!.confidence).toBeCloseTo(0.9, 6)
+    expect(draft!.confidenceBreakdown).toMatchObject({
+      evidence: 0.9,
+      memory: { score: 1, answerId, cosine: 0.92, approvals: 3 },
+      // The category is `review`, so there is no threshold to compare against.
+      threshold: null,
+    })
+    expect(draft!.usedAnswerIds).toEqual([answerId])
+    expect(draft!.retrievedAnswerIds).toEqual([answerId])
+  })
+
+  it('15b. an answer the model did NOT cite contributes no memory (evidence falls back to grounding × model = 0 here)', async () => {
+    const answerId = crypto.randomUUID()
+    const ticketId = await seedDraftableTicket()
+    const provider = createFakeProvider([{ parsed: reply({ confidence: 0.9, usedAnswerIds: [] }) }])
+    const { deps } = makeDeps(provider, { retriever: answerRetriever({ id: answerId, score: 0.92, approvals: 3 }) })
+
+    await run(deps, ticketId)
+
+    const [draft] = await draftsFor(ticketId)
+    expect(draft!.confidenceBreakdown).toMatchObject({ evidence: 0, memory: null })
+    expect(draft!.usedAnswerIds).toEqual([])
+  })
+
+  it('15c. an id the model invented is not a used answer, so it lends no memory either', async () => {
+    const answerId = crypto.randomUUID()
+    const ticketId = await seedDraftableTicket()
+    const provider = createFakeProvider([{ parsed: reply({ confidence: 0.9, usedAnswerIds: [crypto.randomUUID()] }) }])
+    const { deps } = makeDeps(provider, { retriever: answerRetriever({ id: answerId, score: 0.92, approvals: 3 }) })
+
+    await run(deps, ticketId)
+
+    const [draft] = await draftsFor(ticketId)
+    expect(draft!.usedAnswerIds).toEqual([])
+    expect(draft!.confidenceBreakdown).toMatchObject({ evidence: 0, memory: null })
+  })
+
+  it('16. category auto and evidence ≥ threshold lands an auto-send: approved draft, queued send a hold window out, ticket auto_sending', async () => {
+    await setPolicy(fx.categoryId, { mode: 'auto', autoSendMinConfidence: 80 })
+    await seedHumanDecisions(10)
+    const answerId = crypto.randomUUID()
+    const ticketId = await seedDraftableTicket()
+    const provider = createFakeProvider([{ parsed: reply({ confidence: 0.9, usedAnswerIds: [answerId] }) }])
+    const { deps, sends, notified } = makeDeps(provider, { retriever: answerRetriever({ id: answerId, score: 0.95, approvals: 3 }) })
+
+    await run(deps, ticketId)
+
+    const [draft] = await draftsFor(ticketId)
+    expect(draft).toMatchObject({
+      status: 'approved', decision: 'send', decisionReason: 'ok', decisionSource: 'auto', finalBody: CLEAN_BODY,
+      decidedBy: null, viewedAt: null,
+    })
+    expect(draft!.autoDecidedAt).not.toBeNull()
+    expect(draft!.decidedAt).not.toBeNull()
+    expect(draft!.confidenceBreakdown).toMatchObject({
+      evidence: 0.9, threshold: 0.8,
+      blockers: { memoryConflict: false, unresolvedQuestions: false, threadTooLong: false, autoSendCap: false, coldStart: false },
+    })
+
+    const [send] = await sendsFor(draft!.id)
+    expect(send).toMatchObject({ status: 'queued', ticketId, connectionId: fx.connectionId, agentId: fx.agentId })
+    // `agents.auto_send_delay_min` defaults to 2 minutes.
+    expect(send!.sendAfter.getTime()).toBe(NOW.getTime() + 2 * 60_000)
+
+    expect((await getTicket(ticketId)).status).toBe('auto_sending')
+    expect(sends).toEqual([{ orgId: fx.orgId, sendId: send!.id, startAfter: send!.sendAfter }])
+    // `notifications.push_auto_sends` is off by default.
+    expect(await allNotifications()).toEqual([])
+    expect(notified).toEqual([])
+
+    const [run1] = await runsFor(ticketId)
+    expect(run1!.output).toMatchObject({ outcome: 'reply', draftId: draft!.id, decision: 'send' })
+    const created = await auditRowsFor(ticketId, 'draft.created')
+    expect(created[0]!.detail).toMatchObject({ draftId: draft!.id, decision: 'send', reason: 'ok' })
+    const events = await eventsFor(run1!.id)
+    expect(events.at(-1)!.payload).toMatchObject({ action: 'send', reason: 'ok', evidence: 0.9, threshold: 0.8 })
+  })
+
+  it('16b. with notifications.push_auto_sends on, the auto landing inserts ONE auto_send push carrying the ticket and draft ids', async () => {
+    await setPolicy(fx.categoryId, { mode: 'auto', autoSendMinConfidence: 80 })
+    await seedHumanDecisions(10)
+    await setOrgSetting('notifications.push_auto_sends', true)
+    const answerId = crypto.randomUUID()
+    const ticketId = await seedDraftableTicket()
+    const provider = createFakeProvider([{ parsed: reply({ confidence: 0.9, usedAnswerIds: [answerId] }) }])
+    const { deps, notified } = makeDeps(provider, { retriever: answerRetriever({ id: answerId, score: 0.95, approvals: 3 }) })
+
+    await run(deps, ticketId)
+
+    const [draft] = await draftsFor(ticketId)
+    const pushes = await allNotifications()
+    expect(pushes).toHaveLength(1)
+    expect(pushes[0]!.kind).toBe('auto_send')
+    expect(pushes[0]!.title).toBe('Auto-sending in 2 min · Order status · 90%')
+    expect(pushes[0]!.body).toBe(CLEAN_BODY.slice(0, 140))
+    expect(pushes[0]!.dedupeKey).toBe(`auto_send:${draft!.id}`)
+    expect(pushes[0]!.payload).toEqual({ ticketId, draftId: draft!.id })
+    expect(notified).toEqual([pushes[0]!.id])
+  })
+
+  interface AutoBlockerCase {
+    cosine?: number
+    approvals?: number
+    conflict?: boolean
+    unresolved?: string[]
+    threadLength?: number
+    dmarcPass?: boolean
+    hasAttachments?: boolean
+    autoSendsToday?: number
+    humanDecisions?: number
+  }
+
+  const autoBlockers: [string, AutoBlockerCase, string][] = [
+    ['below threshold', { cosine: 0.8, approvals: 1 }, 'below_threshold'],
+    ['memory conflict', { conflict: true }, 'memory_conflict'],
+    ['unresolved questions', { unresolved: ['Is it in stock?'] }, 'unresolved_questions'],
+    ['thread longer than 6', { threadLength: 7 }, 'thread_too_long'],
+    ['dmarc fail', { dmarcPass: false }, 'dmarc_fail'],
+    ['attachments', { hasAttachments: true }, 'attachments'],
+    ['auto-send cap reached', { autoSendsToday: 100 }, 'auto_send_cap'],
+    ['cold start', { humanDecisions: 9 }, 'cold_start'],
+  ]
+
+  it.each(autoBlockers)('16c. category auto but %s → review landing with that reason (never a send)', async (_name, over, reason) => {
+    await setPolicy(fx.categoryId, { mode: 'auto', autoSendMinConfidence: 80 })
+    await seedHumanDecisions(over.humanDecisions ?? 10)
+    if (over.autoSendsToday !== undefined) await setUsageCounter(SEND_METERS.autoSends, over.autoSendsToday)
+    const answerId = crypto.randomUUID()
+    const ticketId = await seedTicket({ hasAttachments: over.hasAttachments ?? false })
+    for (let i = 0; i < (over.threadLength ?? 1); i++) {
+      await seedInbound(ticketId, { dmarcPass: over.dmarcPass ?? true })
+    }
+    const provider = createFakeProvider([{
+      parsed: reply({
+        confidence: 0.9,
+        usedAnswerIds: [answerId],
+        memoryConflictIds: over.conflict ? [answerId] : [],
+        unresolvedQuestions: over.unresolved ?? [],
+      }),
+    }])
+    const { deps, sends } = makeDeps(provider, {
+      retriever: answerRetriever({ id: answerId, score: over.cosine ?? 0.95, approvals: over.approvals ?? 3 }),
+    })
+
+    await run(deps, ticketId)
+
+    const [draft] = await draftsFor(ticketId)
+    expect(draft).toMatchObject({ status: 'pending', decision: 'review', decisionReason: reason, decisionSource: null, finalBody: null })
+    expect(draft!.autoDecidedAt).toBeNull()
+    expect(await sendsFor(draft!.id)).toEqual([])
+    expect((await getTicket(ticketId)).status).toBe('awaiting_review')
+    expect(sends).toEqual([])
+  })
+
+  it('16d. a memory conflict the model flags parks that answer in needs_review at landing time', async () => {
+    const [answer] = await withOrg(app.db, fx.orgId, (tx) =>
+      tx.insert(resolvedAnswers).values({
+        orgId: fx.orgId, agentId: fx.agentId, categoryId: fx.categoryId,
+        questionText: 'where is my order', answerBody: 'It ships tomorrow.', status: 'active', approvals: 3,
+        expiresAt: new Date(NOW.getTime() + 365 * 86_400_000),
+      }).returning({ id: resolvedAnswers.id }))
+    const ticketId = await seedDraftableTicket()
+    const provider = createFakeProvider([{ parsed: reply({ usedAnswerIds: [], memoryConflictIds: [answer!.id] }) }])
+    const { deps } = makeDeps(provider, { retriever: answerRetriever({ id: answer!.id, score: 0.92, approvals: 3 }) })
+
+    await run(deps, ticketId)
+
+    const [row] = await withOrg(app.db, fx.orgId, (tx) =>
+      tx.select().from(resolvedAnswers).where(eq(resolvedAnswers.id, answer!.id)))
+    expect(row!.status).toBe('needs_review')
+    expect(row!.reviewReason).toBe('model_conflict')
+    const [draft] = await draftsFor(ticketId)
+    expect(draft!.memoryConflictIds).toEqual([answer!.id])
+    expect(draft!.confidenceBreakdown).toMatchObject({ blockers: { memoryConflict: true } })
   })
 })

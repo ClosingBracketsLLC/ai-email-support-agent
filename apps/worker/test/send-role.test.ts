@@ -61,14 +61,15 @@ describe('maybeRegisterSendRole', () => {
     expect(lines).toHaveLength(0)
   })
 
-  it('registers send.execute with the ring, the config and the SHARED limiter once a KEK ring and one OAuth pair are present', async () => {
+  it('registers send.execute with the ring, the config, the SHARED limiter and onSent once a KEK ring and one OAuth pair are present', async () => {
     const { logger } = testLogger()
     let seen: SendExecuteDeps | undefined
     const config = baseConfig({ env: 'production' })
+    const onSent: SendExecuteDeps['onSent'] = async () => {}
     await maybeRegisterSendRole(
       {
         boss: fakeBoss, db: fakeDb, config, limiter: createMailLimiter(), logger,
-        enqueueNotify: async () => {}, enqueueDraft: async () => {},
+        enqueueNotify: async () => {}, enqueueDraft: async () => {}, onSent,
       },
       async (_boss, deps) => { seen = deps },
     )
@@ -78,6 +79,9 @@ describe('maybeRegisterSendRole', () => {
     expect(seen?.limiter).toBeDefined()
     expect(seen?.enqueueNotify).toBeDefined()
     expect(seen?.enqueueDraft).toBeDefined()
+    // Phase 5: memory.capture's enqueue seam — send.execute calls this post-commit and never lets
+    // its failure fail the send.
+    expect(seen?.onSent).toBe(onSent)
   })
 
   it('registers on the microsoft pair alone', async () => {

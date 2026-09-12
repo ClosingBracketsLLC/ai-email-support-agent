@@ -69,6 +69,11 @@ export const DUE_SEND_GRACE_SECONDS = 60
  *  has SOMETHING outstanding and is not orphaned regardless of age. */
 const LIVE_DRAFT_STATUSES = ['pending', 'approved', 'held', 'sending'] as const
 
+/** The two ticket statuses (c) can find an orphan in: a reply is outstanding in both, so a ticket
+ *  sitting in either with NO live draft is one nobody will ever answer. `auto_sending` is the
+ *  Phase 5 half — see arm (c)'s own comment for the levered-auto-send case it exists to catch. */
+const ORPHANABLE_TICKET_STATUSES = ['awaiting_review', 'auto_sending'] as const
+
 const SWEEP_ACTOR = 'system:cron:ticket.backstop-sweep' as const
 
 export interface TicketBackstopDeps {
@@ -210,14 +215,26 @@ export async function runTicketBackstopSweep(
       }
     }
 
-    // (c) orphans — an `awaiting_review` ticket with no live draft, idle past ORPHAN_AFTER_MINUTES
-    // on its own anchor (the newest draft's `created_at`, else `last_agent_run_at`, else
-    // `updated_at` — never `updated_at` alone, since a chasing customer bumps that column and must
-    // not reset the very clock meant to catch a stuck ticket). Oldest anchor first, capped. Each
-    // candidate is escalated in its own SAVEPOINT: `escalateTicket` needs an `OrgTx` to audit and
-    // notify through, so the SAVEPOINT's own tx is lent that ticket's identity via
+    // (c) orphans — an `awaiting_review` OR `auto_sending` ticket with no live draft, idle past
+    // ORPHAN_AFTER_MINUTES on its own anchor (the newest draft's `created_at`, else
+    // `last_agent_run_at`, else `updated_at` — never `updated_at` alone, since a chasing customer
+    // bumps that column and must not reset the very clock meant to catch a stuck ticket). Oldest
+    // anchor first, capped.
+    //
+    // BOTH live send statuses (Phase 5, task 6 review Important 1): a levered auto-send lands its
+    // send AND its draft on `held` with the ticket left in `auto_sending`, and if nobody resumes it
+    // `sweeps.daily` eventually expires that `held` draft WITHOUT escalating (only `pending` rows
+    // page there). Arm (d) never selects a `held` send either — so on the review path this neglect
+    // pages `orphaned` and on the auto path the customer email was silently dropped. The
+    // `NOT EXISTS` over `LIVE_DRAFT_STATUSES` (which includes `approved` and `held`) still excludes
+    // every HEALTHY auto-sending ticket: only genuinely draft-less ones reach here.
+    //
+    // Each candidate is escalated in its own SAVEPOINT: `escalateTicket` needs an `OrgTx` to audit
+    // and notify through, so the SAVEPOINT's own tx is lent that ticket's identity via
     // `withOrgIdentity` — RLS is already bypassed under `aesa_platform`, and every write inside is
     // keyed by `ticketId`, so the identity feeds only the audit row and the notification's `org_id`.
+    // `fromStatus` is the status the SELECT read, so the guarded flip still loses to any concurrent
+    // writer that moved the ticket first.
     const orphanBefore = new Date(now.getTime() - ORPHAN_AFTER_MINUTES * 60_000)
     const liveDraftExists = tx
       .select({ one: sql`1` })
@@ -229,9 +246,13 @@ export async function runTicketBackstopSweep(
       ${tickets.updatedAt}
     )`
     const orphanCandidates = await tx
-      .select({ id: tickets.id, orgId: tickets.orgId })
+      .select({ id: tickets.id, orgId: tickets.orgId, status: tickets.status })
       .from(tickets)
-      .where(and(eq(tickets.status, 'awaiting_review'), notExists(liveDraftExists), sql`${orphanAnchor} < ${orphanBefore.toISOString()}::timestamptz`))
+      .where(and(
+        inArray(tickets.status, [...ORPHANABLE_TICKET_STATUSES]),
+        notExists(liveDraftExists),
+        sql`${orphanAnchor} < ${orphanBefore.toISOString()}::timestamptz`,
+      ))
       .orderBy(sql`${orphanAnchor} ASC`)
       .limit(ESCALATIONS_CAP_PER_CYCLE)
 
@@ -240,7 +261,7 @@ export async function runTicketBackstopSweep(
         await tx.transaction(async (tx2) => {
           const orgTx = withOrgIdentity(tx2, candidate.orgId)
           const { escalated, notificationId } = await escalate(orgTx, {
-            orgId: candidate.orgId, ticketId: candidate.id, fromStatus: 'awaiting_review', reason: 'orphaned',
+            orgId: candidate.orgId, ticketId: candidate.id, fromStatus: candidate.status, reason: 'orphaned',
             day, now, dedupeKey: `orphaned:${candidate.id}:${day}`, actor: SWEEP_ACTOR, auditAction: 'ticket.escalated',
           })
           if (escalated) orphans += 1

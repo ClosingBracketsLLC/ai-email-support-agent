@@ -106,7 +106,7 @@ test('pressing "Auto-sending" fires inbox.list with section=auto_sending, select
 
   fireEvent.press(screen.getByTestId('inbox-tab-auto_sending'))
 
-  await waitFor(() => expect(screen.getByText('Nothing is auto-sending — autopilot arrives later')).toBeTruthy())
+  await waitFor(() => expect(screen.getByText('Nothing is auto-sending — turn on Autopilot for a category in Settings')).toBeTruthy())
   expect(mockListInputs.some((i) => i.section === 'auto_sending')).toBe(true)
   expect(screen.getByTestId('inbox-tab-auto_sending').props.accessibilityState.selected).toBe(true)
 })

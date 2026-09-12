@@ -1,8 +1,10 @@
+import { randomUUID } from 'node:crypto'
 import { createTRPCClient, httpBatchLink } from '@trpc/client'
 import { eq } from 'drizzle-orm'
 import superjson from 'superjson'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { auditLog, workspaces } from '@aesa/db'
+import { OPERATING_GUIDANCE_MAX } from '@aesa/contracts'
+import { auditLog, categories, guidanceSuggestions, workspaces } from '@aesa/db'
 import type { AppRouter } from '../src/trpc/router.ts'
 import {
   WEB, createTestApi, insertAgent, insertConnectedMailbox, insertTicket, listen, seedPendingDraft, signInWithOtp,
@@ -139,6 +141,94 @@ describe('workspace router', () => {
     await t.app.inject({ method: 'POST', url: '/api/auth/organization/set-active', headers: { origin: WEB, cookie: member.cookie, 'content-type': 'application/json' }, payload: { organizationId: orgId } })
 
     await expect(client(base, member.cookie).workspace.setAgentEnabled.mutate({ enabled: true })).rejects.toMatchObject({ data: { code: 'FORBIDDEN' } })
+  })
+
+  // ── Phase 5: the guidance suggestions an edited approval produces ──────────
+
+  it('guidanceSuggestions lists the pending ones newest first with their labels; accept appends one line and marks it accepted; dismiss marks it dismissed; both are audited', async () => {
+    const owner = await signInWithOtp(t.app, t.mail, 'suggestions@example.com', 'Owner')
+    const c = client(base, owner.cookie)
+    const { orgId } = await c.workspace.create.mutate({ businessName: 'Suggest Co', timezone: 'UTC' })
+    const connectionId = await insertConnectedMailbox(t.api, orgId, owner.user.id, 'support@suggest.test')
+    const added = await c.mailboxes.addAddress.mutate({ connectionId, address: 'support@suggest.test', replyFromConnection: false })
+    const [category] = await t.api.withOrg(orgId, (tx) => tx.select().from(categories).where(eq(categories.key, 'order_status')))
+
+    const seed = async (text: string, values: Partial<typeof guidanceSuggestions.$inferInsert> = {}) => {
+      const [row] = await t.api.withOrg(orgId, (tx) => tx.insert(guidanceSuggestions).values({
+        orgId, text, rationale: 'The owner added it to every reply.', agentId: added.agentId, categoryId: category!.id, ...values,
+      }).returning())
+      return row!
+    }
+    const older = await seed('Always give the order number.', { createdAt: new Date(Date.now() - 60_000) })
+    const newer = await seed('Never promise a delivery date.')
+    await seed('Already decided.', { status: 'dismissed' })
+
+    const listed = await c.workspace.guidanceSuggestions.query()
+    expect(listed.suggestions.map((s) => s.id)).toEqual([newer.id, older.id])
+    expect(listed.suggestions[0]).toMatchObject({
+      text: 'Never promise a delivery date.', rationale: 'The owner added it to every reply.',
+      categoryLabel: 'Order status', agentAddress: 'support@suggest.test',
+    })
+    expect(listed.suggestions[0]!.createdAt).toBeInstanceOf(Date)
+
+    expect(await c.workspace.acceptSuggestion.mutate({ suggestionId: newer.id })).toEqual({ ok: true })
+    expect((await c.workspace.get.query()).operatingGuidance).toBe('- Never promise a delivery date.')
+    expect(await c.workspace.acceptSuggestion.mutate({ suggestionId: older.id })).toEqual({ ok: true })
+    expect((await c.workspace.get.query()).operatingGuidance).toBe('- Never promise a delivery date.\n- Always give the order number.')
+
+    const appended = await t.api.withOrg(orgId, (tx) => tx.select().from(auditLog).where(eq(auditLog.action, 'workspace.guidance.append')))
+    expect(appended).toHaveLength(2)
+    expect(appended[0]!.detail).toMatchObject({ suggestionId: newer.id, length: '- Never promise a delivery date.'.length })
+    expect(JSON.stringify(appended.map((r) => r.detail))).not.toContain('Never promise')
+
+    // An accepted suggestion is spent — and it is off the list.
+    await expect(c.workspace.acceptSuggestion.mutate({ suggestionId: newer.id })).rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' } })
+    expect((await c.workspace.guidanceSuggestions.query()).suggestions).toEqual([])
+
+    const pending = await seed('Mention the 30-day return window.')
+    expect(await c.workspace.dismissSuggestion.mutate({ suggestionId: pending.id })).toEqual({ ok: true })
+    const [dismissed] = await t.api.withOrg(orgId, (tx) => tx.select().from(guidanceSuggestions).where(eq(guidanceSuggestions.id, pending.id)))
+    expect(dismissed).toMatchObject({ status: 'dismissed', decidedBy: owner.user.id })
+    expect(dismissed!.decidedAt).toBeInstanceOf(Date)
+    expect((await c.workspace.get.query()).operatingGuidance).toBe('- Never promise a delivery date.\n- Always give the order number.')
+    expect(await t.api.withOrg(orgId, (tx) => tx.select().from(auditLog).where(eq(auditLog.action, 'workspace.guidance.dismissed')))).toHaveLength(1)
+
+    await expect(c.workspace.dismissSuggestion.mutate({ suggestionId: pending.id })).rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' } })
+    await expect(c.workspace.acceptSuggestion.mutate({ suggestionId: randomUUID() })).rejects.toMatchObject({ data: { code: 'NOT_FOUND' } })
+  })
+
+  it('acceptSuggestion past the 8,000-character guidance cap is PRECONDITION_FAILED guidance_full and leaves the suggestion pending', async () => {
+    const owner = await signInWithOtp(t.app, t.mail, 'guidancefull@example.com', 'Owner')
+    const c = client(base, owner.cookie)
+    const { orgId } = await c.workspace.create.mutate({ businessName: 'Full Co', timezone: 'UTC' })
+    const full = 'x'.repeat(OPERATING_GUIDANCE_MAX)
+    await t.api.withOrg(orgId, (tx) => tx.update(workspaces).set({ operatingGuidance: full }).where(eq(workspaces.orgId, orgId)))
+    const [suggestion] = await t.api.withOrg(orgId, (tx) => tx.insert(guidanceSuggestions)
+      .values({ orgId, text: 'One rule too many.' }).returning())
+
+    await expect(c.workspace.acceptSuggestion.mutate({ suggestionId: suggestion!.id }))
+      .rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' }, message: 'guidance_full' })
+    expect((await c.workspace.get.query()).operatingGuidance).toBe(full)
+    const [after] = await t.api.withOrg(orgId, (tx) => tx.select().from(guidanceSuggestions).where(eq(guidanceSuggestions.id, suggestion!.id)))
+    expect(after).toMatchObject({ status: 'pending' })
+  })
+
+  it('a member can read the suggestions but cannot accept or dismiss one', async () => {
+    const owner = await signInWithOtp(t.app, t.mail, 'suggestowner@example.com', 'Owner')
+    const ownerClient = client(base, owner.cookie)
+    const { orgId } = await ownerClient.workspace.create.mutate({ businessName: 'Member Co', timezone: 'UTC' })
+    const [suggestion] = await t.api.withOrg(orgId, (tx) => tx.insert(guidanceSuggestions)
+      .values({ orgId, text: 'Say hello first.' }).returning())
+
+    const { invitationId } = await ownerClient.team.invite.mutate({ email: 'suggestmember@example.com', role: 'member' })
+    const member = await signInWithOtp(t.app, t.mail, 'suggestmember@example.com', 'Member')
+    await t.app.inject({ method: 'POST', url: '/api/auth/organization/accept-invitation', headers: { origin: WEB, cookie: member.cookie, 'content-type': 'application/json' }, payload: { invitationId } })
+    await t.app.inject({ method: 'POST', url: '/api/auth/organization/set-active', headers: { origin: WEB, cookie: member.cookie, 'content-type': 'application/json' }, payload: { organizationId: orgId } })
+    const asMember = client(base, member.cookie)
+
+    expect((await asMember.workspace.guidanceSuggestions.query()).suggestions).toHaveLength(1)
+    await expect(asMember.workspace.acceptSuggestion.mutate({ suggestionId: suggestion!.id })).rejects.toMatchObject({ data: { code: 'FORBIDDEN' } })
+    await expect(asMember.workspace.dismissSuggestion.mutate({ suggestionId: suggestion!.id })).rejects.toMatchObject({ data: { code: 'FORBIDDEN' } })
   })
 
   it('goLiveStatus: agent addresses in priority order (active only), ticketsSeen, and the newest live draft', async () => {

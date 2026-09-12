@@ -1,10 +1,10 @@
 import { randomUUID } from 'node:crypto'
 import { createTRPCClient, httpBatchLink } from '@trpc/client'
-import { eq } from 'drizzle-orm'
+import { eq, sql } from 'drizzle-orm'
 import superjson from 'superjson'
 import { afterAll, beforeAll, describe, expect, expectTypeOf, it } from 'vitest'
 import { drafts, messages, outboundSends, tickets, workspaces } from '@aesa/db'
-import { loadTicketSummary, parseCursor, type TicketDraftSummary, type TicketSummary } from '../src/trpc/routers/inbox.ts'
+import { encodeInboxCursor, loadTicketSummary, parseCursor, type TicketDraftSummary, type TicketSummary } from '../src/trpc/routers/inbox.ts'
 import type { AppRouter } from '../src/trpc/router.ts'
 import { SEED_DRAFT_BODY, WEB, createTestApi, insertAgent, insertConnectedMailbox, listen, seedPendingDraft, signInWithOtp } from './helpers/app.ts'
 
@@ -23,6 +23,16 @@ describe('inbox router (read-only)', () => {
       tx.insert(tickets).values({ orgId, connectionId, providerThreadId: `thread-${randomUUID()}`, status: 'new', ...overrides }).returning(),
     )
     return row!
+  }
+
+  /** A fresh owner, a fresh workspace, and one already-`connected` mailbox — the shared starting
+   * point for the keyset-cursor tests below. */
+  async function setupOrgWithMailbox(ownerEmail: string, mailboxEmail: string) {
+    const signed = await signInWithOtp(t.app, t.mail, ownerEmail, 'Owner')
+    const c = client(base, signed.cookie)
+    const { orgId } = await c.workspace.create.mutate({ businessName: 'Acme', timezone: 'UTC' })
+    const connectionId = await insertConnectedMailbox(t.api, orgId, signed.user.id, mailboxEmail)
+    return { orgId, userId: signed.user.id, cookie: signed.cookie, client: c, connectionId }
   }
 
   it('routes tickets into the right section by status', async () => {
@@ -88,6 +98,34 @@ describe('inbox router (read-only)', () => {
 
     const allIds = [...page1.tickets.map((tk) => tk.id), ...page2.tickets.map((tk) => tk.id)]
     expect(new Set(allIds).size).toBe(26) // neither skipped nor duplicated across pages
+  })
+
+  it('pages without dropping or repeating a ticket when several share the same millisecond (Phase 2 carry: row-comparison keyset)', async () => {
+    const { client: c, orgId, connectionId } = await setupOrgWithMailbox('owner-keyset@example.com', 'support@keyset.test')
+    // Five tickets whose sort key differs only in MICROseconds — a millisecond ISO cursor cannot tell them apart.
+    const base = new Date('2026-09-11T10:00:00.123Z')
+    for (let i = 0; i < 5; i++) {
+      await t.api.withOrg(orgId, (tx) => tx.execute(sql`
+        INSERT INTO tickets (org_id, connection_id, provider_thread_id, status, last_inbound_at)
+        VALUES (${orgId}::uuid, ${connectionId}::uuid, ${`thread-keyset-${i}`}, 'needs_owner', ${base.toISOString()}::timestamptz + (${i} * interval '100 microseconds'))`))
+    }
+    const seen: string[] = []
+    let cursor: string | undefined
+    for (let page = 0; page < 6; page++) {
+      const res = await c.inbox.list.query({ section: 'to_review', limit: 2, ...(cursor ? { cursor } : {}) })
+      expect(res.degraded).toBe(false)
+      seen.push(...res.tickets.map((row) => row.id))
+      if (!res.nextCursor) break
+      cursor = res.nextCursor
+    }
+    expect(new Set(seen).size).toBe(5)
+    expect(seen).toHaveLength(5)
+  })
+
+  it('serves the newest page and says degraded for a cursor that is not one it minted', async () => {
+    const { client: c } = await setupOrgWithMailbox('owner-badcursor@example.com', 'support@badcursor.test')
+    const res = await c.inbox.list.query({ section: 'to_review', cursor: 'not-a-cursor' })
+    expect(res.degraded).toBe(true)
   })
 
   it('inbox.ticket returns messages ordered ascending by sentAt; a cross-org id is NOT_FOUND', async () => {
@@ -246,16 +284,61 @@ describe('inbox router (read-only)', () => {
     expect((await c.inbox.ticket.query({ ticketId: handling.id })).draft).toBeNull()
   })
 
-  it('a cursor that passes zod but is not a real instant is served WITHOUT the cursor and flagged degraded', async () => {
-    // zod 4's own `.datetime()` rejects everything a Date cannot represent (an impossible calendar day
-    // included — and V8 would silently ROLL '2026-02-31' over to March rather than refusing it), so
-    // `degraded` is the belt on that brace, unit-tested at its source: whatever passes the input
-    // schema, `list` never hands drizzle an Invalid Date.
-    expect(parseCursor('9999-99-99T99:99:99Z')).toEqual({ cursorDate: null, degraded: true })
-    expect(parseCursor(undefined)).toEqual({ cursorDate: null, degraded: false })
-    const parsed = parseCursor('2026-01-01T00:00:00.000Z')
-    expect(parsed.degraded).toBe(false)
-    expect(parsed.cursorDate?.toISOString()).toBe('2026-01-01T00:00:00.000Z')
+  // Final fix wave: the draft panel's "Should not have sent" button had no draft to render against
+  // from the ticket screen — `loadLiveDraftView` served live drafts (and the failed fallback) only,
+  // and an auto-send's draft is `sent`, on a `waiting_on_customer` ticket.
+  it('inbox.ticket serves the newest SENT auto draft on a waiting_on_customer ticket, and nothing else', async () => {
+    const signed = await signInWithOtp(t.app, t.mail, 'owner-auto-sent-draft@example.com', 'Owner')
+    const c = client(base, signed.cookie)
+    const { orgId } = await c.workspace.create.mutate({ businessName: 'Acme', timezone: 'UTC' })
+    const connectionId = await insertConnectedMailbox(t.api, orgId, signed.user.id, 'support@autosent.test')
+    const agentId = await insertAgent(t.api, orgId, connectionId, 'support@autosent.test')
+    const now = Date.now()
+
+    const markSent = (draftId: string, source: 'auto' | 'app', decidedAt: Date) =>
+      t.api.withOrg(orgId, (tx) => tx.update(drafts)
+        .set({ decisionSource: source, decidedAt, ...(source === 'auto' ? { autoDecidedAt: decidedAt } : { decidedBy: signed.user.id }) })
+        .where(eq(drafts.id, draftId)))
+
+    // The state an auto-send leaves behind: draft `sent`, ledger row `sent`, ticket waiting.
+    const ticket = await insertTicket(orgId, connectionId, { status: 'waiting_on_customer', agentId, lastInboundAt: new Date(now) })
+    const older = await seedPendingDraft(t.api, orgId, ticket.id, { agentId, status: 'sent' })
+    const newest = await seedPendingDraft(t.api, orgId, ticket.id, { agentId, status: 'sent' })
+    await markSent(older.id, 'auto', new Date(now - 60_000))
+    await markSent(newest.id, 'auto', new Date(now))
+
+    const one = await c.inbox.ticket.query({ ticketId: ticket.id })
+    expect(one.draft).toMatchObject({ id: newest.id, status: 'sent', decisionSource: 'auto', flaggedAt: null })
+
+    // The LIST join stays live-only: a recently-sent ticket shows no draft chip.
+    const list = await c.inbox.list.query({ section: 'recent' })
+    expect(list.tickets.find((tk) => tk.id === ticket.id)!.draft).toBeNull()
+
+    // Bounded by the ticket status, exactly like the failed fallback: a resolved ticket carrying the
+    // same rows shows nothing (nothing polls it, and the flag would be refused anyway).
+    const done = await insertTicket(orgId, connectionId, { status: 'resolved', agentId, lastInboundAt: new Date(now) })
+    const doneDraft = await seedPendingDraft(t.api, orgId, done.id, { agentId, status: 'sent' })
+    await markSent(doneDraft.id, 'auto', new Date(now))
+    expect((await c.inbox.ticket.query({ ticketId: done.id })).draft).toBeNull()
+
+    // ...and bounded by `decision_source`: a reply the OWNER approved is finished business.
+    const human = await insertTicket(orgId, connectionId, { status: 'waiting_on_customer', agentId, lastInboundAt: new Date(now) })
+    const humanDraft = await seedPendingDraft(t.api, orgId, human.id, { agentId, status: 'sent' })
+    await markSent(humanDraft.id, 'app', new Date(now))
+    expect((await c.inbox.ticket.query({ ticketId: human.id })).draft).toBeNull()
+  })
+
+  it('parseCursor decodes exactly what encodeInboxCursor minted and flags anything else as degraded', async () => {
+    // The cursor is opaque (base64url JSON, not an ISO instant) — `degraded` is the belt for
+    // anything that isn't a cursor `inbox.list` itself minted: unparseable base64/JSON, a missing
+    // field, a non-uuid id, or a `ts` that isn't a real instant.
+    expect(parseCursor(undefined)).toEqual({ cursorTs: null, cursorId: null, degraded: false })
+    expect(parseCursor('not-a-cursor')).toEqual({ cursorTs: null, cursorId: null, degraded: true })
+    expect(parseCursor(Buffer.from(JSON.stringify({ ts: '9999-99-99T99:99:99Z', id: randomUUID() }), 'utf8').toString('base64url')))
+      .toEqual({ cursorTs: null, cursorId: null, degraded: true })
+    const id = randomUUID()
+    const minted = encodeInboxCursor({ ts: '2026-01-01 00:00:00+00', id })
+    expect(parseCursor(minted)).toEqual({ cursorTs: '2026-01-01 00:00:00+00', cursorId: id, degraded: false })
 
     const signed = await signInWithOtp(t.app, t.mail, 'owner-degraded@example.com', 'Owner')
     const c = client(base, signed.cookie)
@@ -266,7 +349,50 @@ describe('inbox router (read-only)', () => {
     const res = await c.inbox.list.query({ section: 'recent' })
     expect(res.degraded).toBe(false)
     expect(res.tickets.map((tk) => tk.id)).toEqual([ticket.id])
-    await expect(c.inbox.list.query({ section: 'recent', cursor: '2026-02-31T00:00:00Z' })).rejects.toThrow(/Invalid ISO datetime/)
+    const bad = await c.inbox.list.query({ section: 'recent', cursor: 'not-a-cursor' })
+    expect(bad.degraded).toBe(true)
+    expect(bad.tickets.map((tk) => tk.id)).toEqual([ticket.id])
+  })
+
+  // Phase 5: the Auto-sending section's countdown. The row needs two things the chip never had —
+  // that the decision was the agent's, and the instant the reply actually goes.
+  it('an auto_sending ticket lists with its draft decisionSource and the queued send\'s sendAfter, and a held send reports none', async () => {
+    const signed = await signInWithOtp(t.app, t.mail, 'owner-autosending@example.com', 'Owner')
+    const c = client(base, signed.cookie)
+    const { orgId } = await c.workspace.create.mutate({ businessName: 'Acme', timezone: 'UTC' })
+    const connectionId = await insertConnectedMailbox(t.api, orgId, signed.user.id, 'support@autosending.test')
+    const agentId = await insertAgent(t.api, orgId, connectionId, 'support@autosending.test')
+
+    const ticket = await insertTicket(orgId, connectionId, { status: 'auto_sending', agentId, subject: 'Where is my order?', lastInboundAt: new Date() })
+    const draft = await seedPendingDraft(t.api, orgId, ticket.id, { agentId })
+    await t.api.withOrg(orgId, (tx) => tx.update(drafts)
+      .set({ status: 'approved', decisionSource: 'auto', decidedAt: new Date(), autoDecidedAt: new Date(), finalBody: SEED_DRAFT_BODY })
+      .where(eq(drafts.id, draft.id)))
+    const sendAfter = new Date(Date.now() + 120_000)
+    const [send] = await t.api.withOrg(orgId, (tx) => tx.insert(outboundSends).values({
+      orgId, draftId: draft.id, ticketId: ticket.id, connectionId, agentId, status: 'queued', sendAfter,
+    }).returning())
+
+    const list = await c.inbox.list.query({ section: 'auto_sending' })
+    expect(list.tickets.map((tk) => tk.id)).toEqual([ticket.id])
+    expect(list.tickets[0]!.draft).toMatchObject({ id: draft.id, status: 'approved', decisionSource: 'auto' })
+    expect(list.tickets[0]!.draft!.sendAfter).toEqual(sendAfter)
+
+    const one = await c.inbox.ticket.query({ ticketId: ticket.id })
+    expect(one.ticket.draft).toMatchObject({ decisionSource: 'auto' })
+    expect(one.ticket.draft!.sendAfter).toEqual(sendAfter)
+
+    // A send that is no longer counting down (held by a kill lever, or already claimed) has no
+    // countdown to render.
+    await t.api.withOrg(orgId, (tx) => tx.update(outboundSends).set({ status: 'held' }).where(eq(outboundSends.id, send!.id)))
+    const held = await c.inbox.list.query({ section: 'auto_sending' })
+    expect(held.tickets[0]!.draft).toMatchObject({ decisionSource: 'auto', sendAfter: null })
+
+    // A pending human-review draft carries neither.
+    const reviewTicket = await insertTicket(orgId, connectionId, { status: 'awaiting_review', agentId, lastInboundAt: new Date() })
+    await seedPendingDraft(t.api, orgId, reviewTicket.id, { agentId })
+    const review = await c.inbox.list.query({ section: 'to_review' })
+    expect(review.tickets[0]!.draft).toMatchObject({ status: 'pending', decisionSource: null, sendAfter: null })
   })
 
   it('TicketSummary is a concrete type, not a bag of unknown — drafts.get hands it straight to the app', async () => {
@@ -280,6 +406,8 @@ describe('inbox router (read-only)', () => {
     expectTypeOf<TicketSummary['lastInboundAt']>().toEqualTypeOf<Date | null>()
     expectTypeOf<TicketSummary['inboundCount']>().toEqualTypeOf<number>()
     expectTypeOf<TicketSummary['draft']>().toEqualTypeOf<TicketDraftSummary | null>()
+    expectTypeOf<TicketDraftSummary['decisionSource']>().toEqualTypeOf<string | null>()
+    expectTypeOf<TicketDraftSummary['sendAfter']>().toEqualTypeOf<Date | null>()
 
     const signed = await signInWithOtp(t.app, t.mail, 'owner-summary@example.com', 'Owner')
     const c = client(base, signed.cookie)

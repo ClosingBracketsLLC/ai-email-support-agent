@@ -51,7 +51,8 @@ export {
   type RetrieveInput,
   type RetrieverDeps,
 } from './retrieval/retriever.ts'
-export { lexicalSearchSql, vectorLiteral, vectorSearchSql } from './retrieval/sql.ts'
+export { answerSearchSql, lexicalSearchSql, vectorLiteral, vectorSearchSql } from './retrieval/sql.ts'
+export { scrubForMemory } from './memory/scrub.ts'
 export { createMemoryStore } from './storage/memory.ts'
 export { createS3Store, type CreateS3StoreOptions } from './storage/s3.ts'
 export { type ObjectStore } from './storage/types.ts'

@@ -18,6 +18,8 @@ export const UpdateAgentInput = z.object({
   priority: z.number().int().min(0).max(100).optional(),
   replyFromAddress: z.email().max(254).nullable().optional(),
   status: z.enum(['active', 'disabled']).optional(),
+  autoGraduate: z.boolean().optional(),
+  autoSendDelayMin: z.number().int().min(1).max(60).optional(),
 })
 export type UpdateAgentInput = z.infer<typeof UpdateAgentInput>
 

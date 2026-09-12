@@ -22,6 +22,9 @@ export const DECISION_REASON_LABEL: Record<DecisionReason, string> = {
   category_review: 'Category set to review',
   redraft: 'A re-draft always comes to you',
   guardrail_warning: 'Guardrail warnings',
+  memory_conflict: 'A learned answer conflicts with your guidance',
+  unresolved_questions: 'The agent could not answer everything',
+  thread_too_long: 'Long thread — a person should look',
   cold_start: 'Fewer than 10 decisions so far',
   below_threshold: 'Confidence below the send threshold',
   attachments: 'The customer sent attachments',
@@ -54,7 +57,7 @@ export const REASON_SENTENCE: Record<NeedsOwnerReason, string> = {
 
 /**
  * Why an approved send is parked. Unlike the failed vocabulary below this one IS closed, and these
- * are every `held:*` string the product writes into `outbound_sends.last_error`: the six
+ * are every `held:*` string the product writes into `outbound_sends.last_error`: the seven
  * `held:${lever}` arms of `send.execute`'s `firstKillLever`, `ticket.draft`'s
  * `held:superseded_by_redraft` (`outcomes.ts`, when a re-draft retires the draft a send was queued
  * for) and the api's own `held:ticket_resolved` (`resolveTicket`). Anything starting with `reauth`
@@ -68,6 +71,7 @@ const HOLD_REASON_LABEL: Record<string, string> = {
   'held:agent_inactive': 'this agent is not active',
   'held:connection_unavailable': 'the mailbox needs reconnecting',
   'held:category_off': 'this category is off',
+  'held:category_not_auto': 'this category is no longer on Autopilot',
   'held:superseded_by_redraft': 'a newer draft replaced it',
   'held:ticket_resolved': 'the ticket was resolved',
 }

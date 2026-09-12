@@ -7,12 +7,12 @@
  * toast is racing a 15-second clock and losing that race is an ordinary result, not an error.
  */
 import { TRPCError } from '@trpc/server'
-import { ApproveDraftInput, DraftIdInput, RejectDraftInput } from '@aesa/contracts'
+import { ApproveDraftInput, DraftIdInput, FlagAutoSentInput, RejectDraftInput } from '@aesa/contracts'
 import type { AuditActor } from '@aesa/db'
 import type pino from 'pino'
 import type { ApiFacade, EnqueueFn } from '../../deps.ts'
 import {
-  approveDraft, holdDraft, loadDraftView, markViewed, rejectDraft, resumeDraft,
+  approveDraft, flagAutoSent, holdDraft, loadDraftView, markViewed, rejectDraft, resumeDraft,
   type DraftActor, type DraftServiceDeps,
 } from '../../drafts/service.ts'
 import { orgProcedure, router } from '../init.ts'
@@ -77,9 +77,21 @@ export const draftsRouter = router({
     return { resumed: false }
   }),
 
+  /** `guidanceAdded` is false when the owner did not ask for it — and also when they did but the
+   * workspace guidance is already at its 8,000-character cap; the app says so either way. */
   reject: orgProcedure.input(RejectDraftInput).mutation(async ({ ctx, input }) => {
     const res = await rejectDraft(serviceDeps(ctx), ctx.orgId, input, appActor(ctx))
-    if (res.ok) return { resolution: res.resolution }
+    if (res.ok) return { resolution: res.resolution, guidanceAdded: res.guidanceAdded }
+    if (res.code === 'not_found') throw notFound()
+    throw new TRPCError({ code: 'PRECONDITION_FAILED', message: res.code })
+  }),
+
+  /** "Should not have sent" — the only verdict an auto-sent reply ever gets. `not_flaggable` covers
+   * every draft that is not a never-yet-flagged, already-sent auto-send (a human approval has its own
+   * reject path; one still inside its hold window is a Hold). */
+  flagAutoSent: orgProcedure.input(FlagAutoSentInput).mutation(async ({ ctx, input }) => {
+    const res = await flagAutoSent(serviceDeps(ctx), ctx.orgId, input.draftId, appActor(ctx))
+    if (res.ok) return { ok: true as const }
     if (res.code === 'not_found') throw notFound()
     throw new TRPCError({ code: 'PRECONDITION_FAILED', message: res.code })
   }),

@@ -103,6 +103,13 @@ export function digestMail(p: {
    */
   moreDrafts?: number
   escalations: DigestEscalationItem[]
+  /**
+   * Replies the AGENT both decided and delivered on its own in the last 24 hours (spec
+   * §Notifications: "auto-sent activity folds into the digest"). One line, no items and no links:
+   * it is news, not a queue — nothing here needs a decision, and the headline and subject keep
+   * counting only what does. Omitted at zero.
+   */
+  autoSent?: number
   inboxUrl: string
 }): OutgoingMail {
   const moreDrafts = p.moreDrafts ?? 0
@@ -129,6 +136,10 @@ export function digestMail(p: {
       [e.subject || NO_SUBJECT, e.customer, e.reason].filter(Boolean).join(' · '),
       `Open: ${e.openUrl}`,
     ]))
+  }
+  const autoSent = p.autoSent ?? 0
+  if (autoSent > 0) {
+    lines.push(`${autoSent} ${autoSent === 1 ? 'reply' : 'replies'} went out on ${autoSent === 1 ? 'its' : 'their'} own in the last 24 hours.`, '')
   }
   lines.push(`Everything else is in your inbox: ${p.inboxUrl}`)
 

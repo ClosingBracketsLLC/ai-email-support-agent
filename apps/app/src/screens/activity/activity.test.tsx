@@ -25,7 +25,7 @@ interface Summary {
   rejected: number
   sent: number
   escalated: number
-  autoSent: 0
+  autoSent: number
   costMicros: number
   aiHandledConversations: number
   recent: RecentItem[]
@@ -109,9 +109,18 @@ test('renders the tiles from a mocked summary, including the AI cost and the app
   expect(within(screen.getByTestId('stat-approved')).getByText('3 unchanged · 2 edited')).toBeTruthy()
   expect(within(screen.getByTestId('stat-rejected')).getByText('1')).toBeTruthy()
   expect(within(screen.getByTestId('stat-sent')).getByText('5')).toBeTruthy()
+  expect(within(screen.getByTestId('stat-auto-sent')).getByText('0')).toBeTruthy()
   expect(within(screen.getByTestId('stat-escalated')).getByText('1')).toBeTruthy()
   expect(within(screen.getByTestId('stat-ai-cost')).getByText('$0.42')).toBeTruthy()
   expect(within(screen.getByTestId('stat-ai-handled')).getByText('4')).toBeTruthy()
+})
+
+test('the Auto-sent tile renders activity.summary.autoSent', async () => {
+  mockSummaryByDays[7] = summary({ autoSent: 4 })
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('stat-auto-sent')).toBeTruthy())
+  expect(within(screen.getByTestId('stat-auto-sent')).getByText('Auto-sent')).toBeTruthy()
+  expect(within(screen.getByTestId('stat-auto-sent')).getByText('4')).toBeTruthy()
 })
 
 test('the days toggle re-queries with { days: 30 } and the tiles update', async () => {

@@ -118,7 +118,7 @@ describe('drafts router', () => {
     expect(await org.c.drafts.hold.mutate({ draftId: draft.id })).toEqual({ held: true })
 
     const second = await seedReviewable(org)
-    expect(await org.c.drafts.reject.mutate({ draftId: second.draft.id, action: 'handle', reason: '' })).toEqual({ resolution: 'escalate_terminal' })
+    expect(await org.c.drafts.reject.mutate({ draftId: second.draft.id, action: 'handle', reason: '' })).toEqual({ resolution: 'escalate_terminal', guidanceAdded: false })
     await expect(org.c.drafts.reject.mutate({ draftId: second.draft.id, action: 'handle', reason: '' }))
       .rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' }, message: 'not_pending' })
   })
@@ -141,6 +141,40 @@ describe('drafts router', () => {
 
     expect(await org.c.inbox.resolve.mutate({ ticketId: ticket.id })).toEqual({ resolved: true })
     expect(await org.c.inbox.resolve.mutate({ ticketId: ticket.id })).toEqual({ resolved: false })
+  })
+
+  it('reject with addToGuidance reports guidanceAdded and the guidance really grew', async () => {
+    const org = await seedOrg()
+    const { draft } = await seedReviewable(org)
+
+    expect(await org.c.drafts.reject.mutate({ draftId: draft.id, action: 'handle', reason: 'Never quote a delivery date.', addToGuidance: true }))
+      .toEqual({ resolution: 'escalate_terminal', guidanceAdded: true })
+    expect((await org.c.workspace.get.query()).operatingGuidance).toBe('- Never quote a delivery date.')
+  })
+
+  it('flagAutoSent flags a sent auto reply once (PRECONDITION_FAILED on a human one, on a repeat, NOT_FOUND across workspaces)', async () => {
+    const org = await seedOrg()
+    const other = await seedOrg()
+    const ticket = await insertTicket(t.api, org.orgId, { connectionId: org.connectionId, agentId: org.agentId, status: 'waiting_on_customer' })
+    const draft = await seedPendingDraft(t.api, org.orgId, ticket.id, { agentId: org.agentId })
+    await t.api.withOrg(org.orgId, (tx) => tx.update(drafts)
+      .set({ status: 'sent', decisionSource: 'auto', decidedAt: new Date(), autoDecidedAt: new Date(), finalBody: SEED_DRAFT_BODY })
+      .where(eq(drafts.id, draft.id)))
+
+    await expect(other.c.drafts.flagAutoSent.mutate({ draftId: draft.id })).rejects.toMatchObject({ data: { code: 'NOT_FOUND' } })
+    expect(await org.c.drafts.flagAutoSent.mutate({ draftId: draft.id })).toEqual({ ok: true })
+    await expect(org.c.drafts.flagAutoSent.mutate({ draftId: draft.id }))
+      .rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' }, message: 'not_flaggable' })
+
+    const [row] = await t.api.withOrg(org.orgId, (tx) => tx.select().from(drafts).where(eq(drafts.id, draft.id)))
+    expect(row!.flaggedAt).toBeInstanceOf(Date)
+    expect(row!.flaggedBy).toBe(org.userId)
+
+    const human = await seedReviewable(org)
+    await t.api.withOrg(org.orgId, (tx) => tx.update(drafts)
+      .set({ status: 'sent', decisionSource: 'app', decidedAt: new Date() }).where(eq(drafts.id, human.draft.id)))
+    await expect(org.c.drafts.flagAutoSent.mutate({ draftId: human.draft.id }))
+      .rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' }, message: 'not_flaggable' })
   })
 
   it('every draft id from another workspace is NOT_FOUND', async () => {

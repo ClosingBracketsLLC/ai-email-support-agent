@@ -1,0 +1,48 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/gmail/v1/users/me/messages/msg-relay-1",
+    "query": {
+      "format": "metadata",
+      "metadataHeaders": [
+        "From",
+        "To",
+        "Cc",
+        "Delivered-To",
+        "Subject",
+        "Message-ID",
+        "In-Reply-To",
+        "References",
+        "Authentication-Results",
+        "Auto-Submitted",
+        "Precedence",
+        "List-Id",
+        "X-Aesa-Draft"
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": {
+      "id": "msg-relay-1",
+      "threadId": "thread-relay-1",
+      "labelIds": ["INBOX"],
+      "internalDate": "1756148600000",
+      "sizeEstimate": 1200,
+      "historyId": "3080",
+      "payload": {
+        "mimeType": "text/plain",
+        "filename": "",
+        "headers": [
+          { "name": "From", "value": "Jane <jane@example.com>" },
+          { "name": "To", "value": "support@acme.test" },
+          { "name": "Subject", "value": "Order question" },
+          { "name": "Message-Id", "value": "<relay-only-1@mail.gmail.com>" },
+          { "name": "Authentication-Results", "value": "relay.evil.test; dmarc=pass header.from=x.test" },
+          { "name": "Auto-Submitted", "value": "no" }
+        ],
+        "body": { "size": 0 }
+      }
+    }
+  }
+}

@@ -17,6 +17,7 @@ const mockRedraftId = '33333333-3333-4333-8333-333333333333'
 interface MockDraft {
   id: string; version: number; status: string; body: string; finalBody: string | null
   decisionReason: string; confidence: number | null; guardrailResult: unknown
+  confidenceBreakdown: unknown; decisionSource: string | null; flaggedAt: Date | null
   send: unknown; viewedAt: Date | null; undoUntil: Date | null
 }
 interface MockTicket {
@@ -40,6 +41,7 @@ const mockHoldCalls: unknown[] = []
 const mockRejectCalls: unknown[] = []
 const mockResumeCalls: unknown[] = []
 const mockResolveCalls: unknown[] = []
+const mockFlagCalls: unknown[] = []
 
 let mockApproveImpl: (input: unknown) => Promise<unknown> = () => Promise.resolve({})
 let mockHoldImpl: (input: unknown) => Promise<unknown> = () => Promise.resolve({ held: true })
@@ -84,6 +86,7 @@ jest.mock('@/lib/trpc', () => ({
       hold: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => { mockHoldCalls.push(v); return mockHoldImpl(v) }, ...o }) },
       reject: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => { mockRejectCalls.push(v); return mockRejectImpl(v) }, ...o }) },
       resume: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => { mockResumeCalls.push(v); return mockResumeImpl(v) }, ...o }) },
+      flagAutoSent: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => { mockFlagCalls.push(v); return Promise.resolve({ ok: true }) }, ...o }) },
     },
   }),
 }))
@@ -92,6 +95,7 @@ function pendingDraft(overrides: Partial<MockDraft> = {}): MockDraft {
   return {
     id: mockDraftId, version: 1, status: 'pending', body: 'Your order ships tomorrow.', finalBody: null,
     decisionReason: 'cold_start', confidence: 0.82, guardrailResult: { ok: true, findings: [] },
+    confidenceBreakdown: {}, decisionSource: null, flaggedAt: null,
     send: null, viewedAt: null, undoUntil: null, ...overrides,
   }
 }
@@ -129,10 +133,10 @@ beforeEach(() => {
   mockTicketOpts = {}
   mockUndoUntil = new Date(Date.now() + 15_000)
   mockBack.mockReset()
-  for (const calls of [mockMarkViewedCalls, mockApproveCalls, mockHoldCalls, mockRejectCalls, mockResumeCalls, mockResolveCalls]) calls.length = 0
+  for (const calls of [mockMarkViewedCalls, mockApproveCalls, mockHoldCalls, mockRejectCalls, mockResumeCalls, mockResolveCalls, mockFlagCalls]) calls.length = 0
   mockApproveImpl = () => Promise.resolve({ sendId: 'send-1', sendAfter: mockUndoUntil, undoUntil: mockUndoUntil })
   mockHoldImpl = () => Promise.resolve({ held: true })
-  mockRejectImpl = () => Promise.resolve({ resolution: 'redraft' })
+  mockRejectImpl = () => Promise.resolve({ resolution: 'redraft', guidanceAdded: false })
   mockMarkViewedImpl = () => Promise.resolve({ viewed: true })
   mockResumeImpl = () => Promise.resolve({ resumed: true })
   mockResolveImpl = () => Promise.resolve({ resolved: true })
@@ -208,11 +212,11 @@ test('rejecting with a reason asks for a re-draft and says one is coming', async
   await fireEvent.press(screen.getByTestId('reject-redraft'))
 
   await waitFor(() => expect(screen.getByText('The agent is re-drafting — a new draft will appear here.')).toBeTruthy())
-  expect(mockRejectCalls).toEqual([{ draftId: mockDraftId, action: 'redraft', reason: 'Too formal' }])
+  expect(mockRejectCalls).toEqual([{ draftId: mockDraftId, action: 'redraft', reason: 'Too formal', addToGuidance: false }])
 })
 
 test('"I\'ll handle it" hands the ticket to the owner', async () => {
-  mockRejectImpl = () => Promise.resolve({ resolution: 'escalate_terminal' })
+  mockRejectImpl = () => Promise.resolve({ resolution: 'escalate_terminal', guidanceAdded: false })
   await setup()
   await waitFor(() => expect(screen.getByTestId('reject')).toBeTruthy())
 
@@ -220,7 +224,7 @@ test('"I\'ll handle it" hands the ticket to the owner', async () => {
   await fireEvent.press(screen.getByTestId('reject-handle'))
 
   await waitFor(() => expect(screen.getByText('Marked for you to handle.')).toBeTruthy())
-  expect(mockRejectCalls).toEqual([{ draftId: mockDraftId, action: 'handle', reason: '' }])
+  expect(mockRejectCalls).toEqual([{ draftId: mockDraftId, action: 'handle', reason: '', addToGuidance: false }])
 })
 
 test('a held draft offers Back to review, which resumes it', async () => {
@@ -430,4 +434,44 @@ test('an undo window that has already closed shows no undo bar', async () => {
   await waitFor(() => expect(screen.getByTestId('draft-panel')).toBeTruthy())
   expect(screen.queryByTestId('undo-bar')).toBeNull()
   expect(screen.getByText('Approved — going out shortly.')).toBeTruthy()
+})
+
+// --- Phase 5: reject-to-guidance, and the owner's last word on a reply that already went out.
+
+test("the reject sheet's guidance switch rides along, and the note says the rule was added", async () => {
+  mockRejectImpl = () => Promise.resolve({ resolution: 'redraft', guidanceAdded: true })
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('reject')).toBeTruthy())
+
+  await fireEvent.press(screen.getByTestId('reject'))
+  await fireEvent.changeText(screen.getByTestId('reject-reason'), 'Never promise a delivery date')
+  await fireEvent(screen.getByTestId('reject-add-guidance'), 'valueChange', true)
+  await fireEvent.press(screen.getByTestId('reject-redraft'))
+
+  expect(mockRejectCalls).toEqual([{ draftId: mockDraftId, action: 'redraft', reason: 'Never promise a delivery date', addToGuidance: true }])
+  await waitFor(() => expect(screen.getByText('The agent is re-drafting — a new draft will appear here. Added to your guidance.')).toBeTruthy())
+})
+
+test('a guidance that was already full says the reply was still rejected, without claiming a rule was added', async () => {
+  mockRejectImpl = () => Promise.resolve({ resolution: 'redraft', guidanceAdded: false })
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('reject')).toBeTruthy())
+
+  await fireEvent.press(screen.getByTestId('reject'))
+  await fireEvent.changeText(screen.getByTestId('reject-reason'), 'Never promise a delivery date')
+  await fireEvent(screen.getByTestId('reject-add-guidance'), 'valueChange', true)
+  await fireEvent.press(screen.getByTestId('reject-redraft'))
+
+  await waitFor(() => expect(screen.getByText('The agent is re-drafting — a new draft will appear here.')).toBeTruthy())
+})
+
+test('"Should not have sent" flags the auto-sent reply', async () => {
+  mockDraft = pendingDraft({ status: 'sent', decisionSource: 'auto', viewedAt: new Date('2026-01-01T00:00:00Z') })
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('flag-auto-sent')).toBeTruthy())
+
+  await fireEvent.press(screen.getByTestId('flag-auto-sent'))
+
+  expect(mockFlagCalls).toEqual([{ draftId: mockDraftId }])
+  await waitFor(() => expect(screen.getByText('Flagged — the agent will not reuse what it learned here.')).toBeTruthy())
 })

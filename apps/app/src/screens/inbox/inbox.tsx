@@ -17,7 +17,7 @@ const SECTION_LABEL: Record<InboxSection, string> = { to_review: 'To review', au
 /** Task brief's exact per-section copy. */
 const SECTION_EMPTY: Record<InboxSection, string> = {
   to_review: 'Nothing needs you right now',
-  auto_sending: 'Nothing is auto-sending — autopilot arrives later',
+  auto_sending: 'Nothing is auto-sending — turn on Autopilot for a category in Settings',
   recent: 'Connected mail shows up here',
 }
 const REFETCH_INTERVAL_MS = 30_000

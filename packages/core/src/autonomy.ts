@@ -13,6 +13,12 @@ export interface DecisionInput {
   dmarcPass: boolean | null // the latest inbound's stamp; null (unknown) counts as not authenticated
   categoryMode: 'off' | 'review' | 'auto'
   isRedraft: boolean
+  /** The model flagged a retrieved answer as contradicting the guidance (spec blocker "memory conflict"). */
+  memoryConflict: boolean
+  /** The model left something it could not ground (spec blocker "unresolved questions"). */
+  unresolvedQuestions: boolean
+  /** More than THREAD_MAX_MESSAGES_FOR_AUTO messages in the thread (spec blocker). */
+  threadTooLong: boolean
   humanDecisionCount: number // cold-start lock below COLD_START_DECISIONS
   evidence: number | null // Phase 5; null in Phase 3
   threshold: number | null
@@ -51,6 +57,9 @@ export function decide(i: DecisionInput): Decision {
   if (i.categoryMode === 'review') return { action: 'review', reason: 'category_review' }
   if (i.isRedraft) return { action: 'review', reason: 'redraft' }
   if (i.guardrail.warningCount > 0) return { action: 'review', reason: 'guardrail_warning' }
+  if (i.memoryConflict) return { action: 'review', reason: 'memory_conflict' }
+  if (i.unresolvedQuestions) return { action: 'review', reason: 'unresolved_questions' }
+  if (i.threadTooLong) return { action: 'review', reason: 'thread_too_long' }
   if (i.humanDecisionCount < COLD_START_DECISIONS) return { action: 'review', reason: 'cold_start' }
   if (i.evidence === null || i.threshold === null || i.evidence < i.threshold) return { action: 'review', reason: 'below_threshold' }
   if (i.hasAttachments) return { action: 'review', reason: 'attachments' }

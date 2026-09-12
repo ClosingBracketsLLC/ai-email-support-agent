@@ -25,13 +25,14 @@ import {
   type DraftCallResult, type DraftDecision, type DraftPromptInput, type EscalateReason,
   type RetrievedAnswer, type RetrievedChunk, type Retriever, type ThreadMessage, type WorkspaceProfile,
 } from '@aesa/agent'
+import { DEFAULT_AUTO_SEND_THRESHOLD } from '@aesa/contracts'
 import {
-  COLD_START_DECISIONS, collectGroundedNumbers, decide, INVARIANTS,
-  resolveSetting, validateReplyBody, type GuardrailResult, type SettingKey,
+  COLD_START_DECISIONS, collectGroundedNumbers, decide, evidenceScore, INVARIANTS, memoryScore,
+  resolveSetting, THREAD_MAX_MESSAGES_FOR_AUTO, validateReplyBody, type GuardrailResult, type SettingKey,
 } from '@aesa/core'
 import {
   agentCategoryPolicies, agentRuns, agents, audit, drafts, escalateTicket, mailboxConnections,
-  messages, notifications, orgSettings, platformState, tickets, withOrg,
+  messages, notifications, orgSettings, platformState, SEND_METERS, tickets, usageCounters, withOrg,
   type Db, type OrgTx,
 } from '@aesa/db'
 import { computeCostMicros, findPricing, LlmError, type ChatMeta, type LlmProvider } from '@aesa/llm'
@@ -126,6 +127,9 @@ export interface TicketDraftDeps {
   enqueueNotify: (orgId: string, notificationId: string) => Promise<void>
   /** Self re-enqueue for `org_busy` (startAfter +30 s) and the backstop; index.ts wires `enqueueTicketDraft`. */
   enqueueDraft: (orgId: string, ticketId: string, opts?: { startAfter?: Date }) => Promise<void>
+  /** The auto landing's queued send, due when the agent's hold window elapses; index.ts wires
+   *  `enqueueSendExecute`. Best-effort — the backstop sweep's due-send arm (d) is the net. */
+  enqueueSend: (orgId: string, sendId: string, opts: { startAfter: Date }) => Promise<void>
   now?: () => Date
   /** Test seam: the watchdog budget for the WHOLE run (default `INVARIANTS.DRAFT_WATCHDOG_SECONDS`). */
   watchdogMs?: number
@@ -157,6 +161,8 @@ const AGENT_COLUMNS = {
   personaText: agents.personaText,
   guidanceExtra: agents.guidanceExtra,
   status: agents.status,
+  /** The auto-send hold window, in minutes (default 2) — how long an owner has to pull a reply back. */
+  autoSendDelayMin: agents.autoSendDelayMin,
 }
 type AgentRow = { [K in keyof typeof AGENT_COLUMNS]: (typeof agents.$inferSelect)[K] }
 
@@ -203,7 +209,10 @@ async function loadPreClaim(db: Db, orgId: string, ticketId: string, now: Date):
     const settingsRows = await tx
       .select({ key: orgSettings.key, value: orgSettings.value })
       .from(orgSettings)
-      .where(inArray(orgSettings.key, ['autonomy.daily_draft_cap', 'autonomy.daily_llm_usd_cap']))
+      .where(inArray(orgSettings.key, [
+        'autonomy.daily_draft_cap', 'autonomy.daily_llm_usd_cap',
+        'autonomy.daily_auto_send_cap', 'notifications.push_auto_sends',
+      ]))
     const settings = buildOrgSettings(settingsRows)
 
     return { agent: agent ?? null, settings, caps: await readCapsUnlocked(tx, { orgId, ticketId, settings, now }) }
@@ -259,6 +268,12 @@ interface DraftContext {
   agentEnabled: boolean
   cats: { id: string; key: string; label: string }[]
   categoryMode: 'off' | 'review' | 'auto'
+  /** The category policy's own threshold, in PERCENT; null falls back to `DEFAULT_AUTO_SEND_THRESHOLD`. */
+  autoSendMinConfidence: number | null
+  /** Today's `auto_sends` meter — the org's daily auto-send cap is measured against it. */
+  autoSendsToday: number
+  /** Every message on the thread, inbound and outbound: the `thread_too_long` blocker's input. */
+  threadLength: number
   thread: ThreadMessage[]
   latestInboundBody: string
   dmarcPass: boolean | null
@@ -283,13 +298,22 @@ async function loadContext(
     const shared = await loadSharedDraftContext(tx, orgId)
 
     let categoryMode: 'off' | 'review' | 'auto' = 'review'
+    let autoSendMinConfidence: number | null = null
     if (ticket.categoryId) {
       const [policy] = await tx
-        .select({ mode: agentCategoryPolicies.mode })
+        .select({ mode: agentCategoryPolicies.mode, autoSendMinConfidence: agentCategoryPolicies.autoSendMinConfidence })
         .from(agentCategoryPolicies)
         .where(and(eq(agentCategoryPolicies.agentId, agent.id), eq(agentCategoryPolicies.categoryId, ticket.categoryId)))
-      if (policy) categoryMode = policy.mode as 'off' | 'review' | 'auto'
+      if (policy) {
+        categoryMode = policy.mode as 'off' | 'review' | 'auto'
+        autoSendMinConfidence = policy.autoSendMinConfidence
+      }
     }
+
+    const [autoSends] = await tx
+      .select({ value: usageCounters.value })
+      .from(usageCounters)
+      .where(and(eq(usageCounters.day, utcDayString(now)), eq(usageCounters.meter, SEND_METERS.autoSends)))
 
     const messageRows = await tx
       .select({ direction: messages.direction, sentAt: messages.sentAt, fromAddress: messages.fromAddress, bodyText: messages.bodyText, dmarcPass: messages.dmarcPass })
@@ -356,6 +380,9 @@ async function loadContext(
       agentEnabled: shared.agentEnabled,
       cats: shared.cats,
       categoryMode,
+      autoSendMinConfidence,
+      autoSendsToday: autoSends?.value ?? 0,
+      threadLength: messageRows.length,
       thread,
       latestInboundBody: latestInbound?.bodyText ?? '',
       dmarcPass: latestInbound?.dmarcPass ?? null,
@@ -644,6 +671,41 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
     }
   }
 
+  // --- Rules 13/14's shared inputs. They are computed HERE, before `decide()`, because the evidence
+  // score is one of its inputs now — everything below is pure, and the non-reply outcomes simply
+  // have no citations, no memory and no threshold.
+  const retrievedChunkIds = knowledge.chunks.map((c) => c.id)
+  const retrievedAnswerIds = knowledge.answers.map((a) => a.id)
+  const replyDecision = decision.outcome === 'reply' ? decision : null
+  // An id retrieval never returned cannot be a citation — a model that invents one must not be able
+  // to make a draft look grounded (spec §Tenancy: re-check every id that crosses a prompt boundary).
+  const citedChunkIds = replyDecision ? replyDecision.citedChunkIds.filter((id) => retrievedChunkIds.includes(id)) : []
+  const usedAnswerIds = replyDecision ? replyDecision.usedAnswerIds.filter((id) => retrievedAnswerIds.includes(id)) : []
+  const memoryConflictIds = replyDecision
+    ? replyDecision.memoryConflictIds.filter((id) => retrievedChunkIds.includes(id) || retrievedAnswerIds.includes(id))
+    : []
+  const citedScores = knowledge.chunks.filter((c) => citedChunkIds.includes(c.id)).map((c) => c.score)
+  const groundingScore = citedScores.length > 0 ? Math.max(...citedScores) : null
+
+  // The memory half of the evidence score: the best answer the model actually USED, banded by its
+  // retrieval cosine and scaled by how many times a human has approved it (spec §Learning loop).
+  // An answer that was retrieved but not cited lends phrasing, never confidence.
+  const usedAnswers = knowledge.answers.filter((a) => usedAnswerIds.includes(a.id))
+  const bestUsed = usedAnswers.reduce<{ answer: RetrievedAnswer; score: number } | null>((best, a) => {
+    const score = memoryScore(a.score, a.approvals)
+    return best === null || score > best.score ? { answer: a, score } : best
+  }, null)
+  const memory = bestUsed
+    ? { score: bestUsed.score, answerId: bestUsed.answer.id, cosine: bestUsed.answer.score, approvals: bestUsed.answer.approvals }
+    : null
+  const evidence = replyDecision
+    ? evidenceScore({ memory: memory?.score ?? 0, grounding: groundingScore, model: replyDecision.confidence })
+    : null
+  // The bar the evidence has to clear, as a fraction. Only an `auto` category has one at all —
+  // `decide()` reads a null threshold as `below_threshold`, which is the safe direction.
+  const threshold =
+    replyDecision && ctx.categoryMode === 'auto' ? (ctx.autoSendMinConfidence ?? DEFAULT_AUTO_SEND_THRESHOLD) / 100 : null
+
   // --- Rule 14: the autonomy decision, then the landing.
   const verdict = decide({
     platformKillSwitch: false, // rule 1 already returned if the lever were on
@@ -658,18 +720,22 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
     dmarcPass: ctx.dmarcPass,
     categoryMode: ctx.categoryMode,
     isRedraft,
+    memoryConflict: memoryConflictIds.length > 0,
+    unresolvedQuestions: replyDecision !== null && replyDecision.unresolvedQuestions.length > 0,
+    threadTooLong: ctx.threadLength > THREAD_MAX_MESSAGES_FOR_AUTO,
     humanDecisionCount: ctx.humanDecisionCount,
-    evidence: null, // Phase 5
-    threshold: null,
+    evidence,
+    threshold,
     hasAttachments: ticket.hasAttachments,
     allowanceExhausted: false,
-    autoSendCapReached: false,
+    autoSendCapReached: ctx.autoSendsToday >= resolveSetting('autonomy.daily_auto_send_cap', { org: pre.settings }),
     mailboxHealthy: ctx.mailboxHealthy,
   })
   await withOrg(deps.db, orgId, (tx) =>
     appendRunEvent(tx, runId, 'decision', {
       outcome: decision.outcome, action: verdict.action, reason: verdict.reason, quiet: verdict.quiet === true,
       guardrailOk: guardrail?.ok ?? null, warningCount: guardrail?.warningCount ?? null,
+      evidence, threshold,
     }))
 
   // Rule 11.
@@ -701,31 +767,30 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
   const screened = guardrail!
   const category = resolveCategory(ctx.cats, decision.categoryKey)
   const warnings = screened.findings.filter((f) => f.severity === 'warn').map((f) => f.code)
-  const retrievedChunkIds = knowledge.chunks.map((c) => c.id)
-  const retrievedAnswerIds = knowledge.answers.map((a) => a.id)
-  // An id retrieval never returned cannot be a citation — a model that invents one must not be able
-  // to make a draft look grounded (spec §Tenancy: re-check every id that crosses a prompt boundary).
-  const citedChunkIds = decision.citedChunkIds.filter((id) => retrievedChunkIds.includes(id))
-  const usedAnswerIds = decision.usedAnswerIds.filter((id) => retrievedAnswerIds.includes(id))
-  const memoryConflictIds = decision.memoryConflictIds.filter((id) => retrievedChunkIds.includes(id) || retrievedAnswerIds.includes(id))
-  const citedScores = knowledge.chunks.filter((c) => citedChunkIds.includes(c.id)).map((c) => c.score)
-  const groundingScore = citedScores.length > 0 ? Math.max(...citedScores) : null
 
-  // `escalate` is `guardrail_failed` or `category_off`; everything else lands in the review queue.
-  // `send` is unreachable in Phase 3 (`evidence: null` forces `below_threshold` first) and would
-  // land here as `review` anyway — the safe direction, and never an unattended send.
+  // `send` is the auto landing (Phase 5): the draft is stored already approved beside a `queued`
+  // send due when the agent's hold window elapses. `escalate` is `guardrail_failed` or
+  // `category_off`; everything else lands in the review queue.
   const landing: DraftLanding =
-    verdict.action === 'escalate'
+    verdict.action === 'send'
       ? {
-          kind: 'escalate',
-          reason: verdict.reason === 'category_off' ? 'category_off' : 'guardrail_failed',
+          kind: 'auto',
           decisionReason: verdict.reason,
-          quiet: verdict.quiet === true,
+          delayMin: agent.autoSendDelayMin,
+          sendAfter: new Date((deps.now?.() ?? new Date()).getTime() + agent.autoSendDelayMin * 60_000),
+          pushAutoSends: resolveSetting('notifications.push_auto_sends', { org: pre.settings }),
         }
-      : { kind: 'review', decisionReason: verdict.reason }
+      : verdict.action === 'escalate'
+        ? {
+            kind: 'escalate',
+            reason: verdict.reason === 'category_off' ? 'category_off' : 'guardrail_failed',
+            decisionReason: verdict.reason,
+            quiet: verdict.quiet === true,
+          }
+        : { kind: 'review', decisionReason: verdict.reason }
 
   try {
-    const { notificationId } = await applyDraftOutcome(outcomeCtx(), landing, {
+    const { notificationId, sendId } = await applyDraftOutcome(outcomeCtx(), landing, {
       // What was SCREENED is what is stored and sent. The signature is appended by the send path,
       // never here and never by the model.
       body: screened.normalizedBody,
@@ -741,9 +806,14 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
           redraft: isRedraft,
           categoryOff: ctx.categoryMode === 'off',
           coldStart: ctx.humanDecisionCount < COLD_START_DECISIONS,
+          memoryConflict: memoryConflictIds.length > 0,
+          unresolvedQuestions: decision.unresolvedQuestions.length > 0,
+          threadTooLong: ctx.threadLength > THREAD_MAX_MESSAGES_FOR_AUTO,
+          autoSendCap: ctx.autoSendsToday >= resolveSetting('autonomy.daily_auto_send_cap', { org: pre.settings }),
         },
         model: decision.confidence,
-        memory: null,
+        // The best USED answer and what it scored — the owner's "why did it auto-send?" answer.
+        memory,
         grounding: {
           // The best VALIDATED citation's retrieval score — an id the model invented was already
           // filtered out above, so it can never raise this. Null when nothing was cited at all.
@@ -753,7 +823,10 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
           retrieved: retrievedChunkIds.length,
           cited: citedChunkIds.length,
         },
-        evidence: null, // Phase 5
+        // `max(memory, grounding) × model` — the number the auto gate compared against `threshold`
+        // (deviation 1: `drafts.confidence` still means the model's own self-assessment).
+        evidence,
+        threshold,
         warnings,
       },
       guardrailResult: { ok: screened.ok, findings: screened.findings },
@@ -768,6 +841,19 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
       isRedraft,
       warnings,
     })
+    // The draft, the send row and the ticket flip are COMMITTED by here, so a queue hiccup must not
+    // take the run down with it — and the backstop sweep's due-send arm (d), which selects on
+    // `outbound_sends` alone, re-enqueues an auto-send whose job never landed.
+    if (sendId !== undefined && landing.kind === 'auto') {
+      try {
+        await deps.enqueueSend(orgId, sendId, { startAfter: landing.sendAfter })
+      } catch (err) {
+        deps.logger.warn(
+          { orgId, ticketId, sendId, error: err instanceof Error ? err.message : String(err) },
+          'ticket.draft: enqueueing the auto-send failed; the backstop due-send sweep will pick it up',
+        )
+      }
+    }
     if (notificationId) await deps.enqueueNotify(orgId, notificationId)
   } catch (err) {
     if (!(err instanceof LostRaceError)) throw err

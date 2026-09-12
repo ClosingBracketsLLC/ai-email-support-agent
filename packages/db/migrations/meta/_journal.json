@@ -113,6 +113,20 @@
       "when": 1789120254006,
       "tag": "0015_wakeful_tarot",
       "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1789152328347,
+      "tag": "0016_cool_phalanx",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1789152329347,
+      "tag": "0017_autonomy_hardening",
+      "breakpoints": true
     }
   ]
 }

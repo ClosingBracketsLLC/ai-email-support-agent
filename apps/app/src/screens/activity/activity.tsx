@@ -78,6 +78,9 @@ export function ActivityScreen() {
             />
             <StatTile testID="stat-rejected" label="Rejected" value={String(summary.data.rejected)} />
             <StatTile testID="stat-sent" label="Sent" value={String(summary.data.sent)} />
+            {/* The autonomy number, beside "Sent" (which counts every delivered reply, auto or not):
+                replies the agent both decided AND delivered on its own inside the window. */}
+            <StatTile testID="stat-auto-sent" label="Auto-sent" value={String(summary.data.autoSent)} />
             <StatTile testID="stat-escalated" label="Escalated" value={String(summary.data.escalated)} />
             <StatTile testID="stat-ai-cost" label="AI cost" value={formatUsd(summary.data.costMicros)} />
             <StatTile testID="stat-ai-handled" label="AI-handled conversations" value={String(summary.data.aiHandledConversations)} />

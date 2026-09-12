@@ -13,7 +13,7 @@
  * and readable by the app role, so it is a plain, org-filtered query on the pooled handle rather
  * than a tenant transaction.
  */
-import { and, asc, eq, inArray } from 'drizzle-orm'
+import { and, asc, count, eq, gte, inArray } from 'drizzle-orm'
 import { alias } from 'drizzle-orm/pg-core'
 import type pino from 'pino'
 import { resolveSetting, type SettingKey } from '@aesa/core'
@@ -126,8 +126,20 @@ interface PendingEscalation {
   reason: string
 }
 
-/** Everything still waiting on the owner: pending drafts to approve, and open `needs_owner` tickets. */
-async function loadPending(db: Db, orgId: string): Promise<{ drafts: PendingDraft[]; escalations: PendingEscalation[] }> {
+/** How far back the digest's auto-sent line looks. The digest runs once a local day, so a day's
+ *  window is the one that neither double-counts nor leaves a gap worth the complexity of a cursor. */
+const AUTO_SENT_WINDOW_MS = 86_400_000
+
+/**
+ * Everything still waiting on the owner — pending drafts to approve and open `needs_owner` tickets —
+ * plus the one thing that is NOT waiting on them: how many replies went out on their own in the last
+ * 24 hours. All three in ONE short read transaction (spec §Notifications: "auto-sent activity folds
+ * into the digest"); the auto-sent count never decides WHETHER a digest is sent, it only rides along
+ * with one that is.
+ */
+async function loadPending(
+  db: Db, orgId: string, now: Date,
+): Promise<{ drafts: PendingDraft[]; escalations: PendingEscalation[]; autoSent: number }> {
   return withOrg(db, orgId, async (tx) => {
     // Two joins to `categories`: the draft's OWN category (the model's decided one, which the
     // draft_review push already shows) wins, with the ticket's as the fallback when it is NULL.
@@ -152,7 +164,19 @@ async function loadPending(db: Db, orgId: string): Promise<{ drafts: PendingDraf
       .where(and(eq(tickets.orgId, orgId), eq(tickets.status, 'needs_owner')))
       .orderBy(asc(tickets.createdAt))
 
+    // The agent both decided AND delivered it, and nobody has overridden that since: a draft the
+    // owner held and re-approved carries `decision_source: 'app'` and is their reply, not an
+    // auto-send (the same three predicates `activity.summary.autoSent` counts on).
+    const [autoSentRow] = await tx
+      .select({ value: count() })
+      .from(drafts)
+      .where(and(
+        eq(drafts.orgId, orgId), eq(drafts.status, 'sent'), eq(drafts.decisionSource, 'auto'),
+        gte(drafts.autoDecidedAt, new Date(now.getTime() - AUTO_SENT_WINDOW_MS)),
+      ))
+
     return {
+      autoSent: autoSentRow?.value ?? 0,
       drafts: draftRows.map((r) => ({
         draftId: r.draftId,
         ticketId: r.ticketId,
@@ -218,8 +242,10 @@ export async function runDigestEmailForOrg(deps: DigestEmailDeps, orgId: string,
 
   if (!(await claimToday(deps.db, orgId, day, now))) return 'skipped'
 
-  const pending = await loadPending(deps.db, orgId)
-  // Nothing to say is nothing to say — but the lock row above still marks today as run.
+  const pending = await loadPending(deps.db, orgId, now)
+  // Nothing to say is nothing to say — but the lock row above still marks today as run. An auto-send
+  // is deliberately NOT "something to say" on its own: the digest exists to carry what needs a
+  // decision, and a workspace fully on Autopilot should not get a daily mail about replies it trusts.
   if (pending.drafts.length === 0 && pending.escalations.length === 0) return 'skipped'
 
   const recipients = await loadRecipients(deps.db, orgId)
@@ -239,7 +265,10 @@ export async function runDigestEmailForOrg(deps: DigestEmailDeps, orgId: string,
     const draftItems = await mintDraftItems(deps, orgId, recipient.userId, renderable, now)
     try {
       // Network I/O: strictly outside every transaction above.
-      await deps.mail.send(digestMail({ to: recipient.email, businessName: head.businessName, drafts: draftItems, moreDrafts, escalations, inboxUrl }))
+      await deps.mail.send(digestMail({
+        to: recipient.email, businessName: head.businessName, drafts: draftItems, moreDrafts, escalations,
+        autoSent: pending.autoSent, inboxUrl,
+      }))
     } catch (err) {
       // The tokens stay valid for a week, so tomorrow's digest simply mints another set; nothing
       // here is worth failing the whole cron over.

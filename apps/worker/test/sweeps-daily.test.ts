@@ -4,13 +4,15 @@
  * Styled after `mailbox-poll-sweep.test.ts` / `ticket-backstop-sweep.test.ts` — seed the exact row
  * shape one case needs, run the sweep, assert.
  */
-import { randomBytes } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { and, eq } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import pino from 'pino'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { MEMORY_CANDIDATE_MAX_AGE_DAYS } from '@aesa/core'
 import {
-  agentRunEvents, agentRuns, auditLog, draftActionTokens, drafts, mailboxConnections, tickets, user, withOrg, withPlatform,
+  agentRunEvents, agentRuns, auditLog, draftActionTokens, drafts, knowledgeChunks, knowledgeDocuments, knowledgeSources,
+  mailboxConnections, resolvedAnswers, tickets, user, withOrg, withPlatform,
 } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
@@ -105,6 +107,36 @@ describe('sweeps.daily', () => {
 
   async function notifyJobs() {
     return queryJobs(JOB_NAMES.notifyDispatch)
+  }
+
+  async function seedAnswer(orgId: string, overrides: Partial<typeof resolvedAnswers.$inferInsert> = {}): Promise<string> {
+    const [row] = await withOrg(app.db, orgId, (tx) =>
+      tx.insert(resolvedAnswers).values({
+        orgId, questionText: 'How do I track my order?', answerBody: 'Use the tracking link in your confirmation email.',
+        status: 'active', expiresAt: new Date(NOW.getTime() + 365 * 24 * 60 * 60_000), createdAt: NOW, ...overrides,
+      }).returning({ id: resolvedAnswers.id }))
+    return row!.id
+  }
+
+  async function getAnswer(orgId: string, id: string) {
+    const [row] = await withOrg(app.db, orgId, (tx) => tx.select().from(resolvedAnswers).where(eq(resolvedAnswers.id, id)))
+    return row!
+  }
+
+  /** One minimal source → document → chunk chain, so arm (f) has a chunk id that genuinely exists. */
+  async function seedChunk(orgId: string): Promise<string> {
+    return withOrg(app.db, orgId, async (tx) => {
+      const [source] = await tx.insert(knowledgeSources)
+        .values({ orgId, kind: 'paste', status: 'ready', title: 'FAQ', pastedText: 'Orders ship within two business days.' })
+        .returning({ id: knowledgeSources.id })
+      const [doc] = await tx.insert(knowledgeDocuments)
+        .values({ orgId, sourceId: source!.id, uri: `paste:${source!.id}`, contentHash: 'h'.repeat(64), chunkCount: 1 })
+        .returning({ id: knowledgeDocuments.id })
+      const [chunk] = await tx.insert(knowledgeChunks)
+        .values({ orgId, documentId: doc!.id, ordinal: 0, content: 'Orders ship within two business days.', tokenCount: 8 })
+        .returning({ id: knowledgeChunks.id })
+      return chunk!.id
+    })
   }
 
   describe('(a) draft expiry', () => {
@@ -231,6 +263,88 @@ describe('sweeps.daily', () => {
       const remainingIds = remaining.map((r) => r.id)
       expect(remainingIds).not.toContain(oldToken!.id)
       expect(remainingIds).toContain(freshToken!.id)
+    })
+  })
+
+  describe('(d) resolved_answers expiry', () => {
+    it('retires active and needs_review answers past expires_at (reason expired) and leaves candidates/retired alone', async () => {
+      const orgId = await newOrg()
+      const activeExpired = await seedAnswer(orgId, { status: 'active', expiresAt: minutesAgo(60) })
+      const needsReviewExpired = await seedAnswer(orgId, { status: 'needs_review', expiresAt: minutesAgo(60) })
+      const candidateExpired = await seedAnswer(orgId, { status: 'candidate', expiresAt: minutesAgo(60) })
+      const alreadyRetired = await seedAnswer(orgId, { status: 'retired', retiredReason: 'owner', expiresAt: minutesAgo(60) })
+      const activeNotYet = await seedAnswer(orgId, { status: 'active', expiresAt: new Date(NOW.getTime() + 60_000) })
+
+      const result = await runSweepsDaily(boss, makeDeps())
+
+      expect(result.answersExpired).toBeGreaterThanOrEqual(2)
+      expect(await getAnswer(orgId, activeExpired)).toMatchObject({ status: 'retired', retiredReason: 'expired' })
+      expect(await getAnswer(orgId, needsReviewExpired)).toMatchObject({ status: 'retired', retiredReason: 'expired' })
+      expect(await getAnswer(orgId, candidateExpired)).toMatchObject({ status: 'candidate' }) // untouched — (e)'s job, not (d)'s
+      expect(await getAnswer(orgId, alreadyRetired)).toMatchObject({ status: 'retired', retiredReason: 'owner' }) // untouched, not overwritten
+      expect(await getAnswer(orgId, activeNotYet)).toMatchObject({ status: 'active' })
+    })
+  })
+
+  describe('(e) stale candidate retirement', () => {
+    it(`retires candidates older than ${MEMORY_CANDIDATE_MAX_AGE_DAYS} days (reason unsampled)`, async () => {
+      const orgId = await newOrg()
+      const oldCandidate = await seedAnswer(orgId, {
+        status: 'candidate', createdAt: daysAgo(MEMORY_CANDIDATE_MAX_AGE_DAYS + 1), expiresAt: new Date(NOW.getTime() + 365 * 24 * 60 * 60_000),
+      })
+      const freshCandidate = await seedAnswer(orgId, {
+        status: 'candidate', createdAt: daysAgo(1), expiresAt: new Date(NOW.getTime() + 365 * 24 * 60 * 60_000),
+      })
+
+      const result = await runSweepsDaily(boss, makeDeps())
+
+      expect(result.candidatesRetired).toBeGreaterThanOrEqual(1)
+      expect(await getAnswer(orgId, oldCandidate)).toMatchObject({ status: 'retired', retiredReason: 'unsampled' })
+      expect(await getAnswer(orgId, freshCandidate)).toMatchObject({ status: 'candidate' })
+    })
+  })
+
+  describe('(f) source-drift review', () => {
+    it('parks an active answer in needs_review (source_changed) when any of its cited chunks no longer exists; an answer with no citations is untouched', async () => {
+      const orgId = await newOrg()
+      const chunkId = await seedChunk(orgId)
+      const vanishedId = randomUUID()
+      const withVanishedChunk = await seedAnswer(orgId, { status: 'active', citedChunkIds: [chunkId, vanishedId] })
+      const withExistingOnly = await seedAnswer(orgId, { status: 'active', citedChunkIds: [chunkId] })
+      const noCitations = await seedAnswer(orgId, { status: 'active', citedChunkIds: [] })
+
+      const result = await runSweepsDaily(boss, makeDeps())
+
+      expect(result.answersSourceChanged).toBeGreaterThanOrEqual(1)
+      expect(await getAnswer(orgId, withVanishedChunk)).toMatchObject({ status: 'needs_review', reviewReason: 'source_changed' })
+      expect(await getAnswer(orgId, withExistingOnly)).toMatchObject({ status: 'active' })
+      expect(await getAnswer(orgId, noCitations)).toMatchObject({ status: 'active' })
+    })
+  })
+
+  describe('memory retirement audit trail', () => {
+    it('the three arms write ONE audit row per org per arm with the count', async () => {
+      const orgId = await newOrg()
+      await seedAnswer(orgId, { status: 'active', expiresAt: minutesAgo(60) })
+      await seedAnswer(orgId, { status: 'needs_review', expiresAt: minutesAgo(60) })
+      await seedAnswer(orgId, {
+        status: 'candidate', createdAt: daysAgo(MEMORY_CANDIDATE_MAX_AGE_DAYS + 1), expiresAt: new Date(NOW.getTime() + 365 * 24 * 60 * 60_000),
+      })
+      await seedAnswer(orgId, { status: 'active', citedChunkIds: [randomUUID()] })
+
+      await runSweepsDaily(boss, makeDeps())
+
+      const retiredAudits = await withPlatform(app.db, 'test:audit', (tx) =>
+        tx.select().from(auditLog).where(and(eq(auditLog.entityId, orgId), eq(auditLog.action, 'memory.retired'))))
+      const needsReviewAudits = await withPlatform(app.db, 'test:audit', (tx) =>
+        tx.select().from(auditLog).where(and(eq(auditLog.entityId, orgId), eq(auditLog.action, 'memory.needs_review'))))
+
+      expect(retiredAudits).toHaveLength(2)
+      const byArm = Object.fromEntries(retiredAudits.map((a) => [(a.detail as { arm: string }).arm, (a.detail as { count: number }).count]))
+      expect(byArm).toEqual({ expired: 2, unsampled: 1 })
+
+      expect(needsReviewAudits).toHaveLength(1)
+      expect(needsReviewAudits[0]!.detail).toEqual({ arm: 'source_changed', count: 1 })
     })
   })
 })

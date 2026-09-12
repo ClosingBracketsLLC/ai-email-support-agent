@@ -1,7 +1,12 @@
 # Project status
 
 Updated 2026-09-11. The spec (`docs/superpowers/specs/2026-09-07-ai-email-support-agent-design.md`)
-defines seven build phases; this file records where the build stands against them.
+defines Phase 0 (rails and tenancy) plus seven build phases, Phases 1–7; this file records where the
+build stands against them. As of 2026-09-11: Phases 0–4 and the brand are on `main` (Phase 4 via PR #5,
+merge commit `ef81169`); Phase 5 (autonomy and learning) is complete on branch `phase-5` and lands on
+`main` through a GitHub PR on Robert's go-ahead; Phases 6 (provider choice / BYOK) and 7 (billing,
+caps, launch hardening) remain, each starting at `superpowers:writing-plans` from the spec's *Build
+phases* paragraph for that phase.
 
 ## Done
 
@@ -374,7 +379,7 @@ the record)</summary>
 </details>
 
 
-### Phase 3 — draft, review, send (complete on branch `phase-3`; PR not yet opened)
+### Phase 3 — draft, review, send (complete; merged into `main` via PR #3 on 2026-09-11, carrying the brand)
 
 - Plan: `docs/superpowers/plans/2026-09-09-phase-3-draft-review-send.md` (23 tasks, executed with
   subagent-driven development). Commits `acf1f4f..HEAD` on `phase-3`, branched from `main` at
@@ -704,7 +709,7 @@ the record)</summary>
   their guarded UPDATE's `RETURNING`, the draft insert retiring every live draft except `sending`,
   and the app's five copy/state minors.
 
-### Brand — the aesa identity (complete on branch `brand`; PR follows PR #3)
+### Brand — the aesa identity (complete; merged into `phase-3` via PR #4 and landed on `main` with PR #3 on 2026-09-11)
 
 - Plan: `docs/superpowers/plans/2026-09-10-brand-system.md` (7 tasks, executed with
   subagent-driven development). Commits `0f3efbe..1d843c7` on `brand`, branched from `phase-3` at
@@ -826,7 +831,7 @@ the record)</summary>
   (`pnpm --filter @aesa/worker test test/e2e-phase3.test.ts`), and `apps/worker` has no dependency
   on anything this wave touched.
 
-### Phase 4 — knowledge (complete on branch `phase-4`; PR not yet opened)
+### Phase 4 — knowledge (complete; merged into `main` via PR #5 on 2026-09-11, merge commit `ef81169`)
 
 - Plan: `docs/superpowers/plans/2026-09-10-phase-4-knowledge.md` (11 tasks, executed with
   subagent-driven development). Commits **`de35bf9..HEAD`** on `phase-4`, branched from `main` at
@@ -1173,211 +1178,399 @@ the record)</summary>
     static routes**; the Playwright signup smoke passes. The `e2e-phase3` case-10 timing flake did
     not fire.
 
-## Next: Phase 5 — autonomy and learning
+### Phase 5 — autonomy and learning (complete on branch `phase-5`; PR not yet opened)
 
-**Where to start.** `phase-4` is complete on its branch and lands on `main` through a GitHub PR with
-a merge commit on Robert's go-ahead (the standing flow from his 2026-09-09 instruction), after
-`phase-3` (PR #3, which carries `brand`). Once it is merged, check out `main`, pull, and branch
-`phase-5` off it. Start with `superpowers:writing-plans` against the spec's *Build phases → Phase 5*
-section. Run the local setup from `CLAUDE.md` — including `pnpm db:up && pnpm s3:init` and the
-`S3_*` exports, so the minio-gated storage suite actually runs — and confirm the 2,134-test baseline (2,132 + 2 minio-gated skips without `S3_*` exported)
-above before writing the plan. A dev Postgres volume created before Phase 4 predates
-`scripts/db-init/001-roles.sql`'s pgvector install and needs `pnpm db:down && pnpm db:up` to pick it
-up. In production, install the `vector` extension once, as the cluster superuser, before deploying
-Phase 4's migrations — `packages/db/migrations/0012_pgvector.sql` runs as the non-superuser
-`aesa_owner` and cannot install it itself (`docs/runbooks/2026-09-phase-4-external-setup.md` repeats
-this, and is what Phase 4 needs from Robert before a real customer document is ever embedded).
+- Review: `docs/superpowers/reviews/2026-09-11-phase-5-final-review.md` — the whole-branch review
+  (0 Critical, 6 Important, one fix wave `03d2d2a` + `add8ad3`, the scoped re-review clean), the
+  parked residuals with their rulings, and what the review verified holds.
+- Plan: `docs/superpowers/plans/2026-09-11-phase-5-autonomy-and-learning.md` (11 tasks, executed with
+  subagent-driven development). Commits **`ef81169..HEAD`** on `phase-5`, branched from `main` at
+  `ef81169` — the plan commit, a carry-over task, nine implementation tasks with their per-task fix
+  commits, and the Task 11 close-out (the E2E, the external-setup runbook and the docs). The per-task
+  list, newest last:
+  `93bc1d0` plan · `ea7c4cc` T1 carries (the inbox keyset cursor as a row comparison; Gmail's
+  `Authentication-Results` trusted only with its own authserv-id) · `8e0da6b` T2 contracts+core
+  (autonomy/memory vocabulary, the evidence maths, three new `decide()` blockers) ·
+  `6641c26` T3 the three new tables plus the draft/policy/workspace columns and the autonomy helpers ·
+  `a2ba717` T4 `scrubForMemory` and the retriever's answers leg · `7a1aac1` T5 the `guidance_suggest`
+  call · `1718b6d`+`cc16ba9` T6 evidence on every draft, the auto landing, `send.execute` from
+  `auto_sending`, sandbox parity · `09ad6da`+`d745c66` T7 `memory.capture` / `guidance.suggest` and
+  the `onSent` seam · `7d0dd15`+`065703d` T8 `stats.rollup` and `sweeps.daily`'s memory arms ·
+  `ca5feaa`+`75411d5` T9 the api (Hold cancels an auto-send, `flagAutoSent`, inline demotion,
+  `setCategoryPolicy`, the memory router) · `59ee73f`+`814345c` T10 the app (Autopilot, Learned
+  answers, the Auto-sending countdown and Hold) · the T11 close-out commit · `03d2d2a` the FINAL FIX
+  WAVE (the whole-branch review's seven fixes) and the docs commit after it. The per-task execution
+  ledger was an ephemeral SDD artifact; everything load-bearing from it is distilled below, and the
+  git history is the durable account.
+  Gate at the FINAL FIX WAVE commit `03d2d2a` (minio up, the dev `S3_*` exported so the storage suite
+  runs): typecheck and lint clean across all **15** packages/apps; `pnpm test` green with
+  **2,364 tests** plus 4 conditional skips (`@aesa/contracts` 29, `@aesa/crypto` 44,
+  `@aesa/platform-mail` 19, `brand` 110,
+  `@aesa/core` 244, `@aesa/llm` 98, `@aesa/agent` 68, `@aesa/db` 85, `@aesa/queue` 17,
+  `@aesa/mail` 242, `@aesa/knowledge` 162, `@aesa/test-kit` 43 [39 run + 4 conditional skips],
+  `apps/api` 285, `apps/worker` 501 [including the four E2E files], `apps/app` 421 jest across 56
+  suites — no database); `db:check` reports no drift; the
+  Expo web export produces **24 static routes** (up from 22 — `(app)/settings/autopilot` and
+  `(app)/settings/memory` are the two new route files); the Playwright signup smoke passed at the
+  close-out commit and is untouched by the fix wave (still ending at the gated mailbox step, per
+  Phase 2's Task 20 ruling — it runs against the SHARED dev database, so
+  `DATABASE_URL=… pnpm --filter @aesa/db migrate` has to be run once after this phase's 0016/0017
+  land or `workspace.create` fails with a 42703). The pre-existing `e2e-phase3.test.ts` case-10
+  timing flake did NOT fire in either the close-out run or the fix wave's.
+- What exists now:
+  - `packages/contracts` — `autonomy.ts` (`CATEGORY_MODES`, `AUTONOMY_THRESHOLD_PRESETS`
+    cautious 90 / balanced 80 / eager 70, `DEFAULT_AUTO_SEND_THRESHOLD`, `AUTO_SEND_DELAY_CHOICES`
+    2/5/15, `SetCategoryPolicyInput`, `DEMOTION_REASONS`) and `memory.ts` (the four answer statuses,
+    the retired/review reasons, the list/id/delete inputs, the guidance-suggestion vocabulary), three
+    new `DECISION_REASONS` (`memory_conflict`, `unresolved_questions`, `thread_too_long`), four new
+    notification kinds (`auto_send`, `graduation`, `demotion`, `memory_sample`),
+    `RejectDraftInput.addToGuidance` and `FlagAutoSentInput`.
+  - `packages/core` — `evidence.ts`: `memoryBand` / `memoryScore` / `evidenceScore`
+    (`max(memory, grounding) × model`), `DEMOTION_RULES` + `evaluateDemotion`, `GRADUATION_RULES` +
+    `evaluateGraduation`, and the memory constants (retrieve floor 0.70, 365-day expiry, 30-day
+    candidate life, two strikes, six-message thread ceiling). `decide()` gained its three new
+    blockers between `guardrail_warning` and `cold_start`; the settings catalog gained
+    `notifications.push_auto_sends` (false) and `guidance.daily_suggest_cap` (50).
+  - `packages/db` — `resolved_answers` (`vector(1024)`, the four statuses, approvals/strikes/reuse,
+    the salted `source_customer_hash`, a self-referencing `supersedes_id`, a FIXED `expires_at`),
+    `category_stats_daily` (eight counters, PK `(agent_id, category_id, day)`) and
+    `guidance_suggestions`; `drafts.auto_decided_at` / `auto_held_at` / `flagged_at` / `flagged_by` /
+    `memory_captured_at`; `agent_category_policies.suggested_at` / `_would_send` / `_of`;
+    `workspaces.customer_hash_salt`; `customerHash` / `ensureCustomerHashSalt`; the autonomy helpers
+    (`countHumanDecisions`, `readDemotionSignals`, `demoteCategory`, `graduateCategory`);
+    `SEND_METERS.autoSends` and `GUIDANCE_METERS`. Migrations 0016–0017.
+  - `packages/knowledge` — `scrubForMemory` (greeting line, sign-off block, email/phone/long-digit
+    masks, the customer's own name) and the retriever's **answers leg**: vector-only, `status =
+    'active'`, `embedding_model`-filtered, cosine ≥ 0.70, top 3, never fused into the chunk ranking
+    and empty on the degraded path. `RetrievedAnswer` gained `approvals`.
+  - `packages/agent` — `guidance/suggest.ts`: one Haiku call that turns one edited approval into one
+    short general rule, or `null`.
+  - `apps/worker` — evidence, the four new blockers and the **auto landing** on `ticket.draft` (an
+    `approved` draft with `decision_source: 'auto'` beside a `queued` send due the agent's hold
+    window, on an `auto_sending` ticket); `send.execute` delivering from `auto_sending` and metering
+    `auto_sends` vs `review_sends` off `decision_source`; `memory.capture` (scrub → embed → insert or
+    reinforce; a candidate for an auto-send; superseding on an edited reuse) behind `send.execute`'s
+    post-commit `onSent`; `guidance.suggest`; the nightly `stats.rollup` (02:15 UTC — the sole writer
+    of `category_stats_daily`, the Autopilot suggestion and `auto_graduate` graduation, the demotion
+    backstop, the Monday sampling nudge); three new `sweeps.daily` arms (expired answers, unsampled
+    candidates, answers whose source chunks moved); and the backstop's orphan arm widened to
+    `auto_sending`.
+  - `apps/api` — Hold cancels an auto-send and returns the ticket to review (`auto_held_at`, the
+    guarded `auto_sending → awaiting_review` flip); `drafts.flagAutoSent`; the inline demotion check
+    inside every owner correction (reject, flag, an edited approve of a held auto-send), so a
+    category comes off Autopilot in the rejecting transaction rather than overnight;
+    reject-to-guidance; `agents.setCategoryPolicy` with the cold-start lock; the `memory` router over
+    `src/memory/service.ts` (`@aesa/api/memory`: summary, list, keep/retire, confirm/reject a
+    candidate, delete-by-customer); the guidance-suggestion surface; the inbox's countdown data and a
+    real `activity.autoSent`.
+  - `apps/app` — the **Autopilot** screen (Off/Review/Auto per category with the cold-start lock and
+    its live count, threshold presets, `auto_graduate`, the hold-window choice, the graduation
+    suggestion banner and the demotion notice), the **Learned answers** screen (three tabs, sampling,
+    keep/retire, *Forget one customer*), the inbox's Auto-sending countdown chip and Hold, the
+    evidence line on the draft panel, "Should not have sent", reject-to-guidance, the suggested-rules
+    card, and the `auto_send` push category with its Hold action.
+- Deviations from the spec's Phase 5 list, as recorded in the plan (the spec wins on everything
+  else):
+  1. **`drafts.confidence` keeps meaning the model's self-assessment.** The chip is rendered from
+     `confidence_breakdown.evidence` / `.threshold`; the stored column is not redefined, so no Phase 3
+     surface changes meaning. The evidence number IS the number the auto gate compares.
+  2. **Answers are retrieved workspace-wide, not per agent.** `resolved_answers.agent_id` is recorded
+     for statistics and graduation; a `sales@` answer is reference material for `support@`'s prompt,
+     which the persona block re-tones. Per-agent scoping is a `WHERE` away.
+  3. **`push_auto_sends` is an org setting** (`notifications.push_auto_sends`, default false), not a
+     `member_prefs` row — no such table exists yet. Per-member preferences arrive with Phase 7.
+  4. **The Hold window is the agent's `auto_send_delay_min`** (default 2, UI offers 2/5/15), and an
+     auto-send whose delay elapsed but whose `send.execute` job never ran is picked up by the backstop
+     sweep's existing arm (d) — no new sweep. The E2E shortens the window through `ticket.draft`'s
+     `enqueueSend` seam rather than allowing a 0-minute delay in the contract.
+  5. **The weekly sampling nudge is a Monday-morning `memory_sample` notification** from
+     `stats.rollup` (one per org per ISO week, only when a candidate exists), deep-linking to the
+     Learned answers screen's *To check* tab. Unsampled candidates are retired after **30 days**
+     (`unsampled`) so the queue stays bounded — the spec says only that they are never retrieved.
+  6. **Windows the spec leaves open are fixed in one object** (`DEMOTION_RULES`): two rejections in
+     7 days, two "should not have sent" flags in 30 days, the edit-rate rule over 30 days.
+  7. **A reject's reason becomes a guidance rule only when the owner ticks "Also add this to your
+     operating guidance"** — a direct, LLM-free append bounded by the 8,000-char cap. The LLM-drafted
+     `guidance_suggest` runs only after an **edited** approval.
+  8. **A model-flagged memory conflict parks the answer at `needs_review` at draft-landing time**,
+     on every landing kind (one guarded `UPDATE` inside `applyDraftOutcome`'s transaction), not only
+     when a draft is sent — which is what makes the Verify list's "contradiction → `needs_review`"
+     true even for a draft that is then rejected.
+  9. **An edited approval that reused an answer supersedes it**: the new answer carries
+     `supersedes_id`, the old one goes `needs_review` with one strike (two strikes retire). Straight
+     retirement was rejected — an edit can be tone, not fact.
+  10. **`category_stats_daily` is recomputed for the trailing 30 days every night**, not incremented
+      by every writer; the api reads the table for the 30-day line and the live `drafts` rows for the
+      cold-start count and every demotion check, so a demotion never waits for the rollup.
+  11. **Carries folded in (Task 1):** the inbox keyset cursor and the DMARC authserv-id check (see
+      *Carries closed* below).
+  12. **Sandbox parity is informational.** `agent.sandbox` computes evidence and passes the three new
+      blockers so its verdict matches a real draft's; it never creates an answer and never auto-sends.
+- Execution-time rulings recorded during the build (the owner's words, one line each):
+  1. Work in the main checkout on branch `phase-5` — the repo's standing practice; no worktree.
+  2. The Learned-answers screen calls the router procedures `memory.keep` / `memory.retire` while the
+     service functions stay `keepAnswer` / `retireAnswer` — a naming split fixed once, in the plan.
+  3. The guidance-suggestion schema keeps `.trim().min(1)`: an empty-string rule is meaningless and
+     `null` is already the "no rule" signal.
+  4. **The plan's rollup recipe was defective against the spec's per-day table.** The trailing window
+     is the UTC MIDNIGHT of `now − 30 d`, and the `drafted` counter is guarded on
+     `created_at >= cutoff`; a test seeds a complete older row and proves the pass leaves it intact.
+     Without it, every night's full-replace upsert overwrote historical rows and the instant cutoff
+     shaved the oldest in-window day.
+  5. **The global lock order gains a FOURTH position** — `outbound_sends → drafts → tickets →
+     resolved_answers/workspaces` — matching the worker, because `applyDraftOutcome` locks the ticket
+     and then flags a conflicting answer in one transaction. `rejectDraft` was reordered (ticket
+     branches first, learning writes after, on both branches) and wrapped in `withDeadlockRetry`.
+  6. `deleteByCustomer` audits even the no-salt path: "every tRPC mutation writes one audit row" is a
+     rule, and "someone asked us to forget this customer and there was nothing to forget" is exactly
+     what a privacy trail has to show.
+  7. `drafts.edit_distance_ratio` is always a number on approve (0 or the levenshtein ratio), and
+     rejected and auto drafts are excluded from the human-decision counters — so the rollup's `?? 0`
+     cannot inflate graduation.
+  8. `expo export --platform web` prints **Static routes (24)**; `inbox.test.tsx`'s four `act()`
+     warnings are pre-existing on `main` (verified with `git stash -u`).
+  Deviations the task reviews accepted: `MockMailbox`'s default `Authentication-Results` became
+  `mx.google.com; dmarc=pass` (T1); the CHECK-violation assertion uses
+  `toMatchObject({ cause: { constraint } })` and the migrations are `0016_cool_phalanx` +
+  `0017_autonomy_hardening` (T3); the scrub's sign-off window widened from the back third to the back
+  half and `PHONE_RE` now requires a separator so a bare digit run masks as `[number]` (T4);
+  `landDeadLetter` reads the ticket status live, `SandboxOutputView.evidence` is required, and both
+  older E2E harnesses gained a no-op `enqueueSend` (T6); one extra org-cap-override test and an
+  inline org-settings read (T7); `agents.categories` answers NOT_FOUND for a foreign agent id,
+  `RejectInput.addToGuidance` is required (four `e2e-phase3` call sites updated),
+  `setCategoryPolicy` locks the policy row `FOR UPDATE`, and `memory.summary` is a flat shape (T9);
+  `DraftView` gained `flaggedAt` (T10). Five tasks needed a fix round — one item each except T9's,
+  which addressed TWO: T6 (the backstop's orphan arm now covers `auto_sending`), T7
+  (`guidance.suggest` honours the global killswitch), T8 (the day-aligned cutoff above), T9 (the
+  lock-order reorder AND the no-salt audit) and T10 (one shared `m:ss` countdown for the bar and the
+  chip).
+- The E2E: `apps/worker/test/e2e-phase5.test.ts`, **8 scenarios**, one throwaway database, one
+  pg-boss schema of its own, the REAL `mailbox.sync` → `ticket.triage` → `ticket.draft` →
+  `send.execute` → `memory.capture` chain, the REAL api draft and memory services, and the REAL
+  retriever sharing ONE hash embedder with `memory.capture` — (1) three customers ask the same
+  question and three plain approvals teach ONE answer (approvals 1→3, `reuse_count` 2), the memory
+  score it lends the next draft rising 0 → 1/3 → 2/3 and the third draft's evidence landing at
+  `(2/3) × 0.9`; (2) with ten human decisions behind it and the category on Auto at 80%, the fourth
+  question lands `approved` / `decision send` / `decision_source auto` on an `auto_sending` ticket
+  beside a `queued` send, goes out marked and signed, meters `auto_sends` 1 with `review_sends`
+  unchanged, and becomes an UNSAMPLED candidate; (3) Hold inside the window holds the send, returns
+  the draft to `pending` with `auto_held_at` and the ticket to `awaiting_review`, and `send.execute`
+  then finds nothing claimable; (4) the candidate is invisible to retrieval until `confirmCandidate`,
+  proven from the recorded `ChatRequest`'s own knowledge block before and after; (5) a
+  `memoryConflictIds` flag parks that answer at `needs_review`/`model_conflict` and lands the draft in
+  `awaiting_review` with `decision_reason memory_conflict` even in Auto; (6) two rejections in a day
+  demote the category (`demoted_reason rejections`, ONE `demotion` notification) and strike the reused
+  answer twice, retiring it; (7) back on Autopilot, a tripwire phrase still parks the ticket at
+  `needs_owner/tripwire` with no model call at all and a DMARC failure still lands `dmarc_fail` in
+  review, neither auto-sent; (8) delete-by-customer erases exactly that customer's answers, leaves
+  the rest, and audits a COUNT rather than the address. No wall-clock sleeps: every wait polls for the
+  state it expects under a bounded deadline, and the hold window is collapsed by the `enqueueSend`
+  seam (plan deviation 4) with a test-controlled gate so scenario 3's Hold provably runs first.
+- **Carries CLOSED by this phase:**
+  - **The inbox keyset cursor** (open since Phase 2, named again in Phase 3's whole-branch review):
+    the predicate is now a row comparison `(sortKey, id) < (cursorTs, cursorId)` over an opaque
+    base64url cursor carrying the RAW `timestamptz` text, so same-millisecond rows no longer drop.
+  - **The DMARC first-match re-examination** (deferred from Phase 3 to "Phase 5, with `decide()`'s
+    auto branch"): the Gmail adapter now trusts the topmost `Authentication-Results` only when it
+    carries Gmail's own authserv-id (`mx.google.com;`). Graph's header has no authserv-id by design
+    and is trusted as the topmost header, as before.
+  - **The push's Hold action** (Phase 3 whole-branch review: "cannot succeed until Phase 5"). It can
+    now: `auto_send` is its own push category carrying Review + Hold, `draft_review` keeps Review
+    alone, and `holdDraft` accepts exactly the `approved` draft + `queued` send an auto landing
+    writes.
+  - **`memory.capture`** itself (Phase 3 plan deviation 5): `send.execute`'s `onSent` seam is wired,
+    and the no-op is gone.
+  - **The whole-branch final review's SEVEN fixes**, all in the final fix wave (`03d2d2a`) — the first
+    two are the findings this phase's own close-out had left open:
+    - **`scrubForMemory` could erase a short reply outright.** The sign-off cut now has three bounds,
+      not one: the trailing HALF as before, PLUS it never removes the message's first content line,
+      and a candidate sign-off line qualifies only when at most three non-blank lines follow it (a
+      sign-off block is short). "Thanks for getting in touch. I have checked …" now scrubs to itself,
+      and `packages/knowledge/test/scrub.test.ts` pins that body and the "answer, then a real
+      sign-off block" shape; a greeting-plus-sign-off message still scrubs to the empty string.
+    - **`activity.summary.autoSent` is rendered.** The Activity screen carries an **Auto-sent** tile
+      beside **Sent** (`stat-auto-sent`), with its own test row.
+    - **An auto-send survived its category's demotion.** `send.execute` gained a seventh kill lever,
+      `category_not_auto` (right after `category_off`): an auto-decided draft whose category is no
+      longer on Autopilot lands `held` through `landHeld`, with the owner's sentence in the app's
+      `HOLD_REASON_LABEL`. A human-approved draft is untouched — a Hold + re-approve already rewrites
+      `decision_source` to `app`.
+    - **"Should not have sent" was unreachable from the ticket screen.** `loadLiveDraftView` now
+      serves the newest `sent` + `decision_source = 'auto'` draft on a `waiting_on_customer` ticket
+      when no live draft is left, bounded by the ticket status exactly like the `failed` fallback.
+    - **The autonomy helpers had no `org_id` predicate** while running under `withOrgIdentity` in
+      `stats.rollup` (platform role, no RLS): `readDemotionSignals` takes `orgId` and filters on it,
+      and both guarded policy UPDATEs match it too.
+    - **A lost update on `workspaces.operating_guidance`.** Both appenders — `rejectDraft`'s
+      "add this to your guidance" and `workspace.acceptSuggestion` — read the row `FOR UPDATE`; the
+      workspace row is the LAST position in the global lock order, so nothing inverts.
+    - **Auto-sent activity now folds into the daily digest email** (spec §Notifications): one line,
+      "N replies went out on their own in the last 24 hours.", counted in the same short read
+      transaction as the digest's items and omitted at zero. It never decides whether a digest is
+      sent — a workspace fully on Autopilot with nothing pending still gets no mail.
+- **Carries still open**, grouped:
+  - **From Phase 4, unchanged:** the stuck-source sweep (a `queued` crawl with no job, a `processing`
+    source with unembedded chunks, an abandoned `queued` upload) → **Phase 7**; the source cap's
+    read-then-insert race and two concurrent `startCrawl` calls for one new URL (both accepted and
+    commented); a crawl does not resume, so a re-entry re-walks from the start URL.
+  - **Phase 4 residuals that named Phase 5 and did NOT land** — all three move to **Phase 6**: queue
+    options reaching `pgboss.queue` only at a queue's FIRST-EVER registration (the fix is a
+    `QUEUE_OPTIONS` table in `@aesa/queue` consumed by `defineJob` and both pre-create lists); the
+    partial unique index `(org_id, url) WHERE kind = 'crawl' AND status <> 'failed'` that would make
+    the source cap and `refreshCrawl`'s resurrect consistent; and the `registerJob`-level
+    drizzle-error scrub, so no job's rethrow can put a `query`/`params` pair into `pgboss.job.output`.
+  - **Long-standing, unchanged:** the api's three in-memory rate limiters (per-replica since Phase 1);
+    `platform.access` audit retention → **Phase 7**; the Better Auth 1.7.3 ↔ `drizzle-orm` peer bump;
+    `packages/db/test/keys.test.ts`'s order-dependence; the `apps/app` accessibility minors including
+    the draft panel's "Blocked: …" lines rendering as plain `Text`; the three-pane review layout,
+    J/K navigation, multi-select and the stubbed-provider Playwright walk → **Phase 7**; the
+    `pg_try_advisory_lock` slot pool → **Phase 7**; the `workspaces.kill_switch` Settings toggle →
+    **Phase 7**; `agent_runs.kind = 'triage'` rows → **Phase 6**; `notify.digest`'s email pass scanning
+    every workspace on each 5-minute tick; the org-cap arm of the backstop busy loop; emoji
+    presentation flattening; `blocks.ts` still telling the model bidi controls are "rejected"; a
+    re-approve inside the undo window landing up to ~2 minutes late; `sweeps.daily` holding write
+    locks across every expiring draft for the whole pass; the hand-authored cache-hit fixture;
+    `sendFailureLabel`'s untested coupling to worker-owned literals; and Phase 3's list of smaller
+    review minors, unchanged.
+  - **The ledger's deferred minors**, one line per area. *Contracts/core:* no test pins the precedence
+    among the three new `decide()` branches themselves; `GUIDANCE_SUGGESTION_STATUSES` has no
+    companion type alias; `memoryScore` floors `approvals` (not in the spec's literal formula).
+    *db:* `readDemotionSignals` has no boundary test for `decisionWindowDays` (the other two windows
+    do). *knowledge/mail:* the scrub's sign-off window is the back HALF (now with two further
+    bounds — see *Carries CLOSED* above); the keyset test spaces rows 100 µs apart so the id-tiebreaker path itself is uncovered; the cursor
+    predicate checks both halves though `parseCursor` returns them together; the DMARC re-examination
+    note landed on `parseAuthResults`' JSDoc rather than the `DMARC_METHOD_RE` block; `MockMailbox`'s
+    Gmail authserv-id default is inert in graph mode. *worker:* the evidence maths is duplicated
+    between `ticket-draft.ts` and `agent-sandbox.ts` (a pure helper in `drafting/` would be better);
+    `ticket-draft.ts` re-implements `caps.ts`'s private `meterValue`; a stale "Guarded on
+    awaiting_review" comment in `send-execute.ts`; `SandboxOutputView.evidence` is required, so a
+    stored pre-Phase-5 sandbox output `safeParse`s to null; the daily auto-send cap reads the
+    DELIVERED-count meter, so a burst inside one hold window can overshoot it; the 8-blocker
+    `it.each` asserts the reason but not the matching `blockers.*` flag; `sweeps.daily` expires a
+    `held` draft without escalating (arm (c) now compensates on a delayed clock); two definitions of
+    "edited" (`memory.capture` strikes above ratio 0, `guidance.suggest` skips under 0.05); the
+    reinforce UPDATE is not re-guarded on `status = 'active'`; `memory.skipped` audits
+    `empty_after_scrub` even when it was the embedder that returned nothing; no test kills
+    `memory.capture`'s `&& !auto` gate; `guidance.suggest`'s source-draft and `decision_source` skips
+    are untested; `agent-role.ts`'s missing-key warning string still names only three jobs;
+    **`memory.capture`'s embed spend is neither metered nor capped**; `ensureCustomerHashSalt` mints
+    a salt even when the ticket has no customer email; the graduation sample's ordering is not proven
+    by a test; `auto_sent_flagged` bumps on `flagged_at` alone; the `held` counter is gated on
+    `auto_decided_at`'s window rather than `auto_held_at`'s; `stats.rollup` queues notification ids
+    before `maybeNudge` runs in the same SAVEPOINT; the singular nudge copy is untested and the
+    per-org draft load is unbounded. *api:* `rejectCandidate` returns ok for a candidate retired
+    mid-call; `retireAnswer`'s `returning({ status })` is unused; `src/drafts/service.ts` is over
+    1,100 lines with `src/drafts/learning.ts` named as the next split seam.
+    *app:* the mode/delay/auto-graduate radios
+    give no in-flight feedback; the suggestion CTA is not disabled under the cold-start lock (inert —
+    a suggestion needs 20 decisions); one screen-level error banner serves every category and the
+    code is not cleared on an agent switch; "Deleted 1 answers"; the delete-by-customer armed state
+    survives a tab switch; a fourth copy of `relativeTime`; `autopilot.tsx` writes
+    `AUTONOMY_THRESHOLD_PRESETS.balanced` where `DEFAULT_AUTO_SEND_THRESHOLD` would say why;
+    `formatCountdown` has no NaN guard (unreachable); and several error/empty-state strings are
+    untested. *Reports only:* Task 5's index-ordering claim and Task 7's claim that the shared
+    embedder is test-asserted (only its definedness is).
+  - **From the WHOLE-BRANCH final review, what the fix wave did NOT take** (the seven it did take are
+    in *Carries CLOSED* above, in commit `03d2d2a`). Several of these restate a ledger minor; they are
+    grouped here because they are what the final review itself chose to leave standing.
+    *Structure:* `apps/api/src/drafts/service.ts` is still one file — the `src/drafts/learning.ts`
+    split is **Phase 6 cleanup**, not a Phase 5 item; the evidence maths still has no shared helper
+    (`ticket-draft.ts` and `agent-sandbox.ts` each compute it); `relativeTime`, the reason-label
+    `lookup` and `meterValue` each exist in several copies.
+    *Coverage:* no E2E exercises the **`flags`** demotion trigger (two "should not have sent" flags in
+    30 days) — only the `rejections` one.
+    *Worker:* `memory.capture`'s embed spend is neither metered nor capped (→ **Phase 6**, with BYOK);
+    the reinforce UPDATE is not re-guarded on `status = 'active'`; `memory.skipped` audits
+    `empty_after_scrub` even when it was the embedder that returned nothing; `sweeps.daily`'s arm (f)
+    joins without an `org_id` predicate and scans unbounded; `stats.rollup` bumps its counters and
+    queues its notification ids before `maybeNudge` runs in the same SAVEPOINT;
+    `category_stats_daily`'s PK does not lead with `org_id` (the convention, not a test).
+    *api/contracts:* `activity.summary` still leans on `edit_distance_ratio IS NULL` to keep auto
+    drafts out of the approved split rather than on `decision_source`; `guidance.suggest` reads the
+    PLATFORM killswitch but not the workspace's own; `SandboxOutputView.evidence` is required, so a
+    stored pre-Phase-5 sandbox output `safeParse`s to null.
+    *App polish:* the mode/delay/auto-graduate radios give no in-flight feedback; the suggestion CTA
+    is not disabled under the cold-start lock; one screen-level error banner serves every category;
+    "Deleted 1 answers"; the delete-by-customer armed state survives a tab switch; `formatCountdown`
+    has no NaN guard; `autopilot.tsx` writes `AUTONOMY_THRESHOLD_PRESETS.balanced` where
+    `DEFAULT_AUTO_SEND_THRESHOLD` would say why.
 
-**The hand-off.** Phase 5 is autonomy and learning: `resolved_answers` and
-`category_stats_daily`, the jobs `memory.capture` and `stats.rollup` plus memory retirement in
-`sweeps.daily`, pre-retrieval of past answers into the knowledge block, the **evidence score** and
-`decide()`'s auto branch, `auto_sending` with the Hold window and auto-sent sampling, the Agents &
-autonomy screen (Off/Review/Auto per category with the cold-start lock, thresholds, `auto_graduate`,
-graduation and demotion notices), the Learned answers screen with delete-by-customer, and
-"Add to guidance" from rejects. Four seams are already in place and waiting for it:
+## Next: Phase 6 — provider choice
 
-- **`RetrievalResult.answers` is `[]`.** `createRetriever` already returns the slot and
-  `knowledgeBlock` already renders an "Answers this business has given before" section from it; the
-  draft job already threads `retrieved_answer_ids` / `used_answer_ids` / `memory_conflict_ids`
-  through to the row and re-filters every id the model returns. Phase 5 fills the list; nothing
-  above it changes shape.
-- **`confidence_breakdown.grounding`.** Every draft now carries
-  `{ score, mode, knowledgeVersion, retrieved, cited }`, where `score` is the best VALIDATED
-  citation's retrieval score. `evidence` is still the `null` slot beside it, and `decide()`'s auto
-  branch is written, table-tested and unreachable until it is filled.
-- **`knowledge_version` on the draft's grounding.** `workspaces.knowledge_version` is bumped in the
-  same transaction as every chunk-set change, and the version retrieval ran against is recorded on
-  the draft — the provenance `resolved_answers.knowledge_version`'s staleness rule needs.
-- **`onSent` in `send-execute.ts`.** Called post-commit with `{ orgId, ticketId, draftId }` and
-  never allowed to fail a delivered send; Phase 4 still passes a no-op. It is where
-  `memory.capture` hooks in.
+**Where to start.** `phase-5` is complete on its branch and lands on `main` through a GitHub PR with
+a merge commit on Robert's go-ahead (the standing flow from his 2026-09-09 instruction). It was
+branched from `main` at `ef81169`, which is PR #5's merge commit, so `phase-4` is already on `main`.
+Once this one is merged, check out `main`, pull, and branch `phase-6` off it. Start with
+`superpowers:writing-plans` against the spec's *Build phases → Phase 6*. Run the local setup from
+`CLAUDE.md` — including `pnpm db:up && pnpm s3:init` and the `S3_*` exports, so the minio-gated
+storage suite actually runs — and confirm the 2,355-test baseline above before writing the plan. A
+dev Postgres volume created before Phase 4 still needs `pnpm db:down && pnpm db:up` once to pick up
+pgvector, and in production the `vector` extension must be installed by a superuser before Phase 4's
+migrations run (`docs/runbooks/2026-09-phase-4-external-setup.md`).
 
-**Carries still open** (fix in the first Phase 5 task that touches the file, or record why it moves
-again):
+**The hand-off.** Phase 6 is provider choice (BYOK): the OpenAI-compatible adapter and its presets,
+`llm_credentials` + `agent_model_config` + `model_pricing`, the `llm.probe` job with capability
+probes and quality tiers, pinned-fetch SSRF at every call, Settings → AI, quality-tier confidence
+caps and graduation bars, and BYOK dashboards from `llm_calls`. Five seams are already in place and
+waiting for it:
 
-- **From Phase 4** — a stuck-source sweep is the biggest of them, and the final review named its
-  three customers: a `queued` crawl with no job coming (its retries exhausted — `refreshCrawl`
-  accepting `queued` is today's manual escape); a `processing` source whose chunks never got their
-  vectors; and an abandoned `queued` upload (the owner presigned and never PUT), which the app now
-  deletes best-effort on a failed PUT but which survives a closed tab. Both the ingest and crawl
-  leases landed in the final fix wave, so a hard death mid-parse is re-claimed rather than stranded
-  — what is left is the rows nothing is coming back for. One daily sweep, ledgered for **Phase 7**
-  alongside `platform.access` retention.
-- **From Phase 4** — the source cap's read-then-insert race and two concurrent `startCrawl` calls for
-  one brand-new URL are both accepted and commented, not guarded: the first can land one row over the
-  cap, the second can insert two sources for one site. Revisit only if either is seen.
-- **From Phase 4** — a crawl does not resume: a re-entry re-walks from the start URL, and unchanged
-  pages cost a fetch before they skip on their content hash. Cheap in the database, not in requests.
+- **`LlmProvider` is already the port.** `packages/llm` holds the interface, the Anthropic adapter as
+  ONE implementation, the structured-output ladder, the per-model limiter, the metering wrapper, the
+  code-seeded price table and `createManagedProvider` (which composes those three around one
+  adapter). A second adapter slots in beside the first; nothing above `packages/llm` knows which one
+  it is holding, and `createFakeProvider` already stands in for both in every test.
+- **`agent_model_config` is the missing table.** Today `agents` carries persona, guidance and the
+  autonomy knobs but no model choice: `ticket.draft` uses `DRAFT_MODEL` and `guidance.suggest` uses
+  `GUIDANCE_SUGGEST_MODEL`, both module constants. The per-agent override is a new table plus one
+  read in each job's context load — `agent_runs.provider`/`.model` and `llm_calls` already record
+  what actually ran, so the dashboards have their rows from day one.
+- **`structuredOutput: 'none'` needs a real rung** (carried since Phase 3, ruling ledger 74). A
+  provider declaring `'none'` makes zero calls today — Anthropic models are native and unknown models
+  take `json_mode` — so the branch is unreachable and untested. An OpenAI-compatible endpoint with no
+  JSON mode is the first caller that needs it: a plain call with a JSON instruction, then
+  repair/extract.
+- **Quality-tier confidence caps hook `evidenceScore`'s `model` term.** `evidenceScore({ memory,
+  grounding, model })` multiplies by the model's own self-assessed confidence, so a tier cap is a
+  clamp on that one input — no new maths, no new column on `drafts`, and the auto gate keeps
+  comparing exactly one number against `auto_send_min_confidence / 100`. The graduation bar in
+  `GRADUATION_RULES` is the second place a tier would bite.
+- **`llm.probe` is a NEW queue**, and the four-places rule applies to it literally: `JOB_NAMES`, the
+  worker's pre-create list, the api's pre-create list and `queue-preflight.test.ts`'s `it.each`. It
+  is also the first Phase 6 job the api itself produces (Settings → AI's "test this connection"), so
+  its `policy` has to be decided in `defineJob` and carried in BOTH pre-create lists — see the
+  residual below about queue options only landing at a queue's first-ever registration, which is
+  worth fixing in the same phase.
 
-- The api's rate limiters (Better Auth's in-memory limiter, `@fastify/rate-limit`, `team.invite`'s
-  per-org throttle) are all in-memory and therefore per-replica — move to shared/database storage
-  before the api scales past one instance (carried since Phase 1).
-- `platform.access` audit rows still have no retention rule, and Phase 3 raises the volume again:
-  `send.execute` adds ONE credential-read audit row per send on top of Phase 2's per-sync row. The
-  retention rule is Phase 7's sweep; note the volume now, before it is a production surprise.
-- Better Auth 1.7.3 still declares a peer of `drizzle-orm ^0.45.2` against the workspace's pinned
-  `^0.44.0` (pnpm warns only, carried since Phase 1) — bump both together in a dedicated task, since
-  drizzle snapshots may shift.
-- `packages/db/test/keys.test.ts` is still order-dependent (file untouched this phase).
-- The remaining `apps/app` accessibility/UX minors from Phase 1's residuals list, on screens this
-  phase didn't touch, are still open — and Phase 3 adds one on a screen it did: the draft panel's
-  "Blocked: …" guardrail lines render as plain `Text` rather than a `Banner`, so a screen reader
-  hears the generic sentence below them but not the specific reason.
-- The DMARC first-match re-examination moves to **Phase 5**, with `decide()`'s auto branch: this
-  phase's `decide()` consumes a single boolean, and the multi-`Authentication-Results` reasoning only
-  becomes load-bearing once that branch is reachable.
-- The three-pane review layout, J/K queue navigation, multi-select and the stubbed-provider
-  Playwright walk move to **Phase 7** (plan deviation 13). Phase 3 ships the phone composition on
-  every platform plus `A`/`E`/`R` on web, and the Playwright smoke still stops at the mailbox gate.
-- The `pg_try_advisory_lock` slot pool sized to our Anthropic tier moves to **Phase 7** (plan
-  deviation 4). Phase 3's admission control is per-process (`batchSize: 1`) plus a
-  transaction-scoped `pg_advisory_xact_lock` per org.
-- The `workspaces.kill_switch` Settings toggle moves to **Phase 7** (plan deviation 16). The lever is
-  read by `decide()` and by `send.execute`; only the master switch (`agent_enabled`) is exposed.
-- `memory.capture` moves to **Phase 5** (plan deviation 5). `send.execute` already exposes the
-  `onSent({ orgId, ticketId, draftId })` seam, called post-commit and never allowed to fail a
-  delivered send; Phase 3 passes a no-op.
-- `agent_runs.kind = 'triage'` rows move to **Phase 6** (plan deviation 8). The enum admits the
-  value for Phase 6's dashboards, but only draft and sandbox runs create rows today; triage calls DO
-  get `llm_calls` rows, since the agent role wraps its one provider with the metering sink.
-- Deferred from Task 16: `notify.digest`'s email pass still scans every workspace on each 5-minute
-  tick (two `withPlatform` audit rows per tick plus a full `workspaces` scan). The token-minting
-  half of this carry was fixed in the fix wave. A due-orgs pre-filter needs a local-hour index that
-  does not exist yet.
+**Carries still open.** The Phase 5 record above groups all of them — Phase 4's three, the
+long-standing list, the ledger's deferred minors, and what the whole-branch final review left
+standing. The two findings this phase's close-out made (the scrub erasing a short reply, the
+unrendered `autoSent` count) are CLOSED, with five more, by the final fix wave `03d2d2a`.
+Three of Phase 4's residuals explicitly named "Phase 5" and did NOT land, and are the ones most worth
+folding into Phase 6's first task because they touch the same files it will open anyway:
 
-**Carried out of the whole-branch review** — one line each; none is believed to block the live
-verification walk. Three of the original list are CLOSED by Phase 4's Task 1 (plan deviation 11):
-the keyless-`boss.send` collapse (ESLint now bans a bare `boss.send`), the pre-create lists not
-carrying `policy: 'short'` (both now do), and the review pages' missing CSP/frame/nosniff headers:
+- **Queue options reach `pgboss.queue` only at a queue's FIRST-EVER registration.** `createQueue`
+  inserts NULLs and ignores a second call, so a job sent before the first registration carries
+  `retry_limit` 2, delay 0 and a 15-minute expiry. The fix is a `QUEUE_OPTIONS` table in
+  `@aesa/queue` consumed by `defineJob` and both pre-create lists — and `llm.probe` is a new queue
+  landing straight into that hazard.
+- **The `registerJob`-level drizzle-error scrub.** Every job that rethrows a `DrizzleQueryError` puts
+  its `query` and `params` into `pgboss.job.output`; the knowledge paths that could carry customer
+  text are fixed at the call site, and the general fix is a `@aesa/queue` change worth doing once.
+- **The partial unique index `(org_id, url) WHERE kind = 'crawl' AND status <> 'failed'`**, which
+  would make the source cap's read-then-insert and `refreshCrawl`'s resurrect consistent.
 
-- **The org-cap arm of the backstop-sweep busy loop.** The fix wave closed the killswitch arm only.
-  An org that has hit its daily draft or spend cap keeps satisfying sub-sweep (a)'s predicate, so
-  the sweep enqueues up to `SELECT_CAP_PER_CYCLE` (50) `ticket.draft` jobs every minute until UTC
-  midnight, each of which does one read transaction and exits at rule 3's org-cap gate. Nothing is
-  written and the owner is paged once per day, so this is wasted work, not a defect; the fix needs a
-  `usage_counters` join plus per-org settings in the sweep's own predicate.
-- **`structuredOutput: 'none'` moves to Phase 6** (ruling ledger 74): a provider declaring `'none'`
-  makes zero calls today. It is unreachable — Anthropic models are native, unknown models take
-  `json_mode` — and Phase 6's OpenAI-compatible adapter has to give it a real rung (a plain call
-  with a JSON instruction, then repair/extract).
-- **Emoji presentation flattens.** The wider default-ignorable strip (B-I2) removes U+FE0F, so a
-  heart-with-VS16 is stored and sent as its bare text-presentation glyph. Consistent with what
-  already happened to ZWJ sequences (U+200D is `\p{Cf}`) and the price of closing the bypass, but it
-  is a visible change to a sent reply.
-- **`blocks.ts` still tells the model bidi controls are "rejected"** when the validator silently
-  strips them (same for `GUARDRAIL_CODE_TEXT`). It is prompt text inside the cached static prefix,
-  so correcting it belongs with a deliberate prompt change, not a docs pass.
-- **A re-approve inside the undo window can be up to ~2 minutes late.** On the now-`short`
-  `send.execute` queue, a re-approve whose previous job is still `created` gets a `null` back
-  instead of a second job; the already-scheduled job runs, finds `send_after` still in the future
-  and returns, and the backstop sweep's arm (d) re-picks the row on its next pass. No send is lost.
-- **A resume of a stale-`failed` draft onto a `triaged` ticket is wasteful when a re-draft is
-  already in flight** — see fix-wave ruling 6: it self-corrects at the send gate, at the cost of one
-  run.
-- **`sweeps.daily` holds write locks on every expiring draft across every org for the whole pass**,
-  including its per-row escalation loop and both retention deletes. A locked draft blocks a
-  concurrent approve/hold/reject for the duration; the api's 30 s statement timeout would surface it
-  as a failed button, not a hang. Fix when it bites: move the escalation loop and the deletes out of
-  the bulk transaction. (Same file: the two retention `DELETE`s materialize every deleted id via
-  `.returning({ id })` purely to produce a count.)
-- **The push's Hold action cannot succeed until Phase 5.** A `draft_review` notification is only
-  ever created for a freshly created `pending` draft, and `holdDraft` refuses anything that is not
-  `approved` with a `queued` send — so every Hold tap is a guaranteed `not_holdable`, swallowed,
-  with the ticket simply opening. Plan deviation 12 accepts the refusal; it did not observe that it
-  is unconditional. Either drop the action from the category until auto-send exists, or surface the
-  refusal.
-- **The inbox keyset cursor can silently drop rows** (inherited from Phase 2, untouched here): the
-  predicate is `sortKey < cursor` with no `id` tiebreaker while the `ORDER BY` carries one, and the
-  cursor is a millisecond ISO string cut from a microsecond `timestamptz`. Fix as a row-comparison
-  keyset `(sortKey, id) < (cursorTs, cursorId)` carrying the raw value.
-- **The cache-hit fixture is still hand-authored.** `packages/llm/test/fixtures/anthropic/draft-cache-hit.json`
-  pins the field mapping and the pricing, not that Anthropic really returned those numbers. The
-  runbook's `LLM_RECORD=1` recorder step is the only thing that proves caching end to end, and
-  re-running it will need the two `anthropic.test.ts` cache assertions' expected numbers updated.
-- **`sendFailureLabel` maps worker-owned literals.** The app's "Not sent — …" copy keys off four
-  fixed `landTerminal` reason strings plus the `guardrail:`/`stale:` prefixes; if `send-execute.ts`
-  ever rewords one, the label degrades to the generic sentence rather than leaking raw text — safe,
-  but a coupling with no test spanning the two packages.
-- **Smaller review minors, still open**, by area: the "the page that rendered the body IS the read"
-  comments claim more than the code enforces (nothing binds the review POST to a prior GET); the
-  approve gate's edit-distance ratio compares a normalized string against a raw one; `rejectDraft`
-  leaves an inert orphan `held` `outbound_sends` row; Activity's approved counts drop `failed` and
-  `pending` drafts so the summary rows do not reconcile; `LIVE_DRAFT_STATUSES` has three copies
-  (`workspace.ts` still re-declares it); the token-race throw logs as "review page failed" at `warn`
-  with a stack for an expected race; `claim.ts:229`'s `detail` comment invites a body into a run
-  event that must never hold one; the agent-cache rate count includes the run doing the counting;
-  `createFakeProvider` ignores `opts.kind` in the result it returns; `PLAUSIBLE_TLDS` is an 18-entry
-  allowlist so a bare domain on any other TLD is not screened; the phone screens are ASCII-digit
-  only; the subject and triage questions are interpolated raw into the user message; ladder rung 4
-  extracts only from the repair reply, never from the original; the digest subject drops the
-  business name when there are no drafts; `(a2)` escalates under the global killswitch by design, so
-  the lever does not silence owner pages for stuck tickets; and the E2E never drives the digest
-  through `runNotifyDigest`'s own cron branch.
+And two Phase 5 items belong on Phase 6's own list rather than a later one:
 
-**The ledger's deferred minors still carried** — the whole-branch review triaged 24, the fix wave
-cleared nine of them (69, 70, 71, 79, 129 from that triage, plus 39, 112, 136 and 89b picked up by
-the sections that were already in those files), one (47) turned out to be moot and is dropped, and
-these 18 carry:
-
-- 40 — `use-gate.test.tsx` near-duplicates the `setActive`-rejection scaffold (the two tests assert
-  different things; the review's own triage says drop rather than merge).
-- 41 — the Task 1 report's rationale is imprecise about the `provider as MailProvider` cast
-  precedent; the code is safe by the DB CHECK. Report text only.
-- 47 (dropped, not carried) — `ticket-row.test.tsx`'s `it.each` title says "one-word chip"; the
-  review confirmed the block it titles carries only genuinely one-word chips, so the recorded minor
-  no longer applies.
-- 48 — the Task 2 report miscounts `DECISION_REASONS` as 20 (it is 21). Report text only.
-- 53 — the Task 3 report mischaracterises migration 0010's per-table index split (the total, 12, is
-  right). Report text only.
-- 58 — `autonomy.test.ts` asserts the absence of `quiet` implicitly through `toEqual` rather than an
-  explicit per-row check.
-- 76 — the Task 7 report claims a fake-provider test edit that is not in its diff. Report accuracy.
-- 77 — `ZERO_USAGE` is duplicated in `structured.ts` and `with-metering.ts`.
-- 78 — ladder rungs 1–2 repeat the `isRefusal`/parsed shape; a small shared helper would do.
-- 84 — the lockfile regen added unrelated transitive churn under `@react-native/metro-config`, and
-  the default meter `onError` wraps `console.error` with a prefix (the worker overrides it).
-- 89a — the workspace profile block's `contactUrls` are not cross-checked against
-  `allowedUrlHosts`; the assertion belongs where the two are assembled.
-- 89c — an empty `categoryKeys` renders `"from: ."` in the prompt.
-- 89d — the prior-draft body is sliced (a benign extra beyond what the brief asked for).
-- 89e — one `as GuardrailCode` cast in `thread.ts`, type-safe by construction.
-- 92 — a prompt bullet's either/or packs two clauses with a comma; a semicolon would read cleaner.
-- 126 — the job-level `MessageGone` catch in `send.execute`'s recovery scan is unreachable today
-  (both adapters and the mock swallow it inside `findSentByMarker`); kept deliberately, since
-  removing it would make a future adapter that does surface it send blind.
-- 127 — the crash-recovered path reconstructs the outbound `messages` row from this run's
-  body/subject with `sent_at = now` rather than the provider's record. Activity reads
-  `outbound_sends.sent_at`, so the skew is bounded by the retry window; re-check when Phase 4 adds
-  a thread view.
-- 130 — on `send.execute`'s fresh path the kill-lever check sits below the draft-status/null-body
-  refusals, so a rejected draft plus a lever lands `draft not approved` instead of a hold. The
-  owner's own disposition winning is the better outcome; it wants a sentence in the file header.
-- 183 — no test renders a NEW undo window after an expired one (correct by inspection: the latch is
-  keyed to the `undoAt` value, and both ends are pinned by the two existing tests).
+- **`memory.capture`'s embed spend is neither metered nor capped.** One short question per delivered
+  reply, so the volume is bounded by the send volume — but it does not count against
+  `knowledge.daily_embed_tokens_cap` and shows in no meter. BYOK makes "whose key paid for this?" a
+  question with a real answer, which is the moment to fix it.
+- **`agent_runs.kind = 'triage'` rows** (deferred from Phase 3 to Phase 6): the enum admits the value
+  for Phase 6's dashboards, but only draft and sandbox runs create rows today. Triage calls do get
+  `llm_calls` rows, since the agent role wraps its one provider with the metering sink.
 
 ## Later phases (see the spec for scope and verification)
 
-- Phase 5 — autonomy and learning (resolved-answer memory, evidence score, graduation).
 - Phase 6 — provider choice (BYOK adapters, probes, per-agent model config).
 - Phase 7 — billing, caps, launch hardening. Owes the `plan` column and the `{ plan }` argument at every `resolveSetting` site: until then every org sits on the catalog defaults (100 sources, 200 crawl pages, 5,000,000 daily embed tokens) and `PLANS.trial` is inert (Phase 4 final review, seams D1).
 
@@ -1422,6 +1615,17 @@ so a customer can opt out, the live walk (crawl a real site, upload a real PDF a
 AND from a phone, ask a question the document answers and check the draft's
 `confidence_breakdown.grounding`), and the DPA/privacy-policy update — **Voyage and the object store
 are new sub-processors, and customer documents are now stored at rest.**
+
+The Phase 5 external-setup runbook (`docs/runbooks/2026-09-phase-5-external-setup.md`) is the first
+one that needs **nothing provisioned**: no new vendor, no new key, no new environment variable. What
+it needs is the live walk — teach one answer with three unchanged approvals in Review, graduate the
+category to Auto, watch the fourth reply go out on its own from BOTH a Gmail and an outlook.com
+sender, **Hold one from the phone's push** (turn `notifications.push_auto_sends` on in `org_settings`
+first), sample an auto-sent candidate on the Learned answers screen, and flag one "Should not have
+sent" twice to see the category demote itself — plus one privacy edit: `resolved_answers` keeps a
+scrubbed customer question and the business's reply for up to 365 days, keyed by a salted customer
+hash, and the retention section of the privacy policy has to say so. Phase 7's org-delete path must
+cascade that table; delete-by-customer is the interim erasure route.
 
 Open the Knowledge screen in a browser once, signed in, and once on a phone. No gate renders it: the
 Playwright smoke still ends at the gated mailbox step, and jest-expo exercises the components but

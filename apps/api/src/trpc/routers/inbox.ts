@@ -7,7 +7,7 @@
 import { TRPCError } from '@trpc/server'
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm'
 import { InboxListInput, ResolveTicketInput, TicketIdInput, type DraftStatus, type InboxSection } from '@aesa/contracts'
-import { agents, categories, drafts, messages, tickets, type OrgTx } from '@aesa/db'
+import { agents, categories, drafts, isUuid, messages, outboundSends, tickets, type OrgTx } from '@aesa/db'
 import { LIVE_DRAFT_STATUSES, loadLiveDraftView, resolveTicket } from '../../drafts/service.ts'
 import { orgProcedure, router } from '../init.ts'
 
@@ -27,10 +27,13 @@ const ticketSummaryColumns = {
   agentAddress: agents.address, spamFlagged: tickets.spamFlagged, hasAttachments: tickets.hasAttachments,
 }
 
-/** Just enough of the live draft for a list row's chip; the panel loads the full `DraftView`. */
+/** Just enough of the live draft for a list row's chip; the panel loads the full `DraftView`.
+ * Phase 5 adds the two the Auto-sending countdown needs: whose decision it was, and when the reply
+ * actually goes (the send row's `send_after`, which is also the Hold deadline). */
 const draftSummaryColumns = {
   draftId: drafts.id, draftStatus: drafts.status, draftConfidence: drafts.confidence,
   draftDecisionReason: drafts.decisionReason, draftExpiresAt: drafts.expiresAt, draftVersion: drafts.version,
+  draftDecisionSource: drafts.decisionSource, draftSendAfter: outboundSends.sendAfter, draftSendStatus: outboundSends.status,
 }
 
 export interface TicketDraftSummary {
@@ -40,12 +43,20 @@ export interface TicketDraftSummary {
   decisionReason: string
   expiresAt: Date
   version: number
+  /** `auto` = the agent decided this one; `app`/`email` = a human did; null = nobody has yet. */
+  decisionSource: string | null
+  /** The instant the reply goes out — set ONLY while the send is still `queued`, so a held or
+   * already-claimed one renders no countdown the owner can no longer act on. */
+  sendAfter: Date | null
 }
 
 /** The join predicate: the ticket's own org, and only the statuses the one-live-draft unique covers. */
 const liveDraftJoin = and(
   eq(drafts.ticketId, tickets.id), eq(drafts.orgId, tickets.orgId), inArray(drafts.status, [...LIVE_DRAFT_STATUSES]),
 )!
+
+/** At most one send row per draft (the unique on `draft_id`), so this never multiplies the rows. */
+const draftSendJoin = eq(outboundSends.draftId, drafts.id)
 
 /** Typed as the nullable union on purpose — these are LEFT JOIN columns, null on a ticket with no live draft. */
 interface DraftSummaryRow {
@@ -55,6 +66,9 @@ interface DraftSummaryRow {
   draftDecisionReason: string | null
   draftExpiresAt: Date | null
   draftVersion: number | null
+  draftDecisionSource: string | null
+  draftSendAfter: Date | null
+  draftSendStatus: string | null
 }
 
 function toDraftSummary(row: DraftSummaryRow): TicketDraftSummary | null {
@@ -62,6 +76,8 @@ function toDraftSummary(row: DraftSummaryRow): TicketDraftSummary | null {
   return {
     id: row.draftId, status: row.draftStatus as DraftStatus, confidence: row.draftConfidence,
     decisionReason: row.draftDecisionReason!, expiresAt: row.draftExpiresAt!, version: row.draftVersion!,
+    decisionSource: row.draftDecisionSource,
+    sendAfter: row.draftSendStatus === 'queued' ? row.draftSendAfter : null,
   }
 }
 
@@ -118,16 +134,24 @@ function toSummary(row: TicketSummaryRow): TicketSummary {
   }
 }
 
-/**
- * A cursor that passed the input schema but is still not a real instant never reaches drizzle: the
- * page is served WITHOUT it and the response says `degraded`, so the app can say "showing the newest"
- * instead of the client hanging on an error (Phase 2 carry-over). zod's own `.datetime()` already
- * rejects an impossible calendar day; this is the belt on that brace.
- */
-export function parseCursor(cursor: string | undefined): { cursorDate: Date | null; degraded: boolean } {
-  if (cursor === undefined) return { cursorDate: null, degraded: false }
-  const parsed = new Date(cursor)
-  return Number.isNaN(parsed.getTime()) ? { cursorDate: null, degraded: true } : { cursorDate: parsed, degraded: false }
+/** The keyset cursor: the sort key exactly as Postgres rendered it (microseconds intact) plus the
+ * row's id, so the next page's predicate is a ROW comparison `(sortKey, id) < (ts, id)` that can
+ * neither skip a row sharing the millisecond nor repeat the last one (Phase 2 carry). */
+export function encodeInboxCursor(c: { ts: string; id: string }): string {
+  return Buffer.from(JSON.stringify(c), 'utf8').toString('base64url')
+}
+
+export function parseCursor(cursor: string | undefined): { cursorTs: string | null; cursorId: string | null; degraded: boolean } {
+  if (cursor === undefined) return { cursorTs: null, cursorId: null, degraded: false }
+  try {
+    const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as { ts?: unknown; id?: unknown }
+    if (typeof parsed.ts !== 'string' || typeof parsed.id !== 'string' || Number.isNaN(new Date(parsed.ts).getTime()) || !isUuid(parsed.id)) {
+      return { cursorTs: null, cursorId: null, degraded: true }
+    }
+    return { cursorTs: parsed.ts, cursorId: parsed.id, degraded: false }
+  } catch {
+    return { cursorTs: null, cursorId: null, degraded: true }
+  }
 }
 
 // A ticket that has never had an inbound message (an owner-initiated thread still awaiting its first
@@ -151,6 +175,7 @@ export async function loadTicketSummary(tx: OrgTx, orgId: string, ticketId: stri
     .leftJoin(categories, eq(categories.id, tickets.categoryId))
     .leftJoin(agents, eq(agents.id, tickets.agentId))
     .leftJoin(drafts, liveDraftJoin)
+    .leftJoin(outboundSends, draftSendJoin)
     .where(and(eq(tickets.orgId, orgId), eq(tickets.id, ticketId)))
     .limit(1)
   return row ? toSummary(row) : null
@@ -158,17 +183,18 @@ export async function loadTicketSummary(tx: OrgTx, orgId: string, ticketId: stri
 
 export const inboxRouter = router({
   list: orgProcedure.input(InboxListInput).query(async ({ ctx, input }) => {
-    const { cursorDate, degraded } = parseCursor(input.cursor)
+    const { cursorTs, cursorId, degraded } = parseCursor(input.cursor)
     const rows = await ctx.deps.api.withOrg(ctx.orgId, (tx) =>
       tx.select({ ...ticketSummaryColumns, ...draftSummaryColumns, sortKey })
         .from(tickets)
         .leftJoin(categories, eq(categories.id, tickets.categoryId))
         .leftJoin(agents, eq(agents.id, tickets.agentId))
         .leftJoin(drafts, liveDraftJoin)
+        .leftJoin(outboundSends, draftSendJoin)
         .where(and(
           eq(tickets.orgId, ctx.orgId),
           inArray(tickets.status, SECTION_STATUSES[input.section]),
-          ...(cursorDate ? [sql`${sortKey} < ${cursorDate}`] : []),
+          ...(cursorTs && cursorId ? [sql`(${sortKey}, ${tickets.id}) < (${cursorTs}::timestamptz, ${cursorId}::uuid)`] : []),
         ))
         .orderBy(sql`${sortKey} DESC`, desc(tickets.id))
         .limit(input.limit + 1),
@@ -177,11 +203,7 @@ export const inboxRouter = router({
     const hasMore = rows.length > input.limit
     const page = hasMore ? rows.slice(0, input.limit) : rows
     const last = page[page.length - 1]
-    // `sortKey` is a raw SQL expression, not a plain column reference — drizzle only runs a column's
-    // own driver-value mapping (string → Date) for fields tied to a real `Column`, so this comes back
-    // from node-postgres as Postgres' own timestamptz text ('2026-01-01 00:00:00+00'), not a `Date`.
-    // `new Date(...)` parses that format correctly (verified against Node's Date parser).
-    const nextCursor = hasMore && last ? new Date(last.sortKey).toISOString() : null
+    const nextCursor = hasMore && last ? encodeInboxCursor({ ts: last.sortKey, id: last.id }) : null
     return { tickets: page.map(toSummary), nextCursor, degraded }
   }),
 
@@ -196,6 +218,7 @@ export const inboxRouter = router({
         .leftJoin(categories, eq(categories.id, tickets.categoryId))
         .leftJoin(agents, eq(agents.id, tickets.agentId))
         .leftJoin(drafts, liveDraftJoin)
+        .leftJoin(outboundSends, draftSendJoin)
         .where(and(eq(tickets.orgId, ctx.orgId), eq(tickets.id, input.ticketId)))
       if (!row) return null
 

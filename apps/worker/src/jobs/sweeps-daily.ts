@@ -18,13 +18,24 @@
  * Only the `pending`-sourced rows call `escalateTicket` — a `held` draft already has an approved
  * send on hold behind a kill lever (`send.execute`'s `landHeld`), and paging the owner again for
  * its expiry would be noise on top of the page that already went out when it was first held.
+ *
+ * (d)/(e)/(f) — Phase 5's memory retirement — follow the SAME guarded-bulk-`UPDATE`-with-`RETURNING`
+ * discipline as (a), inside this same `withPlatform` tx: cross-org, unscoped by `orgId` (exactly
+ * like (a)/(b)/(c) above them), because the pass is one platform-wide sweep, not a per-org loop.
+ * (f)'s "does any cited chunk no longer exist" predicate has no drizzle query-builder shape (it
+ * needs `unnest`), so it is raw SQL, same discipline `apps/api/src/knowledge/gaps.ts` uses for its
+ * own hand-written query: every identifier is a literal table/column name, every value a bound
+ * parameter. All three write their audit trail through `auditMemoryArm`, which groups the returned
+ * rows by `orgId` so a platform-wide sweep still leaves ONE audit row per ORG per arm, never one
+ * giant cross-tenant row.
  */
-import { and, eq, lt } from 'drizzle-orm'
+import { and, eq, inArray, lt, sql } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import type pino from 'pino'
+import { MEMORY_CANDIDATE_MAX_AGE_DAYS } from '@aesa/core'
 import {
-  agentRunEvents, auditLog, draftActionTokens, drafts, escalateTicket, withOrgIdentity, withPlatform,
-  type Db, type EscalateTicketParams, type OrgTx,
+  agentRunEvents, auditLog, draftActionTokens, drafts, escalateTicket, resolvedAnswers, withOrgIdentity, withPlatform,
+  type Db, type EscalateTicketParams, type OrgTx, type PlatformTx,
 } from '@aesa/db'
 import { registerCron } from '@aesa/queue'
 import { utcDayString } from '../date-utils.ts'
@@ -55,10 +66,29 @@ interface ExpiredDraftRow {
   ticketId: string
 }
 
+/** One audit row per DISTINCT `orgId` among `rows`, each carrying that org's own count — never one
+ *  row per updated answer, and never one cross-tenant row for the whole arm. A no-op when `rows` is
+ *  empty (an arm that touched nothing writes nothing). */
+async function auditMemoryArm(
+  tx: PlatformTx, arm: string, action: 'memory.retired' | 'memory.needs_review', rows: { orgId: string }[],
+): Promise<void> {
+  if (rows.length === 0) return
+  const counts = new Map<string, number>()
+  for (const r of rows) counts.set(r.orgId, (counts.get(r.orgId) ?? 0) + 1)
+  await tx.insert(auditLog).values(
+    [...counts.entries()].map(([orgId, cnt]) => ({
+      orgId, actor: SWEEP_ACTOR, action, entityType: 'workspace', entityId: orgId, detail: { arm, count: cnt },
+    })),
+  )
+}
+
 export async function runSweepsDaily(
   boss: PgBoss,
   deps: SweepsDailyDeps,
-): Promise<{ expiredDrafts: number; eventsDeleted: number; tokensDeleted: number }> {
+): Promise<{
+  expiredDrafts: number; eventsDeleted: number; tokensDeleted: number
+  answersExpired: number; candidatesRetired: number; answersSourceChanged: number
+}> {
   const now = deps.now?.() ?? new Date()
   const day = utcDayString(now)
   const escalate = deps.escalate ?? escalateTicket
@@ -66,6 +96,9 @@ export async function runSweepsDaily(
   let expiredDrafts = 0
   let eventsDeleted = 0
   let tokensDeleted = 0
+  let answersExpired = 0
+  let candidatesRetired = 0
+  let answersSourceChanged = 0
 
   await withPlatform(deps.db, 'cron:sweeps.daily', async (tx) => {
     // (a) draft expiry — two guarded bulk UPDATEs (see file header for why not one pre-SELECT).
@@ -118,6 +151,48 @@ export async function runSweepsDaily(
     const tokenCutoff = new Date(now.getTime() - ACTION_TOKEN_RETENTION_DAYS * 24 * 60 * 60_000)
     const deletedTokens = await tx.delete(draftActionTokens).where(lt(draftActionTokens.expiresAt, tokenCutoff)).returning({ id: draftActionTokens.id })
     tokensDeleted = deletedTokens.length
+
+    // (d) resolved_answers expiry — a fixed 365-day clock from capture/approval time (never rolled
+    // by reuse); `active` and `needs_review` both retire outright once past it, `candidate` is (e)'s
+    // job and `retired` is already terminal.
+    const answersExpiredRows = await tx
+      .update(resolvedAnswers)
+      .set({ status: 'retired', retiredReason: 'expired' })
+      .where(and(inArray(resolvedAnswers.status, ['active', 'needs_review']), lt(resolvedAnswers.expiresAt, now)))
+      .returning({ id: resolvedAnswers.id, orgId: resolvedAnswers.orgId })
+    answersExpired = answersExpiredRows.length
+
+    // (e) stale candidate retirement — never sampled inside the Monday nudge's window, so the "to
+    // check" queue stays bounded (spec: unsampled candidates are never retrieved either way).
+    const candidateCutoff = new Date(now.getTime() - MEMORY_CANDIDATE_MAX_AGE_DAYS * 24 * 60 * 60_000)
+    const candidatesRetiredRows = await tx
+      .update(resolvedAnswers)
+      .set({ status: 'retired', retiredReason: 'unsampled' })
+      .where(and(eq(resolvedAnswers.status, 'candidate'), lt(resolvedAnswers.createdAt, candidateCutoff)))
+      .returning({ id: resolvedAnswers.id, orgId: resolvedAnswers.orgId })
+    candidatesRetired = candidatesRetiredRows.length
+
+    // (f) source-drift review — an `active` answer citing a chunk that no longer exists (its source
+    // was edited or deleted since capture) is parked for a human look rather than kept live and
+    // wrong; an answer with no citations at all is never touched. `cited_chunk_ids` stores chunk ids
+    // as text, hence the `::text` cast on the comparison side.
+    const { rows: sourceChangedRawRows } = await tx.execute<{ id: string; org_id: string }>(sql`
+      UPDATE resolved_answers a
+      SET status = 'needs_review', review_reason = 'source_changed'
+      WHERE a.status = 'active'
+        AND cardinality(a.cited_chunk_ids) > 0
+        AND EXISTS (
+          SELECT 1 FROM unnest(a.cited_chunk_ids) cid
+          WHERE NOT EXISTS (SELECT 1 FROM knowledge_chunks k WHERE k.id::text = cid)
+        )
+      RETURNING a.id, a.org_id
+    `)
+    const sourceChangedRows = sourceChangedRawRows.map((r) => ({ id: r.id, orgId: r.org_id }))
+    answersSourceChanged = sourceChangedRows.length
+
+    await auditMemoryArm(tx, 'expired', 'memory.retired', answersExpiredRows)
+    await auditMemoryArm(tx, 'unsampled', 'memory.retired', candidatesRetiredRows)
+    await auditMemoryArm(tx, 'source_changed', 'memory.needs_review', sourceChangedRows)
   })
 
   for (const item of pendingNotify) {
@@ -128,7 +203,7 @@ export async function runSweepsDaily(
     }
   }
 
-  return { expiredDrafts, eventsDeleted, tokensDeleted }
+  return { expiredDrafts, eventsDeleted, tokensDeleted, answersExpired, candidatesRetired, answersSourceChanged }
 }
 
 export async function registerSweepsDaily(boss: PgBoss, deps: SweepsDailyDeps): Promise<void> {

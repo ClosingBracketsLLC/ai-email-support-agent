@@ -38,6 +38,11 @@ export async function createSendOnlyBoss(connectionString: string): Promise<PgBo
   await createQueueRetrying(boss, JOB_NAMES.knowledgeIngest, { name: JOB_NAMES.knowledgeIngest, policy: 'short' })
   await createQueueRetrying(boss, JOB_NAMES.knowledgeCrawl, { name: JOB_NAMES.knowledgeCrawl, policy: 'short' })
   await createQueueRetrying(boss, JOB_NAMES.knowledgeEmbedBatch, { name: JOB_NAMES.knowledgeEmbedBatch, policy: 'short' })
+  // Phase 5: `approveDraft` sends guidance.suggest after an edited approval — the api IS that
+  // producer. It never sends memory.capture (the worker's send.execute does, from its onSent seam),
+  // but the four-places rule is literal: every queue is pre-created on both processes regardless.
+  await createQueueRetrying(boss, JOB_NAMES.guidanceSuggest, { name: JOB_NAMES.guidanceSuggest, policy: 'short' })
+  await createQueueRetrying(boss, JOB_NAMES.memoryCapture, { name: JOB_NAMES.memoryCapture, policy: 'short' })
 
   return boss
 }

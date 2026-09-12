@@ -176,6 +176,52 @@ describe('runDigestEmailForOrg', () => {
     expect(lock!.sentAt?.getTime()).toBe(NOW.getTime())
   })
 
+  it('folds the last 24 hours of auto-sent replies into one line — omitted at zero, singular at one', async () => {
+    const orgId = await newOrgWithWorkspace()
+    const owner = await addMember(orgId, 'owner')
+    const connectionId = await seedConnection(orgId, owner.userId)
+    const ticketId = await seedTicket(orgId, connectionId)
+    await seedPendingDraft(orgId, ticketId)
+
+    // Zero first: nothing auto-sent, no line at all.
+    const quiet = createDevSink()
+    expect(await runDigestEmailForOrg(makeDeps(quiet), orgId, NOW)).toBe('sent')
+    expect(quiet.latestTo(owner.email)!.text).not.toContain('went out on')
+
+    // One auto-send inside the window (and three rows that must NOT count: an auto-send 25 hours
+    // old, a reply the owner approved, and an auto draft that never left `approved`).
+    const second = await newOrgWithWorkspace()
+    const owner2 = await addMember(second, 'owner')
+    const conn2 = await seedConnection(second, owner2.userId)
+    const t2 = await seedTicket(second, conn2)
+    await seedPendingDraft(second, t2)
+    const autoSent = (orgId2: string, ticket: string, over: Partial<typeof drafts.$inferInsert>) =>
+      seedPendingDraft(orgId2, ticket, { status: 'sent', decisionSource: 'auto', autoDecidedAt: new Date(NOW.getTime() - 3_600_000), ...over })
+    await autoSent(second, t2, {})
+    await autoSent(second, t2, { autoDecidedAt: new Date(NOW.getTime() - 25 * 3_600_000) })
+    await autoSent(second, t2, { decisionSource: 'app' })
+    // `approved` is a LIVE status (one per ticket, by the partial unique), so it needs its own ticket.
+    await autoSent(second, await seedTicket(second, conn2, { status: 'auto_sending' }), { status: 'approved' })
+
+    const one = createDevSink()
+    expect(await runDigestEmailForOrg(makeDeps(one), second, NOW)).toBe('sent')
+    expect(one.latestTo(owner2.email)!.text).toContain('1 reply went out on its own in the last 24 hours.')
+
+    // Three of them: the plural, and the draft headline untouched by any of it.
+    const third = await newOrgWithWorkspace()
+    const owner3 = await addMember(third, 'owner')
+    const conn3 = await seedConnection(third, owner3.userId)
+    const t3 = await seedTicket(third, conn3)
+    await seedPendingDraft(third, t3)
+    for (let i = 0; i < 3; i++) await autoSent(third, t3, {})
+
+    const many = createDevSink()
+    expect(await runDigestEmailForOrg(makeDeps(many), third, NOW)).toBe('sent')
+    expect(many.latestTo(owner3.email)!.text).toContain('3 replies went out on their own in the last 24 hours.')
+    // It is news, not a section: the subject still counts only what needs a decision.
+    expect(many.latestTo(owner3.email)!.subject).toBe('1 draft waiting for review · Acme Widgets')
+  })
+
   it("renders the DRAFT's own category label, falling back to the ticket's when the draft has none", async () => {
     const orgId = await newOrgWithWorkspace()
     const owner = await addMember(orgId, 'owner')
