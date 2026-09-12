@@ -23,7 +23,7 @@
  * `agent_category_policies` → `notifications`, the same in `setAgentModel` and `removeCredential`.
  */
 import { createHash } from 'node:crypto'
-import { and, count, desc, eq, gte, isNotNull, isNull, sql } from 'drizzle-orm'
+import { and, count, countDistinct, desc, eq, gte, isNotNull, isNull, sql } from 'drizzle-orm'
 import type pino from 'pino'
 import {
   LLM_MAX_CREDENTIALS, PROVIDER_PRESETS, ProbeResult, presetModel,
@@ -87,7 +87,8 @@ export interface CredentialView {
   lastError: string | null
   createdAt: Date
   usage30d: CredentialUsage30d
-  /** How many `agent_model_config` rows point at this credential (an agent on BYOK owns two: draft and triage). */
+  /** How many distinct AGENTS are on this credential — an agent owns two config rows (draft and
+   * triage) and counts once, the same unit `removeCredential`'s `agentsReset` reports. */
   agentsUsing: number
 }
 
@@ -121,7 +122,9 @@ export async function listCredentials(deps: LlmServiceDeps, orgId: string): Prom
       .orderBy(llmCalls.credentialId, desc(llmCalls.createdAt))
     const lastErrorBy = new Map(lastErrors.map((e) => [e.credentialId, e.errorCode]))
 
-    const using = await tx.select({ credentialId: agentModelConfig.credentialId, value: count() })
+    // DISTINCT agents, not config rows: an agent on BYOK owns TWO rows (draft and triage) and the
+    // screen says "N agents" — the same unit `removeCredential`'s `agentsReset` reports.
+    const using = await tx.select({ credentialId: agentModelConfig.credentialId, value: countDistinct(agentModelConfig.agentId) })
       .from(agentModelConfig)
       .where(and(eq(agentModelConfig.orgId, orgId), isNotNull(agentModelConfig.credentialId)))
       .groupBy(agentModelConfig.credentialId)
@@ -309,6 +312,7 @@ async function resetAgentsToManaged(
   const agentIds = [...new Set(rows.map((r) => r.agentId!))]
 
   const notificationIds: string[] = []
+  let agentsReset = 0
   for (const agentId of agentIds) {
     const owned = await tx.select({ modelGeneration: agentModelConfig.modelGeneration })
       .from(agentModelConfig)
@@ -316,12 +320,24 @@ async function resetAgentsToManaged(
     // Both roles are written in lockstep by `setAgentModel`, so the max is what they already share.
     const generation = Math.max(0, ...owned.map((r) => r.modelGeneration)) + 1
 
-    await tx.update(agentModelConfig)
-      .set({ mode: 'managed', credentialId: null, model: null, modelGeneration: generation, modelGenerationAt: now, updatedAt: now })
+    // `effort` and `fallback_to_managed` are reset too, so this path and `setAgentModel`'s explicit
+    // managed branch (which writes whatever the owner's form carried) leave the same shape behind
+    // rather than one of them keeping the departed provider's knobs.
+    const flipped = await tx.update(agentModelConfig)
+      .set({
+        mode: 'managed', credentialId: null, model: null, effort: null, fallbackToManaged: false,
+        modelGeneration: generation, modelGenerationAt: now, updatedAt: now,
+      })
       .where(and(
         eq(agentModelConfig.orgId, orgId), eq(agentModelConfig.agentId, agentId),
         eq(agentModelConfig.credentialId, credentialId),
       ))
+      .returning({ id: agentModelConfig.id })
+    // Zero rows is the guarded write's soft outcome (CLAUDE.md): the agent list above was read
+    // unlocked, so a concurrent `setAgentModel` may have moved this agent onto ANOTHER credential in
+    // between. Nothing of this agent's changed, so nothing about it is audited, demoted or counted.
+    if (flipped.length === 0) continue
+    agentsReset += 1
 
     await audit(tx, {
       actor: actor.actor, action: 'agent.model_changed', entityType: 'agent', entityId: agentId,
@@ -336,13 +352,13 @@ async function resetAgentsToManaged(
   // If one ever sat on this credential, the FK's ON DELETE SET NULL alone would leave it `byok` with
   // no credential; there is no agent to bump a generation for or to demote, so it just goes managed.
   await tx.update(agentModelConfig)
-    .set({ mode: 'managed', credentialId: null, model: null, updatedAt: now })
+    .set({ mode: 'managed', credentialId: null, model: null, effort: null, fallbackToManaged: false, updatedAt: now })
     .where(and(
       eq(agentModelConfig.orgId, orgId), eq(agentModelConfig.credentialId, credentialId),
       isNull(agentModelConfig.agentId),
     ))
 
-  return { agentsReset: agentIds.length, notificationIds }
+  return { agentsReset, notificationIds }
 }
 
 // ---------------------------------------------------------------------------

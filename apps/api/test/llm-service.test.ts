@@ -29,7 +29,7 @@ import {
 } from '../src/llm/service.ts'
 import { createAppLogger } from '../src/logging.ts'
 import type { AppRouter } from '../src/trpc/router.ts'
-import { WEB, createTestApi, insertConnectedMailbox, listen, signInWithOtp } from './helpers/app.ts'
+import { WEB, createTestApi, insertAgent, insertConnectedMailbox, listen, signInWithOtp } from './helpers/app.ts'
 
 const client = (base: string, cookie?: string) => createTRPCClient<AppRouter>({
   links: [httpBatchLink({ url: `${base}/trpc`, transformer: superjson, headers: () => ({ origin: WEB, ...(cookie ? { cookie } : {}) }) })],
@@ -264,7 +264,12 @@ describe('llm service', () => {
     const cfg = await configOf(org.orgId, org.agentId)
     expect(cfg).toHaveLength(2)
     for (const row of cfg) {
-      expect(row).toMatchObject({ mode: 'managed', credentialId: null, model: null, modelGeneration: 2 })
+      // `effort` and `fallbackToManaged` go back to their managed defaults too, so this path leaves
+      // the same shape as `setAgentModel`'s explicit managed branch rather than keeping the departed
+      // provider's knobs (they were set to 'medium'/true above).
+      expect(row).toMatchObject({
+        mode: 'managed', credentialId: null, model: null, effort: null, fallbackToManaged: false, modelGeneration: 2,
+      })
     }
 
     const policies = await policiesOf(org.orgId, org.agentId)
@@ -360,7 +365,7 @@ describe('llm service', () => {
     expect(await getAgentModel(deps, org.orgId, randomUUID())).toBeNull()
   })
 
-  it('listCredentials: 30-day usage is summed from llm_calls by credential_id (calls, errors, cost, cost_unknown count, last error code) and agentsUsing counts config rows', async () => {
+  it('listCredentials: 30-day usage is summed from llm_calls by credential_id (calls, errors, cost, cost_unknown count, last error code) and agentsUsing counts DISTINCT agents', async () => {
     const org = await seedOrg()
     const a = await addCredential(deps, org.orgId, { provider: 'openai', label: 'Busy', apiKey: 'sk-openai-busy-abcd' }, org.actor)
     const b = await addCredential(deps, org.orgId, { provider: 'groq', label: 'Idle', apiKey: 'gsk_idle_abcd' }, org.actor)
@@ -388,14 +393,22 @@ describe('llm service', () => {
     const busy = credentials.find((c) => c.id === a.credentialId)!
     expect(busy).toMatchObject({
       provider: 'openai', label: 'Busy', baseUrl: null, healthStatus: 'unknown', lastProbe: null, lastProbedAt: null, lastError: null,
-      agentsUsing: 2,
+      agentsUsing: 1,
     })
+    // The unit is AGENTS, not config rows: this one agent owns two (draft and triage).
+    expect(await configOf(org.orgId, org.agentId)).toHaveLength(2)
     expect(busy.keyFingerprint).toMatch(/^[0-9a-f]{8}…/)
     expect(busy.usage30d).toEqual({ calls: 4, errors: 2, costMicros: 4_000, costUnknownCalls: 1, lastErrorCode: 'auth_failed' })
 
     const idle = credentials.find((c) => c.id === b.credentialId)!
     expect(idle).toMatchObject({ provider: 'groq', label: 'Idle', agentsUsing: 0 })
     expect(idle.usage30d).toEqual({ calls: 0, errors: 0, costMicros: 0, costUnknownCalls: 0, lastErrorCode: null })
+
+    // A SECOND agent on the same connection moves it to 2 — four config rows, two agents.
+    const second = await insertAgent(t.api, org.orgId, org.connectionId, `alias-${org.seq}@llm.test`)
+    await setAgentModel(deps, org.orgId, byok(second, a.credentialId), org.actor)
+    const after = await listCredentials(deps, org.orgId)
+    expect(after.credentials.find((c) => c.id === a.credentialId)!.agentsUsing).toBe(2)
 
     // Nothing key-shaped ever leaves the service.
     const json = JSON.stringify(credentials)
@@ -435,5 +448,60 @@ describe('llm service', () => {
     expect(moved).toEqual({ ok: false, code: 'credential_not_found' })
     expect(await configOf(org.orgId, org.agentId)).toEqual([])
     expect(await credentialsOf(org.orgId)).toEqual([])
+  })
+
+  /**
+   * The other half of that race, and what the guarded write is for: `resetAgentsToManaged` reads its
+   * agent list UNLOCKED, so an agent can be moved onto a DIFFERENT connection between that read and
+   * the update. The update is guarded on `credential_id`, so it matches zero rows for that agent —
+   * and the audit row, the demotion and the `agentsReset` count must all sit behind that outcome
+   * rather than fire on an agent nothing actually changed about.
+   */
+  it('removeCredential skips an agent a concurrent setAgentModel moved to another connection: not counted, not audited, not demoted', async () => {
+    const org = await seedOrg()
+    const leaving = await addCredential(deps, org.orgId, { provider: 'openai', label: 'Leaving', apiKey: 'sk-openai-leave-ab12' }, org.actor)
+    const staying = await addCredential(deps, org.orgId, { provider: 'groq', label: 'Staying', apiKey: 'gsk_stay_ab12' }, org.actor)
+    if (!leaving.ok || !staying.ok) throw new Error('unreachable')
+
+    // Two agents, both on the connection about to be removed. Only the first has Autopilot on, so a
+    // demotion for the second would have to come from the agent list alone — which is the bug.
+    const mover = await insertAgent(t.api, org.orgId, org.connectionId, `mover-${org.seq}@llm.test`)
+    await setAgentModel(deps, org.orgId, byok(org.agentId, leaving.credentialId), org.actor)
+    await setAgentModel(deps, org.orgId, byok(mover, leaving.credentialId), org.actor)
+    await makeAuto(org.orgId, org.agentId, 1)
+
+    let release = (): void => {}
+    let reached = (): void => {}
+    const gate = {
+      reached: () => reached(),
+      release: new Promise<void>((r) => { release = () => r() }),
+      arrived: new Promise<void>((r) => { reached = () => r() }),
+    }
+
+    // The move commits LAST, but its row locks are already held when the disconnect reads the list.
+    const moving = setAgentModel({ ...deps, api: pausingApi(t.api, gate) }, org.orgId, byok(mover, staying.credentialId), org.actor)
+    await gate.arrived
+
+    const removing = removeCredential(deps, org.orgId, leaving.credentialId, org.actor)
+    await delay(150)          // let the disconnect read the agent list and block on the mover's rows
+    release()
+
+    const [moved, removed] = await Promise.all([moving, removing])
+    expect(moved).toMatchObject({ ok: true })
+    // Only the agent whose rows actually flipped is counted.
+    expect(removed).toEqual({ ok: true, agentsReset: 1 })
+
+    // The mover is untouched by the disconnect: still byok, on the OTHER connection.
+    for (const row of await configOf(org.orgId, mover)) {
+      expect(row).toMatchObject({ mode: 'byok', credentialId: staying.credentialId })
+    }
+    for (const row of await configOf(org.orgId, org.agentId)) {
+      expect(row).toMatchObject({ mode: 'managed', credentialId: null })
+    }
+
+    // ...and the disconnect wrote no `credential_removed` trail for it.
+    const changes = await auditsOf(org.orgId, 'agent.model_changed')
+    const byRemoval = changes.filter((a) => (a.detail as { reason?: string }).reason === 'credential_removed')
+    expect(byRemoval.map((a) => a.entityId)).toEqual([org.agentId])
   })
 })

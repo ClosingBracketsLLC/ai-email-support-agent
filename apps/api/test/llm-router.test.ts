@@ -94,8 +94,8 @@ describe('llm router', () => {
     expect(agentList.agents.find((a) => a.id === org.agentId)!.model)
       .toEqual({ mode: 'byok', provider: 'openai', model: presetModel('openai', 'draft'), credentialLabel: 'OpenAI' })
 
-    // Two config rows now point at it.
-    expect((await org.c.llm.list.query()).credentials.find((c) => c.id === credentialId)!.agentsUsing).toBe(2)
+    // ONE agent is on it — it owns two config rows (draft and triage), and counts once.
+    expect((await org.c.llm.list.query()).credentials.find((c) => c.id === credentialId)!.agentsUsing).toBe(1)
 
     expect(await org.c.llm.remove.mutate({ credentialId })).toEqual({ ok: true, agentsReset: 1 })
     const backToManaged = await org.c.llm.agentModel.query({ agentId: org.agentId })
