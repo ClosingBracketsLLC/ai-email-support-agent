@@ -1504,6 +1504,13 @@ the record)</summary>
 
 ### Phase 6 — provider choice (BYOK) (complete on branch `phase-6`; PR pending Robert)
 
+- PR #7 (https://github.com/ClosingBracketsLLC/ai-email-support-agent/pull/7) is open against
+  `main`, CI green. Two CI-only commits sit above the reviewed head `25aad56` and are not part of the
+  record below: `021d66e` (Docker Hub's `minio/minio:latest` became unpullable on 2026-09-12 — `main`'s
+  own last CI run failed the same way — so `compose.yaml` and `ci.yml` pull the pinned
+  `quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z`) and `92b1a77` (a 20 s jest `testTimeout` for
+  `apps/app`: a suite's FIRST test pays jest-expo's cold start on a loaded runner and hit the 5 s
+  default; a passing test never waits on it).
 - Review: `docs/superpowers/reviews/2026-09-12-phase-6-final-review.md` — the whole-branch review
   (four area reviewers, 0 Critical, 12 Important, one fix wave `f5df280`+`a079dde`+`7a3b77f`, the
   scoped re-review clean with four Low residuals), the parked residuals with their rulings, and what
