@@ -53,6 +53,7 @@ export const REASON_SENTENCE: Record<NeedsOwnerReason, string> = {
   send_failed: 'An approved reply could not be sent — check the mailbox and try again.',
   category_off: 'This category is switched off, so replies wait for you.',
   no_agent: 'No agent is set up for this address yet.',
+  provider_unavailable: 'AI provider unavailable — the provider this agent uses rejected its key. Check Settings → AI.',
 }
 
 /**

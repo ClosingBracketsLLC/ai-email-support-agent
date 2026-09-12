@@ -29,6 +29,7 @@ const DEMOTION_SENTENCE: Record<DemotionReason, string> = {
   flags: 'two auto-sent replies were flagged',
   hold_then_edit: 'an auto-send was held and then changed',
   edit_rate: 'more than 30% of recent drafts needed edits',
+  model_changed: "the agent's model was changed",
 }
 const DEMOTION_FALLBACK = 'recent replies needed a closer look'
 

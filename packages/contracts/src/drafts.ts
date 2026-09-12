@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { MANAGED_MODELS } from './llm.ts'
 
 /** Mirrors @aesa/core's DRAFT_STATUSES — the app cannot import @aesa/core (ESLint); Task 4 pins equality. */
 export const DRAFT_STATUSES = ['pending', 'approved', 'held', 'sending', 'sent', 'rejected', 'superseded', 'expired', 'failed'] as const
@@ -36,8 +37,9 @@ export const DRAFT_EXPIRE_DAYS = 7
  * The ONE source for the draft model id. `@aesa/agent`'s `DRAFT_MODEL` (packages/agent/src/draft/prompt.ts)
  * aliases this rather than defining its own literal — the api (Task 18's sandboxStart) writes this into
  * `agent_runs.model` but may not value-import `@aesa/agent`'s runtime (the api never calls a model).
+ * Aliases `MANAGED_MODELS.draft` (`./llm.ts`) — Phase 6's ONE source for every managed model id.
  */
-export const DRAFT_MODEL_ID = 'claude-opus-5' as const
+export const DRAFT_MODEL_ID = MANAGED_MODELS.draft
 
 export const DraftIdInput = z.object({ draftId: z.uuid() })
 /** A customer flagging an auto-sent reply as wrong (spec §Learning loop's "Flag" action) — same shape as DraftIdInput. */

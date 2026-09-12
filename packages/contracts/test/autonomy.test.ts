@@ -9,10 +9,10 @@ describe('autonomy vocabulary', () => {
     expect(CATEGORY_MODES).toEqual(['off', 'review', 'auto'])
     expect(AUTONOMY_THRESHOLD_PRESETS).toEqual({ cautious: 90, balanced: 80, eager: 70 })
     expect(RESOLVED_ANSWER_STATUSES).toEqual(['candidate', 'active', 'needs_review', 'retired'])
-    expect(DEMOTION_REASONS).toEqual(['rejections', 'flags', 'hold_then_edit', 'edit_rate'])
+    expect(DEMOTION_REASONS).toEqual(['rejections', 'flags', 'hold_then_edit', 'edit_rate', 'model_changed'])
     const i = DECISION_REASONS.indexOf('guardrail_warning')
     expect(DECISION_REASONS.slice(i, i + 5)).toEqual(['guardrail_warning', 'memory_conflict', 'unresolved_questions', 'thread_too_long', 'cold_start'])
-    expect(NOTIFICATION_KINDS).toEqual(['escalation', 'mailbox_reauth', 'digest', 'draft_review', 'auto_send', 'graduation', 'demotion', 'memory_sample'])
+    expect(NOTIFICATION_KINDS).toEqual(['escalation', 'mailbox_reauth', 'digest', 'draft_review', 'auto_send', 'graduation', 'demotion', 'memory_sample', 'provider_health'])
   })
   it('SetCategoryPolicyInput bounds the threshold and refuses an unknown mode', () => {
     const ids = { agentId: '11111111-1111-4111-8111-111111111111', categoryId: '22222222-2222-4222-8222-222222222222' }

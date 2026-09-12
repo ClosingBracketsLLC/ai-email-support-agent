@@ -54,6 +54,8 @@ const ESCALATION_COPY: Record<NeedsOwnerReason, { title: string; body: string }>
   send_failed: { title: 'An approved reply could not be sent', body: 'The approved reply for this ticket could not be delivered.' },
   category_off: { title: 'This category is switched off', body: "The agent is switched off for this ticket's category, so it is waiting for you." },
   no_agent: { title: 'No agent is set up for this address', body: 'No agent is set up for the address this ticket arrived on.' },
+  // -- Phase 6 (provider choice / BYOK). --
+  provider_unavailable: { title: 'AI provider unavailable', body: 'The provider this agent uses rejected its key. Check Settings → AI; replies wait for you until then.' },
 }
 
 export function escalationCopy(reason: NeedsOwnerReason): { title: string; body: string } {
