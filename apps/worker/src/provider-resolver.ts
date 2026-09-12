@@ -1,0 +1,210 @@
+/**
+ * The worker's ONE way to get a model provider for a call (Phase 6). `resolve` reads the agent's
+ * config through `resolveModelConfig` (the same reader the api uses), and:
+ *  - managed → the process-wide managed provider (built once by agent-role.ts);
+ *  - byok → the credential's key, opened under the org DEK (or straight out of the sealed box if the
+ *    probe has not re-wrapped it yet), composed by `createByokProvider` and CACHED per credential —
+ *    a key is decrypted once per process, not once per draft. `invalidate(credentialId)` is called
+ *    by the probe job after every store/re-wrap and by nothing else.
+ * Every failure to produce a provider is a typed refusal the job lands as `provider_unavailable`,
+ * never a throw: a dead credential, a missing ring (dev only — production refuses to boot),
+ * a missing secret row (the store step of `llm.probe` has not run yet). No transaction here spans
+ * network I/O — `resolve` only reads; the caller calls the model afterwards.
+ */
+import { and, eq, ne, sql } from 'drizzle-orm'
+import type pino from 'pino'
+import { PROVIDER_PRESETS, type LlmProviderId, type ModelConfigRole } from '@aesa/contracts'
+import { createPinnedFetch, decrypt, Secret, type KekRing } from '@aesa/crypto'
+import {
+  audit, llmCredentials, llmCredentialSecrets, loadOrgDek, managedConfig, openSealedForOrg, resolveModelConfig, withOrg,
+  withPlatform, type AuditActor, type Db, type OrgTx, type ResolvedModelConfig,
+} from '@aesa/db'
+import {
+  BYOK_MAX_CONCURRENT_PER_CREDENTIAL, createByokProvider, createLlmLimiter, scrubSecrets, type LlmProvider,
+  type MeterSink, type ModelPricing,
+} from '@aesa/llm'
+
+export type ProviderUnavailableReason = 'credential_dead' | 'no_kek' | 'no_secret' | 'no_managed_key'
+
+export type ResolvedProvider =
+  | { ok: true; provider: LlmProvider; fallback: LlmProvider | null; config: ResolvedModelConfig }
+  | { ok: false; reason: ProviderUnavailableReason; config: ResolvedModelConfig }
+
+export interface ProviderResolver {
+  resolve(orgId: string, agentId: string | null, role: ModelConfigRole): Promise<ResolvedProvider>
+  /** Drops one credential's cached provider. `llm.probe` calls it after a store or a re-wrap; nothing else does. */
+  invalidate(credentialId: string): void
+}
+
+export interface ProviderResolverDeps {
+  db: Db
+  /** Null only outside production (`loadConfig` refuses an `agent` replica without a ring there). */
+  ring: KekRing | null
+  /** Null when the platform itself has no `ANTHROPIC_API_KEY` — then managed configs cannot resolve. */
+  managed: LlmProvider | null
+  sink: MeterSink
+  pricing?: ModelPricing[]
+  /** Test seam. Production leaves it unset and every BYOK adapter gets its own SSRF-pinned transport. */
+  fetchFn?: typeof fetch
+  logger: pino.Logger
+}
+
+/** The AAD that binds a wrapped provider key to ONE org and ONE credential. `llm.probe`'s re-wrap
+ *  and `openCredentialKey`'s decrypt must spell it identically, so it is spelled exactly once. */
+export function secretAad(orgId: string, credentialId: string): string {
+  return `${orgId}:llm_credential_secrets:${credentialId}`
+}
+
+/** A cached provider is a decrypted key held in memory; 256 credentials is far more than any one
+ *  replica drafts for, and evicting the oldest keeps that ceiling hard. */
+const PROVIDER_CACHE_MAX = 256
+
+export interface OpenedCredentialKey {
+  apiKey: Secret
+  /** `sealed` means `llm.probe` has not re-wrapped this row yet — the probe job acts on that. */
+  encryption: 'sealed' | 'dek'
+}
+
+/**
+ * Reads one credential's secret row (platform role — `llm_credential_secrets` REVOKEs `aesa_app`
+ * entirely) and opens it under the org's own keys: the sealed box the api wrote, or the DEK the
+ * probe re-wrapped it under. No network in either transaction. Null means there is no row at all.
+ */
+export async function openCredentialKey(
+  deps: { db: Db; ring: KekRing },
+  orgId: string,
+  credentialId: string,
+): Promise<OpenedCredentialKey | null> {
+  const [row] = await withPlatform(deps.db, `job:llm.resolve:${credentialId}`, (tx) =>
+    tx
+      .select()
+      .from(llmCredentialSecrets)
+      .where(and(eq(llmCredentialSecrets.credentialId, credentialId), eq(llmCredentialSecrets.orgId, orgId))))
+  if (!row) return null
+
+  const plaintext = await withOrg(deps.db, orgId, async (tx) =>
+    row.encryption === 'sealed'
+      ? openSealedForOrg(tx, deps.ring, row.keyCiphertext)
+      : decrypt((await loadOrgDek(tx, deps.ring)).dek, row.keyCiphertext, secretAad(orgId, credentialId)))
+  const parsed = JSON.parse(plaintext.toString('utf8')) as { apiKey: string }
+  return { apiKey: new Secret(parsed.apiKey), encryption: row.encryption as 'sealed' | 'dek' }
+}
+
+export function createProviderResolver(deps: ProviderResolverDeps): ProviderResolver {
+  // ONE limiter for the process, keyed `byok:${orgId}:${credentialId}` by `createByokProvider`, so a
+  // rebuilt provider for the same credential still draws from that credential's own two slots.
+  const limiter = createLlmLimiter({ maxConcurrentPerKey: BYOK_MAX_CONCURRENT_PER_CREDENTIAL })
+  const cache = new Map<string, LlmProvider>()
+  let warnedNoManagedFallback = false
+
+  function cacheProvider(credentialId: string, provider: LlmProvider): void {
+    if (cache.size >= PROVIDER_CACHE_MAX) {
+      const oldest = cache.keys().next()
+      if (!oldest.done) cache.delete(oldest.value)
+    }
+    cache.set(credentialId, provider)
+  }
+
+  function fallbackFor(config: ResolvedModelConfig): LlmProvider | null {
+    if (!config.fallbackToManaged) return null
+    if (deps.managed) return deps.managed
+    if (!warnedNoManagedFallback) {
+      warnedNoManagedFallback = true
+      deps.logger.warn('fallbackToManaged is set on at least one agent but this platform has no managed key; BYOK failures will not fall back')
+    }
+    return null
+  }
+
+  return {
+    async resolve(orgId: string, agentId: string | null, role: ModelConfigRole): Promise<ResolvedProvider> {
+      const config = await withOrg(deps.db, orgId, (tx) => resolveModelConfig(tx, agentId, role))
+
+      if (config.mode === 'managed') {
+        if (!deps.managed) return { ok: false, reason: 'no_managed_key', config }
+        return { ok: true, provider: deps.managed, fallback: null, config }
+      }
+
+      // Checked BEFORE the secret is read: a dead credential must report itself as dead, not as a
+      // key we could not open, and a key nobody is going to use must not be decrypted at all.
+      if (config.credential?.healthStatus === 'dead') return { ok: false, reason: 'credential_dead', config }
+      if (!deps.ring) return { ok: false, reason: 'no_kek', config }
+
+      const credentialId = config.credentialId
+      // `resolveModelConfig` only ever returns mode `byok` alongside both of these; the guard keeps
+      // that invariant honest rather than asserting it away.
+      if (!credentialId || !config.credential) return { ok: false, reason: 'no_secret', config }
+
+      const fallback = fallbackFor(config)
+      const cached = cache.get(credentialId)
+      if (cached) return { ok: true, provider: cached, fallback, config }
+
+      const opened = await openCredentialKey({ db: deps.db, ring: deps.ring }, orgId, credentialId)
+      if (!opened) return { ok: false, reason: 'no_secret', config }
+
+      const provider = createByokProvider({
+        provider: config.provider,
+        apiKey: opened.apiKey,
+        baseUrl: baseUrlFor(config.provider, config.credential.baseUrl),
+        orgId,
+        credentialId,
+        sink: deps.sink,
+        limiter,
+        ...(deps.fetchFn ? { fetchFn: deps.fetchFn } : { fetchFn: createPinnedFetch({ allowNonstandardPort: true, timeoutMs: 120_000 }) }),
+        ...(deps.pricing ? { pricing: deps.pricing } : {}),
+        structuredOverride: config.credential.lastProbe?.structured ?? null,
+      })
+      cacheProvider(credentialId, provider)
+      return { ok: true, provider, fallback, config }
+    },
+
+    invalidate(credentialId: string): void {
+      cache.delete(credentialId)
+    },
+  }
+}
+
+/** What `llm_credentials.last_error` is allowed to hold: scrubbed of anything key-shaped, and short. */
+export const CREDENTIAL_ERROR_MAX_CHARS = 200
+
+/**
+ * The ONE way a credential reaches `dead`. Guarded on `health_status <> 'dead'`, so a concurrent
+ * probe (or Task 6's draft-time refusal) that got there first simply wins and this returns false —
+ * and the audit row is written only by the call that actually flipped it, never by the loser.
+ * Takes an `OrgTx`: the caller owns the transaction, because the health write usually rides along
+ * with the probe's own `last_probe` update.
+ */
+export async function markCredentialDead(
+  tx: OrgTx, orgId: string, credentialId: string, error: string, actor: AuditActor,
+): Promise<boolean> {
+  const lastError = scrubSecrets(error).slice(0, CREDENTIAL_ERROR_MAX_CHARS)
+  const flipped = await tx
+    .update(llmCredentials)
+    .set({
+      healthStatus: 'dead',
+      lastError,
+      consecutiveFailures: sql`${llmCredentials.consecutiveFailures} + 1`,
+      updatedAt: sql`now()`,
+    })
+    .where(and(eq(llmCredentials.orgId, orgId), eq(llmCredentials.id, credentialId), ne(llmCredentials.healthStatus, 'dead')))
+    .returning({ id: llmCredentials.id })
+  if (flipped.length === 0) return false
+  await audit(tx, { actor, action: 'llm.credential_dead', entityType: 'llm_credential', entityId: credentialId, detail: { lastError } })
+  return true
+}
+
+/** A `custom` credential always carries its own validated https URL; a preset never does. */
+function baseUrlFor(provider: LlmProviderId, stored: string | null): string {
+  const url = stored ?? PROVIDER_PRESETS[provider].baseUrl
+  if (!url) throw new Error(`llm credential for provider ${provider} has no base URL`)
+  return url
+}
+
+/** Tests only: one fixed provider for every org, agent and role. */
+export function staticResolver(provider: LlmProvider, config: Partial<ResolvedModelConfig> = {}): ProviderResolver {
+  return {
+    async resolve(_orgId, _agentId, role): Promise<ResolvedProvider> {
+      return { ok: true, provider, fallback: null, config: { ...managedConfig(role), ...config } }
+    },
+    invalidate(): void {},
+  }
+}
