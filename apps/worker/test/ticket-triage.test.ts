@@ -13,14 +13,14 @@ import pino from 'pino'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import type { TriageVerdict } from '@aesa/contracts'
 import {
-  auditLog, categories, ensureDefaultCategories, mailboxConnections, messages, notifications, orgSettings,
-  tickets, usageCounters, user, withOrg, workspaces,
+  agentRuns, auditLog, categories, ensureDefaultCategories, mailboxConnections, messages, notifications,
+  orgSettings, tickets, usageCounters, user, withOrg, workspaces,
 } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
 import { createFakeProvider, LlmError, type Capabilities, type ChatRequest, type ChatResult, type LlmProvider } from '@aesa/llm'
 import { runTicketTriage, type TicketTriageDeps } from '../src/jobs/ticket-triage.ts'
-import { staticResolver } from '../src/provider-resolver.ts'
+import { staticRefusal, staticResolver } from '../src/provider-resolver.ts'
 
 const rand = () => randomBytes(4).toString('hex')
 const NOW = new Date('2026-09-09T12:00:00Z')
@@ -127,7 +127,7 @@ async function notificationsFor(dedupeKey: string) {
   return withOrg(app.db, orgId, (tx) => tx.select().from(notifications).where(eq(notifications.dedupeKey, dedupeKey)))
 }
 
-function makeDeps(provider: LlmProvider): {
+function makeDeps(provider: LlmProvider, over: Partial<TicketTriageDeps> = {}): {
   deps: TicketTriageDeps
   notified: { orgId: string; notificationId: string }[]
   drafted: { orgId: string; ticketId: string }[]
@@ -136,7 +136,6 @@ function makeDeps(provider: LlmProvider): {
   const drafted: { orgId: string; ticketId: string }[] = []
   const deps: TicketTriageDeps = {
     db: app.db,
-    provider,
     providers: staticResolver(provider),
     logger: pino({ level: 'silent' }),
     enqueueNotify: async (org, notificationId) => {
@@ -146,8 +145,13 @@ function makeDeps(provider: LlmProvider): {
       drafted.push({ orgId: org, ticketId })
     },
     now: () => NOW,
+    ...over,
   }
   return { deps, notified, drafted }
+}
+
+async function runsFor(ticketId: string) {
+  return withOrg(app.db, orgId, (tx) => tx.select().from(agentRuns).where(eq(agentRuns.ticketId, ticketId)))
 }
 
 function verdictProvider(verdict: TriageVerdict): ReturnType<typeof createFakeProvider> {
@@ -539,5 +543,92 @@ describe('runTicketTriage', () => {
 
     await expect(runTicketTriage(deps, { orgId, ticketId }, new AbortController().signal)).rejects.toThrow(/unparsable verdict/)
     expect((await getTicket(ticketId)).triageFailureCount).toBe(1)
+  })
+
+  // --- Phase 6: the resolved provider and the triage run row -----------------------------------
+
+  it('8. a triage call now opens an agent_runs row of kind `triage`, with the resolved provider/model, settled with the call usage', async () => {
+    const ticketId = await seedTicket()
+    await seedInboundMessage(ticketId, 'Where is my order?', new Date('2026-09-09T11:00:00Z'))
+    const provider = createFakeProvider([{ parsed: BASE_VERDICT, usage: { inputTokens: 900, outputTokens: 40 } }])
+    const { deps } = makeDeps(provider, {
+      providers: staticResolver(provider, { mode: 'byok', credentialId: crypto.randomUUID(), provider: 'openai', model: 'gpt-5-mini', tier: 'standard' }),
+    })
+
+    await runTicketTriage(deps, { orgId, ticketId }, new AbortController().signal)
+
+    expect(provider.calls[0]!.model).toBe('gpt-5-mini')
+    expect(provider.calls[0]!.meta.runId).toBeDefined()
+    const [run] = await runsFor(ticketId)
+    expect(run!.kind).toBe('triage')
+    expect(run!.provider).toBe('openai')
+    expect(run!.model).toBe('gpt-5-mini')
+    expect(run!.status).toBe('succeeded')
+    expect(run!.inputTokens).toBe(900)
+    expect(run!.outputTokens).toBe(40)
+    expect(run!.apiCalls).toBe(1)
+    expect(run!.finishedAt).not.toBeNull()
+    expect((await getTicket(ticketId)).status).toBe('triaged')
+  })
+
+  it('8b. a failed call settles the triage run row too, at both the retry and the escalate rung', async () => {
+    const retried = await seedTicket()
+    await seedInboundMessage(retried, 'Where is my order?', new Date('2026-09-09T11:00:00Z'))
+    const failing = createFakeProvider([{ error: new LlmError('boom', 'transient', true) }])
+    const { deps } = makeDeps(failing)
+    await expect(runTicketTriage(deps, { orgId, ticketId: retried }, new AbortController().signal)).rejects.toThrow(/boom/)
+    const [run1] = await runsFor(retried)
+    expect(run1!.status).toBe('failed')
+    expect(run1!.errorCode).toBe('llm_transient')
+
+    const escalating = await seedTicket({ triageFailureCount: 1 })
+    await seedInboundMessage(escalating, 'Where is my order?', new Date('2026-09-09T11:00:00Z'))
+    const failing2 = createFakeProvider([{ error: new LlmError('boom again', 'transient', true) }])
+    const { deps: deps2 } = makeDeps(failing2)
+    await runTicketTriage(deps2, { orgId, ticketId: escalating }, new AbortController().signal)
+    expect((await getTicket(escalating)).needsOwnerReason).toBe('triage_failed')
+    const [run2] = await runsFor(escalating)
+    expect(run2!.status).toBe('failed')
+  })
+
+  it('8c. a resolver refusal lands needs_owner/provider_unavailable with ONE page, and spends neither a call nor the cap', async () => {
+    const ticketId = await seedTicket()
+    await seedInboundMessage(ticketId, 'Where is my order?', new Date('2026-09-09T11:00:00Z'))
+    const provider = createFakeProvider([{ parsed: BASE_VERDICT }])
+    const { deps, notified } = makeDeps(provider, { providers: staticRefusal('credential_dead', { mode: 'byok', provider: 'openai' }) })
+
+    await runTicketTriage(deps, { orgId, ticketId }, new AbortController().signal)
+
+    const ticket = await getTicket(ticketId)
+    expect(ticket.status).toBe('needs_owner')
+    expect(ticket.needsOwnerReason).toBe('provider_unavailable')
+    expect(provider.calls).toHaveLength(0)
+    expect(await readUsageCounter(TODAY)).toBe(0)
+    expect(await runsFor(ticketId)).toHaveLength(0)
+    expect(notified).toHaveLength(1)
+    expect(await notificationsFor(`escalation:${ticketId}:${TODAY}`)).toHaveLength(1)
+  })
+
+  it('8d. fallback_to_managed covers one transient failure on the tenant provider', async () => {
+    const ticketId = await seedTicket()
+    await seedInboundMessage(ticketId, 'Where is my order?', new Date('2026-09-09T11:00:00Z'))
+    const byok = createFakeProvider([{ error: new LlmError('502', 'transient', true) }])
+    const managed = createFakeProvider([{ parsed: BASE_VERDICT }])
+    const { deps } = makeDeps(byok, {
+      providers: staticResolver(
+        byok,
+        { mode: 'byok', credentialId: crypto.randomUUID(), provider: 'openai', model: 'gpt-5-mini', fallbackToManaged: true },
+        managed,
+      ),
+    })
+
+    await runTicketTriage(deps, { orgId, ticketId }, new AbortController().signal)
+
+    expect(byok.calls).toHaveLength(1)
+    expect(managed.calls).toHaveLength(1)
+    expect(managed.calls[0]!.model).toBe('claude-haiku-4-5')
+    expect((await getTicket(ticketId)).status).toBe('triaged')
+    const [run] = await runsFor(ticketId)
+    expect(run!.status).toBe('succeeded')
   })
 })

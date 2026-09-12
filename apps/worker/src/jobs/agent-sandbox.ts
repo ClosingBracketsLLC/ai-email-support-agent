@@ -27,17 +27,18 @@ import {
   type DraftCallResult, type DraftDecision, type DraftPromptInput, type RetrievedAnswer,
   type RetrievedChunk, type Retriever, type ThreadMessage, type UsageTotals,
 } from '@aesa/agent'
-import { DEFAULT_AUTO_SEND_THRESHOLD, type DecisionAction, type DecisionReason } from '@aesa/contracts'
+import { DEFAULT_AUTO_SEND_THRESHOLD, type DecisionAction, type DecisionReason, type QualityTier } from '@aesa/contracts'
 import {
-  collectGroundedNumbers, decide, evidenceScore, memoryScore, validateReplyBody,
+  collectGroundedNumbers, decide, validateReplyBody,
   type GuardrailFinding, type GuardrailResult,
 } from '@aesa/core'
 import { agentCategoryPolicies, agentRuns, agents, drafts, mailboxConnections, platformState, withOrg, type Db } from '@aesa/db'
-import { computeCostMicros, findPricing, LlmError, type ChatMeta, type LlmProvider } from '@aesa/llm'
+import { computeCostMicros, findPricing, LlmError, type ChatMeta } from '@aesa/llm'
 import { defineJob, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
 import { loadSharedDraftContext, type SharedDraftContext } from '../drafting/context.ts'
 import { errorMessage } from '../err-message.ts'
 import { buildReplyPolicy, personaFor } from '../drafting/policy.ts'
+import { computeEvidence } from '../drafting/evidence.ts'
 import { appendRunEvent, finishRun } from '../drafting/runs.ts'
 import type { ProviderResolver } from '../provider-resolver.ts'
 
@@ -58,9 +59,8 @@ export const agentSandboxJob: RegisteredJobDefinition<AgentSandboxPayload> = def
 
 export interface AgentSandboxDeps {
   db: Db
-  provider: LlmProvider
-  /** Phase 6: the per-tenant provider resolver. Task 6 moves this job's model call onto it and drops
-   *  `provider` above; until then it rides alongside, wired but unread. */
+  /** Phase 6: the ONE way this job gets a model — the same resolver `ticket.draft` uses, so a
+   *  "Try it" run exercises exactly the provider and model a real draft would. */
   providers: ProviderResolver
   retriever: Retriever
   logger: pino.Logger
@@ -81,6 +81,9 @@ export interface SandboxOutput {
   /** `max(memory, grounding) × model` — the number a REAL draft's auto gate would compare against
    *  the category's threshold. Null for every outcome but `reply` (deviation 12: informational). */
   evidence: number | null
+  /** The resolved model's quality tier — what capped the `model` term behind `evidence` (Phase 6).
+   *  Null only on an output written before Phase 6. */
+  tier: QualityTier | null
   /** `decide()`'s verdict — informational only; a sandbox run never acts on it. */
   decision: DecisionAction
   decisionReason: DecisionReason
@@ -300,20 +303,6 @@ async function runAgentSandboxUnsafe(
   // thread, so it builds the smallest one the draft prompt can consume.
   const thread: ThreadMessage[] = [{ direction: 'inbound', at: now, from: CUSTOMER_ADDRESS, body: input.question }]
 
-  const blocks = [
-    platformRulesBlock(),
-    workspaceProfileBlock(shared.profile),
-    personaBlock(personaFor(agent)),
-    guidanceBlock({ workspaceGuidance: shared.workspaceGuidance, agentGuidance: agent.guidanceExtra }),
-  ].filter((b) => b !== null)
-  await withOrg(deps.db, orgId, (tx) =>
-    appendRunEvent(tx, runId, 'prompt', {
-      blocks: blocks.map((b) => ({ id: b.id, chars: b.text.length })),
-      effort: 'medium',
-      cacheAgentBlocks: false,
-      threadMessages: thread.length,
-    }))
-
   /** Settles the run as a failure and traces it. Never throws — `retryLimit: 0` means a failed run
    *  IS the answer the owner sees, so there is nothing for pg-boss to retry. */
   const fail = async (code: string, detail: string, status: 'failed' | 'aborted'): Promise<void> => {
@@ -324,6 +313,38 @@ async function runAgentSandboxUnsafe(
       await appendRunEvent(tx, runId, 'error', { code, detail })
     })
   }
+
+  // Phase 6: WHICH model this "Try it" run uses — the agent's own configuration, resolved through
+  // the same seam `ticket.draft` reads. Checked BEFORE the prompt event so a workspace whose key is
+  // gone leaves an `error`-only trace rather than a prompt for a call that never happened. There is
+  // no ticket here to escalate: the failed run IS what the owner sees.
+  const resolved = await deps.providers.resolve(orgId, agent.id, 'draft')
+  if (!resolved.ok) {
+    deps.logger.warn({ orgId, runId, refusal: resolved.reason }, 'agent.sandbox: no model provider for this agent')
+    await fail('provider_unavailable', `the agent's model provider is unavailable (${resolved.reason})`, 'failed')
+    return
+  }
+  const config = resolved.config
+
+  const blocks = [
+    platformRulesBlock(),
+    workspaceProfileBlock(shared.profile),
+    personaBlock(personaFor(agent)),
+    guidanceBlock({ workspaceGuidance: shared.workspaceGuidance, agentGuidance: agent.guidanceExtra }),
+  ].filter((b) => b !== null)
+  await withOrg(deps.db, orgId, async (tx) => {
+    // The api stamped this row from the SAME reader when it opened the run, but an owner can change
+    // the agent's model between the click and this job; the resolved pair is what actually ran, and
+    // what the run row must say. Guarded on `running` so a run the sweep already aborted is left alone.
+    await tx.update(agentRuns).set({ provider: config.provider, model: config.model })
+      .where(and(eq(agentRuns.id, runId), eq(agentRuns.status, 'running')))
+    await appendRunEvent(tx, runId, 'prompt', {
+      blocks: blocks.map((b) => ({ id: b.id, chars: b.text.length })),
+      effort: 'medium',
+      cacheAgentBlocks: false,
+      threadMessages: thread.length,
+    })
+  })
 
   const watchdog = withWatchdog(signal, deps.watchdogMs)
 
@@ -350,6 +371,7 @@ async function runAgentSandboxUnsafe(
     knowledge,
     cacheAgentBlocks: false,
     effort: 'medium',
+    model: config.model,
   }
 
   // ONE model call — no automatic redraft: the sandbox's job is to show the owner what the REAL
@@ -357,7 +379,7 @@ async function runAgentSandboxUnsafe(
   const meta: ChatMeta = { orgId, agentId: agent.id, runId, role: 'draft', idempotencyKey: `sandbox:${runId}:1` }
   let call: DraftCallResult
   try {
-    call = await runDraftCall(deps.provider, promptInput, meta, watchdog)
+    call = await runDraftCall(resolved.provider, promptInput, meta, watchdog)
   } catch (err) {
     const aborted = watchdog.aborted
     const code = aborted ? 'watchdog' : err instanceof LlmError ? `llm_${err.code}` : 'llm_unknown'
@@ -366,7 +388,7 @@ async function runAgentSandboxUnsafe(
   }
   const pricing = findPricing(call.result.model)
   if (!pricing) {
-    deps.logger.warn({ runId, provider: deps.provider.kind, model: call.result.model }, 'agent.sandbox: no pricing for model; cost recorded as 0')
+    deps.logger.warn({ runId, provider: config.provider, model: call.result.model }, 'agent.sandbox: no pricing for model; cost recorded as 0')
   }
   const costMicros = pricing ? computeCostMicros(call.result.usage, pricing, '1h') : 0
   usage.add(call.result.usage, costMicros)
@@ -395,28 +417,14 @@ async function runAgentSandboxUnsafe(
       ? await screenSandboxReply(deps, orgId, runId, decision, shared, agent, knowledge, thread.map((m) => m.body))
       : null
 
-  // Parity with `ticket.draft`'s evidence maths (deviation 12), computed on the SAME inputs: the
-  // answers the model actually used, banded by cosine and scaled by human approvals. A sandbox run
-  // never acts on any of it — it exists so the owner sees the number a real draft would be judged on.
+  // Parity with `ticket.draft`'s evidence maths (deviation 12) — the SAME implementation, not a
+  // second copy: `computeEvidence` is what both jobs call, so the number the owner reads here is the
+  // number a real draft's auto gate would compare against the threshold, tier cap included. A
+  // sandbox run never acts on any of it.
   const replyDecision = decision.outcome === 'reply' ? decision : null
-  const retrievedChunkIds = knowledge.chunks.map((c) => c.id)
-  const retrievedAnswerIds = knowledge.answers.map((a) => a.id)
-  const citedChunkIds = replyDecision ? replyDecision.citedChunkIds.filter((id) => retrievedChunkIds.includes(id)) : []
-  const usedAnswerIds = replyDecision ? replyDecision.usedAnswerIds.filter((id) => retrievedAnswerIds.includes(id)) : []
-  const memoryConflictIds = replyDecision
-    ? replyDecision.memoryConflictIds.filter((id) => retrievedChunkIds.includes(id) || retrievedAnswerIds.includes(id))
-    : []
-  const citedScores = knowledge.chunks.filter((c) => citedChunkIds.includes(c.id)).map((c) => c.score)
-  const groundingScore = citedScores.length > 0 ? Math.max(...citedScores) : null
-  const memoryBest = knowledge.answers
-    .filter((a) => usedAnswerIds.includes(a.id))
-    .reduce<number | null>((best, a) => {
-      const score = memoryScore(a.score, a.approvals)
-      return best === null || score > best ? score : best
-    }, null)
-  const evidence = replyDecision
-    ? evidenceScore({ memory: memoryBest ?? 0, grounding: groundingScore, model: replyDecision.confidence })
-    : null
+  const ev = computeEvidence({ knowledge, reply: replyDecision, tier: config.tier })
+  const memoryConflictIds = ev.memoryConflictIds
+  const evidence = ev.evidence
 
   const finishedAt = deps.now?.() ?? new Date()
   await withOrg(deps.db, orgId, async (tx) => {
@@ -488,6 +496,7 @@ async function runAgentSandboxUnsafe(
             guardrail: { ok: guardrail!.ok, findings: guardrail!.findings },
             confidence: decision.confidence,
             evidence,
+            tier: config.tier,
             decision: verdict.action,
             decisionReason: verdict.reason,
             reason: null,
@@ -502,6 +511,7 @@ async function runAgentSandboxUnsafe(
             guardrail: null,
             confidence: null,
             evidence: null,
+            tier: config.tier,
             decision: verdict.action,
             decisionReason: verdict.reason,
             reason: contentFiltered ? 'content_filtered' : decision.reason,

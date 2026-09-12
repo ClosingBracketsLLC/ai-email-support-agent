@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { MANAGED_MODELS } from './llm.ts'
+import { MANAGED_MODELS, QUALITY_TIERS } from './llm.ts'
 
 /** Mirrors @aesa/core's DRAFT_STATUSES — the app cannot import @aesa/core (ESLint); Task 4 pins equality. */
 export const DRAFT_STATUSES = ['pending', 'approved', 'held', 'sending', 'sent', 'rejected', 'superseded', 'expired', 'failed'] as const
@@ -85,6 +85,9 @@ export const SandboxOutputView = z.object({
   /** `max(memory, grounding) × model` — what a real draft's auto gate would compare against the
    * category threshold; null for every outcome but `reply`. */
   evidence: z.number().nullable(),
+  /** Phase 6: the resolved model's quality tier, which capped the `model` term behind `evidence`.
+   * `.default(null)` so an output stored before Phase 6 still parses instead of becoming `null`. */
+  tier: z.enum(QUALITY_TIERS).nullable().default(null),
   decision: z.enum(DECISION_ACTIONS),
   decisionReason: z.enum(DECISION_REASONS),
   reason: z.string().nullable(),

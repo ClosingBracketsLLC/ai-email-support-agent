@@ -21,15 +21,20 @@ import { and, desc, eq, inArray, sql } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import { z } from 'zod'
-import { runTriageCall, TRIAGE_BODY_COUNT, TRIAGE_MAX_BODY_CHARS } from '@aesa/agent'
-import { type TriageVerdict } from '@aesa/contracts'
+import {
+  createUsageAccumulator, runTriageCallDetailed, TRIAGE_BODY_COUNT, TRIAGE_MAX_BODY_CHARS,
+  type TriageCallResult, type UsageTotals,
+} from '@aesa/agent'
+import { MANAGED_MODELS, type TriageVerdict } from '@aesa/contracts'
 import { resolveSetting, type SettingKey } from '@aesa/core'
 import {
-  audit, categories, escalationDedupeKey, insertEscalationNotification, messages, orgSettings, tickets,
-  usageCounters, withOrg, workspaces, type Db, type OrgTx,
+  agentRuns, audit, categories, escalationDedupeKey, insertEscalationNotification, messages, orgSettings,
+  tickets, usageCounters, withOrg, workspaces, type Db, type OrgTx,
 } from '@aesa/db'
-import type { LlmProvider } from '@aesa/llm'
+import { computeCostMicros, findPricing, LlmError, type ChatMeta } from '@aesa/llm'
 import { defineJob, registerJob, JOB_NAMES, type RegisteredJobDefinition } from '@aesa/queue'
+import { FALLBACK_CODES } from './ticket-draft.ts'
+import { finishRun } from '../drafting/runs.ts'
 import type { ProviderResolver } from '../provider-resolver.ts'
 
 /** The usage_counters meter this job's spend guard reads and writes. */
@@ -56,9 +61,8 @@ export const ticketTriageJob: RegisteredJobDefinition<TicketTriagePayload> = def
 
 export interface TicketTriageDeps {
   db: Db
-  provider: LlmProvider
-  /** Phase 6: the per-tenant provider resolver. Task 6 moves this job's model call onto it and drops
-   *  `provider` above; until then it rides alongside, wired but unread. */
+  /** Phase 6: the ONE way this job gets a model. A ticket with no agent yet (routing has not run)
+   *  resolves the workspace default, which is Managed AI unless an owner configured otherwise. */
   providers: ProviderResolver
   logger: pino.Logger
   /** index.ts wires this to `enqueueNotifyDispatch` (`notify-dispatch.ts`, Task 16). */
@@ -88,6 +92,8 @@ export async function registerTicketTriage(boss: PgBoss, deps: TicketTriageDeps)
 interface SelectedTicket {
   id: string
   status: string
+  /** Nullable: routing may not have picked an agent yet, and a null agent resolves the workspace default. */
+  agentId: string | null
   subject: string | null
   isAutomated: boolean | null
   spamFlagged: boolean
@@ -136,6 +142,7 @@ async function loadContext(db: Db, orgId: string, ticketId: string, day: string)
       .select({
         id: tickets.id,
         status: tickets.status,
+        agentId: tickets.agentId,
         subject: tickets.subject,
         isAutomated: tickets.isAutomated,
         spamFlagged: tickets.spamFlagged,
@@ -171,6 +178,7 @@ async function loadContext(db: Db, orgId: string, ticketId: string, day: string)
       ticket: {
         id: ticket.id,
         status: ticket.status,
+        agentId: ticket.agentId,
         subject: ticket.subject,
         isAutomated: ticket.isAutomated,
         spamFlagged: ticket.spamFlagged,
@@ -223,6 +231,16 @@ function resolveCategoryId(cats: { id: string; key: string }[], categoryKey: str
   return match?.id ?? null
 }
 
+/** `finishRun`, with this job's "already settled" warning spelled once. Guarded on `running`, so a
+ *  backstop sweep that got there first simply wins. */
+async function settleRun(
+  tx: OrgTx, runId: string, status: 'succeeded' | 'failed', usage: { totals(): UsageTotals },
+  deps: TicketTriageDeps, extra: { output?: unknown; errorCode?: string; errorMessage?: string },
+): Promise<void> {
+  const settled = await finishRun(tx, { runId, status, usage: usage.totals(), now: new Date(), ...extra })
+  if (!settled) deps.logger.warn({ runId }, 'ticket.triage: run was already settled')
+}
+
 // -- The run function (pure w.r.t. pg-boss — this is what tests call directly) --
 
 export async function runTicketTriage(deps: TicketTriageDeps, payload: TicketTriagePayload, signal: AbortSignal): Promise<void> {
@@ -267,24 +285,61 @@ export async function runTicketTriage(deps: TicketTriageDeps, payload: TicketTri
     }
   }
 
+  // Phase 6: WHICH model triages this ticket. Resolved BEFORE the spend guard so a workspace whose
+  // key is gone spends neither a triage call nor a cap slot to find out. A null `agentId` (routing
+  // has not picked one yet) resolves the workspace default — Managed AI unless an owner said otherwise.
+  const resolved = await deps.providers.resolve(orgId, ticket.agentId ?? null, 'triage')
+  if (!resolved.ok) {
+    // The FOURTH `needs_owner` landing in this job. The three above it predate `escalateTicket` and
+    // pair their own guarded write with `insertEscalationNotification` inside one transaction,
+    // because they also write the verdict columns; this one follows that LOCAL pattern rather than
+    // introducing a second style into the same file (the draft job, which has no such coupling,
+    // does go through `escalateTicket`). Dedupe key: the day-scoped default — one page per ticket
+    // per UTC day is exactly right for "the provider is down".
+    deps.logger.warn({ orgId, ticketId, refusal: resolved.reason }, 'ticket.triage: no model provider for this agent; escalating provider_unavailable')
+    const notificationId = await withOrg(deps.db, orgId, async (tx) => {
+      const written = await guardedWrite(tx, ticketId, ticket.status, {
+        status: 'needs_owner', needsOwnerReason: 'provider_unavailable', escalationNotifiedAt: null,
+      })
+      if (!written) return undefined
+      await audit(tx, {
+        actor: 'system:ticket.triage', action: 'ticket.escalated', entityType: 'ticket', entityId: ticketId,
+        detail: { reason: 'provider_unavailable', refusal: resolved.reason },
+      })
+      return insertEscalationNotification(tx, orgId, ticketId, escalationDedupeKey(ticketId, day), 'provider_unavailable')
+    })
+    if (notificationId) await deps.enqueueNotify(orgId, notificationId)
+    return
+  }
+  const config = resolved.config
+
   // Rule 4: fail-closed spend guard, in its OWN tx, BEFORE the call. Written before the call runs:
   // a crash mid-call still counts the spend — over-counting a call that never billed is the safe
-  // direction (ported comment, doge-buddy triage.ts).
-  const capped = await withOrg(deps.db, orgId, async (tx) => {
+  // direction (ported comment, doge-buddy triage.ts). Phase 6 puts the `agent_runs` row in the SAME
+  // transaction, for the same reason: it is the run's own spend record, written before the call it
+  // authorizes, so a process that dies mid-call still leaves a trace of what it was doing.
+  const gate = await withOrg(deps.db, orgId, async (tx) => {
     const [row] = await tx
       .select({ value: usageCounters.value })
       .from(usageCounters)
       .where(and(eq(usageCounters.day, day), eq(usageCounters.meter, TRIAGE_METER)))
     const current = row?.value ?? 0
-    if (current >= cap) return true
+    if (current >= cap) return { capped: true as const }
     await tx
       .insert(usageCounters)
       .values({ orgId, day, meter: TRIAGE_METER, value: 1 })
       .onConflictDoUpdate({ target: [usageCounters.orgId, usageCounters.day, usageCounters.meter], set: { value: sql`${usageCounters.value} + 1` } })
-    return false
+    const [run] = await tx
+      .insert(agentRuns)
+      .values({
+        orgId, kind: 'triage', ticketId, agentId: ticket.agentId,
+        provider: config.provider, model: config.model, status: 'running', input: {}, startedAt: now,
+      })
+      .returning({ id: agentRuns.id })
+    return { capped: false as const, runId: run!.id }
   })
 
-  if (capped) {
+  if (gate.capped) {
     // Rule 5: cap path — once per UTC day per ticket (the notification's dedupe key), the job
     // otherwise returns cleanly; re-entry after midnight is Task 15's sweep, not this job's concern.
     const notificationId = await withOrg(deps.db, orgId, async (tx) => {
@@ -296,33 +351,64 @@ export async function runTicketTriage(deps: TicketTriageDeps, payload: TicketTri
     return
   }
 
+  const runId = gate.runId
+  const usage = createUsageAccumulator()
+  const meta: ChatMeta = {
+    orgId, role: 'triage', runId, idempotencyKey: `ticket-triage:${ticketId}`,
+    ...(ticket.agentId ? { agentId: ticket.agentId } : {}),
+  }
+  const input = { subject: ticket.subject, bodies, categoryKeys: cats.map((c) => c.key), businessName }
+
   // Rule 6/7: the model call. Always OUTSIDE a withOrg tx — never spans network I/O.
-  let verdict: TriageVerdict
+  // `fallback_to_managed` is the SAME policy `ticket.draft` applies (`FALLBACK_CODES`): one managed
+  // retry when the agent opted in and a managed provider exists. Triage is cheap, so one retry is
+  // the whole budget — anything past it is the ordinary failure path below.
+  let call: TriageCallResult
   try {
-    verdict = await runTriageCall(
-      deps.provider,
-      { subject: ticket.subject, bodies, categoryKeys: cats.map((c) => c.key), businessName },
-      { orgId, role: 'triage', idempotencyKey: `ticket-triage:${ticketId}` },
-      signal,
-    )
+    try {
+      call = await runTriageCallDetailed(resolved.provider, input, meta, signal, config.model)
+    } catch (err) {
+      if (resolved.fallback && err instanceof LlmError && (FALLBACK_CODES as readonly string[]).includes(err.code)) {
+        deps.logger.warn({ runId, code: err.code }, 'ticket.triage: the agent\'s own provider failed; falling back to Managed AI')
+        call = await runTriageCallDetailed(
+          resolved.fallback, input, { ...meta, mode: 'managed', credentialId: undefined }, signal, MANAGED_MODELS.triage,
+        )
+      } else throw err
+    }
   } catch (err) {
     // Rule 7: failure path. Below the threshold, increment and rethrow so pg-boss retries
-    // (retryLimit 2, backoff); at the threshold, escalate instead of retrying further.
+    // (retryLimit 2, backoff); at the threshold, escalate instead of retrying further. Either way
+    // the run row is settled here — a `running` row left behind would be swept as stuck.
     const failures = ticket.triageFailureCount + 1
+    const code = err instanceof LlmError ? `llm_${err.code}` : 'triage_failed'
+    const detail = err instanceof Error ? err.message : String(err)
     if (failures < TRIAGE_FAILURE_ESCALATE_AT) {
-      await withOrg(deps.db, orgId, (tx) => guardedWrite(tx, ticketId, ticket.status, { triageFailureCount: failures }))
+      await withOrg(deps.db, orgId, async (tx) => {
+        await guardedWrite(tx, ticketId, ticket.status, { triageFailureCount: failures })
+        await settleRun(tx, runId, 'failed', usage, deps, { errorCode: code, errorMessage: detail.slice(0, 500) })
+      })
       throw err
     }
     const notificationId = await withOrg(deps.db, orgId, async (tx) => {
       const written = await guardedWrite(tx, ticketId, ticket.status, {
         status: 'needs_owner', needsOwnerReason: 'triage_failed', triageFailureCount: failures, escalationNotifiedAt: null,
       })
+      // Settled unconditionally, and AFTER the ticket: the call happened whether or not the guarded
+      // write landed, a `running` row left behind would be swept as stuck, and every landing in this
+      // job takes `tickets` before `agent_runs` so two of them can never deadlock each other.
+      await settleRun(tx, runId, 'failed', usage, deps, { errorCode: code, errorMessage: detail.slice(0, 500) })
       if (!written) return undefined
       return insertEscalationNotification(tx, orgId, ticketId, escalationDedupeKey(ticketId, day), 'triage_failed')
     })
     if (notificationId) await deps.enqueueNotify(orgId, notificationId)
     return
   }
+  const verdict: TriageVerdict = call.verdict
+  // A BYOK call's cache writes are billed at the 5-minute rate (`createByokProvider` meters at
+  // `'5m'` too); the managed path writes its static prefix on the 1-hour breakpoint.
+  const pricing = findPricing(call.result.model)
+  if (!pricing) deps.logger.warn({ runId, provider: config.provider, model: call.result.model }, 'ticket.triage: no pricing for model; cost recorded as 0')
+  usage.add(call.result.usage, pricing ? computeCostMicros(call.result.usage, pricing, config.mode === 'byok' ? '5m' : '1h') : 0)
 
   // Rule 6: apply the verdict under the pinned precedence, in one final guarded tx.
   const outcome = computeOutcome(verdict)
@@ -348,6 +434,9 @@ export async function runTicketTriage(deps: TicketTriageDeps, payload: TicketTri
     if (outcome.status === 'needs_owner') patch.escalationNotifiedAt = null
 
     const written = await guardedWrite(tx, ticketId, ticket.status, patch)
+    // Settled unconditionally, and AFTER the ticket (see the failure branch's note): the call
+    // happened and cost money whether or not a concurrent owner won the guarded write above.
+    await settleRun(tx, runId, 'succeeded', usage, deps, { output: { outcome: outcome.status, categoryKey: verdict.categoryKey } })
     if (!written) return { written: false as const }
 
     let notifId: string | undefined
