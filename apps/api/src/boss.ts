@@ -43,6 +43,9 @@ export async function createSendOnlyBoss(connectionString: string): Promise<PgBo
   // but the four-places rule is literal: every queue is pre-created on both processes regardless.
   await createQueueRetrying(boss, JOB_NAMES.guidanceSuggest, queueOptionsFor(JOB_NAMES.guidanceSuggest))
   await createQueueRetrying(boss, JOB_NAMES.memoryCapture, queueOptionsFor(JOB_NAMES.memoryCapture))
+  // Phase 6: the api's `llm.addCredential`/`probeCredential` send it on every key added or
+  // re-probed by hand, and the worker's own `llm.reprobe-sweep` cron sends it every six hours.
+  await createQueueRetrying(boss, JOB_NAMES.llmProbe, queueOptionsFor(JOB_NAMES.llmProbe))
 
   return boss
 }

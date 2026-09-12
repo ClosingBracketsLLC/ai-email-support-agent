@@ -140,4 +140,24 @@ describe('createByokProvider', () => {
     const { fetchFn } = capturingFetch(() => jsonResponse({ object: 'list', data: [{ id: 'gpt-5', object: 'model' }] }))
     expect(await byok(fetchFn).listModels!()).toEqual(['gpt-5'])
   })
+
+  /** Defense in depth: a BYOK base URL is customer-supplied, so the SSRF pin is the DEFAULT transport,
+   *  not something each caller has to remember to pass. `apps/worker`'s resolver still passes its own
+   *  `createPinnedFetch` (that is its test seam) — this proves a caller that passes none is pinned too. */
+  it('with no fetchFn, an IP-literal base URL is refused by the default pinned fetch', async () => {
+    const provider = createByokProvider({
+      provider: 'openai',
+      apiKey: new Secret('sk-byok-key-1234567890'),
+      baseUrl: 'https://10.0.0.1/v1',
+      orgId: 'org_1',
+      credentialId: 'cred_1',
+      sink: recordingSink(),
+      limiter: createLlmLimiter({ maxConcurrentPerKey: BYOK_MAX_CONCURRENT_PER_CREDENTIAL }),
+    })
+
+    await expect(provider.chat(req({ output: undefined }))).rejects.toMatchObject({
+      name: 'LlmError',
+      message: expect.stringMatching(/hostname, not an IP literal/),
+    })
+  })
 })

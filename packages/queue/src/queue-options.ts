@@ -41,6 +41,7 @@ export const QUEUE_OPTIONS: Record<JobName, JobQueueOptions> = {
   [JOB_NAMES.knowledgeEmbedBatch]: { policy: 'short', expireInSeconds: 300, retryLimit: 5, retryDelay: 30, retryBackoff: true },
   [JOB_NAMES.memoryCapture]: { policy: 'short', expireInSeconds: 120, retryLimit: 3, retryDelay: 30, retryBackoff: true },
   [JOB_NAMES.guidanceSuggest]: { policy: 'short', expireInSeconds: 120, retryLimit: 1 },
+  [JOB_NAMES.llmProbe]: { policy: 'short', expireInSeconds: 120, retryLimit: 2, retryBackoff: true },
 }
 
 /** The `PgBoss.Queue` shape both pre-create lists hand to `createQueueRetrying`. */

@@ -4,7 +4,7 @@
  * adapter, metered (innermost, so every rung's API call becomes its own `llm_calls` row),
  * rate-limited, and climbing the structured-output ladder (outermost).
  */
-import type { Secret } from '@aesa/crypto'
+import { createPinnedFetch, type Secret } from '@aesa/crypto'
 import type { LlmProviderId } from '@aesa/contracts'
 import { createAnthropicProvider } from '../adapters/anthropic/index.ts'
 import { createOpenAiCompatibleProvider } from '../adapters/openai-compatible/index.ts'
@@ -63,6 +63,7 @@ export interface ByokProviderOptions {
   /** Shared across every BYOK provider on the process; keyed `byok:${orgId}:${credentialId}` so a
    * stalled tenant never starves another. */
   limiter: LlmLimiter
+  /** Omit it and the SSRF-pinned transport below is used — see `createByokProvider`. */
   fetchFn?: typeof fetch
   pricing?: ModelPricing[]
   /** The stored probe verdict: `'none'` forces the plain rung regardless of the preset. */
@@ -90,14 +91,19 @@ export function createByokProvider(o: ByokProviderOptions): LlmProvider {
           structuredOutput: preset.structuredOutput === 'none' ? 'none' : narrowed,
         })
       : undefined
+  // A BYOK base URL is customer-supplied, so the SSRF pin is the DEFAULT transport on BOTH branches,
+  // never something each caller has to remember to pass: `validateOutboundUrl` + a re-resolve on every
+  // call + no redirects. `allowNonstandardPort` because a self-hosted OpenAI-compatible endpoint often
+  // lives on :8000/:11434; the 120 s budget is the ceiling a slow local model is allowed to take.
+  const fetchFn = o.fetchFn ?? createPinnedFetch({ allowNonstandardPort: true, timeoutMs: 120_000 })
   const adapter: LlmProvider =
     o.provider === 'anthropic'
-      ? createAnthropicProvider({ apiKey: o.apiKey, ...(o.fetchFn ? { fetchFn: o.fetchFn } : {}) })
+      ? createAnthropicProvider({ apiKey: o.apiKey, fetchFn })
       : createOpenAiCompatibleProvider({
           kind: o.provider,
           apiKey: o.apiKey,
           baseUrl: o.baseUrl,
-          ...(o.fetchFn ? { fetchFn: o.fetchFn } : {}),
+          fetchFn,
           ...(override ? { capabilitiesOverride: override } : {}),
         })
   // `cacheTtl: '5m'` — none of the BYOK providers exposes a TTL choice, and the OpenAI-compatible

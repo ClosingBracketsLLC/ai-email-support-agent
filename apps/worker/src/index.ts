@@ -42,7 +42,7 @@ logger.info({ roles: [...config.roles], kekActive: config.kekRing?.active ?? nul
 // `ticket.triage` regardless; the same gap hits mailbox.sync on a `sync`-role replica missing the KEK
 // ring or MAIL_FROM, which mailbox.poll-sweep's (a) enqueues into unconditionally too, agent.sandbox
 // (whose producer is the API's sandbox-start mutation, on a process that runs no worker roles at all),
-// and send.execute (whose producer is the API's approve mutation, same story). Create all nine
+// and send.execute (whose producer is the API's approve mutation, same story). Create all twelve
 // unconditionally at boot, before any role-gated registration, so a send never silently no-ops on a
 // role-partitioned or under-configured replica.
 // Every option below comes from `QUEUE_OPTIONS` (`packages/queue/src/queue-options.ts`) via
@@ -68,6 +68,9 @@ await createQueueRetrying(boss, JOB_NAMES.knowledgeEmbedBatch, queueOptionsFor(J
 // approval. Pre-created here regardless of producer, same as every queue above.
 await createQueueRetrying(boss, JOB_NAMES.memoryCapture, queueOptionsFor(JOB_NAMES.memoryCapture))
 await createQueueRetrying(boss, JOB_NAMES.guidanceSuggest, queueOptionsFor(JOB_NAMES.guidanceSuggest))
+// Phase 6: the api's `llm.addCredential`/`probeCredential` and the worker's own `llm.reprobe-sweep`
+// both send it.
+await createQueueRetrying(boss, JOB_NAMES.llmProbe, queueOptionsFor(JOB_NAMES.llmProbe))
 
 // notify.dispatch's producers span every role (ticket.triage's escalations under `agent`,
 // mailbox.sync/renew-watch's reauth notices and mailbox.poll-sweep's stuck-pending retry under
