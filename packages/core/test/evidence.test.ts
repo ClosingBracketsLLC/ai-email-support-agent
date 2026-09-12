@@ -50,4 +50,15 @@ describe('evaluateGraduation (≥ 20 decisions, ≥ 90% unchanged, no rejection 
   ])('%j → %s', (s, want) => {
     expect(evaluateGraduation(s)).toBe(want)
   })
+
+  it('honours a custom minDecisions override (the standard tier\'s 40): 39 decisions at 92% unchanged still fail (39 < 40); 40 at exactly 90% pass', () => {
+    const at39 = { unchanged: 36, edited: 3, rejected: 0, daysSinceLastRejection: null }   // 39 total, 36/39 ≈ 92%
+    const at40 = { unchanged: 36, edited: 4, rejected: 0, daysSinceLastRejection: null }   // 40 total, 36/40 = 90%
+    const standardRules = { minDecisions: 40, minUnchangedRate: 0.9, rejectionFreeDays: 14 }
+    expect(evaluateGraduation(at39, standardRules)).toBe(false)   // 39 < 40, despite a passing rate
+    expect(evaluateGraduation(at40, standardRules)).toBe(true)    // 40 decisions, exactly at the 90% floor
+    // The default (no override) still uses GRADUATION_RULES.minDecisions (20), so the 39-decision
+    // sample that failed above passes here — proving every existing caller (no second argument) is unaffected.
+    expect(evaluateGraduation(at39)).toBe(true)
+  })
 })

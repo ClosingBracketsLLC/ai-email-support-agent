@@ -64,10 +64,18 @@ export interface GraduationSignals {
   daysSinceLastRejection: number | null
 }
 
-export function evaluateGraduation(s: GraduationSignals): boolean {
+/** The three rule fields `evaluateGraduation` reads, widened to `number` — `GRADUATION_RULES` itself
+ *  is `as const`, so picking straight from it would fossilize each value as its own literal type
+ *  (e.g. `minDecisions: 20`), rejecting `graduationRulesFor`'s `standard`-tier override of 40. */
+export interface GraduationRuleInputs { minDecisions: number; minUnchangedRate: number; rejectionFreeDays: number }
+
+/** `rules` defaults to `GRADUATION_RULES` — every existing caller passes nothing. `stats.rollup`
+ *  passes `@aesa/core`'s `graduationRulesFor(tier)` result instead, so a `standard`-tier agent's
+ *  higher `minDecisions` bar is enforced by the SAME function, not a duplicated copy of it. */
+export function evaluateGraduation(s: GraduationSignals, rules: GraduationRuleInputs = GRADUATION_RULES): boolean {
   const total = s.unchanged + s.edited + s.rejected
-  if (total < GRADUATION_RULES.minDecisions) return false
-  if (s.unchanged / total < GRADUATION_RULES.minUnchangedRate) return false
-  if (s.daysSinceLastRejection !== null && s.daysSinceLastRejection < GRADUATION_RULES.rejectionFreeDays) return false
+  if (total < rules.minDecisions) return false
+  if (s.unchanged / total < rules.minUnchangedRate) return false
+  if (s.daysSinceLastRejection !== null && s.daysSinceLastRejection < rules.rejectionFreeDays) return false
   return true
 }
