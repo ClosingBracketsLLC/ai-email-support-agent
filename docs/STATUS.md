@@ -1180,6 +1180,9 @@ the record)</summary>
 
 ### Phase 5 — autonomy and learning (complete on branch `phase-5`; PR not yet opened)
 
+- Review: `docs/superpowers/reviews/2026-09-11-phase-5-final-review.md` — the whole-branch review
+  (0 Critical, 6 Important, one fix wave `03d2d2a` + `add8ad3`, the scoped re-review clean), the
+  parked residuals with their rulings, and what the review verified holds.
 - Plan: `docs/superpowers/plans/2026-09-11-phase-5-autonomy-and-learning.md` (11 tasks, executed with
   subagent-driven development). Commits **`ef81169..HEAD`** on `phase-5`, branched from `main` at
   `ef81169` — the plan commit, a carry-over task, nine implementation tasks with their per-task fix
