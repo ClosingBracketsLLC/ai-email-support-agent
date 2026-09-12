@@ -22,7 +22,7 @@ first if either is not already done. Phase 5 assumes both.
 | | |
 |---|---|
 | New third-party account | none |
-| New environment variable | **none** — `apps/api/.env.example` and `apps/worker/.env.example` are unchanged |
+| New environment variable | **none** — no variable is added; `apps/api/.env.example` and `apps/worker/.env.example` each gain a comment block naming the two org settings below |
 | New queue | `memory.capture` and `guidance.suggest`, both created at boot by the pre-create lists in `apps/worker/src/index.ts` and `apps/api/src/boss.ts` |
 | New cron | `stats.rollup`, registered by the `cron` role at boot |
 | New migrations | `0016_cool_phalanx.sql` (generated) and `0017_autonomy_hardening.sql` (hand-written) |
@@ -135,10 +135,12 @@ an **outlook.com** sender so both threading paths are covered, exactly as the Ph
     so a reply you held and then approved bills as a review send, not an auto-send — which is the
     right answer for both billing and the "did the agent do this?" question.
 
-    The **Activity** screen still shows one combined "Sent" tile: `activity.summary` returns an
-    `autoSent` count, but no tile renders it yet (recorded as a carry in `docs/STATUS.md`). Until it
-    does, the Autopilot screen's per-category line and the `auto_sends` meter are where you read the
-    autonomy numbers.
+    The **Activity** screen shows **Auto-sent** beside **Sent** (`activity.summary.autoSent`: drafts
+    the agent both decided and delivered inside the window). Closed by the final fix wave
+    (`03d2d2a`) — it was an open carry at the close-out, when the count was computed and no tile
+    rendered it. The Autopilot screen's per-category 30-day line and the `auto_sends` meter are the
+    other two places to read the autonomy numbers, and the daily digest email now carries its own
+    one-line "N replies went out on their own in the last 24 hours.".
 
 ---
 
@@ -207,11 +209,13 @@ Before the first real auto-send:
 - **`memory.capture` runs on the `agent` role, not `send`.** It embeds, so a `send`-only replica
   enqueues the job and an `agent` replica runs it. A deployment with a `send` role and no `agent`
   role anywhere would deliver replies and learn nothing.
-- **An empty answer is a skip, not a failure.** `scrubForMemory` can legitimately reduce a reply to
-  nothing (see the carry in `docs/STATUS.md` about one-line replies that open with "Thanks"), and
-  `memory.capture` then audits `memory.skipped` with `empty_after_scrub` and stores no row. That is
-  the correct behaviour for an empty string; it is also why a workspace can send replies and gain no
-  answers.
+- **An empty answer is a skip, not a failure.** `scrubForMemory` can still legitimately reduce a
+  reply to nothing (a greeting plus a sign-off block and nothing else), and `memory.capture` then
+  audits `memory.skipped` with `empty_after_scrub` and stores no row. That is the correct behaviour
+  for an empty string; it is also why a workspace can send replies and gain no answers. The related
+  close-out finding — a ONE-line reply opening "Thanks for getting in touch, …" being erased whole —
+  is **fixed** by the final fix wave (`03d2d2a`): the sign-off cut never removes the first content
+  line, and a candidate sign-off line qualifies only when at most three non-blank lines follow it.
 - **Nothing but `ticket.draft`'s auto landing may write `decision_source = 'auto'`.** If you are ever
   asked "did a human approve this?", that column plus `auto_decided_at` is the answer:
   `auto_decided_at` is set once and never cleared, so a reply the owner held and re-approved still

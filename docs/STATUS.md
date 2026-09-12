@@ -1190,23 +1190,25 @@ the record)</summary>
   the `onSent` seam · `7d0dd15`+`065703d` T8 `stats.rollup` and `sweeps.daily`'s memory arms ·
   `ca5feaa`+`75411d5` T9 the api (Hold cancels an auto-send, `flagAutoSent`, inline demotion,
   `setCategoryPolicy`, the memory router) · `59ee73f`+`814345c` T10 the app (Autopilot, Learned
-  answers, the Auto-sending countdown and Hold) · the T11 close-out commit. The per-task execution
+  answers, the Auto-sending countdown and Hold) · the T11 close-out commit · `03d2d2a` the FINAL FIX
+  WAVE (the whole-branch review's seven fixes) and the docs commit after it. The per-task execution
   ledger was an ephemeral SDD artifact; everything load-bearing from it is distilled below, and the
   git history is the durable account.
-  Gate at the close-out commit (minio up, the dev `S3_*` exported so the storage suite runs):
-  typecheck and lint clean across all **15** packages/apps; `pnpm test` green with
-  **2,355 tests** plus 4 conditional skips (`@aesa/contracts` 29, `@aesa/crypto` 44,
-  `@aesa/platform-mail` 18, `brand` 110,
-  `@aesa/core` 244, `@aesa/llm` 98, `@aesa/agent` 68, `@aesa/db` 84, `@aesa/queue` 17,
-  `@aesa/mail` 242, `@aesa/knowledge` 160, `@aesa/test-kit` 43 [39 run + 4 conditional skips],
-  `apps/api` 284, `apps/worker` 498 [including the four E2E files], `apps/app` 420 jest across 56
+  Gate at the FINAL FIX WAVE commit `03d2d2a` (minio up, the dev `S3_*` exported so the storage suite
+  runs): typecheck and lint clean across all **15** packages/apps; `pnpm test` green with
+  **2,364 tests** plus 4 conditional skips (`@aesa/contracts` 29, `@aesa/crypto` 44,
+  `@aesa/platform-mail` 19, `brand` 110,
+  `@aesa/core` 244, `@aesa/llm` 98, `@aesa/agent` 68, `@aesa/db` 85, `@aesa/queue` 17,
+  `@aesa/mail` 242, `@aesa/knowledge` 162, `@aesa/test-kit` 43 [39 run + 4 conditional skips],
+  `apps/api` 285, `apps/worker` 501 [including the four E2E files], `apps/app` 421 jest across 56
   suites — no database); `db:check` reports no drift; the
   Expo web export produces **24 static routes** (up from 22 — `(app)/settings/autopilot` and
-  `(app)/settings/memory` are the two new route files); the Playwright signup smoke passes (still
-  ending at the gated mailbox step, per Phase 2's Task 20 ruling — it runs against the SHARED dev
-  database, so `DATABASE_URL=… pnpm --filter @aesa/db migrate` has to be run once after this phase's
-  0016/0017 land or `workspace.create` fails with a 42703). The pre-existing `e2e-phase3.test.ts`
-  case-10 timing flake did NOT fire in this run.
+  `(app)/settings/memory` are the two new route files); the Playwright signup smoke passed at the
+  close-out commit and is untouched by the fix wave (still ending at the gated mailbox step, per
+  Phase 2's Task 20 ruling — it runs against the SHARED dev database, so
+  `DATABASE_URL=… pnpm --filter @aesa/db migrate` has to be run once after this phase's 0016/0017
+  land or `workspace.create` fails with a 42703). The pre-existing `e2e-phase3.test.ts` case-10
+  timing flake did NOT fire in either the close-out run or the fix wave's.
 - What exists now:
   - `packages/contracts` — `autonomy.ts` (`CATEGORY_MODES`, `AUTONOMY_THRESHOLD_PRESETS`
     cautious 90 / balanced 80 / eager 70, `DEFAULT_AUTO_SEND_THRESHOLD`, `AUTO_SEND_DELAY_CHOICES`
@@ -1255,7 +1257,7 @@ the record)</summary>
     real `activity.autoSent`.
   - `apps/app` — the **Autopilot** screen (Off/Review/Auto per category with the cold-start lock and
     its live count, threshold presets, `auto_graduate`, the hold-window choice, the graduation
-    suggestion banner and the demotion notice), the **Learned answers** screen (four tabs, sampling,
+    suggestion banner and the demotion notice), the **Learned answers** screen (three tabs, sampling,
     keep/retire, *Forget one customer*), the inbox's Auto-sending countdown chip and Hold, the
     evidence line on the draft panel, "Should not have sent", reject-to-guidance, the suggested-rules
     card, and the `auto_send` push category with its Hold action.
@@ -1329,10 +1331,11 @@ the record)</summary>
   inline org-settings read (T7); `agents.categories` answers NOT_FOUND for a foreign agent id,
   `RejectInput.addToGuidance` is required (four `e2e-phase3` call sites updated),
   `setCategoryPolicy` locks the policy row `FOR UPDATE`, and `memory.summary` is a flat shape (T9);
-  `DraftView` gained `flaggedAt` (T10). Five tasks needed a one-item fix round: T6 (the backstop's
-  orphan arm now covers `auto_sending`), T7 (`guidance.suggest` honours the global killswitch), T8
-  (the day-aligned cutoff above), T9 (the lock-order reorder and the no-salt audit) and T10 (one
-  shared `m:ss` countdown for the bar and the chip).
+  `DraftView` gained `flaggedAt` (T10). Five tasks needed a fix round — one item each except T9's,
+  which addressed TWO: T6 (the backstop's orphan arm now covers `auto_sending`), T7
+  (`guidance.suggest` honours the global killswitch), T8 (the day-aligned cutoff above), T9 (the
+  lock-order reorder AND the no-salt audit) and T10 (one shared `m:ss` countdown for the bar and the
+  chip).
 - The E2E: `apps/worker/test/e2e-phase5.test.ts`, **8 scenarios**, one throwaway database, one
   pg-boss schema of its own, the REAL `mailbox.sync` → `ticket.triage` → `ticket.draft` →
   `send.execute` → `memory.capture` chain, the REAL api draft and memory services, and the REAL
@@ -1369,6 +1372,34 @@ the record)</summary>
     writes.
   - **`memory.capture`** itself (Phase 3 plan deviation 5): `send.execute`'s `onSent` seam is wired,
     and the no-op is gone.
+  - **The whole-branch final review's SEVEN fixes**, all in the final fix wave (`03d2d2a`) — the first
+    two are the findings this phase's own close-out had left open:
+    - **`scrubForMemory` could erase a short reply outright.** The sign-off cut now has three bounds,
+      not one: the trailing HALF as before, PLUS it never removes the message's first content line,
+      and a candidate sign-off line qualifies only when at most three non-blank lines follow it (a
+      sign-off block is short). "Thanks for getting in touch. I have checked …" now scrubs to itself,
+      and `packages/knowledge/test/scrub.test.ts` pins that body and the "answer, then a real
+      sign-off block" shape; a greeting-plus-sign-off message still scrubs to the empty string.
+    - **`activity.summary.autoSent` is rendered.** The Activity screen carries an **Auto-sent** tile
+      beside **Sent** (`stat-auto-sent`), with its own test row.
+    - **An auto-send survived its category's demotion.** `send.execute` gained a seventh kill lever,
+      `category_not_auto` (right after `category_off`): an auto-decided draft whose category is no
+      longer on Autopilot lands `held` through `landHeld`, with the owner's sentence in the app's
+      `HOLD_REASON_LABEL`. A human-approved draft is untouched — a Hold + re-approve already rewrites
+      `decision_source` to `app`.
+    - **"Should not have sent" was unreachable from the ticket screen.** `loadLiveDraftView` now
+      serves the newest `sent` + `decision_source = 'auto'` draft on a `waiting_on_customer` ticket
+      when no live draft is left, bounded by the ticket status exactly like the `failed` fallback.
+    - **The autonomy helpers had no `org_id` predicate** while running under `withOrgIdentity` in
+      `stats.rollup` (platform role, no RLS): `readDemotionSignals` takes `orgId` and filters on it,
+      and both guarded policy UPDATEs match it too.
+    - **A lost update on `workspaces.operating_guidance`.** Both appenders — `rejectDraft`'s
+      "add this to your guidance" and `workspace.acceptSuggestion` — read the row `FOR UPDATE`; the
+      workspace row is the LAST position in the global lock order, so nothing inverts.
+    - **Auto-sent activity now folds into the daily digest email** (spec §Notifications): one line,
+      "N replies went out on their own in the last 24 hours.", counted in the same short read
+      transaction as the digest's items and omitted at zero. It never decides whether a digest is
+      sent — a workspace fully on Autopilot with nothing pending still gets no mail.
 - **Carries still open**, grouped:
   - **From Phase 4, unchanged:** the stuck-source sweep (a `queued` crawl with no job, a `processing`
     source with unembedded chunks, an abandoned `queued` upload) → **Phase 7**; the source cap's
@@ -1393,26 +1424,12 @@ the record)</summary>
     locks across every expiring draft for the whole pass; the hand-authored cache-hit fixture;
     `sendFailureLabel`'s untested coupling to worker-owned literals; and Phase 3's list of smaller
     review minors, unchanged.
-  - **Found by THIS phase's close-out, both new:**
-    - **`scrubForMemory` can erase a short reply outright.** It cuts from the last sign-off-shaped
-      line in the message's trailing HALF onward, and a ONE-line reply's only line IS its trailing
-      half — so a single-paragraph reply opening "Thanks for getting in touch, …" scrubs to the empty
-      string and `memory.capture` correctly stores nothing (`memory.skipped`, `empty_after_scrub`).
-      The same cut truncates a 3-line reply whose MIDDLE line starts with "Thanks"/"Best"/"Cheers".
-      The prompt tells the model not to write a sign-off, which is what keeps this narrow, but a
-      concise one-paragraph reply is exactly the shape the `concise` persona asks for. The E2E works
-      around it with a body that does not open with a sign-off word; the fix belongs in
-      `packages/knowledge/src/memory/scrub.ts` with its own unit rows.
-    - **`activity.summary.autoSent` is computed and never rendered.** The api counts it (sent drafts
-      with `auto_decided_at` in the window and `decision_source = 'auto'`); the Activity screen has no
-      tile for it, so the only autonomy numbers an owner sees are the Autopilot screen's per-category
-      30-day line and the `auto_sends` meter.
   - **The ledger's deferred minors**, one line per area. *Contracts/core:* no test pins the precedence
     among the three new `decide()` branches themselves; `GUIDANCE_SUGGESTION_STATUSES` has no
     companion type alias; `memoryScore` floors `approvals` (not in the spec's literal formula).
     *db:* `readDemotionSignals` has no boundary test for `decisionWindowDays` (the other two windows
-    do). *knowledge/mail:* the scrub's sign-off window is the back HALF (see the finding above); the
-    keyset test spaces rows 100 µs apart so the id-tiebreaker path itself is uncovered; the cursor
+    do). *knowledge/mail:* the scrub's sign-off window is the back HALF (now with two further
+    bounds — see *Carries CLOSED* above); the keyset test spaces rows 100 µs apart so the id-tiebreaker path itself is uncovered; the cursor
     predicate checks both halves though `parseCursor` returns them together; the DMARC re-examination
     note landed on `parseAuthResults`' JSDoc rather than the `DMARC_METHOD_RE` block; `MockMailbox`'s
     Gmail authserv-id default is inert in graph mode. *worker:* the evidence maths is duplicated
@@ -1433,12 +1450,10 @@ the record)</summary>
     by a test; `auto_sent_flagged` bumps on `flagged_at` alone; the `held` counter is gated on
     `auto_decided_at`'s window rather than `auto_held_at`'s; `stats.rollup` queues notification ids
     before `maybeNudge` runs in the same SAVEPOINT; the singular nudge copy is untested and the
-    per-org draft load is unbounded. *api:* the `operating_guidance` append reads the workspace row
-    without `FOR UPDATE` (a lost update under concurrent appends); `rejectCandidate` returns ok for a
-    candidate retired mid-call; `retireAnswer`'s `returning({ status })` is unused;
-    `setCategoryPolicy` entering `auto` leaves `demoted_at`/`demoted_reason` standing, so the app has
-    to compare `graduatedAt` vs `demotedAt`; `src/drafts/service.ts` is 1,118 lines with
-    `src/drafts/learning.ts` named as the next split seam. *app:* the mode/delay/auto-graduate radios
+    per-org draft load is unbounded. *api:* `rejectCandidate` returns ok for a candidate retired
+    mid-call; `retireAnswer`'s `returning({ status })` is unused; `src/drafts/service.ts` is over
+    1,100 lines with `src/drafts/learning.ts` named as the next split seam.
+    *app:* the mode/delay/auto-graduate radios
     give no in-flight feedback; the suggestion CTA is not disabled under the cold-start lock (inert —
     a suggestion needs 20 decisions); one screen-level error banner serves every category and the
     code is not cleared on an agent switch; "Deleted 1 answers"; the delete-by-customer armed state
@@ -1447,6 +1462,30 @@ the record)</summary>
     `formatCountdown` has no NaN guard (unreachable); and several error/empty-state strings are
     untested. *Reports only:* Task 5's index-ordering claim and Task 7's claim that the shared
     embedder is test-asserted (only its definedness is).
+  - **From the WHOLE-BRANCH final review, what the fix wave did NOT take** (the seven it did take are
+    in *Carries CLOSED* above, in commit `03d2d2a`). Several of these restate a ledger minor; they are
+    grouped here because they are what the final review itself chose to leave standing.
+    *Structure:* `apps/api/src/drafts/service.ts` is still one file — the `src/drafts/learning.ts`
+    split is **Phase 6 cleanup**, not a Phase 5 item; the evidence maths still has no shared helper
+    (`ticket-draft.ts` and `agent-sandbox.ts` each compute it); `relativeTime`, the reason-label
+    `lookup` and `meterValue` each exist in several copies.
+    *Coverage:* no E2E exercises the **`flags`** demotion trigger (two "should not have sent" flags in
+    30 days) — only the `rejections` one.
+    *Worker:* `memory.capture`'s embed spend is neither metered nor capped (→ **Phase 6**, with BYOK);
+    the reinforce UPDATE is not re-guarded on `status = 'active'`; `memory.skipped` audits
+    `empty_after_scrub` even when it was the embedder that returned nothing; `sweeps.daily`'s arm (f)
+    joins without an `org_id` predicate and scans unbounded; `stats.rollup` bumps its counters and
+    queues its notification ids before `maybeNudge` runs in the same SAVEPOINT;
+    `category_stats_daily`'s PK does not lead with `org_id` (the convention, not a test).
+    *api/contracts:* `activity.summary` still leans on `edit_distance_ratio IS NULL` to keep auto
+    drafts out of the approved split rather than on `decision_source`; `guidance.suggest` reads the
+    PLATFORM killswitch but not the workspace's own; `SandboxOutputView.evidence` is required, so a
+    stored pre-Phase-5 sandbox output `safeParse`s to null.
+    *App polish:* the mode/delay/auto-graduate radios give no in-flight feedback; the suggestion CTA
+    is not disabled under the cold-start lock; one screen-level error banner serves every category;
+    "Deleted 1 answers"; the delete-by-customer armed state survives a tab switch; `formatCountdown`
+    has no NaN guard; `autopilot.tsx` writes `AUTONOMY_THRESHOLD_PRESETS.balanced` where
+    `DEFAULT_AUTO_SEND_THRESHOLD` would say why.
 
 ## Next: Phase 6 — provider choice
 
@@ -1495,7 +1534,9 @@ waiting for it:
   worth fixing in the same phase.
 
 **Carries still open.** The Phase 5 record above groups all of them — Phase 4's three, the
-long-standing list, the two findings this phase's close-out made, and the ledger's deferred minors.
+long-standing list, the ledger's deferred minors, and what the whole-branch final review left
+standing. The two findings this phase's close-out made (the scrub erasing a short reply, the
+unrendered `autoSent` count) are CLOSED, with five more, by the final fix wave `03d2d2a`.
 Three of Phase 4's residuals explicitly named "Phase 5" and did NOT land, and are the ones most worth
 folding into Phase 6's first task because they touch the same files it will open anyway:
 
