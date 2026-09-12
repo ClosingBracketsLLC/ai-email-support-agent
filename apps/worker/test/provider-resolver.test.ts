@@ -18,7 +18,8 @@ import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
 import { createFakeProvider, noopMeterSink, type LlmProvider } from '@aesa/llm'
 import { createWorkerLogger } from '../src/logging.ts'
 import {
-  createProviderResolver, markCredentialDead, secretAad, staticRefusal, staticResolver, type ProviderResolverDeps,
+  createProviderResolver, markCredentialDead, PROVIDER_CACHE_TTL_MS, secretAad, staticRefusal, staticResolver,
+  type ProviderResolverDeps,
 } from '../src/provider-resolver.ts'
 
 const ring: KekRing = loadKekRing({ AESA_KEK_V1: randomBytes(32).toString('base64'), AESA_KEK_ACTIVE: '1' })
@@ -162,6 +163,51 @@ describe('createProviderResolver', () => {
     const third = await resolver.resolve(orgId, agentId, 'draft')
     expect(third.ok && third.provider).not.toBe(first.ok && first.provider)
     expect(third.ok && third.provider.kind).toBe('openai')
+  })
+
+  it('the cache is keyed on the credential\'s freshness: a probe on ANOTHER replica (lastProbedAt moves) rebuilds without invalidate()', async () => {
+    const agentId = await createAgent()
+    const credentialId = await createCredential({ healthStatus: 'healthy', lastProbedAt: new Date('2026-09-12T09:00:00Z') })
+    await seedDekSecret(credentialId)
+    await seedConfig(agentId, { credentialId, model: 'gpt-5' })
+    const { resolver } = makeResolver()
+
+    const first = await resolver.resolve(orgId, agentId, 'draft')
+    expect(first.ok).toBe(true)
+    const second = await resolver.resolve(orgId, agentId, 'draft')
+    expect(second.ok && second.provider).toBe(first.ok && first.provider)
+
+    // What `llm.probe` writes — on whichever replica ran it. This process never hears about it, so
+    // `invalidate()` is never called here; the KEY is what must retire the entry.
+    await withOrg(app.db, orgId, (tx) =>
+      tx.update(llmCredentials).set({ lastProbedAt: new Date('2026-09-12T10:00:00Z') }).where(eq(llmCredentials.id, credentialId)))
+
+    const third = await resolver.resolve(orgId, agentId, 'draft')
+    expect(third.ok && third.provider).not.toBe(first.ok && first.provider)
+    expect(third.ok && third.provider.kind).toBe('openai')
+    // And the new entry is itself cached — the rebuild is once per probe, not once per draft.
+    const fourth = await resolver.resolve(orgId, agentId, 'draft')
+    expect(fourth.ok && fourth.provider).toBe(third.ok && third.provider)
+  })
+
+  it('a never-probed credential still rebuilds after PROVIDER_CACHE_TTL_MS', async () => {
+    const agentId = await createAgent()
+    // lastProbedAt null: the freshness key never moves, so only the TTL can retire this entry.
+    const credentialId = await createCredential({ healthStatus: 'healthy' })
+    await seedDekSecret(credentialId)
+    await seedConfig(agentId, { credentialId, model: 'gpt-5' })
+    let now = new Date('2026-09-12T09:00:00Z')
+    const { resolver } = makeResolver({ now: () => now })
+
+    const first = await resolver.resolve(orgId, agentId, 'draft')
+    now = new Date(now.getTime() + PROVIDER_CACHE_TTL_MS - 1_000)
+    const withinTtl = await resolver.resolve(orgId, agentId, 'draft')
+    expect(withinTtl.ok && withinTtl.provider).toBe(first.ok && first.provider)
+
+    now = new Date(now.getTime() + 2_000)
+    const afterTtl = await resolver.resolve(orgId, agentId, 'draft')
+    expect(afterTtl.ok && afterTtl.provider).not.toBe(first.ok && first.provider)
+    expect(afterTtl.ok && afterTtl.provider.kind).toBe('openai')
   })
 
   it('byok config with a SEALED secret (the probe has not re-wrapped it yet) → opens the sealed box, and leaves the row sealed', async () => {

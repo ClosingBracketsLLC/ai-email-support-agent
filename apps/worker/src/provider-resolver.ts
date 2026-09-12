@@ -4,8 +4,17 @@
  *  - managed → the process-wide managed provider (built once by agent-role.ts);
  *  - byok → the credential's key, opened under the org DEK (or straight out of the sealed box if the
  *    probe has not re-wrapped it yet), composed by `createByokProvider` and CACHED per credential —
- *    a key is decrypted once per process, not once per draft. `invalidate(credentialId)` is called
- *    by the probe job after every store/re-wrap and by nothing else.
+ *    a key is decrypted once per process, not once per draft.
+ *
+ * The cache is keyed on the credential's FRESHNESS, `${credentialId}:${lastProbedAt}`, not on its id:
+ * a cached provider holds a decrypted key, a base URL and the probe's `structuredOverride` frozen at
+ * build time, and `invalidate()` only ever reaches the replica that called it — the replica that runs
+ * `llm.probe` is usually not the one that drafts. Keying on a value `resolve` re-reads anyway means a
+ * probe on ANY replica retires every replica's entry, and the `PROVIDER_CACHE_TTL_MS` ceiling bounds the
+ * never-probed case (a key rotated in place behind an id that never moves). `invalidate(credentialId)`
+ * stays, as the same-process fast path `llm.probe` calls after a store/re-wrap; it is a belt on top of
+ * the key, not the guarantee.
+ *
  * Every failure to produce a provider is a typed refusal the job lands as `provider_unavailable`,
  * never a throw: a dead credential, a missing ring (dev only — production refuses to boot),
  * a missing secret row (the store step of `llm.probe` has not run yet). No transaction here spans
@@ -51,7 +60,9 @@ export type ResolvedProvider =
 
 export interface ProviderResolver {
   resolve(orgId: string, agentId: string | null, role: ModelConfigRole): Promise<ResolvedProvider>
-  /** Drops one credential's cached provider. `llm.probe` calls it after a store or a re-wrap; nothing else does. */
+  /** Drops one credential's cached provider IN THIS PROCESS. `llm.probe` calls it after a store or a
+   *  re-wrap; nothing else does. It is a fast path, not the invalidation guarantee — the cache key
+   *  carries the credential's `lastProbedAt`, which is what retires other replicas' entries. */
   invalidate(credentialId: string): void
 }
 
@@ -65,6 +76,8 @@ export interface ProviderResolverDeps {
   pricing?: ModelPricing[]
   /** Test seam. Production leaves it unset and every BYOK adapter gets its own SSRF-pinned transport. */
   fetchFn?: typeof fetch
+  /** Test seam for the cache TTL's clock; production leaves it unset and reads the wall clock. */
+  now?: () => Date
   logger: pino.Logger
 }
 
@@ -77,6 +90,12 @@ export function secretAad(orgId: string, credentialId: string): string {
 /** A cached provider is a decrypted key held in memory; 256 credentials is far more than any one
  *  replica drafts for, and evicting the oldest keeps that ceiling hard. */
 const PROVIDER_CACHE_MAX = 256
+
+/** How long one composed provider may live before it is rebuilt from the database regardless of
+ *  freshness. The key already retires an entry whenever a probe lands anywhere; this bounds the
+ *  case where nothing probes at all — a credential whose key was replaced behind the same id would
+ *  otherwise be called with the revoked one until 256 other credentials pushed it out. */
+export const PROVIDER_CACHE_TTL_MS = 15 * 60_000
 
 export interface OpenedCredentialKey {
   apiKey: Secret
@@ -138,15 +157,28 @@ export function createProviderResolver(deps: ProviderResolverDeps): ProviderReso
   // ONE limiter for the process, keyed `byok:${orgId}:${credentialId}` by `createByokProvider`, so a
   // rebuilt provider for the same credential still draws from that credential's own two slots.
   const limiter = createLlmLimiter({ maxConcurrentPerKey: BYOK_MAX_CONCURRENT_PER_CREDENTIAL })
-  const cache = new Map<string, LlmProvider>()
+  /** Keyed on `${credentialId}:${lastProbedAt}` — see the file header. */
+  const cache = new Map<string, { provider: LlmProvider; builtAt: number }>()
+  /** The freshness key each credential currently occupies, so a rebuild (or `invalidate`) can drop
+   *  the entry it replaces instead of leaving a stale key holding a decrypted secret. */
+  const keyByCredential = new Map<string, string>()
   let warnedNoManagedFallback = false
 
-  function cacheProvider(credentialId: string, provider: LlmProvider): void {
+  const nowMs = (): number => (deps.now?.() ?? new Date()).getTime()
+
+  function freshnessKey(credentialId: string, config: ResolvedModelConfig): string {
+    return `${credentialId}:${config.credential?.lastProbedAt?.getTime() ?? 0}`
+  }
+
+  function cacheProvider(credentialId: string, key: string, provider: LlmProvider): void {
+    const previous = keyByCredential.get(credentialId)
+    if (previous !== undefined && previous !== key) cache.delete(previous)
     if (cache.size >= PROVIDER_CACHE_MAX) {
       const oldest = cache.keys().next()
       if (!oldest.done) cache.delete(oldest.value)
     }
-    cache.set(credentialId, provider)
+    cache.set(key, { provider, builtAt: nowMs() })
+    keyByCredential.set(credentialId, key)
   }
 
   function fallbackFor(config: ResolvedModelConfig): LlmProvider | null {
@@ -179,8 +211,12 @@ export function createProviderResolver(deps: ProviderResolverDeps): ProviderReso
       if (!credentialId || !config.credential) return { ok: false, reason: 'no_secret', config }
 
       const fallback = fallbackFor(config)
-      const cached = cache.get(credentialId)
-      if (cached) return { ok: true, provider: cached, fallback, config }
+      const key = freshnessKey(credentialId, config)
+      const cached = cache.get(key)
+      if (cached) {
+        if (nowMs() - cached.builtAt < PROVIDER_CACHE_TTL_MS) return { ok: true, provider: cached.provider, fallback, config }
+        cache.delete(key)
+      }
 
       const opened = await openCredentialKey({ db: deps.db, ring: deps.ring }, orgId, credentialId)
       if (!opened) return { ok: false, reason: 'no_secret', config }
@@ -197,12 +233,14 @@ export function createProviderResolver(deps: ProviderResolverDeps): ProviderReso
         ...(deps.pricing ? { pricing: deps.pricing } : {}),
         structuredOverride: config.credential.lastProbe?.structured ?? null,
       })
-      cacheProvider(credentialId, provider)
+      cacheProvider(credentialId, key, provider)
       return { ok: true, provider, fallback, config }
     },
 
     invalidate(credentialId: string): void {
-      cache.delete(credentialId)
+      const key = keyByCredential.get(credentialId)
+      if (key !== undefined) cache.delete(key)
+      keyByCredential.delete(credentialId)
     },
   }
 }

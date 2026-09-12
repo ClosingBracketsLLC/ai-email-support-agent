@@ -63,6 +63,16 @@ import {
 export const STOP_LOSS_MICROS = 400_000
 
 /**
+ * Spec §Budgets, the other half of the same sentence — "$0.40 managed / 30k output tokens BYOK".
+ * A tenant's model is very often not in `model_pricing` at all (every `custom` endpoint, every
+ * un-seeded catalog id), and an unpriced call costs `0`, which makes the micro-dollar stop-loss
+ * silently inert for exactly the runs this limit was written for. Output tokens are reported by
+ * every provider, so they are the currency that always works — and it is the owner's bill, not the
+ * platform's, that this protects.
+ */
+export const STOP_LOSS_BYOK_OUTPUT_TOKENS = 30_000
+
+/**
  * Spec §Prompt blocks → caching: the per-org/agent 5-minute breakpoint only pays for its write cost
  * above roughly this many drafts an hour. Below it the agent blocks ride uncached and only the
  * cross-tenant static prefix caches.
@@ -664,7 +674,7 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
    */
   let pricingWarned = false
   /** A fallback was ATTEMPTED — so the error the attempt-1 catch below sees may be the MANAGED
-   *  provider's, and must not be blamed on (or kill) the tenant's credential. Run-scoped on purpose:
+   *  provider's, and must not be blamed on the tenant's credential. Run-scoped on purpose:
    *  only attempt 1's catch reads it, and only attempt 1 can have set it by then. */
   let triedFallback = false
   const callModel = async (attempt: number, guardrailRetry: { codes: string[] } | null, effort: LlmEffort): Promise<DraftAttempt> => {
@@ -677,6 +687,16 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
     try {
       call = await runDraftCall(resolved.provider, promptInput(guardrailRetry, effort), meta, watchdog)
     } catch (err) {
+      // The credential is killed HERE, where the error is known to be the PRIMARY's — and before the
+      // fallback is even considered. A fallback that succeeds never reaches the attempt-1 catch, so
+      // gating the kill on `!triedFallback` down there meant an opted-in agent's key was rejected on
+      // every draft, forever, and the owner was never told (review B-I2). What the fallback DOES
+      // change is the ticket: a draft that landed from Managed AI is not `provider_unavailable`.
+      // `killCredential` is guarded on `health_status <> 'dead'` and day-deduped, so attempt 2
+      // calling it again writes nothing and pages nobody.
+      if (err instanceof LlmError && err.code === 'auth' && config.mode === 'byok') {
+        await killCredential(deps, orgId, config, err.message, now)
+      }
       if (resolved.fallback && err instanceof LlmError && (FALLBACK_CODES as readonly string[]).includes(err.code) && !watchdog.aborted) {
         deps.logger.warn({ runId, code: err.code }, 'ticket.draft: the agent\'s own provider failed; falling back to Managed AI')
         await withOrg(deps.db, orgId, (tx) =>
@@ -724,12 +744,14 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
     const aborted = watchdog.aborted
 
     // Phase 6: a tenant key the provider REJECTED is not a transient failure — retrying it spends
-    // the ticket's remaining attempts on a key that will keep saying no. The credential goes `dead`
-    // (guarded: a probe that got there first wins), the owner gets one `provider_health` page, and
-    // the ticket lands `provider_unavailable` rather than `agent_failed`. The job does not rethrow:
-    // there is nothing for pg-boss to retry.
+    // the ticket's remaining attempts on a key that will keep saying no. The credential went `dead`
+    // in `callModel`'s catch (guarded: a probe that got there first wins) with one `provider_health`
+    // page; here the TICKET lands `provider_unavailable` rather than `agent_failed`, and only when
+    // no fallback answered. The job does not rethrow: there is nothing for pg-boss to retry.
     if (!aborted && err instanceof LlmError && err.code === 'auth' && config.mode === 'byok' && !triedFallback) {
-      await killCredential(deps, orgId, config, err.message, now)
+      // The credential is already dead: `callModel`'s own catch killed it the moment the PRIMARY
+      // rejected the key, whether or not a fallback then ran. What is left here is the ticket, and
+      // only when no fallback landed a draft for it.
       // `fail` returning true means the failure ceiling already escalated the ticket (`agent_failed`
       // — an owner-facing landing this must not clobber); otherwise this reason is the better one.
       const alreadyEscalated = await fail('llm_auth', errorToDetail(err), 'failed')
@@ -766,7 +788,11 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
     const attempted = decision
     guardrail = await screen(deps, orgId, runId, 1, attempted, ctx, agent, ticket.language, knowledge)
     if (!guardrail.ok) {
-      const stopLoss = usage.totals().costMicros >= STOP_LOSS_MICROS
+      // Both halves of the spec's stop-loss, and both skip the redraft the same way: managed spend
+      // in micro-dollars, BYOK in output tokens (which a provider always reports, priced or not).
+      const totals = usage.totals()
+      const stopLoss = totals.costMicros >= STOP_LOSS_MICROS
+        || (config.mode === 'byok' && totals.outputTokens >= STOP_LOSS_BYOK_OUTPUT_TOKENS)
       if (stopLoss || watchdog.aborted) {
         deps.logger.warn({ runId, ticketId, stopLoss }, 'ticket.draft: skipping the automatic redraft')
       } else {

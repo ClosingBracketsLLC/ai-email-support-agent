@@ -13,8 +13,9 @@ import pino from 'pino'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import type { TriageVerdict } from '@aesa/contracts'
 import {
-  agentRunEvents, agentRuns, auditLog, categories, createMeterSink, ensureDefaultCategories, llmCalls,
+  agentRunEvents, agentRuns, auditLog, categories, createMeterSink, ensureDefaultCategories, llmCalls, llmCredentials,
   mailboxConnections, messages, notifications, orgSettings, tickets, usageCounters, user, withOrg, workspaces,
+  type ResolvedModelConfig,
 } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
@@ -128,6 +129,36 @@ async function auditRowsFor(ticketId: string, action: string) {
 
 async function notificationsFor(dedupeKey: string) {
   return withOrg(app.db, orgId, (tx) => tx.select().from(notifications).where(eq(notifications.dedupeKey, dedupeKey)))
+}
+
+async function notificationsWithPrefix(prefix: string) {
+  const rows = await withOrg(app.db, orgId, (tx) => tx.select().from(notifications))
+  return rows.filter((r) => r.dedupeKey.startsWith(prefix))
+}
+
+/** A BYOK credential row the resolver's config can point at — what `markCredentialDead` flips. */
+async function seedCredential(over: Partial<typeof llmCredentials.$inferInsert> = {}): Promise<string> {
+  const [row] = await withOrg(app.db, orgId, (tx) =>
+    tx.insert(llmCredentials).values({
+      orgId, provider: 'custom', label: 'Acme local LLM', baseUrl: 'https://llm.acme.test/v1',
+      keyFingerprint: 'abcd1234…7890', probeModel: 'qwen3:32b', healthStatus: 'healthy', createdBy: `user:${userId}`,
+      ...over,
+    }).returning({ id: llmCredentials.id }))
+  return row!.id
+}
+
+/** What `resolveModelConfig` really returns for a byok agent — `credential` is never null there. */
+function byokConfig(credentialId: string, over: Partial<ResolvedModelConfig> = {}): Partial<ResolvedModelConfig> {
+  return {
+    mode: 'byok', credentialId, provider: 'custom', model: 'qwen3:32b', tier: 'limited',
+    credential: { label: 'Acme local LLM', baseUrl: 'https://llm.acme.test/v1', healthStatus: 'healthy', lastProbe: null, lastProbedAt: null },
+    ...over,
+  }
+}
+
+async function credentialRow(credentialId: string) {
+  const [row] = await withOrg(app.db, orgId, (tx) => tx.select().from(llmCredentials).where(eq(llmCredentials.id, credentialId)))
+  return row!
 }
 
 function makeDeps(provider: LlmProvider, over: Partial<TicketTriageDeps> = {}): {
@@ -619,7 +650,63 @@ describe('runTicketTriage', () => {
     expect(await readUsageCounter(TODAY)).toBe(0)
     expect(await runsFor(ticketId)).toHaveLength(0)
     expect(notified).toHaveLength(1)
-    expect(await notificationsFor(`escalation:${ticketId}:${TODAY}`)).toHaveLength(1)
+    // Reason-scoped, exactly as `ticket.draft`'s landing for the same reason — the day-scoped
+    // default would let an unrelated escalation earlier today swallow this page.
+    expect(await notificationsFor(`provider_unavailable:${ticketId}:${TODAY}`)).toHaveLength(1)
+    expect(await notificationsFor(`escalation:${ticketId}:${TODAY}`)).toEqual([])
+    const [audited] = await auditRowsFor(ticketId, 'ticket.escalated')
+    expect(audited!.detail).toMatchObject({ reason: 'provider_unavailable', refusal: 'credential_dead' })
+  })
+
+  it('8g. llm auth on a byok primary with no fallback: the credential goes dead, ONE provider_health page, ticket needs_owner/provider_unavailable, run failed llm_auth, no rethrow', async () => {
+    const ticketId = await seedTicket()
+    await seedInboundMessage(ticketId, 'Where is my order?', new Date('2026-09-09T11:00:00Z'))
+    const credentialId = await seedCredential()
+    const provider = createFakeProvider([{ error: new LlmError('401 invalid api key', 'auth', false) }])
+    const { deps, notified } = makeDeps(provider, { providers: staticResolver(provider, byokConfig(credentialId)) })
+
+    // Does NOT throw: a key the provider rejected is not something pg-boss can retry.
+    await runTicketTriage(deps, { orgId, ticketId }, new AbortController().signal)
+
+    const cred = await credentialRow(credentialId)
+    expect(cred.healthStatus).toBe('dead')
+    expect(cred.consecutiveFailures).toBe(1)
+    const ticket = await getTicket(ticketId)
+    expect(ticket.status).toBe('needs_owner')
+    expect(ticket.needsOwnerReason).toBe('provider_unavailable')
+    // The failure count is NOT incremented: this ticket is with the owner, not mid-retry.
+    expect(ticket.triageFailureCount).toBe(0)
+    const [run] = await runsFor(ticketId)
+    expect(run!.status).toBe('failed')
+    expect(run!.errorCode).toBe('llm_auth')
+    expect(run!.finishedAt).not.toBeNull()
+    expect(await notificationsWithPrefix(`provider_health:${credentialId}:`)).toHaveLength(1)
+    expect(await notificationsFor(`provider_unavailable:${ticketId}:${TODAY}`)).toHaveLength(1)
+    expect(notified).toHaveLength(2)
+  })
+
+  it('8h. llm auth WITH fallback: the managed provider lands the verdict AND the rejected key still goes dead with ONE page', async () => {
+    const ticketId = await seedTicket()
+    await seedInboundMessage(ticketId, 'Where is my order?', new Date('2026-09-09T11:00:00Z'))
+    const credentialId = await seedCredential()
+    const byok = createFakeProvider([{ error: new LlmError('401 invalid api key', 'auth', false) }])
+    const managed = createFakeProvider([{ parsed: BASE_VERDICT }])
+    const { deps, notified } = makeDeps(byok, {
+      providers: staticResolver(byok, byokConfig(credentialId, { fallbackToManaged: true }), managed),
+    })
+
+    await runTicketTriage(deps, { orgId, ticketId }, new AbortController().signal)
+
+    // The opt-in buys the TICKET a verdict; it does not make a rejected key usable.
+    expect((await getTicket(ticketId)).status).toBe('triaged')
+    const [run] = await runsFor(ticketId)
+    expect(run!.status).toBe('succeeded')
+    const cred = await credentialRow(credentialId)
+    expect(cred.healthStatus).toBe('dead')
+    const health = await notificationsWithPrefix(`provider_health:${credentialId}:`)
+    expect(health).toHaveLength(1)
+    expect(notified.map((n) => n.notificationId)).toContain(health[0]!.id)
+    expect(await notificationsFor(`provider_unavailable:${ticketId}:${TODAY}`)).toEqual([])
   })
 
   it('8d. fallback_to_managed covers one transient failure on the tenant provider', async () => {

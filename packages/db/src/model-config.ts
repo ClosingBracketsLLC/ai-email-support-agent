@@ -16,7 +16,16 @@ export interface ResolvedModelConfig {
   tier: QualityTier
   modelGeneration: number
   modelGenerationAt: Date | null
-  credential: { label: string; baseUrl: string | null; healthStatus: CredentialHealth; lastProbe: ProbeResultView | null } | null
+  /** `lastProbedAt` is the credential's FRESHNESS: the worker's provider cache keys on it, so a
+   *  probe on any replica invalidates every replica's cached provider (whose `structuredOverride`
+   *  and base URL were frozen at build time). Null until the first probe lands. */
+  credential: {
+    label: string
+    baseUrl: string | null
+    healthStatus: CredentialHealth
+    lastProbe: ProbeResultView | null
+    lastProbedAt: Date | null
+  } | null
 }
 
 export function managedConfig(role: ModelConfigRole): ResolvedModelConfig {
@@ -49,6 +58,9 @@ export async function resolveModelConfig(tx: OrgTx, agentId: string | null, role
   return {
     mode: 'byok', credentialId: cred.id, provider, model, effort: base.effort, fallbackToManaged: row.fallbackToManaged, tier,
     modelGeneration: row.modelGeneration, modelGenerationAt: row.modelGenerationAt,
-    credential: { label: cred.label, baseUrl: cred.baseUrl, healthStatus: cred.healthStatus as CredentialHealth, lastProbe },
+    credential: {
+      label: cred.label, baseUrl: cred.baseUrl, healthStatus: cred.healthStatus as CredentialHealth,
+      lastProbe, lastProbedAt: cred.lastProbedAt,
+    },
   }
 }

@@ -30,7 +30,7 @@ import {
   createFakeProvider, LlmError, withMeta, withMetering,
   type Capabilities, type ChatRequest, type ChatResult, type LlmProvider,
 } from '@aesa/llm'
-import { runTicketDraft, STOP_LOSS_MICROS, type TicketDraftDeps } from '../src/jobs/ticket-draft.ts'
+import { runTicketDraft, STOP_LOSS_BYOK_OUTPUT_TOKENS, STOP_LOSS_MICROS, type TicketDraftDeps } from '../src/jobs/ticket-draft.ts'
 import { staticRefusal, staticResolver } from '../src/provider-resolver.ts'
 
 const rand = () => randomBytes(4).toString('hex')
@@ -286,7 +286,7 @@ async function seedCredential(over: Partial<typeof llmCredentials.$inferInsert> 
 function byokConfig(credentialId: string, over: Partial<ResolvedModelConfig> = {}): Partial<ResolvedModelConfig> {
   return {
     mode: 'byok', credentialId, provider: 'custom', model: 'qwen3:32b', tier: 'limited',
-    credential: { label: 'Acme local LLM', baseUrl: 'https://llm.acme.test/v1', healthStatus: 'healthy', lastProbe: null },
+    credential: { label: 'Acme local LLM', baseUrl: 'https://llm.acme.test/v1', healthStatus: 'healthy', lastProbe: null, lastProbedAt: null },
     ...over,
   }
 }
@@ -689,6 +689,41 @@ describe('runTicketDraft', () => {
     const rows = await draftsFor(ticketId)
     expect(rows[0]!.decisionReason).toBe('guardrail_failed')
     expect((await getTicket(ticketId)).needsOwnerReason).toBe('guardrail_failed')
+  })
+
+  it('13d. the BYOK stop-loss is output tokens, not dollars: an unpriced tenant model past 30k skips the redraft too', async () => {
+    const credentialId = await seedCredential()
+    const ticketId = await seedDraftableTicket()
+    // `qwen3:32b` has no `model_pricing` row, so this run costs 0 and the micro-dollar stop-loss is
+    // inert — exactly the case the spec's BYOK half is for.
+    const provider = createFakeProvider([{ parsed: reply({ body: HTML_BODY }), usage: { outputTokens: STOP_LOSS_BYOK_OUTPUT_TOKENS + 1 } }])
+    const { deps } = makeDeps(provider, { providers: staticResolver(provider, byokConfig(credentialId)) })
+
+    await run(deps, ticketId)
+
+    expect(provider.calls).toHaveLength(1)                       // no attempt 2
+    const [run1] = await runsFor(ticketId)
+    expect(run1!.costMicros).toBe(0)
+    expect(run1!.outputTokens).toBe(STOP_LOSS_BYOK_OUTPUT_TOKENS + 1)
+    const rows = await draftsFor(ticketId)
+    expect(rows[0]!.decisionReason).toBe('guardrail_failed')
+    expect((await getTicket(ticketId)).needsOwnerReason).toBe('guardrail_failed')
+  })
+
+  it('13e. a MANAGED run is not governed by the BYOK token limit: 30k output tokens still buys its redraft', async () => {
+    const ticketId = await seedDraftableTicket()
+    // Managed pricing would trip the micro-dollar stop-loss long before 30k tokens, so this run is
+    // priced at 0 by naming a model with no pricing row — isolating the token check itself.
+    const provider = createFakeProvider([
+      { parsed: reply({ body: HTML_BODY }), usage: { outputTokens: STOP_LOSS_BYOK_OUTPUT_TOKENS + 1 } },
+      { parsed: reply({ body: CLEAN_BODY }), usage: { outputTokens: 10 } },
+    ])
+    const { deps } = makeDeps(provider, { providers: staticResolver(provider, { mode: 'managed', model: 'qwen3:32b' }) })
+
+    await run(deps, ticketId)
+
+    expect(provider.calls).toHaveLength(2)                       // the redraft still ran
+    expect((await draftsFor(ticketId))[0]!.body).toBe(CLEAN_BODY)
   })
 
   it('11. an escalate outcome hands the ticket over with a page and stores no draft', async () => {
@@ -1407,12 +1442,12 @@ describe('runTicketDraft', () => {
     expect(notified).toHaveLength(2)
   })
 
-  it('17e. llm auth WITH fallback: the second call goes to the managed provider, the run records the fallback and the breakdown says managed', async () => {
+  it('17e. llm auth WITH fallback: the managed provider lands the draft AND the rejected key still goes dead with ONE page', async () => {
     const credentialId = await seedCredential()
     const ticketId = await seedDraftableTicket()
     const byok = createFakeProvider([{ error: new LlmError('401 invalid api key', 'auth', false) }])
     const managed = createFakeProvider([{ parsed: REPLY }])
-    const { deps } = makeDeps(byok, { providers: staticResolver(byok, byokConfig(credentialId, { fallbackToManaged: true }), managed) })
+    const { deps, notified } = makeDeps(byok, { providers: staticResolver(byok, byokConfig(credentialId, { fallbackToManaged: true }), managed) })
 
     await run(deps, ticketId)
 
@@ -1423,8 +1458,17 @@ describe('runTicketDraft', () => {
     const [draft] = await draftsFor(ticketId)
     expect(draft!.status).toBe('pending')
     expect(draft!.confidenceBreakdown).toMatchObject({ mode: 'managed', provider: 'anthropic', modelId: 'claude-opus-5', tier: 'limited' })
-    // The credential is NOT killed: the fallback covered this call and the probe owns health.
-    expect((await credentialRow(credentialId)).healthStatus).toBe('healthy')
+    // The key the provider REJECTED is dead whether or not the fallback covered this draft — the
+    // opt-in buys the ticket a reply, it does not make a rejected key usable (review B-I2). The
+    // ticket, though, is NOT escalated: a draft did land.
+    const cred = await credentialRow(credentialId)
+    expect(cred.healthStatus).toBe('dead')
+    expect(cred.consecutiveFailures).toBe(1)
+    const health = await notificationsWithPrefix(`provider_health:${credentialId}:`)
+    expect(health).toHaveLength(1)
+    expect(notified).toContain(health[0]!.id)      // dispatched, not just written
+    expect(await notificationsWithPrefix(`provider_unavailable:${ticketId}:`)).toEqual([])
+    expect((await getTicket(ticketId)).status).toBe('awaiting_review')
     const [run1] = await runsFor(ticketId)
     const fallbackEvents = (await eventsFor(run1!.id)).filter((e) => (e.payload as { fallback?: boolean }).fallback === true)
     expect(fallbackEvents).toHaveLength(1)
