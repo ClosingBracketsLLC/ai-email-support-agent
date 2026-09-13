@@ -19,9 +19,10 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { INVARIANTS } from '@aesa/core'
 import { encrypt, hashToken, loadKekRing, type KekRing } from '@aesa/crypto'
 import {
-  agentCategoryPolicies, agents, audit, auditLog, bumpMeter, categories, drafts, ensureDefaultCategories,
-  loadOrgDek, mailboxConnections, mailboxCredentials, messages, notifications, outboundSends, platformState,
-  provisionOrgKeys, SEND_METERS, tickets, usageCounters, user, withOrg, withPlatform, workspaces,
+  agentCategoryPolicies, agentModelConfig, agents, audit, auditLog, billingSubscriptions, bumpMeter, categories,
+  drafts, ensureDefaultCategories, llmCredentials, loadOrgDek, mailboxConnections, mailboxCredentials, messages,
+  notifications, outboundSends, platformState, provisionOrgKeys, SEND_METERS, tickets, usageCounters, user,
+  withOrg, withPlatform, workspaces,
 } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
@@ -61,6 +62,10 @@ function baseConfig(overrides: Partial<WorkerConfig> = {}): WorkerConfig {
     knowledgeEmbedModel: 'voyage-4',
     knowledgeRerank: false,
     s3: null,
+    stripe: null,
+    managedDraftSlots: 0,
+    sentryDsn: null,
+    sentryEnvironment: 'test',
     gmailPubsubTopic: null, webhookPublicUrl: null, platformSender: 'no-reply@aesa.test',
     ...overrides,
   }
@@ -254,6 +259,29 @@ async function seedApprovedDraft(opts: SeedOpts = {}): Promise<Seeded> {
       })
       .returning({ id: outboundSends.id })
     return { ticketId: ticket!.id, draftId: draft!.id, sendId: send!.id, threadId: threadId!, inbound, threadSnapshotAt }
+  })
+}
+
+/** Phase 7: the workspace's `billing_subscriptions` row. Without one every fixture reads as a fresh
+ *  TRIAL — `trialing`, `trial_ends_at NULL`, which `isBillingActive` calls ACTIVE, so every existing
+ *  test in this file is unaffected. */
+async function seedBilling(over: Partial<typeof billingSubscriptions.$inferInsert> = {}): Promise<void> {
+  await withOrg(app.db, fx.orgId, (tx) =>
+    tx.insert(billingSubscriptions).values({ orgId: fx.orgId, plan: 'standard', status: 'active', ...over })
+      .onConflictDoUpdate({ target: billingSubscriptions.orgId, set: { plan: 'standard', status: 'active', ...over } }))
+}
+
+/** Points this fixture's agent at its own provider key for the DRAFT role — what `resolveModelConfig`
+ *  reads, and therefore what decides whether a delivered reply counts against the MANAGED allowance. */
+async function setByokDraftModel(): Promise<void> {
+  await withOrg(app.db, fx.orgId, async (tx) => {
+    const [cred] = await tx.insert(llmCredentials).values({
+      orgId: fx.orgId, provider: 'custom', label: 'Acme local LLM', baseUrl: 'https://llm.acme.test/v1',
+      keyFingerprint: 'abcd1234…7890', probeModel: 'qwen3:32b', healthStatus: 'healthy', createdBy: `user:${userId}`,
+    }).returning({ id: llmCredentials.id })
+    await tx.insert(agentModelConfig).values({
+      orgId: fx.orgId, agentId: fx.agentId, role: 'draft', mode: 'byok', credentialId: cred!.id, model: 'qwen3:32b',
+    })
   })
 }
 
@@ -1461,6 +1489,111 @@ describe('send.execute', () => {
     expect(ticket.status).toBe('needs_owner')
     expect(ticket.needsOwnerReason).toBe('send_failed')
     expect(notified).toHaveLength(1)
+  })
+
+  // --- Phase 7: the eighth lever and the managed conversations meter -----------------------------
+
+  it('P7 an AUTO send on a past_due workspace holds (held:subscription_inactive) with one day-deduped page', async () => {
+    const s = await seedAutoSend()
+    await seedBilling({ status: 'past_due' })
+    const { deps, notified } = makeDeps()
+
+    await run(deps, s.sendId)
+
+    expect(fx.mailbox.sentMessages()).toHaveLength(0)
+    const send = await getSend(s.sendId)
+    expect(send.status).toBe('held')
+    expect(send.lastError).toBe('held:subscription_inactive')
+    expect((await getDraft(s.draftId)).status).toBe('held')
+    expect((await getTicket(s.ticketId)).status).toBe('auto_sending')
+    expect(await auditActions(s.sendId)).toContain('send.held')
+    const rows = await orgNotifications()
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.title).toBe('Reply on hold — the workspace has no active subscription')
+    expect(rows[0]!.dedupeKey).toBe(`send_held:${s.sendId}:${TODAY}`)
+    expect(notified.map((n) => n.notificationId)).toEqual([rows[0]!.id])
+  })
+
+  it('P7 an expired trial holds an auto-send the same way — the clock alone decides', async () => {
+    const s = await seedAutoSend()
+    await seedBilling({ plan: 'trial', status: 'trialing', trialEndsAt: new Date(NOW.getTime() - 86_400_000) })
+    const { deps } = makeDeps()
+
+    await run(deps, s.sendId)
+
+    expect(fx.mailbox.sentMessages()).toHaveLength(0)
+    expect((await getSend(s.sendId)).lastError).toBe('held:subscription_inactive')
+  })
+
+  it('P7 a HUMAN-approved send on the SAME past_due workspace still goes out — an approval is a decision, not an auto-send', async () => {
+    const s = await seedApprovedDraft()          // decision_source 'app'
+    await seedBilling({ status: 'past_due' })
+    const { deps } = makeDeps()
+
+    await run(deps, s.sendId)
+
+    // The spec's wording is "nothing sends AUTOMATICALLY": an owner who read this reply and tapped
+    // Approve while the card was declining must not have their decision silently swallowed.
+    expect(fx.mailbox.sentMessages()).toHaveLength(1)
+    const send = await getSend(s.sendId)
+    expect(send.status).toBe('sent')
+    expect(send.lastError).toBeNull()
+    expect((await getDraft(s.draftId)).status).toBe('sent')
+    expect((await getTicket(s.ticketId)).status).toBe('waiting_on_customer')
+    expect(await orgNotifications()).toEqual([])
+  })
+
+  it('P7 a Hold + re-approve inside the hold window sends on a past_due workspace: the lever reads the DRAFT', async () => {
+    const s = await seedAutoSend()
+    await seedBilling({ status: 'past_due' })
+    // What the api's Hold + re-approve leaves behind: the agent proposed it (`auto_decided_at`
+    // stands) but a HUMAN sent it, so `decision_source` is `app`.
+    await withOrg(app.db, fx.orgId, (tx) =>
+      tx.update(drafts).set({ decisionSource: 'app', decidedBy: userId }).where(eq(drafts.id, s.draftId)))
+    const { deps } = makeDeps()
+
+    await run(deps, s.sendId)
+
+    expect(fx.mailbox.sentMessages()).toHaveLength(1)
+    expect((await getSend(s.sendId)).status).toBe('sent')
+  })
+
+  it('P7 a MANAGED reply bumps ai_handled_conversations_managed beside ai_handled_conversations', async () => {
+    const s = await seedApprovedDraft()
+    const { deps } = makeDeps()
+
+    await run(deps, s.sendId)
+
+    const m = await meters()
+    expect(m[SEND_METERS.aiHandledConversations]).toBe(1)
+    expect(m[SEND_METERS.aiHandledManaged]).toBe(1)
+    expect((await getTicket(s.ticketId)).aiHandledMonth).toBe(THIS_MONTH)
+  })
+
+  it('P7 a BYOK reply bumps ai_handled_conversations but NOT the managed meter — BYOK pays the subscription only', async () => {
+    await setByokDraftModel()
+    const s = await seedApprovedDraft()
+    const { deps } = makeDeps()
+
+    await run(deps, s.sendId)
+
+    const m = await meters()
+    expect(m[SEND_METERS.aiHandledConversations]).toBe(1)
+    expect(m[SEND_METERS.aiHandledManaged]).toBeUndefined()
+  })
+
+  it('P7 the ai_handled_month stamp is the ONE idempotency gate for BOTH meters', async () => {
+    const s = await seedApprovedDraft()
+    await run(makeDeps().deps, s.sendId)
+
+    // A second reply on the SAME ticket in the same calendar month.
+    const second = await seedSecondSend(s.ticketId)
+    await run(makeDeps().deps, second.sendId)
+
+    const m = await meters()
+    expect(m[SEND_METERS.reviewSends]).toBe(2)
+    expect(m[SEND_METERS.aiHandledConversations]).toBe(1)
+    expect(m[SEND_METERS.aiHandledManaged]).toBe(1)
   })
 })
 

@@ -9,8 +9,7 @@
 import { and, eq, inArray, type SQL } from 'drizzle-orm'
 import type { PgUpdateSetSource } from 'drizzle-orm/pg-core'
 import type { KnowledgeFailureReason, KnowledgeSourceStatus } from '@aesa/contracts'
-import type { SettingKey } from '@aesa/core'
-import { audit, knowledgeSources, orgSettings, withOrg, type AuditActor, type Db, type OrgTx } from '@aesa/db'
+import { audit, knowledgeSources, withOrg, type AuditActor, type Db, type OrgTx } from '@aesa/db'
 
 /** Accepts drizzle `sql` fragments as column values (the crawl's jsonb progress merge), not only literals. */
 export type SourcePatch = PgUpdateSetSource<typeof knowledgeSources>
@@ -103,18 +102,4 @@ export async function failSource(
       detail: { reason: p.reason },
     })
   })
-}
-
-/** The org's rows for the keys a job resolves, in `resolveSetting`'s `{ org }` shape (ticket-triage.ts's pattern). */
-export async function loadOrgSettings(tx: OrgTx, keys: SettingKey[]): Promise<Partial<Record<SettingKey, unknown>>> {
-  // The `orgId` predicate is a brace, not the lock: RLS already scopes this read. It is here to
-  // match the api's identical helper (`apps/api/src/org-settings.ts`) exactly — a table that ever
-  // landed in `RLS_EXEMPT`'s list would otherwise silently read another org's cap.
-  const rows = await tx
-    .select({ key: orgSettings.key, value: orgSettings.value })
-    .from(orgSettings)
-    .where(and(eq(orgSettings.orgId, tx.orgId), inArray(orgSettings.key, keys)))
-  const out: Partial<Record<SettingKey, unknown>> = {}
-  for (const row of rows) out[row.key as SettingKey] = row.value
-  return out
 }

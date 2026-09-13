@@ -330,6 +330,10 @@ describe('Phase 6 close-out E2E (the real llm service, the real llm.probe job, t
       knowledgeEmbedModel: 'voyage-4',
       knowledgeRerank: false,
       s3: null,
+      stripe: null,
+      managedDraftSlots: 0,
+      sentryDsn: null,
+      sentryEnvironment: 'test',
       platformSender: 'no-reply@aesa.test',
     }
   }

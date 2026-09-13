@@ -3,6 +3,8 @@ import { parseS3Env, type S3Config } from '@aesa/knowledge'
 import { parseFirstAddrSpec } from '@aesa/mail'
 import { parseMailConfig, type MailConfig } from '@aesa/platform-mail'
 import { z } from 'zod'
+// type-only: the SDK lives behind `createStripeUsagePort` and must never enter config's module graph.
+import type { StripeUsageConfig } from './billing/stripe.ts'
 import { parseWorkerRoles, type WorkerRole } from './roles.ts'
 
 const EnvSchema = z.object({
@@ -61,6 +63,22 @@ const EnvSchema = z.object({
   S3_ACCESS_KEY_ID: z.string().optional(),
   S3_SECRET_ACCESS_KEY: z.string().optional(),
   S3_FORCE_PATH_STYLE: z.string().optional(),
+  /** Phase 7 billing, the worker's half. REQUIRED IN PRODUCTION when `WORKER_ROLES` includes `cron`:
+   * `billing.report-usage` is what turns a workspace's overage into money and keeps the licensed
+   * per-domain quantity in step, and a `cron` replica without it would look healthy while nobody
+   * was ever billed. Unset elsewhere is normal — the cron still runs its local half (the trial and
+   * allowance notices) and counts every Stripe call it could not make as `skipped`.
+   * `STRIPE_METER_EVENT_NAME` must name the SAME Billing Meter the api's `STRIPE_PRICE_OVERAGE`
+   * price is attached to. */
+  STRIPE_SECRET_KEY: z.string().optional(),
+  STRIPE_METER_EVENT_NAME: z.string().default('ai_conversation_overage'),
+  /** How many MANAGED model calls this deployment may have in flight at once, across every replica
+   * (plan deviation 13). Sized to the Anthropic tier in the runbook; `0` disables the pool. */
+  MANAGED_DRAFT_SLOTS: z.coerce.number().int().min(0).default(4),
+  /** Task 11's error reporting. Parsed here (one schema owns the worker's environment) and read
+   * there; absent everywhere it is not configured, which is the normal state of a dev box. */
+  SENTRY_DSN: z.string().optional(),
+  SENTRY_ENVIRONMENT: z.string().optional(),
 })
 
 export interface OAuthClient {
@@ -95,6 +113,14 @@ export interface WorkerConfig {
   knowledgeRerank: boolean
   /** The six `S3_*` as one config, or null when object storage is not configured at all. */
   s3: WorkerS3Config | null
+  /** `STRIPE_SECRET_KEY` + `STRIPE_METER_EVENT_NAME`, or null when billing is not configured. */
+  stripe: StripeUsageConfig | null
+  /** The deployment-wide managed-draft admission slot count; 0 disables the pool. */
+  managedDraftSlots: number
+  /** Task 11: the Sentry DSN, or null. Wrapped like every other credential in this file. */
+  sentryDsn: Secret | null
+  /** Task 11: the environment tag Sentry stamps on an event; defaults to NODE_ENV. */
+  sentryEnvironment: string
 }
 
 /** `parseS3Env`'s shape with the secret wrapped: the same rule every other credential here follows
@@ -162,6 +188,24 @@ export function loadConfig(env: NodeJS.ProcessEnv): WorkerConfig {
     throw new Error('MAIL_FROM is required in production when WORKER_ROLES includes `sync` (mailbox.sync platform-mail detection)')
   }
 
+  // Only the `cron` role sends platform mail (notify.digest's email pass), so only it must be
+  // fully configured in production — a sync/agent/send replica lands on the devsink it never calls.
+  // Built here rather than inline in the return so the `cron` role's TWO production requirements
+  // are refused in a fixed order: the mail transport first, then Stripe.
+  const mail = parseMailConfig(
+    { EMAIL_TRANSPORT: d.EMAIL_TRANSPORT, RESEND_API_KEY: d.RESEND_API_KEY, MAIL_FROM: d.MAIL_FROM },
+    { production, requireInProduction: roles.has('cron') },
+  )
+
+  // `billing.report-usage` runs under `cron` and is the ONLY thing on this side that talks to
+  // Stripe, so the gate is role-scoped exactly like the ring's and the bucket's.
+  const stripe: StripeUsageConfig | null = d.STRIPE_SECRET_KEY
+    ? { secretKey: new Secret(d.STRIPE_SECRET_KEY), meterEventName: d.STRIPE_METER_EVENT_NAME }
+    : null
+  if (production && roles.has('cron') && !stripe) {
+    throw new Error('STRIPE_SECRET_KEY is required in production when WORKER_ROLES includes `cron` (billing.report-usage)')
+  }
+
   return {
     env: d.NODE_ENV,
     databaseUrl: d.DATABASE_URL,
@@ -174,17 +218,16 @@ export function loadConfig(env: NodeJS.ProcessEnv): WorkerConfig {
     gmailPubsubTopic: d.GMAIL_PUBSUB_TOPIC?.trim() || null,
     webhookPublicUrl: d.WEBHOOK_PUBLIC_URL ? d.WEBHOOK_PUBLIC_URL.replace(/\/+$/, '') : null,
     platformSender,
-    // Only the `cron` role sends platform mail (notify.digest's email pass), so only it must be
-    // fully configured in production — a sync/agent/send replica lands on the devsink it never calls.
-    mail: parseMailConfig(
-      { EMAIL_TRANSPORT: d.EMAIL_TRANSPORT, RESEND_API_KEY: d.RESEND_API_KEY, MAIL_FROM: d.MAIL_FROM },
-      { production, requireInProduction: roles.has('cron') },
-    ),
+    mail,
     appBaseUrl: optionalOrigin('APP_BASE_URL', d.APP_BASE_URL),
     appWebOrigin: optionalOrigin('APP_WEB_ORIGIN', d.APP_WEB_ORIGIN),
     voyageApiKey: d.VOYAGE_API_KEY ? new Secret(d.VOYAGE_API_KEY) : null,
     knowledgeEmbedModel: d.KNOWLEDGE_EMBED_MODEL,
     knowledgeRerank: d.KNOWLEDGE_RERANK === 'on',
     s3,
+    stripe,
+    managedDraftSlots: d.MANAGED_DRAFT_SLOTS,
+    sentryDsn: d.SENTRY_DSN ? new Secret(d.SENTRY_DSN) : null,
+    sentryEnvironment: d.SENTRY_ENVIRONMENT ?? d.NODE_ENV,
   }
 }

@@ -136,7 +136,8 @@ describe('worker config', () => {
     })
 
     it('builds the resend transport config in production when the cron role is fully configured', () => {
-      const config = loadConfig({ DATABASE_URL, NODE_ENV: 'production', WORKER_ROLES: 'cron', RESEND_API_KEY: 're_k', MAIL_FROM: 'aesa <no-reply@x.test>' })
+      // STRIPE_SECRET_KEY rides along: a production `cron` replica needs both (billing.report-usage).
+      const config = loadConfig({ DATABASE_URL, NODE_ENV: 'production', WORKER_ROLES: 'cron', RESEND_API_KEY: 're_k', MAIL_FROM: 'aesa <no-reply@x.test>', STRIPE_SECRET_KEY: 'sk_live_x' })
       expect(config.mail.transport).toBe('resend')
       expect(config.mail.transport === 'resend' && config.mail.apiKey.expose()).toBe('re_k')
       expect(JSON.stringify(config.mail)).not.toContain('re_k')
@@ -156,6 +157,73 @@ describe('worker config', () => {
       expect(() => loadConfig({ DATABASE_URL, APP_WEB_ORIGIN: 'aesa://app' })).toThrow(/APP_WEB_ORIGIN must be an http\(s\) URL/)
     })
   })
+  describe('billing: STRIPE_* (Phase 7)', () => {
+    const cronEnv = { NODE_ENV: 'production' as const, WORKER_ROLES: 'cron', RESEND_API_KEY: 're_k', MAIL_FROM: 'aesa <no-reply@x.test>' }
+
+    it('reports null when STRIPE_SECRET_KEY is unset, so a dev box boots with billing inert', () => {
+      const config = loadConfig({ DATABASE_URL })
+      expect(config.stripe).toBeNull()
+    })
+
+    it('wraps the key in a Secret and defaults the meter event name', () => {
+      const config = loadConfig({ DATABASE_URL, STRIPE_SECRET_KEY: 'sk_test_x' })
+      expect(config.stripe?.secretKey.expose()).toBe('sk_test_x')
+      expect(config.stripe?.meterEventName).toBe('ai_conversation_overage')
+      expect(JSON.stringify(config.stripe)).not.toContain('sk_test_x')
+    })
+
+    it('reads STRIPE_METER_EVENT_NAME when the deployment names its meter something else', () => {
+      expect(loadConfig({ DATABASE_URL, STRIPE_SECRET_KEY: 'sk_test_x', STRIPE_METER_EVENT_NAME: 'aesa_overage' }).stripe?.meterEventName)
+        .toBe('aesa_overage')
+    })
+
+    it('throws in production when the cron role is active and STRIPE_SECRET_KEY is missing', () => {
+      expect(() => loadConfig({ DATABASE_URL, ...cronEnv }))
+        .toThrow(/STRIPE_SECRET_KEY is required in production when WORKER_ROLES includes `cron`/)
+    })
+
+    it('does NOT throw in production without the cron role — no other replica ever calls Stripe', () => {
+      const config = loadConfig({ DATABASE_URL, NODE_ENV: 'production', WORKER_ROLES: 'send' })
+      expect(config.stripe).toBeNull()
+    })
+
+    it('does NOT throw in development/test even when the cron role is active', () => {
+      expect(loadConfig({ DATABASE_URL, WORKER_ROLES: 'cron' }).stripe).toBeNull()
+    })
+  })
+
+  describe('MANAGED_DRAFT_SLOTS (Phase 7)', () => {
+    it('defaults to 4', () => {
+      expect(loadConfig({ DATABASE_URL }).managedDraftSlots).toBe(4)
+    })
+
+    it('parses a numeric string, and 0 (the pool switched off)', () => {
+      expect(loadConfig({ DATABASE_URL, MANAGED_DRAFT_SLOTS: '12' }).managedDraftSlots).toBe(12)
+      expect(loadConfig({ DATABASE_URL, MANAGED_DRAFT_SLOTS: '0' }).managedDraftSlots).toBe(0)
+    })
+
+    it('rejects a negative, a fraction and a non-number', () => {
+      expect(() => loadConfig({ DATABASE_URL, MANAGED_DRAFT_SLOTS: '-1' })).toThrow(/MANAGED_DRAFT_SLOTS/)
+      expect(() => loadConfig({ DATABASE_URL, MANAGED_DRAFT_SLOTS: '2.5' })).toThrow(/MANAGED_DRAFT_SLOTS/)
+      expect(() => loadConfig({ DATABASE_URL, MANAGED_DRAFT_SLOTS: 'four' })).toThrow(/MANAGED_DRAFT_SLOTS/)
+    })
+  })
+
+  describe('SENTRY_* (Phase 7, read by Task 11)', () => {
+    it('reports null and falls back to NODE_ENV when unset', () => {
+      const config = loadConfig({ DATABASE_URL })
+      expect(config.sentryDsn).toBeNull()
+      expect(config.sentryEnvironment).toBe('development')
+    })
+
+    it('wraps the DSN in a Secret and reads an explicit environment tag', () => {
+      const config = loadConfig({ DATABASE_URL, SENTRY_DSN: 'https://abc@o1.ingest.sentry.io/2', SENTRY_ENVIRONMENT: 'staging' })
+      expect(config.sentryDsn?.expose()).toBe('https://abc@o1.ingest.sentry.io/2')
+      expect(String(config.sentryDsn)).toBe('[redacted]')
+      expect(config.sentryEnvironment).toBe('staging')
+    })
+  })
+
   describe('knowledge: Voyage, the embed model, rerank and S3 (Task 8)', () => {
     const s3Env = {
       S3_ENDPOINT: 'http://localhost:9000', S3_REGION: 'us-east-1', S3_BUCKET: 'aesa-dev',

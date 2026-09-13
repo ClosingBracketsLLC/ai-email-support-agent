@@ -7,8 +7,11 @@
 import { randomBytes } from 'node:crypto'
 import { and, eq, sql } from 'drizzle-orm'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
-import { INVARIANTS, type SettingKey } from '@aesa/core'
-import { agentRunEvents, agentRuns, mailboxConnections, tickets, usageCounters, user, withOrg, withPlatform, workspaces } from '@aesa/db'
+import { INVARIANTS, PLANS, planSettingDefaults } from '@aesa/core'
+import {
+  agentRunEvents, agentRuns, LLM_METERS, mailboxConnections, tickets, usageCounters, user, withOrg, withPlatform, workspaces,
+  type SettingSources,
+} from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
 import { DRAFT_METER, gateAndRecordRun, PER_ORG_DRAFT_CONCURRENCY, readCapsUnlocked, utcMidnight } from '../src/drafting/caps.ts'
@@ -55,8 +58,9 @@ afterAll(async () => {
 // object its caller passes — the draft job is what reads org_settings, in Task 11.)
 beforeEach(async () => {
   await withOrg(app.db, orgId, (tx) => tx.delete(agentRuns))   // agent_run_events cascade
-  await setUsageCounter(DRAFT_METER, 0)
-  await setUsageCounter('llm_cost_micros', 0)
+  // Every day, not just today: the trial budget sums the whole history, so a counter one test
+  // seeded on an earlier day would silently cap the next one.
+  await withOrg(app.db, orgId, (tx) => tx.delete(usageCounters))
   ticketId = await seedTicket()
 })
 
@@ -90,7 +94,11 @@ async function runRows() {
   return withOrg(app.db, orgId, (tx) => tx.select().from(agentRuns))
 }
 
-const SETTINGS: Partial<Record<SettingKey, unknown>> = {}
+/** What `loadSettingSources` returns for a workspace on the paid plan with no overrides — the
+ *  shape `GateParams.settings` now takes (Phase 7: org rows AND the plan's defaults). */
+const SETTINGS: SettingSources = { org: {}, plan: planSettingDefaults('standard'), planId: 'standard' }
+/** The same for a trial workspace: a 50-draft day, a $3 day and the $10 TOTAL trial budget. */
+const TRIAL_SETTINGS: SettingSources = { org: {}, plan: planSettingDefaults('trial'), planId: 'trial' }
 
 const gate = (over: Partial<Parameters<typeof gateAndRecordRun>[1]> = {}, db = app.db) =>
   withOrg(db, orgId, (tx) =>
@@ -154,7 +162,7 @@ describe('gateAndRecordRun', () => {
   it("org_draft_capped: the caller's resolved daily draft cap is what the meter is measured against", async () => {
     await setUsageCounter(DRAFT_METER, 1)
 
-    expect(await gate({ settings: { 'autonomy.daily_draft_cap': 1 } })).toEqual({ outcome: 'org_draft_capped' })
+    expect(await gate({ settings: { ...SETTINGS, org: { 'autonomy.daily_draft_cap': 1 } } })).toEqual({ outcome: 'org_draft_capped' })
     expect(await runRows()).toHaveLength(0)
     expect(await readUsageCounter(DRAFT_METER)).toBe(1)
   })
@@ -162,8 +170,39 @@ describe('gateAndRecordRun', () => {
   it('org_spend_capped: the daily USD cap is compared in micros', async () => {
     await setUsageCounter('llm_cost_micros', 60_000_000)
 
-    expect(await gate()).toEqual({ outcome: 'org_spend_capped', costMicrosToday: 60_000_000 })
+    expect(await gate()).toEqual({ outcome: 'org_spend_capped', scope: 'daily', costMicros: 60_000_000 })
     expect(await runRows()).toHaveLength(0)
+  })
+
+  // Phase 7 branch 4b. The trial's TOTAL Managed-AI budget, summed over every day there has ever
+  // been — the daily cap passes ($2.50 today against the trial's $3) and the trial total ($10.50
+  // against $10) is what refuses. Worked with real numbers so the two caps cannot be confused.
+  it("org_spend_capped/trial: the trial's TOTAL budget trips even when today's daily cap passes", async () => {
+    await setUsageCounter(LLM_METERS.costMicros, 2_500_000)                       // $2.50 today  < $3 daily
+    await setUsageCounter(LLM_METERS.costMicros, 5_000_000, '2026-06-13')         // $5.00 earlier
+    await setUsageCounter(LLM_METERS.costMicros, 3_000_000, YESTERDAY)            // $3.00 earlier — $10.50 total
+
+    expect(await gate({ settings: TRIAL_SETTINGS })).toEqual({
+      outcome: 'org_spend_capped', scope: 'trial', costMicros: PLANS.trial.llmUsdBudget * 1_000_000 + 500_000,
+    })
+    expect(await runRows()).toHaveLength(0)
+    expect(await readUsageCounter(DRAFT_METER)).toBe(0)
+  })
+
+  it('the same spend on a standard workspace proceeds — a paid plan has no total budget at all', async () => {
+    await setUsageCounter(LLM_METERS.costMicros, 2_500_000)
+    await setUsageCounter(LLM_METERS.costMicros, 5_000_000, '2026-06-13')
+    await setUsageCounter(LLM_METERS.costMicros, 3_000_000, YESTERDAY)
+
+    expect((await gate({ settings: SETTINGS })).outcome).toBe('proceed')
+  })
+
+  it("org_draft_capped: the PLAN's daily draft cap is what gates, not the catalog default", async () => {
+    await setUsageCounter(DRAFT_METER, PLANS.trial.dailyDraftCap)
+
+    // 50 runs today is under the catalog default (2000) and AT the trial plan's own cap.
+    expect(await gate({ settings: TRIAL_SETTINGS })).toEqual({ outcome: 'org_draft_capped' })
+    expect((await gate({ settings: SETTINGS })).outcome).toBe('proceed')
   })
 
   it('evaluates the per-ticket cap FIRST — a capped ticket in a capped org still reads ticket_capped', async () => {
@@ -210,7 +249,7 @@ describe('gateAndRecordRun', () => {
   it('serializes two concurrent gates: exactly one proceeds through a cap of 1', async () => {
     const otherTicketId = await seedTicket()       // hoisted: both gates must start together
     const second = createDb(t.url)
-    const settings = { 'autonomy.daily_draft_cap': 1 }
+    const settings: SettingSources = { ...SETTINGS, org: { 'autonomy.daily_draft_cap': 1 } }
     try {
       // Warm the second pool first: establishing its connection takes long enough that an unwarmed
       // one would let the first gate finish before the second even began — no race to observe.
@@ -240,7 +279,17 @@ describe('readCapsUnlocked', () => {
 
     const caps = await withOrg(app.db, orgId, (tx) => readCapsUnlocked(tx, { orgId, ticketId, settings: SETTINGS, now: NOW }))
 
-    expect(caps).toEqual({ ticketRunsToday: 2, orgCostMicrosToday: 1_234_000, orgDraftsToday: 7 })
+    expect(caps).toEqual({ ticketRunsToday: 2, orgCostMicrosToday: 1_234_000, orgDraftsToday: 7, orgTrialCostMicros: 1_234_000 })
+  })
+
+  it("mirrors the gate's trial budget read: orgTrialCostMicros sums EVERY day, not just today", async () => {
+    await setUsageCounter(LLM_METERS.costMicros, 2_500_000)
+    await setUsageCounter(LLM_METERS.costMicros, 8_000_000, YESTERDAY)
+
+    const caps = await withOrg(app.db, orgId, (tx) => readCapsUnlocked(tx, { orgId, ticketId, settings: TRIAL_SETTINGS, now: NOW }))
+
+    expect(caps.orgCostMicrosToday).toBe(2_500_000)
+    expect(caps.orgTrialCostMicros).toBe(10_500_000)
   })
 
   it('writes nothing — a capped ticket must never be stamped by a pre-check', async () => {

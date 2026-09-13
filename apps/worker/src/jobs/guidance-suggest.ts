@@ -26,7 +26,7 @@ import { z } from 'zod'
 import { runGuidanceSuggestCall } from '@aesa/agent'
 import { resolveSetting } from '@aesa/core'
 import {
-  agents, audit, bumpMeter, categories, drafts, GUIDANCE_METERS, guidanceSuggestions, orgSettings,
+  agents, audit, bumpMeter, categories, drafts, GUIDANCE_METERS, guidanceSuggestions, loadSettingSources,
   platformState, usageCounters, withOrg, workspaces, type Db,
 } from '@aesa/db'
 import { defineJob, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
@@ -107,16 +107,12 @@ async function load(db: Db, orgId: string, draftId: string): Promise<Loaded | nu
 /** Fail-closed: the lock, the compare, and the bump all happen in the SAME transaction as
  *  `drafting/caps.ts`'s draft gate — the spend row lands before the call it authorizes, so a
  *  process that dies mid-call still counts. Returns `true` when the org is AT or OVER cap. */
-async function gateAndBumpCap(db: Db, orgId: string, day: string): Promise<boolean> {
+async function gateAndBumpCap(db: Db, orgId: string, day: string, now: Date): Promise<boolean> {
   return withOrg(db, orgId, async (tx) => {
     await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`guidance-gate:${orgId}`}))`)
     const [counter] = await tx.select({ value: usageCounters.value }).from(usageCounters)
       .where(and(eq(usageCounters.orgId, orgId), eq(usageCounters.day, day), eq(usageCounters.meter, GUIDANCE_METERS.suggestCalls)))
-    const [settingRow] = await tx.select({ value: orgSettings.value }).from(orgSettings)
-      .where(and(eq(orgSettings.orgId, orgId), eq(orgSettings.key, 'guidance.daily_suggest_cap')))
-    const cap = resolveSetting('guidance.daily_suggest_cap', {
-      org: settingRow ? { 'guidance.daily_suggest_cap': settingRow.value } : {},
-    })
+    const cap = resolveSetting('guidance.daily_suggest_cap', await loadSettingSources(tx, ['guidance.daily_suggest_cap'], now))
     if ((counter?.value ?? 0) >= cap) return true
     await bumpMeter(tx, orgId, day, GUIDANCE_METERS.suggestCalls, 1)
     return false
@@ -147,7 +143,7 @@ export async function runGuidanceSuggest(
     return 'skipped'
   }
 
-  if (await gateAndBumpCap(deps.db, orgId, day)) return 'capped'
+  if (await gateAndBumpCap(deps.db, orgId, day, now)) return 'capped'
 
   // ── the model call, outside every transaction ──
   const result = await runGuidanceSuggestCall(

@@ -17,8 +17,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { emptyRetriever, type DraftDecision } from '@aesa/agent'
 import { DRAFT_EXPIRE_DAYS } from '@aesa/contracts'
 import {
-  agentCategoryPolicies, agentRunEvents, agentRuns, agents, auditLog, categories, createMeterSink,
-  drafts, ensureDefaultCategories, llmCalls, llmCredentials, mailboxConnections, messages,
+  agentCategoryPolicies, agentRunEvents, agentRuns, agents, auditLog, billingSubscriptions, categories,
+  createMeterSink, drafts, ensureDefaultCategories, llmCalls, llmCredentials, mailboxConnections, messages,
   notifications, orgSettings, outboundSends, platformState, resolvedAnswers, SEND_METERS, tickets,
   usageCounters, user, withOrg, withPlatform, workspaces,
 } from '@aesa/db'
@@ -244,6 +244,14 @@ function answerRetriever(answer: { id: string; score: number; approvals: number 
 async function setPolicy(categoryId: string, values: { mode: 'off' | 'review' | 'auto'; autoSendMinConfidence?: number }): Promise<void> {
   await withOrg(app.db, fx.orgId, (tx) =>
     tx.insert(agentCategoryPolicies).values({ orgId: fx.orgId, agentId: fx.agentId, categoryId, ...values }))
+}
+
+/** Phase 7: the workspace's `billing_subscriptions` row. Without one `readBillingState` reads a
+ *  fresh TRIAL (active, allowance 50), which is what every other test in this file runs on. */
+async function seedBilling(over: Partial<typeof billingSubscriptions.$inferInsert> = {}): Promise<void> {
+  await withOrg(app.db, fx.orgId, (tx) =>
+    tx.insert(billingSubscriptions).values({ orgId: fx.orgId, plan: 'standard', status: 'active', domainQuantity: 2, ...over })
+      .onConflictDoUpdate({ target: billingSubscriptions.orgId, set: { plan: 'standard', status: 'active', domainQuantity: 2, ...over } }))
 }
 
 async function setOrgSetting(key: string, value: unknown): Promise<void> {
@@ -1541,5 +1549,161 @@ describe('runTicketDraft', () => {
     const [draft] = await draftsFor(ticketId)
     expect(draft!.body).toBe(CLEAN_BODY)
     expect(draft!.confidenceBreakdown).toMatchObject({ provider: 'custom', modelId: 'qwen3:32b', mode: 'byok' })
+  })
+
+  // --- Phase 7: the two billing facts `decide()` now takes ---------------------------------------
+
+  describe('18. subscription_inactive: a workspace that cannot send still gets its draft', () => {
+    it('a past_due row lands the draft in review with decision_reason subscription_inactive', async () => {
+      await seedBilling({ status: 'past_due' })
+      const ticketId = await seedDraftableTicket()
+      const provider = createFakeProvider([{ parsed: REPLY }])
+      const { deps, sends } = makeDeps(provider)
+
+      await run(deps, ticketId)
+
+      const [draft] = await draftsFor(ticketId)
+      // The DRAFT still exists and still carries the body — "drafts continue, nothing sends
+      // automatically" (spec's trial/past-due policy).
+      expect(draft).toMatchObject({ status: 'pending', decision: 'review', decisionReason: 'subscription_inactive', body: CLEAN_BODY })
+      expect(draft!.confidenceBreakdown).toMatchObject({ blockers: { subscription: 'past_due' } })
+      expect((await getTicket(ticketId)).status).toBe('awaiting_review')
+      expect(await sendsFor(draft!.id)).toEqual([])
+      expect(sends).toEqual([])
+    })
+
+    it('an expired trial reads the same way — the clock alone decides, nothing is written back', async () => {
+      await seedBilling({ plan: 'trial', status: 'trialing', trialEndsAt: new Date(NOW.getTime() - 86_400_000) })
+      const ticketId = await seedDraftableTicket()
+      const provider = createFakeProvider([{ parsed: REPLY }])
+      const { deps } = makeDeps(provider)
+
+      await run(deps, ticketId)
+
+      const [draft] = await draftsFor(ticketId)
+      expect(draft).toMatchObject({ decision: 'review', decisionReason: 'subscription_inactive' })
+      expect(draft!.confidenceBreakdown).toMatchObject({ blockers: { subscription: 'trial_expired' } })
+      // `trial_expired` is DERIVED: the stored status is untouched.
+      const [row] = await withOrg(app.db, fx.orgId, (tx) => tx.select().from(billingSubscriptions))
+      expect(row!.status).toBe('trialing')
+    })
+
+    it('an inactive subscription beats every later blocker — an otherwise auto-eligible draft still reads subscription_inactive', async () => {
+      await seedBilling({ status: 'canceled' })
+      await setPolicy(fx.categoryId, { mode: 'auto', autoSendMinConfidence: 80 })
+      await seedHumanDecisions(10)
+      const answerId = crypto.randomUUID()
+      const ticketId = await seedDraftableTicket()
+      const provider = createFakeProvider([{ parsed: reply({ confidence: 0.9, usedAnswerIds: [answerId] }) }])
+      const { deps } = makeDeps(provider, { retriever: answerRetriever({ id: answerId, score: 0.95, approvals: 3 }) })
+
+      await run(deps, ticketId)
+
+      const [draft] = await draftsFor(ticketId)
+      expect(draft).toMatchObject({ decision: 'review', decisionReason: 'subscription_inactive', decisionSource: null })
+      expect(await sendsFor(draft!.id)).toEqual([])
+    })
+  })
+
+  describe('19. allowance_exhausted: the MANAGED conversation allowance', () => {
+    /** The Phase 5 auto fixture: Autopilot on at 80, cold start cleared, one strong used answer. */
+    async function seedAutoEligible(): Promise<{ ticketId: string; answerId: string }> {
+      await setPolicy(fx.categoryId, { mode: 'auto', autoSendMinConfidence: 80 })
+      await seedHumanDecisions(10)
+      return { ticketId: await seedDraftableTicket(), answerId: crypto.randomUUID() }
+    }
+
+    it('standard + blocked + 2 domains + 600 managed conversations this period → review, allowance_exhausted', async () => {
+      await seedBilling({ overageMode: 'blocked' })
+      await setUsageCounter(SEND_METERS.aiHandledManaged, 600)
+      const { ticketId, answerId } = await seedAutoEligible()
+      const provider = createFakeProvider([{ parsed: reply({ confidence: 0.9, usedAnswerIds: [answerId] }) }])
+      const { deps, sends } = makeDeps(provider, { retriever: answerRetriever({ id: answerId, score: 0.95, approvals: 3 }) })
+
+      await run(deps, ticketId)
+
+      const [draft] = await draftsFor(ticketId)
+      expect(draft).toMatchObject({ status: 'pending', decision: 'review', decisionReason: 'allowance_exhausted', decisionSource: null })
+      // 300 included per domain × 2 domains.
+      expect(draft!.confidenceBreakdown).toMatchObject({
+        blockers: { allowance: { used: 600, allowance: 600, mode: 'blocked', exhausted: true } },
+      })
+      expect(await sendsFor(draft!.id)).toEqual([])
+      expect((await getTicket(ticketId)).status).toBe('awaiting_review')
+      expect(sends).toEqual([])
+    })
+
+    it('the SAME usage under automatic overage sends — metered overage accrues instead of stopping', async () => {
+      await seedBilling({ overageMode: 'automatic' })
+      await setUsageCounter(SEND_METERS.aiHandledManaged, 600)
+      const { ticketId, answerId } = await seedAutoEligible()
+      const provider = createFakeProvider([{ parsed: reply({ confidence: 0.9, usedAnswerIds: [answerId] }) }])
+      const { deps } = makeDeps(provider, { retriever: answerRetriever({ id: answerId, score: 0.95, approvals: 3 }) })
+
+      await run(deps, ticketId)
+
+      const [draft] = await draftsFor(ticketId)
+      expect(draft).toMatchObject({ decision: 'send', decisionReason: 'ok', decisionSource: 'auto' })
+      expect(draft!.confidenceBreakdown).toMatchObject({
+        blockers: { allowance: { used: 600, allowance: 600, mode: 'automatic', exhausted: false } },
+      })
+      expect(await sendsFor(draft!.id)).toHaveLength(1)
+    })
+
+    it('a BYOK agent is NEVER exhausted — the same blocked row at 600 still sends', async () => {
+      await seedBilling({ overageMode: 'blocked' })
+      await setUsageCounter(SEND_METERS.aiHandledManaged, 600)
+      const credentialId = await seedCredential()
+      // A `limited` tier caps the model term at 0.6, so the bar is set where 0.6 clears it — the
+      // point under test is the allowance, not the quality cap.
+      await setPolicy(fx.categoryId, { mode: 'auto', autoSendMinConfidence: 50 })
+      await seedHumanDecisions(10)
+      const answerId = crypto.randomUUID()
+      const ticketId = await seedDraftableTicket()
+      const provider = createFakeProvider([{ parsed: reply({ confidence: 0.9, usedAnswerIds: [answerId] }) }])
+      const { deps } = makeDeps(provider, {
+        providers: staticResolver(provider, byokConfig(credentialId)),
+        retriever: answerRetriever({ id: answerId, score: 0.95, approvals: 3 }),
+      })
+
+      await run(deps, ticketId)
+
+      const [draft] = await draftsFor(ticketId)
+      expect(draft).toMatchObject({ decision: 'send', decisionReason: 'ok', decisionSource: 'auto' })
+      expect(draft!.confidenceBreakdown).toMatchObject({
+        blockers: { allowance: { used: 600, allowance: 600, mode: 'blocked', exhausted: false } },
+      })
+      expect(await sendsFor(draft!.id)).toHaveLength(1)
+    })
+
+    it("a trial hard-stops at its FLAT 50, whatever the overage mode", async () => {
+      await seedBilling({ plan: 'trial', status: 'trialing', overageMode: 'automatic', domainQuantity: 0 })
+      await setUsageCounter(SEND_METERS.aiHandledManaged, 50)
+      const { ticketId, answerId } = await seedAutoEligible()
+      const provider = createFakeProvider([{ parsed: reply({ confidence: 0.9, usedAnswerIds: [answerId] }) }])
+      const { deps } = makeDeps(provider, { retriever: answerRetriever({ id: answerId, score: 0.95, approvals: 3 }) })
+
+      await run(deps, ticketId)
+
+      const [draft] = await draftsFor(ticketId)
+      expect(draft).toMatchObject({ decision: 'review', decisionReason: 'allowance_exhausted' })
+      expect(draft!.confidenceBreakdown).toMatchObject({
+        blockers: { allowance: { used: 50, allowance: 50, mode: 'automatic', exhausted: true } },
+      })
+    })
+
+    it('only the MANAGED meter counts: 600 ai_handled_conversations with no managed half is not exhausted', async () => {
+      await seedBilling({ overageMode: 'blocked' })
+      await setUsageCounter(SEND_METERS.aiHandledConversations, 600)
+      const { ticketId, answerId } = await seedAutoEligible()
+      const provider = createFakeProvider([{ parsed: reply({ confidence: 0.9, usedAnswerIds: [answerId] }) }])
+      const { deps } = makeDeps(provider, { retriever: answerRetriever({ id: answerId, score: 0.95, approvals: 3 }) })
+
+      await run(deps, ticketId)
+
+      const [draft] = await draftsFor(ticketId)
+      expect(draft).toMatchObject({ decision: 'send', decisionReason: 'ok' })
+      expect(draft!.confidenceBreakdown).toMatchObject({ blockers: { allowance: { used: 0, exhausted: false } } })
+    })
   })
 })

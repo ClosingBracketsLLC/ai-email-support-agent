@@ -82,6 +82,10 @@ function baseConfig(): WorkerConfig {
     knowledgeEmbedModel: 'voyage-4',
     knowledgeRerank: false,
     s3: null,
+    stripe: null,
+    managedDraftSlots: 0,
+    sentryDsn: null,
+    sentryEnvironment: 'test',
     platformSender: 'no-reply@aesa.test',
   }
 }

@@ -9,13 +9,12 @@ import type pino from 'pino'
 import { z } from 'zod'
 import { MEMORY_EXPIRY_DAYS, MEMORY_STRIKES_TO_RETIRE, resolveSetting } from '@aesa/core'
 import {
-  audit, bumpMeter, customerHash, drafts, ensureCustomerHashSalt, KNOWLEDGE_METERS, messages,
+  audit, bumpMeter, customerHash, drafts, ensureCustomerHashSalt, KNOWLEDGE_METERS, loadSettingSources, messages,
   resolvedAnswers, tickets, usageCounters, withOrg, type Db,
 } from '@aesa/db'
 import { scrubForMemory, type Embedder } from '@aesa/knowledge'
 import { defineJob, enqueue, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
 import { utcDayString } from '../date-utils.ts'
-import { loadOrgSettings } from '../knowledge/sources.ts'
 
 export const MemoryCapturePayload = z.object({ orgId: z.string(), draftId: z.string() })
 export type MemoryCapturePayload = z.infer<typeof MemoryCapturePayload>
@@ -46,7 +45,7 @@ interface Loaded {
   atEmbedCap: boolean
 }
 
-async function load(db: Db, orgId: string, draftId: string, day: string): Promise<Loaded | null> {
+async function load(db: Db, orgId: string, draftId: string, day: string, now: Date): Promise<Loaded | null> {
   return withOrg(db, orgId, async (tx) => {
     const [d] = await tx.select({
       id: drafts.id, ticketId: drafts.ticketId, agentId: drafts.agentId, categoryId: drafts.categoryId, status: drafts.status,
@@ -65,7 +64,7 @@ async function load(db: Db, orgId: string, draftId: string, day: string): Promis
     // workspace budget covers chunk vectors and answer vectors alike.
     const [counter] = await tx.select({ value: usageCounters.value }).from(usageCounters)
       .where(and(eq(usageCounters.day, day), eq(usageCounters.meter, KNOWLEDGE_METERS.embedTokens)))
-    const cap = resolveSetting('knowledge.daily_embed_tokens_cap', { org: await loadOrgSettings(tx, ['knowledge.daily_embed_tokens_cap']) })
+    const cap = resolveSetting('knowledge.daily_embed_tokens_cap', await loadSettingSources(tx, ['knowledge.daily_embed_tokens_cap'], now))
 
     const grounding = (d.confidenceBreakdown as { grounding?: { knowledgeVersion?: unknown } }).grounding
     return {
@@ -84,7 +83,7 @@ export async function runMemoryCapture(deps: MemoryCaptureDeps, payload: MemoryC
   const { orgId, draftId } = payload
   const now = deps.now?.() ?? new Date()
   const day = utcDayString(now)
-  const loaded = await load(deps.db, orgId, draftId, day)
+  const loaded = await load(deps.db, orgId, draftId, day, now)
   if (!loaded) return 'skipped'
   const { draft, ticket } = loaded
 

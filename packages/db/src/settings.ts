@@ -1,8 +1,9 @@
 /**
- * `resolveSetting`'s two data sources (`@aesa/core`), read together. `org` mirrors the api's
- * `org-settings.ts` / the worker's `knowledge/sources.ts` `loadOrgSettings` twin (one SELECT over
- * the requested keys) — this is the same shape, now in `@aesa/db` because it is also the place that
- * can resolve `plan`, which those two duplicates never did: `plan` is
+ * `resolveSetting`'s two data sources (`@aesa/core`), read together. `org` is one SELECT over the
+ * requested keys — the shape the api's `org-settings.ts` and the worker's `knowledge/sources.ts`
+ * each used to carry their own copy of (both deleted in Phase 7; this is the ONE loader now),
+ * because it is also the place that can resolve `plan`, which those two duplicates never did:
+ * `plan` is
  * `planSettingDefaults(readBillingState(tx, now).plan)`, so a caller resolving a cap gets the org's
  * own override, falling back to the WORKSPACE'S CURRENT PLAN's default, falling back to the code
  * default `resolveSetting` already knows — in that order.

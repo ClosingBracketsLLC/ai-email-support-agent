@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto'
+import type pg from 'pg'
 import type PgBoss from 'pg-boss'
 import { describe, expect, it } from 'vitest'
 import { emptyRetriever } from '@aesa/agent'
@@ -15,6 +16,9 @@ import type { TicketDraftDeps } from '../src/jobs/ticket-draft.ts'
 import type { TicketTriageDeps } from '../src/jobs/ticket-triage.ts'
 
 const fakeDb = {} as Db
+/** The admission pool only ever CONNECTS when a managed call asks for a slot, and no job runs in
+ *  this suite — registration alone never touches it. */
+const fakePool = {} as pg.Pool
 const fakeBoss = {} as PgBoss
 const ring: KekRing = loadKekRing({ AESA_KEK_V1: randomBytes(32).toString('base64'), AESA_KEK_ACTIVE: '1' })
 
@@ -37,6 +41,10 @@ function baseConfig(overrides: Partial<WorkerConfig> = {}): WorkerConfig {
     knowledgeEmbedModel: 'voyage-4',
     knowledgeRerank: false,
     s3: null,
+    stripe: null,
+    managedDraftSlots: 0,
+    sentryDsn: null,
+    sentryEnvironment: 'test',
     platformSender: null,
     ...overrides,
   }
@@ -60,7 +68,7 @@ describe('maybeRegisterAgentRole', () => {
     const { logger, lines } = testLogger()
     let registered = false
     await maybeRegisterAgentRole(
-      { boss: fakeBoss, db: fakeDb, logger, config: baseConfig({ roles: new Set(['sync']) }), enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {} },
+      { boss: fakeBoss, db: fakeDb, pool: fakePool, logger, config: baseConfig({ roles: new Set(['sync']) }), enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {} },
       spyRegistrars(() => { registered = true }),
     )
     expect(registered).toBe(false)
@@ -72,7 +80,7 @@ describe('maybeRegisterAgentRole', () => {
     let registered = false
     await expect(
       maybeRegisterAgentRole(
-        { boss: fakeBoss, db: fakeDb, logger, config: baseConfig({ env: 'production' }), enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {} },
+        { boss: fakeBoss, db: fakeDb, pool: fakePool, logger, config: baseConfig({ env: 'production' }), enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {} },
         spyRegistrars(() => { registered = true }),
       ),
     ).rejects.toThrow(/ANTHROPIC_API_KEY/)
@@ -83,7 +91,7 @@ describe('maybeRegisterAgentRole', () => {
     const { logger, lines } = testLogger()
     let registered = 0
     await maybeRegisterAgentRole(
-      { boss: fakeBoss, db: fakeDb, logger, config: baseConfig({ env: 'development' }), enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {} },
+      { boss: fakeBoss, db: fakeDb, pool: fakePool, logger, config: baseConfig({ env: 'development' }), enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {} },
       spyRegistrars(() => { registered += 1 }),
     )
     // Phase 6: a null managed provider is a real state the RESOLVER handles (`no_managed_key` →
@@ -104,7 +112,7 @@ describe('maybeRegisterAgentRole', () => {
     let modelJobs = 0
     await maybeRegisterAgentRole(
       {
-        boss: fakeBoss, db: fakeDb, logger,
+        boss: fakeBoss, db: fakeDb, pool: fakePool, logger,
         config: baseConfig({ env: 'development', anthropicApiKey: null, kekRing: ring }),
         enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {},
       },
@@ -124,7 +132,7 @@ describe('maybeRegisterAgentRole', () => {
     const { logger } = testLogger()
     let registered = 0
     await maybeRegisterAgentRole(
-      { boss: fakeBoss, db: fakeDb, logger, config: baseConfig({ env: 'test' }), enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {} },
+      { boss: fakeBoss, db: fakeDb, pool: fakePool, logger, config: baseConfig({ env: 'test' }), enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {} },
       spyRegistrars(() => { registered += 1 }),
     )
     expect(registered).toBe(5)
@@ -140,7 +148,7 @@ describe('maybeRegisterAgentRole', () => {
     const enqueueSend: TicketDraftDeps['enqueueSend'] = async () => {}
     await maybeRegisterAgentRole(
       {
-        boss: fakeBoss, db: fakeDb, logger,
+        boss: fakeBoss, db: fakeDb, pool: fakePool, logger,
         // VOYAGE_API_KEY too: the role now builds the retriever's embedder, which refuses to fall
         // back to the hash embedder in production (knowledge-deps.ts).
         config: baseConfig({ env: 'production', anthropicApiKey: new Secret('sk-ant-test'), voyageApiKey: new Secret('pa-voyage') }),
@@ -187,7 +195,7 @@ describe('maybeRegisterAgentRole', () => {
     let modelJobs = 0
     await maybeRegisterAgentRole(
       {
-        boss: fakeBoss, db: fakeDb, logger,
+        boss: fakeBoss, db: fakeDb, pool: fakePool, logger,
         config: baseConfig({ anthropicApiKey: new Secret('sk-ant-test'), kekRing: ring }),
         enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {},
       },
@@ -215,7 +223,7 @@ describe('maybeRegisterAgentRole', () => {
     let draftRegistered = false
     await maybeRegisterAgentRole(
       {
-        boss: fakeBoss, db: fakeDb, logger,
+        boss: fakeBoss, db: fakeDb, pool: fakePool, logger,
         config: baseConfig({ anthropicApiKey: new Secret('sk-ant-test'), kekRing: null }),
         enqueueNotify: async () => {}, enqueueDraft: async () => {}, enqueueSend: async () => {},
       },
@@ -237,7 +245,7 @@ describe('maybeRegisterAgentRole', () => {
     let sandboxDeps: AgentSandboxDeps | undefined
     await maybeRegisterAgentRole(
       {
-        boss: fakeBoss, db: fakeDb, logger,
+        boss: fakeBoss, db: fakeDb, pool: fakePool, logger,
         config: baseConfig({ anthropicApiKey: new Secret('sk-ant-test') }),
         enqueueNotify: async () => {},
         enqueueDraft: async () => {},
@@ -264,7 +272,7 @@ describe('maybeRegisterAgentRole', () => {
     const { logger, lines } = testLogger()
     await maybeRegisterAgentRole(
       {
-        boss: fakeBoss, db: fakeDb, logger,
+        boss: fakeBoss, db: fakeDb, pool: fakePool, logger,
         config: baseConfig({ roles: new Set(['agent', 'knowledge']), anthropicApiKey: new Secret('sk-ant-test') }),
         enqueueNotify: async () => {},
         enqueueDraft: async () => {},

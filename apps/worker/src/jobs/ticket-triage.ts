@@ -17,7 +17,7 @@
  * transaction must never span network I/O (the app role's 5 s idle-in-transaction timeout would
  * turn a slow model call into a killed connection).
  */
-import { and, desc, eq, inArray, sql } from 'drizzle-orm'
+import { and, desc, eq, sql } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import { z } from 'zod'
@@ -26,10 +26,10 @@ import {
   type TriageCallResult, type UsageTotals,
 } from '@aesa/agent'
 import { MANAGED_MODELS, type TriageVerdict } from '@aesa/contracts'
-import { resolveSetting, type SettingKey } from '@aesa/core'
+import { resolveSetting } from '@aesa/core'
 import {
-  agentRuns, audit, categories, escalateTicket, escalationDedupeKey, insertEscalationNotification, messages, orgSettings,
-  tickets, usageCounters, withOrg, workspaces, type Db, type OrgTx, type ResolvedModelConfig,
+  agentRuns, audit, categories, escalateTicket, escalationDedupeKey, insertEscalationNotification, loadSettingSources, messages,
+  tickets, usageCounters, withOrg, workspaces, type Db, type OrgTx, type ResolvedModelConfig, type SettingSources,
 } from '@aesa/db'
 import { computeCostMicros, findPricing, LlmError, type ChatMeta } from '@aesa/llm'
 import { defineJob, registerJob, JOB_NAMES, type RegisteredJobDefinition } from '@aesa/queue'
@@ -120,23 +120,19 @@ function utcDayString(d: Date): string {
   return d.toISOString().slice(0, 10)
 }
 
-function buildOrgSettings(rows: { key: string; value: unknown }[]): Partial<Record<SettingKey, unknown>> {
-  const out: Partial<Record<SettingKey, unknown>> = {}
-  for (const row of rows) out[row.key as SettingKey] = row.value
-  return out
-}
-
 interface LoadedContext {
   ticket: SelectedTicket
   bodies: string[]
   categories: { id: string; key: string }[]
   businessName: string
-  settings: Partial<Record<SettingKey, unknown>>
+  /** The org's own rows AND its plan's defaults — `triage.daily_cap` is three times the plan's
+   *  draft cap, so a trial workspace's ceiling is the trial tier's unless an owner overrode it. */
+  settings: SettingSources
   callsToday: number
 }
 
 /** One read-only `withOrg` tx: the ticket (if selectable), its context, and today's spend so far. */
-async function loadContext(db: Db, orgId: string, ticketId: string, day: string): Promise<LoadedContext | null> {
+async function loadContext(db: Db, orgId: string, ticketId: string, day: string, now: Date): Promise<LoadedContext | null> {
   return withOrg(db, orgId, async (tx) => {
     const [ticket] = await tx
       .select({
@@ -165,10 +161,7 @@ async function loadContext(db: Db, orgId: string, ticketId: string, day: string)
 
     const cats = await tx.select({ id: categories.id, key: categories.key }).from(categories)
     const [workspace] = await tx.select({ businessName: workspaces.businessName }).from(workspaces).where(eq(workspaces.orgId, orgId))
-    const settingsRows = await tx
-      .select({ key: orgSettings.key, value: orgSettings.value })
-      .from(orgSettings)
-      .where(inArray(orgSettings.key, ['triage.daily_cap', 'support.spam_shortcircuit.always']))
+    const settings = await loadSettingSources(tx, ['triage.daily_cap', 'support.spam_shortcircuit.always'], now)
     const [counterRow] = await tx
       .select({ value: usageCounters.value })
       .from(usageCounters)
@@ -187,7 +180,7 @@ async function loadContext(db: Db, orgId: string, ticketId: string, day: string)
       bodies,
       categories: cats,
       businessName: workspace?.businessName ?? '',
-      settings: buildOrgSettings(settingsRows),
+      settings,
       callsToday: counterRow?.value ?? 0,
     }
   })
@@ -300,7 +293,7 @@ export async function runTicketTriage(deps: TicketTriageDeps, payload: TicketTri
   const now = deps.now?.() ?? new Date()
   const day = utcDayString(now)
 
-  const loaded = await loadContext(deps.db, orgId, ticketId, day)
+  const loaded = await loadContext(deps.db, orgId, ticketId, day, now)
   if (!loaded) return // rule 1: not selectable — skip silently
   const { ticket, bodies, categories: cats, businessName, settings, callsToday } = loaded
 
@@ -318,12 +311,12 @@ export async function runTicketTriage(deps: TicketTriageDeps, payload: TicketTri
     return
   }
 
-  const cap = resolveSetting('triage.daily_cap', { org: settings })
+  const cap = resolveSetting('triage.daily_cap', settings)
   const atCap = callsToday >= cap
 
   // Rule 3: spam short-circuit — never reaches the model, never spends a call.
   if (ticket.spamFlagged) {
-    const always = resolveSetting('support.spam_shortcircuit.always', { org: settings })
+    const always = resolveSetting('support.spam_shortcircuit.always', settings)
     if (atCap || always) {
       await withOrg(deps.db, orgId, async (tx) => {
         // needsOwnerReason: null — see the rule-2 comment above; same reasoning applies here.

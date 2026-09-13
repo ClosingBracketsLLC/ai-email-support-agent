@@ -13,8 +13,8 @@ import pino from 'pino'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { emptyRetriever, type DraftDecision } from '@aesa/agent'
 import {
-  agentRunEvents, agentRuns, agents, categories, drafts, ensureDefaultCategories, mailboxConnections,
-  tickets, user, withOrg, workspaces, type Db,
+  agentRunEvents, agentRuns, agents, billingSubscriptions, categories, drafts, ensureDefaultCategories,
+  mailboxConnections, tickets, user, withOrg, workspaces, type Db,
 } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
@@ -512,5 +512,22 @@ describe('runAgentSandbox', () => {
     expect(provider.calls[0]!.effort).toBe('low')
     const prompt = (await eventsFor(runId)).find((e) => e.kind === 'prompt')
     expect(prompt!.payload).toMatchObject({ effort: 'low' })
+  })
+
+  it('P7 an inactive subscription is a FACT here too: a "Try it" run on a past_due workspace reads review / subscription_inactive', async () => {
+    await withOrg(app.db, fx.orgId, (tx) =>
+      tx.insert(billingSubscriptions).values({ orgId: fx.orgId, plan: 'standard', status: 'past_due' }))
+    const runId = await seedSandboxRun()
+    const provider = createFakeProvider([{ parsed: REPLY }])
+
+    await run(makeDeps(provider), runId)
+
+    // The run still CALLS the model and still shows the body — the owner is trying the agent out,
+    // and what they need to see is the verdict a real draft would land.
+    const output = (await getRun(runId)).output as SandboxOutput
+    expect(output.outcome).toBe('reply')
+    expect(output.body).toBe(CLEAN_BODY)
+    expect(output.decision).toBe('review')
+    expect(output.decisionReason).toBe('subscription_inactive')
   })
 })

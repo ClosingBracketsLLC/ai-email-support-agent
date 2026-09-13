@@ -33,6 +33,10 @@ function baseConfig(overrides: Partial<WorkerConfig> = {}): WorkerConfig {
     knowledgeEmbedModel: 'voyage-4',
     knowledgeRerank: false,
     s3: null,
+    stripe: null,
+    managedDraftSlots: 0,
+    sentryDsn: null,
+    sentryEnvironment: 'test',
     gmailPubsubTopic: 'projects/p/topics/t', webhookPublicUrl: 'https://api.example.com', platformSender: 'no-reply@aesa.test',
     ...overrides,
   }

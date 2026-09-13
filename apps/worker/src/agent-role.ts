@@ -29,11 +29,13 @@
  * every draft on this replica reads.
  */
 import { createManagedProvider, type ModelPricing } from '@aesa/llm'
+import type pg from 'pg'
 import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import { createMeterSink, type Db } from '@aesa/db'
 import { createRetriever } from '@aesa/knowledge'
 import type { WorkerConfig } from './config.ts'
+import { createAdmissionPool } from './drafting/admission.ts'
 import { registerAgentSandbox, type AgentSandboxDeps } from './jobs/agent-sandbox.ts'
 import { registerGuidanceSuggest, type GuidanceSuggestDeps } from './jobs/guidance-suggest.ts'
 import { registerLlmProbe, type LlmProbeDeps } from './jobs/llm-probe.ts'
@@ -46,6 +48,9 @@ import { createProviderResolver } from './provider-resolver.ts'
 export interface AgentRoleDeps {
   boss: PgBoss
   db: Db
+  /** The process's ONE pg pool (`createDb`). Phase 7's admission pool borrows a dedicated client
+   *  from it per held slot — see `drafting/admission.ts`. */
+  pool: pg.Pool
   logger: pino.Logger
   config: WorkerConfig
   /** index.ts wires this to `enqueueNotifyDispatch`, the real `notify.dispatch` enqueue. */
@@ -137,14 +142,19 @@ export async function maybeRegisterAgentRole(deps: AgentRoleDeps, register: Agen
   const retriever = createRetriever({
     db: deps.db, embedder, reranker: createKnowledgeReranker(deps.config), logger: deps.logger,
   })
+  // Phase 7: ONE admission pool for the role, shared by `ticket.draft` and `agent.sandbox` so a
+  // "Try it" run competes for the same deployment-wide managed slots a real draft does.
+  // `MANAGED_DRAFT_SLOTS=0` makes this `noAdmission` (`createAdmissionPool` returns it for 0).
+  const admission = createAdmissionPool(deps.pool, deps.config.managedDraftSlots)
+
   await register.registerTriage(deps.boss, {
     db: deps.db, providers, logger: deps.logger, enqueueNotify: deps.enqueueNotify, enqueueDraft: deps.enqueueDraft,
   })
   await register.registerDraft(deps.boss, {
-    db: deps.db, providers, retriever, logger: deps.logger,
+    db: deps.db, providers, retriever, logger: deps.logger, admission,
     enqueueNotify: deps.enqueueNotify, enqueueDraft: deps.enqueueDraft, enqueueSend: deps.enqueueSend,
   })
-  await register.registerSandbox(deps.boss, { db: deps.db, providers, retriever, logger: deps.logger })
+  await register.registerSandbox(deps.boss, { db: deps.db, providers, retriever, logger: deps.logger, admission })
   await register.registerMemoryCapture(deps.boss, { db: deps.db, embedder, logger: deps.logger })
   await register.registerGuidanceSuggest(deps.boss, { db: deps.db, providers, logger: deps.logger })
 }

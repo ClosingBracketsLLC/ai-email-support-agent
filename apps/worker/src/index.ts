@@ -5,6 +5,8 @@ import { createMailLimiter } from '@aesa/mail'
 import { createMailTransport } from '@aesa/platform-mail'
 import { createQueueRetrying, JOB_NAMES, queueOptionsFor, startBoss } from '@aesa/queue'
 import { maybeRegisterAgentRole } from './agent-role.ts'
+import { registerBillingReportUsage } from './billing/report-usage.ts'
+import { createStripeUsagePort } from './billing/stripe.ts'
 import { loadConfig } from './config.ts'
 import { registerKeysProvision } from './jobs/keys-provision.ts'
 import { enqueueKnowledgeEmbedBatch } from './jobs/knowledge-embed-batch.ts'
@@ -101,10 +103,18 @@ if (config.roles.has('cron')) {
   await registerLlmReprobeSweep(boss, {
     db, logger, enqueueProbe: (orgId, credentialId, opts) => enqueueLlmProbe(boss, orgId, credentialId, opts),
   })
+  // Phase 7: the nightly billing pass. `stripe: null` (no STRIPE_SECRET_KEY) still runs the local
+  // half — the trial and allowance pages — and counts every Stripe call it could not make;
+  // `loadConfig` refuses a PRODUCTION `cron` replica without the key.
+  await registerBillingReportUsage(boss, {
+    db, logger,
+    stripe: config.stripe ? createStripeUsagePort(config.stripe) : null,
+    enqueueNotify: (orgId, notificationId) => enqueueNotifyDispatch(boss, orgId, notificationId),
+  })
 }
 
 await maybeRegisterAgentRole({
-  boss, db, logger, config,
+  boss, db, pool, logger, config,
   enqueueNotify: (orgId, notificationId) => enqueueNotifyDispatch(boss, orgId, notificationId),
   enqueueDraft: (orgId, ticketId, opts) => enqueueTicketDraft(boss, orgId, ticketId, opts),
   // The auto landing's send. `enqueueSendExecute` resolves the pg-boss job id (or null when the
