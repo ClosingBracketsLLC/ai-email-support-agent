@@ -9,6 +9,7 @@ import { Button } from '@/components/button'
 import { Card } from '@/components/card'
 import { TextField } from '@/components/text-field'
 import { Body, Heading, Muted } from '@/components/typography'
+import { openPopup, POPUP_BLOCKED_MESSAGE } from '@/lib/open-external'
 import { fetchMeta, useTRPC, useTRPCClient } from '@/lib/trpc'
 import { spacing } from '@/theme'
 
@@ -106,12 +107,14 @@ export function ConnectMailboxCard({
     // stack. Opening the tab/window AFTER an `await` (the `startConnect` round trip below) lets it be
     // silently blocked — the poll would then run for 5 minutes against a window that never opened. So
     // on web this opens a blank window HERE, before any await, and only points it at the real URL once
-    // `startConnect` resolves.
+    // `startConnect` resolves. `openPopup` is the same mechanic `@/lib/open-external`'s `openExternal`
+    // uses for its own one-shot callers — this flow needs the window HANDLE itself (to close it once
+    // the claim poll below lands), which that simpler one-shot helper does not hand back.
     let webWindow: Window | null = null
-    if (Platform.OS === 'web' && typeof window !== 'undefined') {
-      webWindow = window.open('', '_blank')
+    if (Platform.OS === 'web') {
+      webWindow = openPopup()
       if (!webWindow) {
-        setPhaseSafe({ kind: 'error', message: 'Your browser blocked the popup. Allow popups for this site and try again.' })
+        setPhaseSafe({ kind: 'error', message: POPUP_BLOCKED_MESSAGE })
         return
       }
     }

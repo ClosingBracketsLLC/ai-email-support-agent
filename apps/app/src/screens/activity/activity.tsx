@@ -27,6 +27,13 @@ export function formatUsd(micros: number): string {
   return `$${(value / 1_000_000).toFixed(2)}`
 }
 
+/** Whole-cents money — Billing's numbers (Stripe prices, the per-unit overage rate) are never the
+ * sub-cent LLM costs `formatUsd` exists for, so there is no `<$0.01` rung here: a negative still
+ * clamps to zero for the same reason `formatUsd` does. */
+export function formatCents(cents: number): string {
+  return `$${(Math.max(0, cents) / 100).toFixed(2)}`
+}
+
 /** Same shape/rounding as `ticket-row.tsx`'s and `mailboxes.tsx`'s own `relativeTime` — each of
  * those screens keeps its own copy rather than sharing one; this one does too. */
 function relativeTime(date: Date | null): string {

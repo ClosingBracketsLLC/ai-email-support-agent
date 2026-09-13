@@ -39,6 +39,14 @@ describe('pathForNotification', () => {
     expect(pathForNotification({ kind: 'provider_health', credentialId: 'cred1' })).toBe('/settings/ai')
   })
 
+  // Phase 7's two kinds.
+  test('billing opens the Billing settings screen', () => {
+    expect(pathForNotification({ kind: 'billing' })).toBe('/settings/billing')
+  })
+  test('workspace opens the Workspace settings screen', () => {
+    expect(pathForNotification({ kind: 'workspace' })).toBe('/settings/workspace')
+  })
+
   // The worker now stamps `kind` onto every push's `data` (notify-dispatch.ts / notify-digest.ts),
   // but a push already sitting in a device's notification tray from before that change has neither
   // — these are that backward-compatibility fallback's shapes, kept so an old, undelivered

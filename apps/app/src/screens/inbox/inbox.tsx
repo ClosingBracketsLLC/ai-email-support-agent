@@ -11,6 +11,7 @@ import { Muted } from '@/components/typography'
 import { useTRPC } from '@/lib/trpc'
 import { WIDE_BREAKPOINT, font, radius, spacing, typeScale, useColors } from '@/theme'
 import { AgentOffBanner } from './agent-off-banner'
+import { BillingBanner } from './billing-banner'
 import { TicketRow, type TicketSummary } from './ticket-row'
 
 const SECTION_LABEL: Record<InboxSection, string> = { to_review: 'To review', auto_sending: 'Auto-sending', recent: 'Recent' }
@@ -47,6 +48,7 @@ export function InboxScreen() {
       <View style={[styles.body, wide && styles.wideBody]}>
         <View style={styles.column}>
           <AgentOffBanner />
+          <BillingBanner />
           <View style={styles.segmented} accessibilityRole="tablist" testID="inbox-tabs">
             {INBOX_SECTIONS.map((s) => (
               <Pressable

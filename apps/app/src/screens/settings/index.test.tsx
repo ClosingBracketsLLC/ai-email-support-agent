@@ -27,7 +27,24 @@ jest.mock('@/lib/auth-client', () => ({
 
 jest.mock('@/lib/trpc', () => ({
   useTRPC: () => ({
-    workspace: { get: { queryOptions: () => ({ queryKey: ['workspace', 'get'], queryFn: () => Promise.resolve({ businessName: 'Acme', role: 'owner' as const }) }) } },
+    workspace: {
+      get: {
+        queryOptions: () => ({
+          queryKey: ['workspace', 'get'],
+          queryFn: () => Promise.resolve({ businessName: 'Acme', role: 'owner' as const, deletionRequestedAt: null, purgeAfter: null }),
+        }),
+      },
+    },
+    // BillingBanner (rendered at the top of this screen) reads these too — `active` and no deletion
+    // pending renders it as `null`, so this screen's own tests stay about ITS rows, not the banner's
+    // own states (covered by billing-banner.test.tsx).
+    billing: {
+      get: {
+        queryOptions: () => ({ queryKey: ['billing', 'get'], queryFn: () => Promise.resolve({ state: 'active', trialEndsAt: null }) }),
+      },
+      startCheckout: { mutationOptions: (o: object) => ({ mutationFn: () => Promise.resolve({ url: 'https://checkout.stripe.com' }), ...o }) },
+      openPortal: { mutationOptions: (o: object) => ({ mutationFn: () => Promise.resolve({ url: 'https://billing.stripe.com' }), ...o }) },
+    },
   }),
 }))
 
@@ -86,4 +103,13 @@ test('Autopilot, Learned answers and AI are live rows now, each opening its own 
   await fireEvent.press(screen.getByTestId('settings-ai'))
   expect(mockPush).toHaveBeenCalledWith('/settings/ai')
   expect(screen.queryByText('Phase 6')).toBeNull()
+})
+
+test('Phase 7: the Billing row lost its badge and opens Settings › Billing', async () => {
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('settings-billing')).toBeTruthy())
+
+  await fireEvent.press(screen.getByTestId('settings-billing'))
+  expect(mockPush).toHaveBeenCalledWith('/settings/billing')
+  expect(screen.queryByText('Phase 7')).toBeNull()
 })

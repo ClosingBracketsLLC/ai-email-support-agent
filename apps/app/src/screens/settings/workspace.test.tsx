@@ -11,6 +11,8 @@ interface MockWorkspace {
   orgId: string; businessName: string; timezone: string; role: string; agentEnabled: boolean
   websiteUrl: string | null; description: string; tone: 'friendly' | 'formal' | 'concise'
   contactPhone: string | null; contactUrls: string[]
+  // Phase 7's DangerZone reads these off the SAME `workspace.get` row.
+  killSwitch: boolean; retentionDays: number; deletionRequestedAt: Date | null; purgeAfter: Date | null
 }
 
 // Every variable a jest.mock() factory closes over must be prefixed `mock` (case-insensitive) —
@@ -35,6 +37,18 @@ jest.mock('@/lib/trpc', () => ({
       },
       // The ProfileForm below this screen's switch has its own mutation.
       updateProfile: { mutationOptions: (o: object) => ({ mutationFn: () => Promise.resolve({}), ...o }) },
+      // Phase 7's DangerZone, rendered below the profile form — this screen's own tests never touch
+      // it (danger-zone.test.tsx owns that), so every mutation here is a no-op stub and the export
+      // poll starts (and stays) `none`.
+      setKillSwitch: { mutationOptions: (o: object) => ({ mutationFn: () => Promise.resolve({}), ...o }) },
+      setRetentionDays: { mutationOptions: (o: object) => ({ mutationFn: () => Promise.resolve({}), ...o }) },
+      requestExport: { mutationOptions: (o: object) => ({ mutationFn: () => Promise.resolve({}), ...o }) },
+      requestDeletion: { mutationOptions: (o: object) => ({ mutationFn: () => Promise.resolve({}), ...o }) },
+      cancelDeletion: { mutationOptions: (o: object) => ({ mutationFn: () => Promise.resolve({}), ...o }) },
+      exportStatus: {
+        queryOptions: () => ({ queryKey: ['workspace', 'exportStatus'], queryFn: () => Promise.resolve({ state: 'none', readyAt: null, url: null }) }),
+        queryKey: () => ['workspace', 'exportStatus'],
+      },
     },
   }),
 }))
@@ -42,7 +56,9 @@ jest.mock('@/lib/trpc', () => ({
 function workspace(overrides: Partial<MockWorkspace> = {}): MockWorkspace {
   return {
     orgId: 'o1', businessName: 'Acme', timezone: 'UTC', role: 'owner', agentEnabled: true,
-    websiteUrl: null, description: '', tone: 'friendly', contactPhone: null, contactUrls: [], ...overrides,
+    websiteUrl: null, description: '', tone: 'friendly', contactPhone: null, contactUrls: [],
+    killSwitch: false, retentionDays: 90, deletionRequestedAt: null, purgeAfter: null,
+    ...overrides,
   }
 }
 
@@ -77,13 +93,19 @@ test('a manager sees the master switch, set to whatever the workspace says', asy
 test('turning the agent off sends enabled:false and re-reads the workspace', async () => {
   await setup()
   await waitFor(() => expect(screen.getByTestId('agent-switch')).toBeTruthy())
-  expect(mockWorkspaceQueries).toBe(1)
+  // Phase 7's DangerZone (rendered below the switch, once `ws.data` first arrives) reads the SAME
+  // `workspace.get` query through its own `useQuery` call — a second observer joining an
+  // already-fetched-but-stale (default `staleTime: 0`) query refetches once more on mount, so the
+  // settled count here is 2, not 1. What this test cares about is that flipping the switch triggers
+  // ANOTHER read on top of however many already happened, which the relative check below still proves.
+  await waitFor(() => expect(mockWorkspaceQueries).toBeGreaterThanOrEqual(2))
+  const queriesBeforeToggle = mockWorkspaceQueries
 
   mockWorkspace = workspace({ agentEnabled: false })
   await fireEvent(screen.getByTestId('agent-switch'), 'valueChange', false)
   expect(mockEnableCalls).toEqual([{ enabled: false }])
   // onSuccess invalidates workspace.get, which refetches it.
-  await waitFor(() => expect(mockWorkspaceQueries).toBe(2))
+  await waitFor(() => expect(mockWorkspaceQueries).toBeGreaterThan(queriesBeforeToggle))
   await waitFor(() => expect(screen.getByTestId('agent-switch').props.accessibilityState.checked).toBe(false))
 })
 

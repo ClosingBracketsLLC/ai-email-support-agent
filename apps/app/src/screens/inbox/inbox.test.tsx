@@ -22,7 +22,8 @@ type ListInput = { section: string }
 let mockTicketsBySection: Record<string, Ticket[]> = {}
 let mockDegraded = false
 let mockListInputs: ListInput[] = []
-let mockWorkspace = { agentEnabled: true, role: 'owner' }
+let mockWorkspace = { agentEnabled: true, role: 'owner', deletionRequestedAt: null as Date | null, purgeAfter: null as Date | null }
+const mockBilling = { state: 'active', trialEndsAt: null as Date | null }
 const mockPush = jest.fn()
 
 jest.mock('expo-router', () => ({
@@ -31,10 +32,15 @@ jest.mock('expo-router', () => ({
 
 jest.mock('@/lib/trpc', () => ({
   useTRPC: () => ({
-    // <AgentOffBanner /> sits at the top of the screen and reads the workspace for itself.
+    // <AgentOffBanner /> and <BillingBanner /> both sit at the top of the screen and read for themselves.
     workspace: {
       get: { queryOptions: () => ({ queryKey: ['workspace', 'get'], queryFn: () => Promise.resolve(mockWorkspace) }), queryKey: () => ['workspace', 'get'] },
       setAgentEnabled: { mutationOptions: (o: object) => ({ mutationFn: () => Promise.resolve(mockWorkspace), ...o }) },
+    },
+    billing: {
+      get: { queryOptions: () => ({ queryKey: ['billing', 'get'], queryFn: () => Promise.resolve(mockBilling) }) },
+      startCheckout: { mutationOptions: (o: object) => ({ mutationFn: () => Promise.resolve({ url: 'https://checkout.stripe.com' }), ...o }) },
+      openPortal: { mutationOptions: (o: object) => ({ mutationFn: () => Promise.resolve({ url: 'https://billing.stripe.com' }), ...o }) },
     },
     inbox: {
       list: {
@@ -81,7 +87,7 @@ beforeEach(() => {
   mockTicketsBySection = { to_review: [], auto_sending: [], recent: [] }
   mockDegraded = false
   mockListInputs = []
-  mockWorkspace = { agentEnabled: true, role: 'owner' }
+  mockWorkspace = { agentEnabled: true, role: 'owner', deletionRequestedAt: null, purgeAfter: null }
   mockPush.mockClear()
 })
 afterEach(async () => { for (const teardown of teardowns.splice(0)) await teardown() })
@@ -149,7 +155,7 @@ test('no degraded banner on an ordinary page', async () => {
 })
 
 test('an agent that is switched off is called out above the list', async () => {
-  mockWorkspace = { agentEnabled: false, role: 'owner' }
+  mockWorkspace = { agentEnabled: false, role: 'owner', deletionRequestedAt: null, purgeAfter: null }
   await setup()
   await waitFor(() => expect(screen.getByTestId('agent-off')).toBeTruthy())
 })

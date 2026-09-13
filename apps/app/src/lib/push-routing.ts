@@ -36,6 +36,10 @@ export function pathForNotification(data: Record<string, unknown> | undefined | 
   // (or lost) Autopilot, and the weekly nudge to check what the agent has been remembering.
   if (kind === 'graduation' || kind === 'demotion') return '/settings/autopilot'
   if (kind === 'memory_sample') return '/settings/memory'
+  // Phase 7's two: a billing-state change (trial ending, a card that failed) and the workspace
+  // lifecycle (kill switch, retention, a deletion pending) are both about a SETTING, not a ticket.
+  if (kind === 'billing') return '/settings/billing'
+  if (kind === 'workspace') return '/settings/workspace'
 
   // No `kind` on this payload (pre-fix push) — infer it from whichever field is present, ticketId first.
   if (ticketId) return `/ticket/${ticketId}`

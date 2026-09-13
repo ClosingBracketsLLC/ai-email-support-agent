@@ -10,28 +10,15 @@ import { Chip, type ChipTone } from '@/components/chip'
 import { Loading } from '@/components/loading'
 import { Heading, Muted } from '@/components/typography'
 import { useTRPC } from '@/lib/trpc'
-import { radius, spacing, typeScale, useColors } from '@/theme'
+import { spacing, typeScale, useColors } from '@/theme'
 import { DraftPanel, type DraftPanelHandle } from './draft-panel'
+import { MessageBubble } from './message-bubble'
 import { reasonSentence } from './reason-labels'
 
 /** How often the ticket re-reads itself while a reply is on its way out (spec §Send). */
 const TICKET_POLL_MS = 10_000
 
 const TICKET_STATUS_TONE: Record<string, ChipTone> = { awaiting_review: 'primary', auto_sending: 'primary', needs_owner: 'warning', waiting_on_customer: 'success', resolved: 'success' }
-
-interface AttachmentMeta { filename?: string; mime?: string; size?: number }
-/** `messages.attachments` is a jsonb column typed `unknown` at the schema level (comment: "[{filename,
- * mime, size}] metadata only") — narrowed defensively rather than trusted. */
-function attachmentList(raw: unknown): AttachmentMeta[] {
-  if (!Array.isArray(raw)) return []
-  return raw.filter((a): a is AttachmentMeta => typeof a === 'object' && a !== null)
-}
-function formatBytes(size: number | undefined): string {
-  if (!size || size <= 0) return ''
-  if (size < 1024) return `${size} B`
-  if (size < 1024 * 1024) return `${Math.round(size / 1024)} KB`
-  return `${(size / (1024 * 1024)).toFixed(1)} MB`
-}
 
 /** The keyboard event this cares about — structural so a test can pass a plain object. */
 interface ShortcutEvent { key: string; target?: unknown; ctrlKey?: boolean; metaKey?: boolean; altKey?: boolean }
@@ -71,6 +58,14 @@ function findingText(raw: unknown): string {
   return detail ? `${code}: ${detail}` : code
 }
 
+/** `memory.rememberReply`'s own refusals are already owner-facing sentences straight from the router
+ * (there is no `MEMORY_ERROR_MESSAGES` catalog the way billing and workspace have one) — rendered as
+ * given rather than re-worded, with a generic fallback for anything that is not a string at all. */
+function rememberErrorText(error: unknown): string {
+  const message = (error as { message?: unknown } | null | undefined)?.message
+  return typeof message === 'string' && message.length > 0 ? message : 'Could not save that. Try again.'
+}
+
 export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?: number; undoTickMs?: number } = {}) {
   const { id } = useLocalSearchParams<{ id: string }>()
   const router = useRouter()
@@ -106,6 +101,9 @@ export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?:
   const [approveError, setApproveError] = useState<{ code: string; findings?: string[] } | null>(null)
   const [note, setNote] = useState<{ tone: 'info' | 'error'; text: string; retryView?: boolean } | null>(null)
   const [confirmingResolve, setConfirmingResolve] = useState(false)
+  // Which message id "Remember this reply" was last pressed for — scopes the pending spinner to the
+  // one bubble it belongs to rather than every outbound bubble on screen.
+  const [rememberingId, setRememberingId] = useState<string | null>(null)
   const panel = useRef<DraftPanelHandle | null>(null)
 
   const ticketKey = trpc.inbox.ticket.queryKey({ ticketId: id })
@@ -189,6 +187,13 @@ export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?:
     },
     onError: () => setNote({ tone: 'error', text: 'Could not bring this draft back. Try again.' }),
   }))
+  // Phase 7's "Remember this reply" (plan deviation 16): backfills memory from an already-sent
+  // outbound message with no draft behind it. Shares this screen's own `note` banner rather than a
+  // per-bubble one — the same seam every other action here already reports through.
+  const rememberReply = useMutation(trpc.memory.rememberReply.mutationOptions({
+    onSuccess: () => { setNote({ tone: 'info', text: 'Saved — the agent can reuse this answer.' }); setRememberingId(null) },
+    onError: (error) => { setNote({ tone: 'error', text: rememberErrorText(error) }); setRememberingId(null) },
+  }))
   const resolve = useMutation(trpc.inbox.resolve.mutationOptions({
     // Likewise `resolved: false`: a foreign or already-resolved ticket resolves nothing and throws nothing.
     onSuccess: (data) => {
@@ -254,6 +259,12 @@ export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?:
   const { ticket, messages } = query.data
   const sentence = reasonSentence(ticket.needsOwnerReason)
   const busy = approve.isPending || hold.isPending || reject.isPending || resume.isPending || flag.isPending
+
+  function pressRemember(messageId: string) {
+    if (rememberReply.isPending) return
+    setRememberingId(messageId)
+    rememberReply.mutate({ messageId })
+  }
 
   return (
     <SafeAreaView style={[styles.safe, { backgroundColor: c.bg }]} testID="ticket">
@@ -323,19 +334,14 @@ export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?:
       <ScrollView contentContainerStyle={styles.messages} testID="ticket-messages">
         {messages.map((m) => {
           const outbound = m.direction === 'outbound'
-          const attachments = attachmentList(m.attachments)
           return (
-            <View key={m.id} style={[styles.bubbleRow, outbound && styles.bubbleRowOut]}>
-              <View style={[styles.bubble, { backgroundColor: outbound ? c.primary : c.surface, borderColor: c.border }]} testID={`message-${m.id}`}>
-                {!outbound && m.dmarcPass === false ? <Muted testID={`message-unverified-${m.id}`}>unverified sender</Muted> : null}
-                <Text style={{ color: outbound ? c.onPrimary : c.text }}>{m.bodyText ?? ''}</Text>
-                {attachments.map((a, i) => (
-                  <Text key={i} style={[typeScale.caption, { color: outbound ? c.onPrimary : c.muted }]} testID={`message-attachment-${m.id}-${i}`}>
-                    {(a.filename ?? 'attachment') + (formatBytes(a.size) ? ` · ${formatBytes(a.size)}` : '')}
-                  </Text>
-                ))}
-              </View>
-            </View>
+            <MessageBubble
+              key={m.id}
+              message={m}
+              outbound={outbound}
+              onRemember={outbound ? () => pressRemember(m.id) : undefined}
+              remembering={rememberingId === m.id && rememberReply.isPending}
+            />
           )
         })}
       </ScrollView>
@@ -360,7 +366,4 @@ const styles = StyleSheet.create({
   backRow: { paddingVertical: spacing.xs },
   headerMeta: { flexDirection: 'row', gap: spacing.sm, flexWrap: 'wrap', alignItems: 'center' },
   messages: { padding: spacing.md, gap: spacing.sm },
-  bubbleRow: { flexDirection: 'row' },
-  bubbleRowOut: { justifyContent: 'flex-end' },
-  bubble: { maxWidth: '85%', borderWidth: 1, borderRadius: radius.lg, padding: spacing.sm, gap: 2 },
 })
