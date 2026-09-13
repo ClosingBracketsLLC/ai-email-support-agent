@@ -18,7 +18,8 @@ import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
 import { JOB_NAMES } from '@aesa/queue'
 import {
-  ACTION_TOKEN_RETENTION_DAYS, runSweepsDaily, RUN_EVENT_RETENTION_DAYS, type SweepsDailyDeps,
+  ACTION_TOKEN_RETENTION_DAYS, AGENT_RUN_RETENTION_DAYS, PLATFORM_ACCESS_AUDIT_RETENTION_DAYS,
+  runSweepsDaily, RUN_EVENT_RETENTION_DAYS, type SweepsDailyDeps,
 } from '../src/jobs/sweeps-daily.ts'
 import { deleteJobsForOrgs, queryJobs, startTestBoss } from './helpers/boss.ts'
 
@@ -319,6 +320,86 @@ describe('sweeps.daily', () => {
       expect(await getAnswer(orgId, withVanishedChunk)).toMatchObject({ status: 'needs_review', reviewReason: 'source_changed' })
       expect(await getAnswer(orgId, withExistingOnly)).toMatchObject({ status: 'active' })
       expect(await getAnswer(orgId, noCitations)).toMatchObject({ status: 'active' })
+    })
+  })
+
+  describe('(g) agent_runs retention', () => {
+    it('deletes finished agent_runs older than AGENT_RUN_RETENTION_DAYS and keeps younger ones and their events (cascade only from the deleted parent)', async () => {
+      const orgId = await newOrg()
+      // A finished run well past the cutoff, with an event whose OWN age (fresh) would survive
+      // arm (b)'s 30-day retention on its own — its only route to deletion is the FK cascade off
+      // the parent run this arm deletes.
+      const [oldRun] = await withOrg(app.db, orgId, (tx) =>
+        tx.insert(agentRuns).values({
+          orgId, kind: 'draft', provider: 'anthropic', model: 'claude-x', status: 'succeeded',
+          startedAt: daysAgo(AGENT_RUN_RETENTION_DAYS + 1), finishedAt: daysAgo(AGENT_RUN_RETENTION_DAYS + 1),
+        }).returning({ id: agentRuns.id }))
+      const [oldEvent] = await withOrg(app.db, orgId, (tx) =>
+        tx.insert(agentRunEvents).values({ orgId, runId: oldRun!.id, seq: 1, kind: 'prompt', createdAt: NOW }).returning({ id: agentRunEvents.id }))
+
+      // A finished run just inside the cutoff: survives, and so does its event.
+      const [youngRun] = await withOrg(app.db, orgId, (tx) =>
+        tx.insert(agentRuns).values({
+          orgId, kind: 'draft', provider: 'anthropic', model: 'claude-x', status: 'succeeded',
+          startedAt: daysAgo(AGENT_RUN_RETENTION_DAYS - 1), finishedAt: daysAgo(AGENT_RUN_RETENTION_DAYS - 1),
+        }).returning({ id: agentRuns.id }))
+      const [youngEvent] = await withOrg(app.db, orgId, (tx) =>
+        tx.insert(agentRunEvents).values({ orgId, runId: youngRun!.id, seq: 1, kind: 'prompt', createdAt: NOW }).returning({ id: agentRunEvents.id }))
+
+      // An abandoned `running` row, started past the cutoff: bookkeeping from a dead process, not a
+      // run in flight — deleted just like a finished one past the same age.
+      const [abandonedRun] = await withOrg(app.db, orgId, (tx) =>
+        tx.insert(agentRuns).values({
+          orgId, kind: 'draft', provider: 'anthropic', model: 'claude-x', status: 'running',
+          startedAt: daysAgo(AGENT_RUN_RETENTION_DAYS + 1),
+        }).returning({ id: agentRuns.id }))
+
+      const result = await runSweepsDaily(boss, makeDeps())
+
+      expect(result.runsDeleted).toBe(2)
+      const remainingRuns = await withOrg(app.db, orgId, (tx) => tx.select({ id: agentRuns.id }).from(agentRuns))
+      const remainingRunIds = remainingRuns.map((r) => r.id)
+      expect(remainingRunIds).toContain(youngRun!.id)
+      expect(remainingRunIds).not.toContain(oldRun!.id)
+      expect(remainingRunIds).not.toContain(abandonedRun!.id)
+
+      const remainingEvents = await withOrg(app.db, orgId, (tx) => tx.select({ id: agentRunEvents.id }).from(agentRunEvents))
+      const remainingEventIds = remainingEvents.map((e) => e.id)
+      expect(remainingEventIds).toContain(youngEvent!.id)
+      expect(remainingEventIds).not.toContain(oldEvent!.id) // gone via FK cascade off the deleted run, not arm (b)
+    })
+  })
+
+  describe('(h) platform.access audit retention', () => {
+    it('deletes platform.access audit rows older than PLATFORM_ACCESS_AUDIT_RETENTION_DAYS and touches no tenant audit row of the same age', async () => {
+      const orgId = await newOrg()
+      const [oldPlatform] = await withPlatform(app.db, 'test:seed', (tx) =>
+        tx.insert(auditLog).values({
+          orgId: null, actor: 'system:test', action: 'platform.access', entityType: 'platform', entityId: 'seed',
+          createdAt: daysAgo(PLATFORM_ACCESS_AUDIT_RETENTION_DAYS + 1),
+        }).returning({ id: auditLog.id }))
+      const [freshPlatform] = await withPlatform(app.db, 'test:seed', (tx) =>
+        tx.insert(auditLog).values({
+          orgId: null, actor: 'system:test', action: 'platform.access', entityType: 'platform', entityId: 'seed',
+          createdAt: daysAgo(PLATFORM_ACCESS_AUDIT_RETENTION_DAYS - 1),
+        }).returning({ id: auditLog.id }))
+      const [tenantRow] = await withPlatform(app.db, 'test:seed', (tx) =>
+        tx.insert(auditLog).values({
+          orgId, actor: 'system:test', action: 'draft.expired', entityType: 'draft', entityId: 'seed-tenant',
+          createdAt: daysAgo(PLATFORM_ACCESS_AUDIT_RETENTION_DAYS + 1),
+        }).returning({ id: auditLog.id }))
+
+      const result = await runSweepsDaily(boss, makeDeps())
+
+      expect(result.platformAuditDeleted).toBe(1)
+      const remaining = await withPlatform(app.db, 'test:check', (tx) =>
+        tx.select({ id: auditLog.id }).from(auditLog).where(eq(auditLog.entityId, 'seed')))
+      const remainingIds = remaining.map((r) => r.id)
+      expect(remainingIds).not.toContain(oldPlatform!.id)
+      expect(remainingIds).toContain(freshPlatform!.id)
+      const remainingTenant = await withPlatform(app.db, 'test:check', (tx) =>
+        tx.select({ id: auditLog.id }).from(auditLog).where(eq(auditLog.id, tenantRow!.id)))
+      expect(remainingTenant).toHaveLength(1)
     })
   })
 

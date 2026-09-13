@@ -44,16 +44,14 @@ import { gateAndRecordRun, readCapsUnlocked } from '../drafting/caps.ts'
 import { claimTicket, recordFailure, unwindClaimStamp, type ClaimedTicket } from '../drafting/claim.ts'
 import { loadSharedDraftContext } from '../drafting/context.ts'
 import {
-  applyDraftOutcome, applyEscalateOutcome, applyNoReplyOutcome, DRAFT_ACTOR, LostRaceError, recordLostRace,
+  applyDraftOutcome, applyEscalateOutcome, applyNoReplyOutcome, DRAFT_ACTOR, escalateProviderUnavailable,
+  killCredential, LostRaceError, recordLostRace,
   type DraftLanding, type OutcomeContext,
 } from '../drafting/outcomes.ts'
 import { buildReplyPolicy, personaFor } from '../drafting/policy.ts'
 import { computeEvidence } from '../drafting/evidence.ts'
 import { appendRunEvent, finishRun } from '../drafting/runs.ts'
-import { notifyProviderHealth } from '../provider-health-notify.ts'
-import {
-  cacheTtlFor, FALLBACK_CODES, markCredentialDead, type ProviderResolver, type ResolvedProvider,
-} from '../provider-resolver.ts'
+import { cacheTtlFor, FALLBACK_CODES, type ProviderResolver } from '../provider-resolver.ts'
 
 /**
  * Spec §Budgets: $0.40 of managed spend per run. Past it the automatic redraft after a guardrail
@@ -257,46 +255,6 @@ async function escalateRunCapped(deps: TicketDraftDeps, orgId: string, ticketId:
     return notificationId
   })
   if (notificationId) await deps.enqueueNotify(orgId, notificationId)
-}
-
-/**
- * Phase 6: the agent's configured provider cannot be produced at all — a dead credential, no KEK
- * ring, a secret row the probe has not written yet, or a managed config on a replica with no
- * platform key. Same discipline as `no_agent`: this happens BEFORE the claim, so there is no stamp,
- * no run row and no spend; the owner gets one page per ticket per UTC day (reason-scoped, because a
- * key that stopped working is materially different from whatever else escalated this ticket today).
- */
-async function escalateProviderUnavailable(
-  deps: TicketDraftDeps, orgId: string, ticketId: string, day: string, now: Date, refusal: string,
-): Promise<void> {
-  deps.logger.warn({ orgId, ticketId, refusal }, 'ticket.draft: no model provider for this agent; escalating provider_unavailable')
-  const notificationId = await withOrg(deps.db, orgId, async (tx) => {
-    const { notificationId } = await escalateTicket(tx, {
-      orgId, ticketId, fromStatus: 'triaged', reason: 'provider_unavailable', day, now,
-      dedupeKey: `provider_unavailable:${ticketId}:${day}`, actor: DRAFT_ACTOR, auditAction: 'ticket.escalated',
-      detail: { refusal },
-    })
-    return notificationId
-  })
-  if (notificationId) await deps.enqueueNotify(orgId, notificationId)
-}
-
-/**
- * Phase 6: the provider rejected the tenant's own key mid-run. `markCredentialDead` is guarded on
- * `health_status <> 'dead'`, so a probe (or another draft) that got there first simply wins and this
- * writes nothing at all — including the page, which belongs to whoever actually flipped the row.
- * Its own short transaction: `notifyProviderHealth` opens another, and neither may span the model call.
- */
-async function killCredential(
-  deps: TicketDraftDeps, orgId: string, config: ResolvedProvider['config'], error: string, now: Date,
-): Promise<void> {
-  const credentialId = config.credentialId
-  if (!credentialId || !config.credential) return
-  const flipped = await withOrg(deps.db, orgId, (tx) => markCredentialDead(tx, orgId, credentialId, error, DRAFT_ACTOR))
-  if (!flipped) return
-  await notifyProviderHealth(
-    { db: deps.db, enqueueNotify: deps.enqueueNotify }, orgId, credentialId, config.credential.label, config.provider, now,
-  )
 }
 
 /**
