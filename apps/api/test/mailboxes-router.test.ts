@@ -264,6 +264,13 @@ describe('mailboxes router: addresses, verification, consent, gmail access', () 
    * org override → the PLAN's default (`PLANS.trial.maxConnections` is 1, standard's is 5) → the
    * settings-catalog default (5). Its own api, because `startConnect` refuses outright unless Gmail
    * mailbox OAuth is configured, which the shared `t` above deliberately is not.
+   *
+   * What the cap COUNTS is the ruling these cases pin (R7): live sync slots, i.e.
+   * `status IN ('connected','pending_claim')`. `reauth_required` is excluded because such a mailbox
+   * syncs nothing AND its row is reused by the reconnect that repairs it — counting it would lock
+   * an owner out of fixing the only mailbox they have, which on Gmail's 7-day Testing-mode tokens
+   * is the normal case at the trial cap of 1. `pending_claim` is counted, or N flows could be
+   * opened at once.
    */
   describe('the mailbox connection cap', () => {
     let withOauth: Awaited<ReturnType<typeof createTestApi>>
@@ -286,13 +293,44 @@ describe('mailboxes router: addresses, verification, consent, gmail access', () 
       // Refused BEFORE anything is written: no oauth_flows row was created.
       expect(await withOauth.api.withOrg(orgId, (tx) => tx.select().from(oauthFlows))).toEqual([])
 
-      // `status <> 'disabled'` is the live set, so disconnecting one frees its slot. The box key is
-      // not provisioned in this suite, so the next refusal is 'provisioning' — which is precisely
-      // the point: the cap is no longer what stops it.
+      // A disconnected mailbox frees its slot. The box key is not provisioned in this suite, so the
+      // next refusal is 'provisioning' — which is precisely the point: the cap is no longer what
+      // stops it.
       await withOauth.api.withOrg(orgId, (tx) => tx.update(mailboxConnections)
         .set({ status: 'disabled' }).where(eq(mailboxConnections.id, first)))
       await expect(c.mailboxes.startConnect.mutate({ provider: 'gmail', platform: 'web' }))
         .rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' }, message: 'provisioning' })
+    })
+
+    it('ruling R7 — the cap counts LIVE SYNC SLOTS: connected blocks, pending_claim blocks, reauth_required does not (the owner can always repair their only mailbox)', async () => {
+      const signed = await signInWithOtp(withOauth.app, withOauth.mail, 'owner-r7@example.com', 'Owner')
+      const c = client(oauthBase, signed.cookie)
+      const { orgId } = await c.workspace.create.mutate({ businessName: 'R7', timezone: 'UTC' })
+      const setStatus = (id: string, status: string) => withOauth.api.withOrg(orgId, (tx) =>
+        tx.update(mailboxConnections).set({ status }).where(eq(mailboxConnections.id, id)))
+
+      // The trial cap is 1, and this is the workspace's only connection.
+      const only = await insertConnectedMailbox(withOauth.api, orgId, signed.user.id, 'only@r7.test')
+
+      // connected → at the cap.
+      await expect(c.mailboxes.startConnect.mutate({ provider: 'gmail', platform: 'web' }))
+        .rejects.toMatchObject({ data: { code: 'FORBIDDEN' }, message: BILLING_ERROR_MESSAGES.connection_limit })
+
+      // reauth_required → NOT at the cap. This is the case the ruling exists for: the mailbox syncs
+      // nothing and the reconnect reuses this very row, so the repair must be startable. The refusal
+      // that follows is 'provisioning' (no box key in this suite), i.e. the cap let it through.
+      await setStatus(only, 'reauth_required')
+      await expect(c.mailboxes.startConnect.mutate({ provider: 'gmail', platform: 'web' }))
+        .rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' }, message: 'provisioning' })
+
+      // pending_claim → at the cap again: an in-flight claim becomes a connection, so excluding it
+      // would let N flows be opened at once.
+      await setStatus(only, 'pending_claim')
+      await expect(c.mailboxes.startConnect.mutate({ provider: 'gmail', platform: 'web' }))
+        .rejects.toMatchObject({ data: { code: 'FORBIDDEN' }, message: BILLING_ERROR_MESSAGES.connection_limit })
+
+      // Nothing above wrote an oauth_flows row — every refusal happened before the flow insert.
+      expect(await withOauth.api.withOrg(orgId, (tx) => tx.select().from(oauthFlows))).toEqual([])
     })
 
     it('an org_settings override beats the plan default, and the standard plan lifts it to 5 without one', async () => {

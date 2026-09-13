@@ -458,12 +458,10 @@ describe('mailbox connect flow: storeCredentials enqueue_failed recovery', () =>
           status: 'reauth_required', connectedByUserId: signed.user.id,
         }).returning())
 
-      // The existing connection occupies the org's only TRIAL slot (`PLANS.trial.maxConnections` is
-      // 1, and Phase 7's cap counts every `status <> 'disabled'` row — `reauth_required` included),
-      // so without this override `startConnect` would refuse the RECONNECT below on the connection
-      // limit. `startConnect` cannot tell a reconnect from a new mailbox: the flow names no target,
-      // the provider does, at callback time. Raised here so this case still tests what it is about.
-      await t2.api.withOrg(orgId2, (tx) => tx.insert(orgSettings).values({ orgId: orgId2, key: 'mailboxes.max_connections', value: 20 }))
+      // No connection-cap override here, deliberately: this org is on the trial plan, whose cap is
+      // 1, and the existing connection above is `reauth_required` — which ruling R7 does NOT count
+      // (it syncs nothing, and the reconnect below reuses its very row). So this case doubles as
+      // the end-to-end proof of R7: the repair of a workspace's only, broken mailbox is startable.
 
       providerOverrides.gmail = fakeGmailProvider(fixedExchange({
         tokens: { refreshToken: 'rt-enqfail-2', accessToken: 'at-enqfail-2', accessTokenExpiresAt: null },

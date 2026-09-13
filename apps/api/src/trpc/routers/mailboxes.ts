@@ -8,7 +8,7 @@
  */
 import { randomInt } from 'node:crypto'
 import { TRPCError } from '@trpc/server'
-import { and, count, eq, ne } from 'drizzle-orm'
+import { and, count, eq, inArray } from 'drizzle-orm'
 import {
   AddAddressInput, AdminConsentInfoInput, BILLING_ERROR_MESSAGES, ClaimConnectionInput, ConsentAddressInput, DisconnectInput,
   MAX_AGENTS_PER_DOMAIN, RequestGmailAccessInput, ResendVerificationInput, StartConnectInput, emailDomain,
@@ -62,15 +62,29 @@ export const mailboxesRouter = router({
       // cap should be told so, not walked through a consent screen whose connection cannot land.
       // It comes first for the same reason: "you are at your plan's limit" is a truer answer than
       // "provisioning", which is what the box-key check below would say on a brand-new workspace.
-      // `status <> 'disabled'` is the live set: a disconnected mailbox frees its slot, a
-      // `reauth_required` one does not. That second half has a real edge: a workspace AT its cap
-      // whose only mailbox needs re-authorising is refused here, because this hop names no target
-      // (the provider decides which mailbox at callback time) and so cannot tell a reconnect from a
-      // new connection. Disconnecting the broken one first is the way through.
+      //
+      // The counted set is `connected` + `pending_claim` — LIVE SYNC SLOTS, which is the resource
+      // this cap protects (controller ruling R7). `disabled` and `reauth_required` are both
+      // excluded: a reauth_required mailbox syncs nothing, and the reconnect that repairs it REUSES
+      // its row (`connect/routes.ts` updates the existing connection to `pending_claim` rather than
+      // inserting a second one), so counting it would refuse a repair that could never create a new
+      // connection. `startConnect` takes only `{ provider, platform }` and cannot tell a repair from
+      // a new mailbox, so the count is the only lever — and on Gmail's Testing-mode consent screen,
+      // where every external refresh token dies after 7 days, that lockout would be the NORMAL case
+      // at the trial plan's cap of 1: the owner's only inbox breaks weekly and the sole escape is a
+      // destructive-sounding Disconnect. `pending_claim` MUST stay counted — an in-flight claim
+      // becomes a connection, and excluding it would let someone open N flows at once.
+      //
+      // Accepted residual risk, stated so nobody "fixes" it back: a workspace can end ONE over its
+      // cap by connecting a new mailbox while an old one is broken and then repairing the old one.
+      // Bounded by one, self-limiting (they can add no more), and far cheaper than the lockout.
       const sources = await loadSettingSources(tx, ['mailboxes.max_connections'])
       const maxConnections = resolveSetting('mailboxes.max_connections', sources)
       const [live] = await tx.select({ value: count() }).from(mailboxConnections)
-        .where(and(eq(mailboxConnections.orgId, ctx.orgId), ne(mailboxConnections.status, 'disabled')))
+        .where(and(
+          eq(mailboxConnections.orgId, ctx.orgId),
+          inArray(mailboxConnections.status, ['connected', 'pending_claim']),
+        ))
       if ((live?.value ?? 0) >= maxConnections) {
         throw new TRPCError({ code: 'FORBIDDEN', message: BILLING_ERROR_MESSAGES.connection_limit })
       }
