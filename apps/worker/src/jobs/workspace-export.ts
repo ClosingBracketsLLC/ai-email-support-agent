@@ -59,6 +59,7 @@ import {
 import type { ObjectStore } from '@aesa/knowledge'
 import { defineJob, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
 import { errorMessage } from '../err-message.ts'
+import { alert } from '../observability.ts'
 
 export const WorkspaceExportPayload = z.object({ orgId: z.string(), exportId: z.string() })
 export type WorkspaceExportPayload = z.infer<typeof WorkspaceExportPayload>
@@ -430,13 +431,10 @@ export async function runWorkspaceExport(
   })
 
   if (claim.outcome === 'key_mismatch') {
-    // Task 11 replaces this with `alert('export_failed', { orgId, exportId })`. No push: the owner
-    // has nothing to act on, and the state they can already see reads `failed`. This line is for
-    // whoever has to fix the mint/validate pair, which is why it carries BOTH keys verbatim.
-    deps.logger.error(
-      { alert: true, kind: 'export_failed', orgId, exportId, expectedKey: key, actualKey: claim.actualKey },
-      'workspace.export: the workspace row names a different export key than this job\'s payload — landed failed',
-    )
+    // No push: the owner has nothing to act on, and the state they can already see reads `failed`.
+    // This line is for whoever has to fix the mint/validate pair, which is why it carries BOTH keys
+    // verbatim.
+    alert(deps.logger, 'export_failed', { orgId, exportId, expectedKey: key, actualKey: claim.actualKey })
     return 'skipped'
   }
   if (claim.outcome === 'not_queued') {
@@ -492,11 +490,7 @@ export async function runWorkspaceExport(
 async function landFailed(
   deps: WorkspaceExportDeps, orgId: string, exportId: string, key: string, err: unknown,
 ): Promise<void> {
-  // Task 11 replaces this with `alert('export_failed', { orgId, exportId })`.
-  deps.logger.error(
-    { alert: true, kind: 'export_failed', orgId, exportId, error: errorMessage(err) },
-    'workspace.export: building or storing the bundle failed; the workspace is marked failed',
-  )
+  alert(deps.logger, 'export_failed', { orgId, exportId, error: errorMessage(err) })
   try {
     await deps.store.delete(key)
   } catch (deleteErr) {

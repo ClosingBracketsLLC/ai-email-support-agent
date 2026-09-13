@@ -28,6 +28,7 @@ import { z } from 'zod'
 import { audit, billingSubscriptions, ensureBillingRow, notifications, readBillingState } from '@aesa/db'
 import { JOB_NAMES } from '@aesa/queue'
 import type { ServerDeps } from '../deps.ts'
+import { alert } from '../observability.ts'
 import type { BillingServiceDeps } from './service.ts'
 import type { StripeEvent } from './stripe.ts'
 
@@ -335,10 +336,7 @@ export async function applyStripeEvent(deps: BillingServiceDeps, event: StripeEv
     // Not a bug we can fix from here: a customer this platform has never stored means a webhook
     // endpoint pointed at the wrong account, or a workspace whose row was purged with the Stripe
     // customer still live. Both need a human.
-    deps.logger.error(
-      { alert: true, kind: 'stripe_unknown_customer', eventId: event.id, type: event.type, customerId: parsed.customerId },
-      'stripe webhook: unknown customer',
-    )
+    alert(deps.logger, 'stripe_unknown_customer', { eventId: event.id, type: event.type, customerId: parsed.customerId })
     return 'unknown_customer'
   }
 
@@ -458,10 +456,9 @@ export async function applyStripeEvent(deps: BillingServiceDeps, event: StripeEv
   // `client_reference_id` pointing at a workspace that is already somebody else's customer is
   // either a replayed session or a forged one.
   if (outcome.result === 'unknown_customer') {
-    deps.logger.error(
-      { alert: true, kind: 'stripe_unknown_customer', eventId: event.id, type: event.type, customerId: parsed.customerId, claimedOrgId: parsed.claimedOrgId },
-      'stripe webhook: claimed workspace already belongs to another customer',
-    )
+    alert(deps.logger, 'stripe_unknown_customer', {
+      eventId: event.id, type: event.type, customerId: parsed.customerId, claimedOrgId: parsed.claimedOrgId,
+    })
   }
 
   if (outcome.result === 'applied' && parsed.deferredFulfilment) {
@@ -485,14 +482,11 @@ export async function applyStripeEvent(deps: BillingServiceDeps, event: StripeEv
   }
 
   if (outcome.displacedSubscriptionId) {
-    deps.logger.error(
-      {
-        alert: true, kind: 'stripe_double_subscription', eventId: event.id, type: event.type, orgId,
-        previousSubscriptionId: outcome.displacedSubscriptionId,
-        incomingSubscriptionId: parsed.patch.stripeSubscriptionId,
-      },
-      'stripe webhook: workspace has a second live subscription; cancel the previous one',
-    )
+    alert(deps.logger, 'stripe_double_subscription', {
+      eventId: event.id, type: event.type, orgId,
+      previousSubscriptionId: outcome.displacedSubscriptionId,
+      incomingSubscriptionId: parsed.patch.stripeSubscriptionId ?? null,
+    })
   }
 
   // Post-commit, like every other notification path in the api.
@@ -539,7 +533,9 @@ export function registerStripeWebhook(routes: FastifyInstance, deps: ServerDeps)
         // The only 4xx this route ever answers, and the only branch that records nothing: anybody can
         // POST here, so an unverifiable body is not evidence of a Stripe problem — but a SUSTAINED
         // run of them is either a rotated webhook secret or someone probing, and both want a human.
-        req.log.error({ alert: true, kind: 'stripe_webhook_rejected', err }, 'stripe webhook: signature rejected')
+        // The shared app-level logger, not `req.log` — `alert()` takes a `pino.Logger`, and
+        // Fastify's per-request child is a narrower `FastifyBaseLogger`.
+        alert(deps.logger, 'stripe_webhook_rejected', { error: err instanceof Error ? err.message : String(err) })
         return reply.code(400).send({ statusCode: 400, error: 'Bad Request' })
       }
 

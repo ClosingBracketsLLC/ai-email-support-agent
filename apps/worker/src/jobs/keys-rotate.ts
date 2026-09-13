@@ -24,6 +24,7 @@ import type { KekRing } from '@aesa/crypto'
 import { audit, rewrapOrgDek, withOrg, type AuditActor, type Db } from '@aesa/db'
 import { defineJob, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
 import { errorMessage } from '../err-message.ts'
+import { alert } from '../observability.ts'
 
 export const KeysRotatePayload = z.object({ orgId: z.string() })
 export type KeysRotatePayload = z.infer<typeof KeysRotatePayload>
@@ -68,10 +69,7 @@ export async function runKeysRotate(deps: KeysRotateDeps, payload: KeysRotatePay
     // replica" failure the header warns about — so it must never be just a pg-boss retry record that
     // nobody reads until three backed-off attempts have gone by. Rethrown unchanged: the retry is
     // still worth having, in case the ring was mid-rollout.
-    deps.logger.error(
-      { alert: true, kind: 'keys_rotate_failed', orgId: payload.orgId, ringActive: deps.ring.active, error: errorMessage(err) },
-      'keys.rotate: re-wrapping this workspace\'s data key failed — check that every replica holds the same KEK ring',
-    )
+    alert(deps.logger, 'keys_rotate_failed', { orgId: payload.orgId, ringActive: deps.ring.active, error: errorMessage(err) })
     throw err
   }
 

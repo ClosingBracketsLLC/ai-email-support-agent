@@ -38,6 +38,7 @@ import type { ObjectStore } from '@aesa/knowledge/storage'
 import { JOB_NAMES } from '@aesa/queue'
 import type { StripePort } from '../billing/stripe.ts'
 import type { ApiFacade, EnqueueFn } from '../deps.ts'
+import { alert } from '../observability.ts'
 
 export interface LifecycleDeps {
   api: ApiFacade
@@ -197,11 +198,8 @@ export async function requestDeletion(
       // A workspace holding a live Stripe subscription on a process with no Stripe keys is a
       // misconfiguration, not a soft state — and the safe direction is to refuse, because the
       // alternative is a purged tenant whose card keeps being charged with nothing left to cancel it
-      // from. (Task 11 replaces this with `alert('billing_unconfigured', …)`.)
-      deps.logger.error(
-        { alert: true, kind: 'deletion_billing_unconfigured', orgId },
-        'workspace.requestDeletion: a live subscription cannot be cancelled — STRIPE_* is not configured',
-      )
+      // from.
+      alert(deps.logger, 'deletion_billing_unconfigured', { orgId })
       return { ok: false, code: 'billing_cancel_failed' }
     }
     try {
@@ -366,14 +364,10 @@ export async function requestExport(
  *
  * The caller still reports `{ ok: true }`: the request WAS accepted, and the export then failed. That
  * is where every export failure surfaces — `exportStatus`, which the screen is polling anyway — so
- * there is no second failure channel to keep in step. (Task 11 replaces the log with
- * `alert('export_failed', …)`.)
+ * there is no second failure channel to keep in step.
  */
 async function releaseStrandedClaim(deps: LifecycleDeps, orgId: string, exportId: string, key: string): Promise<void> {
-  deps.logger.error(
-    { alert: true, kind: 'export_failed', orgId, exportId, reason: 'enqueue_returned_null' },
-    'workspace.requestExport: no job id came back; the export claim was rolled back to failed',
-  )
+  alert(deps.logger, 'export_failed', { orgId, exportId, reason: 'enqueue_returned_null' })
   try {
     await deps.api.withOrg(orgId, async (tx) => {
       await tx.update(workspaces)
@@ -387,8 +381,7 @@ async function releaseStrandedClaim(deps: LifecycleDeps, orgId: string, exportId
   } catch (err) {
     // The alert above already fired, and it is the thing an operator acts on. A rollback that itself
     // failed must not turn an accepted request into a 500 on top of everything else.
-    deps.logger.error({ err, alert: true, kind: 'export_failed', orgId, exportId, reason: 'rollback_failed' },
-      'workspace.requestExport: rolling the stranded export claim back failed')
+    alert(deps.logger, 'export_failed', { orgId, exportId, reason: 'rollback_failed', error: err instanceof Error ? err.message : String(err) })
   }
 }
 

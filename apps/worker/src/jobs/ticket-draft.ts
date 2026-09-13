@@ -52,6 +52,7 @@ import {
 } from '../drafting/outcomes.ts'
 import { buildReplyPolicy, personaFor } from '../drafting/policy.ts'
 import { computeEvidence } from '../drafting/evidence.ts'
+import { alert } from '../observability.ts'
 import { appendRunEvent, finishRun } from '../drafting/runs.ts'
 import { cacheTtlFor, FALLBACK_CODES, type ProviderResolver } from '../provider-resolver.ts'
 
@@ -297,11 +298,11 @@ async function notifyOrgCapped(deps: TicketDraftDeps, orgId: string, day: string
     return row?.id
   })
   if (!notificationId) return
-  // Task 11 replaces this with `alert('org_spend_capped', { orgId, scope })` — an operator has to see
-  // a workspace that has stopped drafting, and a `notifications` row only reaches its owner. It rides
-  // the SAME dedupe the page does (once per org per day): a capped workspace hits this path on every
-  // queued ticket, and an alert per refusal would bury the one that mattered.
-  deps.logger.error({ alert: true, kind: 'org_spend_capped', orgId, scope }, 'ticket.draft: the workspace has spent its AI budget')
+  // An operator has to see a workspace that has stopped drafting, and a `notifications` row only
+  // reaches its owner. It rides the SAME dedupe the page does (once per org per day): a capped
+  // workspace hits this path on every queued ticket, and an alert per refusal would bury the one
+  // that mattered.
+  alert(deps.logger, 'org_spend_capped', { orgId, scope })
   await deps.enqueueNotify(orgId, notificationId)
 }
 
@@ -689,11 +690,7 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
     const admission = deps.admission ?? noAdmission
     const slot = config.mode === 'managed' ? await admission.acquire(watchdog) : null
     if (config.mode === 'managed' && slot === null) {
-      // Task 11 replaces this with `alert('admission_slot_timeout', { orgId })`.
-      deps.logger.error(
-        { alert: true, kind: 'admission_slot_timeout', orgId, runId, attempt },
-        'ticket.draft: no managed admission slot freed in time; proceeding uncontrolled',
-      )
+      alert(deps.logger, 'admission_slot_timeout', { orgId, runId, attempt })
     }
     try {
       call = await runDraftCall(resolved.provider, promptInput(guardrailRetry, effort), meta, watchdog)

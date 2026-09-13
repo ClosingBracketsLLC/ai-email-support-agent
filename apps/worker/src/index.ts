@@ -3,7 +3,7 @@ import { loadModelPricing } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createMailLimiter } from '@aesa/mail'
 import { createMailTransport } from '@aesa/platform-mail'
-import { createQueueRetrying, JOB_NAMES, queueOptionsFor, startBoss } from '@aesa/queue'
+import { createQueueRetrying, JOB_NAMES, queueOptionsFor, setJobObserver, startBoss } from '@aesa/queue'
 import { maybeRegisterAgentRole } from './agent-role.ts'
 import { registerBillingReportUsage } from './billing/report-usage.ts'
 import { createStripeUsagePort } from './billing/stripe.ts'
@@ -30,20 +30,31 @@ import { enqueueTicketDraft } from './jobs/ticket-draft.ts'
 import { registerWorkspacePurgeSweep } from './jobs/workspace-purge.ts'
 import { maybeRegisterKnowledgeRole } from './knowledge-role.ts'
 import { createWorkerLogger } from './logging.ts'
+import { captureWithOrg, initObservability } from './observability.ts'
 import { createExpoPush } from './push.ts'
 import { maybeRegisterSendRole } from './send-role.ts'
 
 loadDotEnv(import.meta.url)
 const config = loadConfig(process.env)
 assertInvariants()
+// Task 11, FIRST thing after config/invariants: every job failure from here on (the observer wired
+// below) and every alert() call anywhere in this process can reach Sentry from the moment the
+// queue starts working jobs. `SENTRY_RELEASE` is deliberately not part of `WorkerConfig` — the
+// runbook sets it from the deploy's git SHA as a plain env var, read here at the composition root.
+const sentryEnabled = initObservability({
+  sentry: config.sentryDsn ? { dsn: config.sentryDsn, environment: config.sentryEnvironment } : null,
+  release: process.env.SENTRY_RELEASE,
+})
 const logger = createWorkerLogger(config.logLevel)
+if (!sentryEnabled) logger.warn('SENTRY_DSN missing; error reporting is off (alerts still log via pino)')
+setJobObserver({ onFailure: (err, ctx) => captureWithOrg(err, { orgId: ctx.orgId, job: ctx.name }) })
 const { db, pool } = createDb(config.databaseUrl, { role: 'app' })
 // The platform price table, read ONCE at boot and handed to every metered provider. An empty table
 // (nothing seeded, or a database that predates 0020) is passed as `undefined` so `withMetering`
 // stays on its code-seeded `PRICING_SEED` rather than costing every call at zero.
 const pricing = await loadModelPricing(db)
 const boss = await startBoss(config.databaseUrl)
-logger.info({ roles: [...config.roles], kekActive: config.kekRing?.active ?? null }, 'worker up')
+logger.info({ roles: [...config.roles], kekActive: config.kekRing?.active ?? null, sentry: sentryEnabled }, 'worker up')
 
 // pg-boss 10's insertJob SQL INNER JOINs the new job row against the queue table and returns zero
 // rows (no error, `boss.send` resolves `null`) when the named queue does not exist yet. notify.dispatch

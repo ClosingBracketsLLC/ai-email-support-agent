@@ -179,6 +179,11 @@ describe('the api module graph', () => {
     `
     const stdout = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', probe], {
       cwd: API_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'],
+      // Task 11: @sentry/node + @opentelemetry/* add a deep module graph, and this probe's `seen`
+      // array records every specifier resolved while loading it — comfortably past Node's default
+      // 1 MB stdout maxBuffer (spawnSync's failure mode for that is ENOBUFS, not a buffer-size
+      // error, which is what actually surfaced here). 64 MB is generous headroom, not a tuned number.
+      maxBuffer: 64 * 1024 * 1024,
     })
     const result = JSON.parse(stdout.trim().split('\n').at(-1)!) as { approve: string; seen: string[] }
 
@@ -216,6 +221,15 @@ describe('the api module graph', () => {
    * the same barrel; the connect flow's own outbound OAuth calls are what that guard is for), and
    * one this task has no charter to touch. So the assertion is "undici enters only through
    * `@aesa/crypto`, never through `@aesa/knowledge`" rather than "undici never appears at all".
+   *
+   * Task 11 adds a SECOND sanctioned source: `@sentry/node` (loaded by `./src/observability.ts`,
+   * which `./src/workspace/lifecycle.ts`'s `alert(...)` calls import directly, and which
+   * `trpc/router.ts` never reaches on its own) statically pulls in `@sentry/opentelemetry` and
+   * `@opentelemetry/instrumentation-undici` — Sentry instruments the Node global fetch/http stack
+   * for its own error and breadcrumb capture, and it NEVER fetches a customer- or tenant-supplied
+   * URL (unlike the crawler `@aesa/knowledge` guards against), so a parent module under
+   * `node_modules/@sentry/` or `node_modules/@opentelemetry/` is allowed the same way
+   * `@aesa/crypto`'s pinned fetch is.
    */
   it.each([
     ['./src/config.ts', 'loadConfig'],
@@ -223,7 +237,8 @@ describe('the api module graph', () => {
     ['./src/memory/service.ts', 'summary'],
     ['./src/billing/service.ts', 'getBilling'],
     ['./src/workspace/lifecycle.ts', 'requestDeletion'],
-  ])('importing %s never pulls in @anthropic-ai/sdk, @aesa/llm, pdfjs-dist or mammoth, and only reaches undici through @aesa/crypto', (modulePath, exportName) => {
+    ['./src/observability.ts', 'initObservability'],
+  ])('importing %s never pulls in @anthropic-ai/sdk, @aesa/llm, pdfjs-dist or mammoth, and only reaches undici through @aesa/crypto or @sentry/@opentelemetry', (modulePath, exportName) => {
     const probe = `
       import { registerHooks } from 'node:module'
       const seen = []
@@ -233,6 +248,11 @@ describe('the api module graph', () => {
     `
     const stdout = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', probe], {
       cwd: API_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'],
+      // Task 11: @sentry/node + @opentelemetry/* add a deep module graph, and this probe's `seen`
+      // array records every specifier resolved while loading it — comfortably past Node's default
+      // 1 MB stdout maxBuffer (spawnSync's failure mode for that is ENOBUFS, not a buffer-size
+      // error, which is what actually surfaced here). 64 MB is generous headroom, not a tuned number.
+      maxBuffer: 64 * 1024 * 1024,
     })
     const result = JSON.parse(stdout.trim().split('\n').at(-1)!) as { hasExport: boolean; seen: { specifier: string; parent: string | null }[] }
 
@@ -241,7 +261,11 @@ describe('the api module graph', () => {
     const hardForbidden = ['@anthropic-ai/', '@aesa/llm', 'pdfjs-dist', 'mammoth']
     expect(result.seen.filter((s) => hardForbidden.some((f) => s.specifier.includes(f)))).toEqual([])
 
-    const undiciFromOutsideCrypto = result.seen.filter((s) => s.specifier === 'undici' && !(s.parent ?? '').includes('/packages/crypto/'))
+    const undiciFromOutsideCrypto = result.seen.filter((s) => {
+      if (s.specifier !== 'undici') return false
+      const parent = s.parent ?? ''
+      return !parent.includes('/packages/crypto/') && !parent.includes('/node_modules/@sentry/') && !parent.includes('/node_modules/@opentelemetry/')
+    })
     expect(undiciFromOutsideCrypto).toEqual([])
 
     expect(result.seen.filter((s) => s.specifier === '@aesa/knowledge')).toEqual([])   // the pure sub-paths only
@@ -272,6 +296,11 @@ describe('the api module graph', () => {
     `
     const stdout = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', probe], {
       cwd: API_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'],
+      // Task 11: @sentry/node + @opentelemetry/* add a deep module graph, and this probe's `seen`
+      // array records every specifier resolved while loading it — comfortably past Node's default
+      // 1 MB stdout maxBuffer (spawnSync's failure mode for that is ENOBUFS, not a buffer-size
+      // error, which is what actually surfaced here). 64 MB is generous headroom, not a tuned number.
+      maxBuffer: 64 * 1024 * 1024,
     })
     const result = JSON.parse(stdout.trim().split('\n').at(-1)!) as {
       hasRouter: boolean; hasPort: string; beforePort: string[]; seen: { specifier: string; parent: string | null }[]

@@ -9,13 +9,23 @@ import { loadConfig } from './config.ts'
 import { createApiFacade, createEnqueue } from './deps.ts'
 import { createAppLogger } from './logging.ts'
 import { createMailTransport } from './mail/transport.ts'
+import { initObservability } from './observability.ts'
 import { buildServer } from './server.ts'
 
 loadDotEnv(import.meta.url)
 const config = loadConfig(process.env)
+// Task 11: initObservability FIRST, right after loadConfig — every error this process can produce
+// from here on (the Fastify handler and the tRPC onError, both wired in server.ts) can reach Sentry.
+// `SENTRY_RELEASE` is deliberately not part of `ApiConfig` — the runbook sets it from the deploy's
+// git SHA as a plain env var, read here at the composition root.
+const sentryEnabled = initObservability({
+  sentry: config.sentryDsn ? { dsn: config.sentryDsn, environment: config.sentryEnvironment } : null,
+  release: process.env.SENTRY_RELEASE,
+})
 assertInvariants()
 
 const logger = createAppLogger({ level: config.logLevel })
+if (!sentryEnabled) logger.warn('SENTRY_DSN missing; error reporting is off (alerts still log via pino)')
 // The only raw handle in the api. Everything below sees the facade or Better Auth, never db/pool.
 const handle = createDb(config.databaseUrl, { role: 'app' })
 const api = createApiFacade(handle)

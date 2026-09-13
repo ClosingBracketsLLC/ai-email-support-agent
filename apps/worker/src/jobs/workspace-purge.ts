@@ -40,6 +40,7 @@ import {
 import type { ObjectStore } from '@aesa/knowledge'
 import { defineJob, enqueue, JOB_NAMES, registerCron, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
 import { errorMessage } from '../err-message.ts'
+import { alert } from '../observability.ts'
 
 export const WorkspacePurgePayload = z.object({ orgId: z.string() })
 export type WorkspacePurgePayload = z.infer<typeof WorkspacePurgePayload>
@@ -135,13 +136,9 @@ export async function runWorkspacePurge(
   signal.throwIfAborted()
 
   for (const key of plan.foreignKeys) {
-    // Task 11 replaces this with `alert('purge_failed', { orgId, key })`. An irreversible delete is
-    // the last operation that should act on a key it cannot account for, so the key is left alone
-    // and an operator is told which row points where.
-    deps.logger.error(
-      { alert: true, kind: 'purge_failed', orgId, key },
-      'workspace.purge: a stored object key is outside this workspace\'s own prefix — NOT deleted; find out which row wrote it',
-    )
+    // An irreversible delete is the last operation that should act on a key it cannot account for,
+    // so the key is left alone and an operator is told which row points where.
+    alert(deps.logger, 'purge_failed', { orgId, key })
   }
 
   // --- Phase 2: objects, outside every transaction. Best-effort, but never silently.
@@ -155,12 +152,9 @@ export async function runWorkspacePurge(
     }
   }
   if (failedKeys.length > 0) {
-    // Task 11 replaces this with `alert('purge_failed', { orgId, keys })`. Nothing re-sweeps a
-    // stranded object, so the runbook needs the keys themselves, not just a count.
-    deps.logger.error(
-      { alert: true, kind: 'purge_failed', orgId, keys: failedKeys },
-      'workspace.purge: these objects could not be deleted and nothing will retry them — delete them by hand',
-    )
+    // Nothing re-sweeps a stranded object, so the runbook needs the keys themselves, not just a
+    // count — joined into one string, `alert`'s ctx being scalar-values-only.
+    alert(deps.logger, 'purge_failed', { orgId, keys: failedKeys.join(',') })
   }
 
   // --- Phase 3: rows. Tenant tables, then workspaces, then the auth rows (see the header for why).
@@ -179,14 +173,11 @@ export async function runWorkspacePurge(
       })
     })
   } catch (err) {
-    // Task 11 replaces this with `alert('purge_failed', { orgId, phase: 'rows' })`. By this point
-    // phase 2 has already emptied the bucket, so a throw here leaves the workspace HALF purged —
-    // objects gone, rows present — which the retry will finish but which nobody should learn about
-    // only from a pg-boss failure record. Rethrown unchanged so the retry still happens.
-    deps.logger.error(
-      { alert: true, kind: 'purge_failed', orgId, phase: 'rows', error: errorMessage(err) },
-      'workspace.purge: the row purge failed AFTER the objects were deleted — this workspace is half purged',
-    )
+    // By this point phase 2 has already emptied the bucket, so a throw here leaves the workspace
+    // HALF purged — objects gone, rows present — which the retry will finish but which nobody
+    // should learn about only from a pg-boss failure record. Rethrown unchanged so the retry still
+    // happens.
+    alert(deps.logger, 'purge_failed', { orgId, phase: 'rows', error: errorMessage(err) })
     throw err
   }
 

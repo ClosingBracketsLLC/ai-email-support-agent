@@ -36,6 +36,7 @@ import {
 import { registerCron } from '@aesa/queue'
 import { utcDayString } from '../date-utils.ts'
 import { errorMessage } from '../err-message.ts'
+import { alert } from '../observability.ts'
 import type { StripeUsagePort } from './stripe.ts'
 
 /** Bound on how many workspaces one nightly pass visits — the `stats.rollup` bound, same reasoning. */
@@ -334,11 +335,7 @@ export async function runBillingReportUsage(deps: ReportUsageDeps): Promise<Repo
         plan.overageDone = true
         result.reported += 1
       } catch (err) {
-        // Task 11 replaces this with `alert('stripe_report_failed', { orgId })`.
-        deps.logger.error(
-          { alert: true, kind: 'stripe_report_failed', orgId: plan.orgId, op: 'reportOverage', error: errorMessage(err) },
-          'billing.report-usage: reporting overage to Stripe failed; the watermark is left where it was',
-        )
+        alert(deps.logger, 'stripe_report_failed', { orgId: plan.orgId, op: 'reportOverage', error: errorMessage(err) })
       }
     }
     if (plan.quantity) {
@@ -349,10 +346,7 @@ export async function runBillingReportUsage(deps: ReportUsageDeps): Promise<Repo
         plan.quantityDone = true
         result.quantitySynced += 1
       } catch (err) {
-        deps.logger.error(
-          { alert: true, kind: 'stripe_report_failed', orgId: plan.orgId, op: 'setDomainQuantity', error: errorMessage(err) },
-          'billing.report-usage: syncing the licensed domain quantity to Stripe failed',
-        )
+        alert(deps.logger, 'stripe_report_failed', { orgId: plan.orgId, op: 'setDomainQuantity', error: errorMessage(err) })
       }
     }
   }
@@ -371,11 +365,7 @@ export async function runBillingReportUsage(deps: ReportUsageDeps): Promise<Repo
         // moved at all in between, the identifier differs (`…:10` vs `…:15`) and Stripe's 24-hour
         // dedupe does not apply — the overlapping units bill twice. Losing overage outright is still
         // worse, so the ordering stands; what must not happen is it passing silently.
-        // Task 11 replaces this with `alert('stripe_report_failed', { orgId, op: 'record' })`.
-        deps.logger.error(
-          { alert: true, kind: 'stripe_report_failed', orgId: plan.orgId, op: 'record', error: errorMessage(err) },
-          'billing.report-usage: the overage was REPORTED to Stripe but the watermark did not record; the next pass may re-report it',
-        )
+        alert(deps.logger, 'stripe_report_failed', { orgId: plan.orgId, op: 'record', error: errorMessage(err) })
       } else {
         // Nothing was reported, so nothing can be double-billed: the notices and the quantity row
         // are simply re-derived tomorrow.

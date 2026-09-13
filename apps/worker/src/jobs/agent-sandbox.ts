@@ -44,6 +44,7 @@ import { buildReplyPolicy, personaFor } from '../drafting/policy.ts'
 import { computeEvidence } from '../drafting/evidence.ts'
 import { noAdmission, type AdmissionPool } from '../drafting/admission.ts'
 import { appendRunEvent, finishRun } from '../drafting/runs.ts'
+import { alert } from '../observability.ts'
 import { cacheTtlFor, type ProviderResolver } from '../provider-resolver.ts'
 
 export const AgentSandboxPayload = z.object({ orgId: z.string(), runId: z.string() })
@@ -399,11 +400,7 @@ async function runAgentSandboxUnsafe(
   const admission = deps.admission ?? noAdmission
   const slot = config.mode === 'managed' ? await admission.acquire(watchdog) : null
   if (config.mode === 'managed' && slot === null) {
-    // Task 11 replaces this with `alert('admission_slot_timeout', { orgId })`.
-    deps.logger.error(
-      { alert: true, kind: 'admission_slot_timeout', orgId, runId },
-      'agent.sandbox: no managed admission slot freed in time; proceeding uncontrolled',
-    )
+    alert(deps.logger, 'admission_slot_timeout', { orgId, runId })
   }
   try {
     call = await runDraftCall(resolved.provider, promptInput, meta, watchdog)

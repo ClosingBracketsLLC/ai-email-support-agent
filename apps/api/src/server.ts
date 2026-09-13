@@ -1,4 +1,5 @@
 import { STATUS_CODES } from 'node:http'
+import * as Sentry from '@sentry/node'
 import cors from '@fastify/cors'
 import formbody from '@fastify/formbody'
 import rateLimit from '@fastify/rate-limit'
@@ -9,6 +10,7 @@ import { registerStripeWebhook } from './billing/webhook.ts'
 import { registerBrandAssets } from './brand/assets.ts'
 import { registerConnectRoutes } from './connect/routes.ts'
 import type { ServerDeps } from './deps.ts'
+import { captureWithOrg } from './observability.ts'
 import { redactUrl } from './redact.ts'
 import { registerReviewRoutes } from './review/routes.ts'
 import { createContextFactory } from './trpc/context.ts'
@@ -29,6 +31,10 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // incompatible with the plain `FastifyInstance` this function returns (a childLoggerFactory variance issue).
   const loggerInstance: FastifyBaseLogger = deps.logger
   const app = Fastify({ loggerInstance, trustProxy: deps.config.trustProxy })
+  // Task 11: Sentry's own `onError` hook (it never replaces the custom setErrorHandler below —
+  // Fastify runs every registered `onError` hook, this one just also reports to Sentry) — a no-op
+  // call when initObservability never ran (no SENTRY_DSN, the normal dev-box state).
+  if (Sentry.isInitialized()) Sentry.setupFastifyErrorHandler(app)
   const startedAt = Date.now()
 
   // Better Auth's client posts JSON; some calls carry no body. Fastify's stock parser 400s an empty JSON body.
@@ -188,10 +194,17 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     trpcOptions: {
       router: appRouter,
       createContext: createContextFactory(deps),
-      onError({ path, error }) {
+      onError({ path, error, ctx }) {
         // Client errors are expected traffic; only unexpected failures deserve the (redacting) err serializer.
-        if (error.code === 'INTERNAL_SERVER_ERROR') app.log.error({ err: error.cause ?? error, path }, 'trpc failed')
-        else app.log.warn({ path, code: error.code }, 'trpc rejected')
+        if (error.code === 'INTERNAL_SERVER_ERROR') {
+          app.log.error({ err: error.cause ?? error, path }, 'trpc failed')
+          // `ctx`'s base type (TrpcContext) carries no orgId — orgProcedure's middleware is what adds
+          // it, and only once a procedure actually reaches that middleware before throwing — hence
+          // the cast rather than a static field.
+          captureWithOrg(error.cause ?? error, { orgId: (ctx as { orgId?: string } | undefined)?.orgId ?? null, path })
+        } else {
+          app.log.warn({ path, code: error.code }, 'trpc rejected')
+        }
       },
     } satisfies FastifyTRPCPluginOptions<AppRouter>['trpcOptions'],
   })
