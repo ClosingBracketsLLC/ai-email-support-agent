@@ -1,15 +1,24 @@
 import { TRPCError } from '@trpc/server'
 import { APIError } from 'better-auth/api'
 import { and, asc, count, desc, eq, inArray, sql } from 'drizzle-orm'
+import type pino from 'pino'
 import {
-  BILLING_PRICING, CreateWorkspaceInput, OPERATING_GUIDANCE_MAX, SetAgentEnabledInput, SuggestionIdInput, UpdateGuidanceInput,
+  BILLING_PRICING, CreateWorkspaceInput, OPERATING_GUIDANCE_MAX, RequestDeletionInput, SetAgentEnabledInput,
+  SetKillSwitchInput, SetRetentionDaysInput, SuggestionIdInput, UpdateGuidanceInput, WORKSPACE_ERROR_MESSAGES,
   deriveAllowedHosts, isOnboardingStep, nextOnboardingStep, slugify,
-  UpdateProfileInput, type OnboardingStep, type Tone,
+  UpdateProfileInput, type ExportState, type OnboardingStep, type Tone,
 } from '@aesa/contracts'
-import { agents, audit, billingSubscriptions, categories, drafts, ensureBillingRow, guidanceSuggestions, tickets, workspaces } from '@aesa/db'
+import { agents, audit, billingSubscriptions, categories, drafts, ensureBillingRow, guidanceSuggestions, tickets, workspaces, type AuditActor } from '@aesa/db'
+import type { ObjectStore } from '@aesa/knowledge/storage'
 import type { Auth } from '../../auth.ts'
+import type { StripePort } from '../../billing/stripe.ts'
+import type { ApiFacade, EnqueueFn } from '../../deps.ts'
+import {
+  cancelDeletion, exportStatus, purgeAfterFor, requestDeletion, requestExport, setKillSwitch, setRetentionDays,
+  type LifecycleActor, type LifecycleDeps,
+} from '../../workspace/lifecycle.ts'
 import { mapAuthError } from '../auth-errors.ts'
-import { authedProcedure, managerProcedure, orgProcedure, router } from '../init.ts'
+import { authedProcedure, managerProcedure, orgProcedure, ownerProcedure, router } from '../init.ts'
 
 /** The "live" draft statuses — the same set `drafts_live_per_ticket_uidx` (migration 0011) enforces
  * one-per-ticket over. `goLiveStatus`'s `firstDraft` is the newest of these, org-wide. */
@@ -28,17 +37,58 @@ export interface WorkspaceView {
   orgId: string; businessName: string; websiteUrl: string | null; description: string | null; tone: Tone
   timezone: string; locale: string; contactPhone: string | null; contactUrls: string[]; allowedUrlHosts: string[]
   operatingGuidance: string; agentEnabled: boolean; agentEnabledAt: Date | null; onboardingStep: OnboardingStep; createdAt: Date
+  /** Phase 7's lifecycle, all of it the OWNER's to see (Settings → Workspace renders every field;
+   * `workspace.get` itself stays `orgProcedure`, because a teammate needs to know the agent is
+   * stopped or the workspace is on its way out). `purgeAfter` is derived, never stored. */
+  killSwitch: boolean; retentionDays: number
+  deletionRequestedAt: Date | null; purgeAfter: Date | null
+  exportState: ExportState; exportReadyAt: Date | null
 }
 
-/** The client-facing shape. Never the box key, never the kill switch internals. */
+/** The client-facing shape. Never the box key, never the customer-hash salt — and never
+ * `export_key` either, which is an object-store path the owner reaches only through a presigned URL
+ * (`workspace.exportStatus`). The KILL SWITCH is on the view since Phase 7: it is the owner's own
+ * control, and a workspace that has stopped sending has to be able to say so. */
 export function toWorkspaceView(w: WorkspaceRow): WorkspaceView {
   return {
     orgId: w.orgId, businessName: w.businessName, websiteUrl: w.websiteUrl, description: w.description, tone: w.tone as Tone,
     timezone: w.timezone, locale: w.locale, contactPhone: w.contactPhone, contactUrls: w.contactUrls, allowedUrlHosts: w.allowedUrlHosts,
     operatingGuidance: w.operatingGuidance, agentEnabled: w.agentEnabled, agentEnabledAt: w.agentEnabledAt,
     onboardingStep: isOnboardingStep(w.onboardingStep) ? w.onboardingStep : 'profile', createdAt: w.createdAt,
+    killSwitch: w.killSwitch, retentionDays: w.retentionDays,
+    deletionRequestedAt: w.deletionRequestedAt,
+    purgeAfter: w.deletionRequestedAt ? purgeAfterFor(w.deletionRequestedAt) : null,
+    exportState: w.exportState as ExportState, exportReadyAt: w.exportReadyAt,
   }
 }
+
+/** The slice of the tRPC context `src/workspace/lifecycle.ts` needs — structural, so the real
+ * context just satisfies it (the same shape `routers/billing.ts` and `routers/memory.ts` use). */
+interface LifecycleContext {
+  deps: { api: ApiFacade; enqueue: EnqueueFn; logger: pino.Logger; stripe: StripePort | null; store: ObjectStore }
+  user: { id: string }
+  actor: AuditActor
+  ip: string
+  userAgent: string | null
+}
+
+const lifecycleDeps = (ctx: LifecycleContext): LifecycleDeps => ({
+  api: ctx.deps.api, enqueue: ctx.deps.enqueue, logger: ctx.deps.logger, stripe: ctx.deps.stripe, store: ctx.deps.store,
+})
+const lifecycleActor = (ctx: LifecycleContext): LifecycleActor =>
+  ({ userId: ctx.user.id, actor: ctx.actor, ip: ctx.ip, userAgent: ctx.userAgent })
+
+/** `confirm_mismatch` is the caller's own input being wrong — BAD_REQUEST. `deletion_pending`,
+ * `not_pending` and `export_in_progress` are states of the workspace that a different action clears
+ * (cancel the deletion; request one first; wait for the export) — PRECONDITION_FAILED.
+ * `billing_cancel_failed` is Stripe being unreachable or refusing, which is a BAD_GATEWAY and the
+ * one code the screen may offer a plain "try again" for. */
+const precondition = (message: string): TRPCError => new TRPCError({ code: 'PRECONDITION_FAILED', message })
+
+/** `not_pending` has no `WORKSPACE_ERROR_MESSAGES` entry because it is a pure race outcome — a
+ * second Cancel tap, or the purge having already claimed the workspace — not a state the owner can
+ * deliberately be in while the button they pressed is on screen. */
+const NOT_PENDING_MESSAGE = 'This workspace is not scheduled for deletion.'
 
 /** Better Auth owns the organization row; the slug is unique, so retry with a fresh suffix on collision. */
 async function createOrganizationWithFreshSlug(auth: Auth, headers: Headers, name: string): Promise<{ id: string }> {
@@ -304,4 +354,60 @@ export const workspaceRouter = router({
       }
     }),
   ),
+
+  // -----------------------------------------------------------------------------------------
+  // Phase 7's lifecycle — thin wrappers over `src/workspace/lifecycle.ts`. Every MUTATION here is
+  // `ownerProcedure`: an ADMIN manages the workspace (mailboxes, guidance, the agent switch), but
+  // only the OWNER stops it dead, changes how long it keeps customer mail, exports it, or deletes
+  // it. `exportStatus` alone is `orgProcedure` — whether the export finished is not a privileged
+  // fact, and the bundle itself is behind a presigned URL that only that query ever mints.
+  // -----------------------------------------------------------------------------------------
+
+  /** "Stop sending, now" — the switch `send.execute`, `drafts.approve` and the review pages already
+   * obey. Nothing downstream changes; this is only the owner's hand on it. */
+  setKillSwitch: ownerProcedure.input(SetKillSwitchInput).mutation(({ ctx, input }) =>
+    setKillSwitch(lifecycleDeps(ctx), ctx.orgId, input.on, lifecycleActor(ctx))),
+
+  /** How long this workspace keeps message bodies; `retention.sweep` purges past it nightly. */
+  setRetentionDays: ownerProcedure.input(SetRetentionDaysInput).mutation(({ ctx, input }) =>
+    setRetentionDays(lifecycleDeps(ctx), ctx.orgId, input.retentionDays, lifecycleActor(ctx))),
+
+  /** The one irreversible thing the app can start. `confirm` must be the business name EXACTLY, a
+   * live Stripe subscription is cancelled BEFORE anything is written, and a failure there refuses
+   * the deletion outright rather than scheduling a purge on a card that keeps being charged. */
+  requestDeletion: ownerProcedure.input(RequestDeletionInput).mutation(async ({ ctx, input }) => {
+    const res = await requestDeletion(lifecycleDeps(ctx), ctx.orgId, input.confirm, lifecycleActor(ctx))
+    if (res.ok) return { purgeAfter: res.purgeAfter }
+    switch (res.code) {
+      case 'confirm_mismatch': throw new TRPCError({ code: 'BAD_REQUEST', message: WORKSPACE_ERROR_MESSAGES.confirm_mismatch })
+      case 'deletion_pending': throw precondition(WORKSPACE_ERROR_MESSAGES.deletion_pending)
+      case 'billing_cancel_failed': throw new TRPCError({ code: 'BAD_GATEWAY', message: WORKSPACE_ERROR_MESSAGES.billing_cancel_failed })
+    }
+  }),
+
+  /** "Actually, keep it." Clears the stamps alone — the kill switch stays on and the agent stays
+   * off, for the owner to turn back on deliberately. */
+  cancelDeletion: ownerProcedure.mutation(async ({ ctx }) => {
+    const res = await cancelDeletion(lifecycleDeps(ctx), ctx.orgId, lifecycleActor(ctx))
+    if (res.ok) return { ok: true as const }
+    switch (res.code) {
+      case 'not_pending': throw precondition(NOT_PENDING_MESSAGE)
+    }
+  }),
+
+  /** Queues `workspace.export`. Refuses while one is still `queued` (ruling R16) — see the service's
+   * own comment: moving `export_key` under a job in flight makes that job fail the owner's newest
+   * request. */
+  requestExport: ownerProcedure.mutation(async ({ ctx }) => {
+    const res = await requestExport(lifecycleDeps(ctx), ctx.orgId, lifecycleActor(ctx))
+    if (res.ok) return { exportId: res.exportId }
+    switch (res.code) {
+      case 'export_in_progress': throw precondition(WORKSPACE_ERROR_MESSAGES.export_in_progress)
+    }
+  }),
+
+  /** The export screen's poll target — and the only way the bundle's bytes are ever reachable: a
+   * presigned GET, valid for seven days, issued only once the worker has landed `ready`.
+   * `orgProcedure`, because knowing whether the export finished is not a privileged fact. */
+  exportStatus: orgProcedure.query(({ ctx }) => exportStatus(lifecycleDeps(ctx), ctx.orgId)),
 })

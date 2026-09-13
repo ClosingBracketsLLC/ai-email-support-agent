@@ -222,6 +222,7 @@ describe('the api module graph', () => {
     ['./src/trpc/router.ts', 'appRouter'],
     ['./src/memory/service.ts', 'summary'],
     ['./src/billing/service.ts', 'getBilling'],
+    ['./src/workspace/lifecycle.ts', 'requestDeletion'],
   ])('importing %s never pulls in @anthropic-ai/sdk, @aesa/llm, pdfjs-dist or mammoth, and only reaches undici through @aesa/crypto', (modulePath, exportName) => {
     const probe = `
       import { registerHooks } from 'node:module'

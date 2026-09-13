@@ -42,6 +42,15 @@ describe('workspace router', () => {
     const ws = await a.workspace.get.query()
     expect(ws).toMatchObject({ orgId, businessName: 'Acme & Sons', timezone: 'Europe/Berlin', tone: 'friendly', onboardingStep: 'profile', role: 'owner', allowedUrlHosts: [] })
     expect(Object.keys(ws)).not.toContain('boxPublicKey')
+    // Phase 7 widened the view with the lifecycle the owner now controls — and nothing else: the box
+    // key and the customer-hash salt stay server-side (`workspace-lifecycle.test.ts` drives the
+    // procedures that move these).
+    expect(ws).toMatchObject({
+      killSwitch: false, retentionDays: 180, deletionRequestedAt: null, purgeAfter: null,
+      exportState: 'none', exportReadyAt: null,
+    })
+    expect(Object.keys(ws)).not.toContain('customerHashSalt')
+    expect(Object.keys(ws)).not.toContain('exportKey')
     const rows = await t.api.withOrg(orgId, (tx) => tx.select().from(auditLog).where(eq(auditLog.action, 'workspace.create')))
     expect(rows).toHaveLength(1)
     expect(rows[0]).toMatchObject({ actor: `user:${userA.id}`, entityType: 'workspace', entityId: orgId })

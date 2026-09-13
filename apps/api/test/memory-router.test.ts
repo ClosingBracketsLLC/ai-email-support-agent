@@ -10,7 +10,9 @@ import { eq } from 'drizzle-orm'
 import superjson from 'superjson'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { MEMORY_EXPIRY_DAYS } from '@aesa/core'
-import { auditLog, categories, customerHash, drafts, ensureCustomerHashSalt, resolvedAnswers, workspaces } from '@aesa/db'
+import { auditLog, categories, customerHash, drafts, ensureCustomerHashSalt, messages, resolvedAnswers, workspaces } from '@aesa/db'
+import { JOB_NAMES } from '@aesa/queue'
+import type { EnqueueFn } from '../src/deps.ts'
 import type { AppRouter } from '../src/trpc/router.ts'
 import {
   SEED_DRAFT_BODY, WEB, createTestApi, insertConnectedMailbox, insertTicket, listen, seedPendingDraft, signInWithOtp,
@@ -22,11 +24,18 @@ const client = (base: string, cookie?: string) => createTRPCClient<AppRouter>({
 
 const DAY_MS = 86_400_000
 
+interface Recorded { name: string; data: Record<string, unknown>; opts: { entityId: string } }
+
 describe('memory router', () => {
   let t: Awaited<ReturnType<typeof createTestApi>>
   let base: string
   let seq = 0
-  beforeAll(async () => { t = await createTestApi(); base = await listen(t.app) })
+  /** Phase 7: `rememberReply` is the one procedure here that produces a job, so this suite records. */
+  const sent: Recorded[] = []
+  beforeAll(async () => {
+    const enqueue: EnqueueFn = async (name, data, opts) => { sent.push({ name, data, opts }); return `job-${sent.length}` }
+    t = await createTestApi({}, { enqueue }); base = await listen(t.app)
+  })
   afterAll(async () => { await t.close() })
 
   async function setupOrg() {
@@ -202,6 +211,56 @@ describe('memory router', () => {
     expect(JSON.stringify(freshRows[0]!.detail)).not.toContain('casey')
   })
 
+  it('rememberReply: an outbound reply enqueues memory.capture with the messageId payload and audits; inbound, empty, already-remembered and foreign messages are refused and enqueue nothing', async () => {
+    const org = await setupOrg()
+    const other = await setupOrg()
+    const ticket = await insertTicket(t.api, org.orgId, { connectionId: org.connectionId, agentId: org.agentId })
+
+    const seedMessage = async (orgId: string, connectionId: string, ticketId: string, values: Partial<typeof messages.$inferInsert> = {}) => {
+      const [row] = await t.api.withOrg(orgId, (tx) => tx.insert(messages).values({
+        orgId, ticketId, connectionId, providerMessageId: `pm-${randomUUID()}`,
+        direction: 'outbound', bodyText: 'It ships the next working day.', sentAt: new Date(), ...values,
+      }).returning())
+      return row!
+    }
+
+    const reply = await seedMessage(org.orgId, org.connectionId, ticket.id)
+    sent.length = 0
+    expect(await org.c.memory.rememberReply.mutate({ messageId: reply.id })).toEqual({ ok: true })
+    expect(sent).toEqual([
+      { name: JOB_NAMES.memoryCapture, data: { orgId: org.orgId, messageId: reply.id }, opts: { entityId: reply.id } },
+    ])
+    const audits = await readAudit(org.orgId, 'memory.remember_requested')
+    expect(audits).toHaveLength(1)
+    expect(audits[0]).toMatchObject({ actor: `user:${org.userId}`, entityType: 'message', entityId: reply.id })
+
+    // The job is idempotent, and so is the ask — but once an answer names the message, saying so is
+    // more useful than queueing a job that would only skip.
+    await seedAnswer(org.orgId, { status: 'active', sourceMessageId: reply.id })
+    sent.length = 0
+    await expect(org.c.memory.rememberReply.mutate({ messageId: reply.id })).rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' } })
+
+    // The customer's own message is never "a reply the agent sent".
+    const inbound = await seedMessage(org.orgId, org.connectionId, ticket.id, { direction: 'inbound' })
+    await expect(org.c.memory.rememberReply.mutate({ messageId: inbound.id })).rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' } })
+
+    // A body-less (or whitespace-only) reply has nothing to learn from.
+    const blank = await seedMessage(org.orgId, org.connectionId, ticket.id, { bodyText: '   \n  ' })
+    await expect(org.c.memory.rememberReply.mutate({ messageId: blank.id })).rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' } })
+    const purged = await seedMessage(org.orgId, org.connectionId, ticket.id, { bodyText: null })
+    await expect(org.c.memory.rememberReply.mutate({ messageId: purged.id })).rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' } })
+
+    // Another workspace's message does not exist as far as this one is concerned.
+    const foreignTicket = await insertTicket(t.api, other.orgId, { connectionId: other.connectionId, agentId: other.agentId })
+    const foreign = await seedMessage(other.orgId, other.connectionId, foreignTicket.id)
+    await expect(org.c.memory.rememberReply.mutate({ messageId: foreign.id })).rejects.toMatchObject({ data: { code: 'NOT_FOUND' } })
+    await expect(org.c.memory.rememberReply.mutate({ messageId: randomUUID() })).rejects.toMatchObject({ data: { code: 'NOT_FOUND' } })
+
+    // Not one refusal produced a job, and not one wrote a second audit row.
+    expect(sent).toEqual([])
+    expect(await readAudit(org.orgId, 'memory.remember_requested')).toHaveLength(1)
+  })
+
   it('members can read; only managers can mutate', async () => {
     const org = await setupOrg()
     const candidate = await seedAnswer(org.orgId, { status: 'candidate' })
@@ -230,6 +289,9 @@ describe('memory router', () => {
     ]) {
       await expect(call).rejects.toMatchObject({ data: { code: 'FORBIDDEN' } })
     }
+    // Outside the array on purpose: httpBatchLink batches everything created in one tick into a
+    // single URL, and a sixth procedure name tips it past Fastify's max param length (414).
+    await expect(asMember.memory.rememberReply.mutate({ messageId: randomUUID() })).rejects.toMatchObject({ data: { code: 'FORBIDDEN' } })
     expect(await readAnswer(org.orgId, candidate.id)).toMatchObject({ status: 'candidate' })
   })
 })

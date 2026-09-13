@@ -25,9 +25,10 @@ import type pino from 'pino'
 import type { MemoryListInput, MemoryTab } from '@aesa/contracts'
 import { MEMORY_EXPIRY_DAYS } from '@aesa/core'
 import {
-  agents, audit, categories, customerHash, resolvedAnswers, workspaces,
+  agents, audit, categories, customerHash, messages, resolvedAnswers, workspaces,
   type AuditActor, type OrgTx,
 } from '@aesa/db'
+import { JOB_NAMES } from '@aesa/queue'
 import type { ApiFacade, EnqueueFn } from '../deps.ts'
 import { flagAutoSent, type DraftServiceDeps } from '../drafts/service.ts'
 
@@ -264,6 +265,57 @@ export async function deleteByCustomer(
     })
     return { deleted: count }
   })
+}
+
+export type RememberReplyResult =
+  | { ok: true }
+  | { ok: false; code: 'not_found' | 'not_outbound' | 'empty' | 'already_remembered' }
+
+/**
+ * "Remember this reply" (plan deviation 16, the spec's Phase 7 backfill): an owner turns a reply the
+ * workspace already SENT into a learned answer, with no draft behind it — a hand-written reply, or
+ * one from before the agent existed. There is no connect-time backfill; every such reply is one tap
+ * away instead.
+ *
+ * This procedure neither writes nor scrubs anything: `memory.capture` stays the ONLY writer of a
+ * `resolved_answers` row (CLAUDE.md, Memory). All it does is check what it can see cheaply and
+ * enqueue the `messageId` variant of that job. The four refusals exist because they are the cases a
+ * human just clicked on and deserves an answer about — the job's own re-validation would otherwise
+ * turn each into a silent skip. It still re-validates everything (and skips on its own for the one
+ * case only it can see: a reply with no inbound message before it to pair as the question), so
+ * `{ ok: true }` means "queued", never "learned".
+ */
+export async function rememberReply(
+  deps: MemoryServiceDeps, orgId: string, messageId: string, actor: MemoryActor,
+): Promise<RememberReplyResult> {
+  const outcome = await deps.api.withOrg(orgId, async (tx) => {
+    const [message] = await tx.select({ id: messages.id, direction: messages.direction, bodyText: messages.bodyText })
+      .from(messages).where(and(eq(messages.orgId, orgId), eq(messages.id, messageId))).limit(1)
+    // Another workspace's message, or none at all — the same code for both, because telling them
+    // apart would leak whether an id exists elsewhere (the rule this file's `notFound` already keeps).
+    if (!message) return { ok: false as const, code: 'not_found' as const }
+    if (message.direction !== 'outbound') return { ok: false as const, code: 'not_outbound' as const }
+
+    // Checked before `empty` for the same reason the job checks it first: an answer already naming
+    // this message is the more useful thing to say, and it is the state a second tap lands in.
+    const [already] = await tx.select({ id: resolvedAnswers.id }).from(resolvedAnswers)
+      .where(and(eq(resolvedAnswers.orgId, orgId), eq(resolvedAnswers.sourceMessageId, messageId))).limit(1)
+    if (already) return { ok: false as const, code: 'already_remembered' as const }
+
+    // A purged body (`retention.sweep`) or a whitespace-only one has nothing to learn from.
+    if (!message.bodyText || message.bodyText.trim().length === 0) return { ok: false as const, code: 'empty' as const }
+
+    await audit(tx, {
+      actor: actor.actor, action: 'memory.remember_requested', entityType: 'message', entityId: messageId,
+      detail: { messageId }, ip: actor.ip, userAgent: actor.userAgent,
+    })
+    return { ok: true as const }
+  })
+  if (!outcome.ok) return outcome
+
+  const jobId = await deps.enqueue(JOB_NAMES.memoryCapture, { orgId, messageId }, { entityId: messageId })
+  if (jobId === null) deps.logger.debug({ orgId, messageId }, 'memory.capture enqueue returned no job id (duplicate collapsed)')
+  return { ok: true }
 }
 
 /** One audit row per decision, always naming the answer — never its text. */
