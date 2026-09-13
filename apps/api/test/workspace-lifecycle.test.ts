@@ -28,7 +28,7 @@ import { JOB_NAMES } from '@aesa/queue'
 import type { EnqueueFn } from '../src/deps.ts'
 import type { AppRouter } from '../src/trpc/router.ts'
 import { createAppLogger } from '../src/logging.ts'
-import { cancelDeletion, requestDeletion, type LifecycleDeps } from '../src/workspace/lifecycle.ts'
+import { cancelDeletion, requestDeletion, requestExport, type LifecycleDeps } from '../src/workspace/lifecycle.ts'
 import { WEB, createTestApi, listen, signInWithOtp } from './helpers/app.ts'
 import { callsTo, createFakeStripe, type FakeStripe } from './helpers/fake-stripe.ts'
 
@@ -232,6 +232,32 @@ describe('workspace lifecycle', () => {
     expect(await readAudit(org.orgId, 'workspace.deletion_requested')).toHaveLength(1)
   })
 
+  it('the deletion notice and both results tell the truth about the subscription: cancelled immediately, and never restored by Cancel', async () => {
+    const subscribed = await setupOrg()
+    await giveSubscription(subscribed.orgId, 'sub_live_truth')
+
+    const requested = await subscribed.c.workspace.requestDeletion.mutate({ confirm: 'Acme' })
+    expect(requested.subscriptionCancelled).toBe(true)
+
+    // `subscriptions.cancel` is immediate, not `cancel_at_period_end` — so the owner-facing copy must
+    // not imply Cancel puts the plan back.
+    const [note] = await t.api.withOrg(subscribed.orgId, (tx) =>
+      tx.select().from(notifications).where(eq(notifications.orgId, subscribed.orgId)))
+    expect(note!.body).toMatch(/subscription/i)
+    expect(note!.body).toMatch(/re-?subscrib/i)
+
+    // …and Cancel says so too, so the Workspace screen can point at Billing.
+    expect(await subscribed.c.workspace.cancelDeletion.mutate()).toEqual({ ok: true, subscriptionCancelled: true })
+
+    // A workspace that never had a subscription is told none of that, on either call.
+    const free = await setupOrg()
+    expect((await free.c.workspace.requestDeletion.mutate({ confirm: 'Acme' })).subscriptionCancelled).toBe(false)
+    const [freeNote] = await t.api.withOrg(free.orgId, (tx) =>
+      tx.select().from(notifications).where(eq(notifications.orgId, free.orgId)))
+    expect(freeNote!.body).not.toMatch(/subscription/i)
+    expect(await free.c.workspace.cancelDeletion.mutate()).toEqual({ ok: true, subscriptionCancelled: false })
+  })
+
   it('a failing Stripe cancel refuses the deletion outright (BAD_GATEWAY) and writes nothing', async () => {
     const org = await setupOrg()
     await giveSubscription(org.orgId, 'sub_live_boom')
@@ -297,7 +323,8 @@ describe('workspace lifecycle', () => {
     await org.c.workspace.setAgentEnabled.mutate({ enabled: true })
     await org.c.workspace.requestDeletion.mutate({ confirm: 'Acme' })
 
-    expect(await org.c.workspace.cancelDeletion.mutate()).toEqual({ ok: true })
+    // A workspace that never subscribed is told so — the subscription half is pinned by its own case.
+    expect(await org.c.workspace.cancelDeletion.mutate()).toEqual({ ok: true, subscriptionCancelled: false })
     expect(await readWorkspace(org.orgId)).toMatchObject({
       deletionRequestedAt: null, deletionRequestedBy: null,
       // Deliberate: the owner turns these back on themselves, one considered tap at a time.
@@ -332,13 +359,13 @@ describe('workspace lifecycle', () => {
     expect(sent.filter((s) => s.name === JOB_NAMES.notifyDispatch)).toHaveLength(1)
 
     // Same day, cancelled and asked for again: one decision made twice in an afternoon — one page.
-    expect(await cancelDeletion(deps, org.orgId, actor)).toEqual({ ok: true })
+    expect(await cancelDeletion(deps, org.orgId, actor)).toMatchObject({ ok: true })
     expect(await requestDeletion(deps, org.orgId, 'Acme', actor)).toMatchObject({ ok: true })
     expect(await notes()).toHaveLength(1)
     expect(sent.filter((s) => s.name === JOB_NAMES.notifyDispatch)).toHaveLength(1)
 
     // A LATER day is a fresh decision to destroy the workspace, and must reach a human again.
-    expect(await cancelDeletion(deps, org.orgId, actor)).toEqual({ ok: true })
+    expect(await cancelDeletion(deps, org.orgId, actor)).toMatchObject({ ok: true })
     now = day2
     expect(await requestDeletion(deps, org.orgId, 'Acme', actor)).toMatchObject({ ok: true })
     const after = await notes()
@@ -406,12 +433,60 @@ describe('workspace lifecycle', () => {
     })
   })
 
+  it('the export download link is OWNER-only: a member and an admin see the ready state but never a URL', async () => {
+    const org = await setupOrg()
+    const asMember = await inviteMember(org, 'member')
+    const asAdmin = await inviteMember(org, 'admin')
+
+    const { exportId } = await org.c.workspace.requestExport.mutate()
+    const key = exportObjectKey(org.orgId, exportId)
+    const readyAt = new Date()
+    await t.api.withOrg(org.orgId, (tx) => tx.update(workspaces)
+      .set({ exportState: 'ready', exportReadyAt: readyAt }).where(eq(workspaces.orgId, org.orgId)))
+
+    // The bundle is not a member-visible subset: `workspace.export` writes the COMPLETE audit log
+    // (every colleague's every action, which no member-facing procedure exposes — `activity` gives a
+    // count) and the Stripe customer and subscription ids. So the STATE is everyone's and the URL is
+    // the owner's, matching `requestExport`'s own rung.
+    expect(await asMember.workspace.exportStatus.query()).toEqual({ state: 'ready', readyAt, url: null })
+    expect(await asAdmin.workspace.exportStatus.query()).toEqual({ state: 'ready', readyAt, url: null })
+    expect(presigned).toEqual([])
+
+    expect(await org.c.workspace.exportStatus.query()).toEqual({ state: 'ready', readyAt, url: `memory://${key}` })
+    expect(presigned).toEqual([{ key, expiresSeconds: 7 * 24 * 60 * 60 }])
+  })
+
   it('a failed export can be retried, and exportStatus presigns nothing for it', async () => {
     const org = await setupOrg()
     await org.c.workspace.requestExport.mutate()
     await t.api.withOrg(org.orgId, (tx) => tx.update(workspaces).set({ exportState: 'failed', exportReadyAt: null }).where(eq(workspaces.orgId, org.orgId)))
 
     expect(await org.c.workspace.exportStatus.query()).toEqual({ state: 'failed', readyAt: null, url: null })
+    const retry = await org.c.workspace.requestExport.mutate()
+    expect(await readWorkspace(org.orgId)).toMatchObject({ exportState: 'queued', exportKey: exportObjectKey(org.orgId, retry.exportId) })
+  })
+
+  it('a null workspace.export job id rolls the claim back to failed and alerts, instead of stranding the workspace queued forever', async () => {
+    const org = await setupOrg()
+    const lines: string[] = []
+    const deps: LifecycleDeps = {
+      api: t.api, enqueue: async () => null, stripe: fake.port, store: t.store,
+      logger: createAppLogger({ level: 'error', stream: { write: (line: string) => void lines.push(line) } }),
+    }
+    const actor = { userId: org.userId, actor: `user:${org.userId}` as const }
+
+    const res = await requestExport(deps, org.orgId, actor)
+    expect(res).toMatchObject({ ok: true })
+
+    // Without the rollback the row sits `queued` with no job behind it, and R16 then refuses every
+    // future export FOREVER — `workspace.export` is the only thing that ever moves the state, so
+    // nothing would reset it short of hand-written SQL.
+    expect(await readWorkspace(org.orgId)).toMatchObject({ exportState: 'failed', exportReadyAt: null })
+    expect(lines.join('')).toContain('"alert":true')
+    expect(lines.join('')).toContain('enqueue_returned_null')
+
+    // Which means the owner sees a failure they can simply retry.
+    expect(await org.c.workspace.exportStatus.query()).toMatchObject({ state: 'failed', url: null })
     const retry = await org.c.workspace.requestExport.mutate()
     expect(await readWorkspace(org.orgId)).toMatchObject({ exportState: 'queued', exportKey: exportObjectKey(org.orgId, retry.exportId) })
   })

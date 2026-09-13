@@ -31,7 +31,7 @@
 import { randomUUID } from 'node:crypto'
 import { and, eq, isNotNull, isNull } from 'drizzle-orm'
 import type pino from 'pino'
-import { WORKSPACE_DELETE_GRACE_DAYS, exportObjectKey, type ExportState } from '@aesa/contracts'
+import { WORKSPACE_DELETE_GRACE_DAYS, exportObjectKey, type ExportState, type OrgRole } from '@aesa/contracts'
 import { audit, notifications, readBillingState, workspaces, type AuditActor } from '@aesa/db'
 import type { ObjectStore } from '@aesa/knowledge/storage'
 import { JOB_NAMES } from '@aesa/queue'
@@ -142,7 +142,9 @@ export async function setRetentionDays(
 // ---------------------------------------------------------------------------
 
 export type RequestDeletionResult =
-  | { ok: true; purgeAfter: Date }
+  /** `subscriptionCancelled` is what the screen needs to say "and your plan is gone" — see
+   *  `cancelDeletion` for why the owner has to be told twice. */
+  | { ok: true; purgeAfter: Date; subscriptionCancelled: boolean }
   | { ok: false; code: 'confirm_mismatch' | 'deletion_pending' | 'billing_cancel_failed' }
 
 /**
@@ -162,6 +164,11 @@ export type RequestDeletionResult =
  *     notification, guarded on `deletion_requested_at IS NULL` so a second tap lands `deletion_pending`
  *     instead of restarting the clock;
  *  5. dispatch the notification after the commit.
+ *
+ * The cancel at step 3 is `subscriptions.cancel` — IMMEDIATE, not `cancel_at_period_end` — and
+ * `cancelDeletion` cannot undo it. So the notification says so in words, and `subscriptionCancelled`
+ * rides out on the result for the screen to repeat: a grace period that restores the workspace but
+ * not its plan is a promise that has to be made precisely or not at all.
  */
 export async function requestDeletion(
   deps: LifecycleDeps, orgId: string, confirm: string, actor: LifecycleActor,
@@ -222,7 +229,12 @@ export async function requestDeletion(
     const [note] = await tx.insert(notifications)
       .values({
         orgId, kind: 'workspace', title: 'Workspace deletion scheduled',
-        body: 'Everything this workspace holds is erased after the grace period. Cancel any time before then in Settings → Workspace.',
+        // Two bodies, because only one of them is true. Cancelling the DELETION restores the
+        // workspace; it does not restore a subscription Stripe has already ended, and a notice that
+        // said "cancel any time" while the plan was gone would be a promise this product cannot keep.
+        body: live
+          ? 'Everything this workspace holds is erased after the grace period. Your subscription has already been cancelled — cancelling the deletion in Settings → Workspace keeps the workspace, but you will need to re-subscribe in Billing.'
+          : 'Everything this workspace holds is erased after the grace period. Cancel any time before then in Settings → Workspace.',
         // Day-scoped, like every other notification here (ruling R19). Scheduling the destruction of
         // a workspace is precisely the event that must always reach a human, so a deletion cancelled
         // and asked for again on a LATER day pages again; the same day collapses, because that is one
@@ -237,21 +249,37 @@ export async function requestDeletion(
 
   if (!outcome) return { ok: false, code: 'deletion_pending' }
   if (outcome.notificationId) await dispatchNotification(deps, orgId, outcome.notificationId)
-  return { ok: true, purgeAfter: outcome.purgeAfter }
+  return { ok: true, purgeAfter: outcome.purgeAfter, subscriptionCancelled: live }
 }
 
-export type CancelDeletionResult = { ok: true } | { ok: false; code: 'not_pending' }
+export type CancelDeletionResult =
+  | { ok: true; subscriptionCancelled: boolean }
+  | { ok: false; code: 'not_pending' }
 
 /**
- * "Actually, keep it." Clears the stamps and nothing else: the kill switch stays ON and the agent
- * stays OFF, because both are decisions with customer-visible consequences and the owner turns each
- * back on deliberately, from its own control. Guarded on the stamp being set, so the nightly purge
- * having already claimed the workspace reads as `not_pending` rather than as a cancel that did
- * nothing.
+ * "Actually, keep it." Clears the stamps and nothing else. THREE things it deliberately does not
+ * restore, and the owner has to know about all three:
+ *  - the KILL SWITCH stays on and the AGENT stays off — both have customer-visible consequences, so
+ *    the owner turns each back on deliberately, from its own control;
+ *  - the SUBSCRIPTION stays cancelled, and unlike the other two nothing here could bring it back:
+ *    `requestDeletion` called Stripe's `subscriptions.cancel`, which ends the subscription outright
+ *    rather than at the period end. Re-subscribing is a Checkout session in Billing.
+ *
+ * `subscriptionCancelled` is what lets the Workspace screen say that last part out loud. It reads
+ * "this workspace holds a Stripe subscription id", which is exactly the right question: a workspace
+ * only reaches here past `requestDeletion`, which REFUSES unless a live subscription was successfully
+ * cancelled — so a non-null id means the subscription was ended, either by that call or by the owner
+ * earlier through the Portal. Either way the answer to "am I still on a plan?" is no. It deliberately
+ * does NOT read `status`, which still says `active` until Stripe's `customer.subscription.deleted`
+ * webhook lands.
+ *
+ * Guarded on the stamp being set, so the nightly purge having already claimed the workspace reads as
+ * `not_pending` rather than as a cancel that did nothing.
  */
 export async function cancelDeletion(
   deps: LifecycleDeps, orgId: string, actor: LifecycleActor,
 ): Promise<CancelDeletionResult> {
+  const now = clock(deps)
   return deps.api.withOrg(orgId, async (tx) => {
     const cleared = await tx.update(workspaces)
       .set({ deletionRequestedAt: null, deletionRequestedBy: null })
@@ -262,7 +290,8 @@ export async function cancelDeletion(
       actor: actor.actor, action: 'workspace.deletion_cancelled', entityType: 'workspace', entityId: orgId,
       detail: {}, ip: actor.ip, userAgent: actor.userAgent,
     })
-    return { ok: true }
+    const billing = await readBillingState(tx, now)
+    return { ok: true, subscriptionCancelled: billing.stripeSubscriptionId !== null }
   })
 }
 
@@ -314,18 +343,65 @@ export async function requestExport(
   if (!claimed) return { ok: false, code: 'export_in_progress' }
 
   const jobId = await deps.enqueue(JOB_NAMES.workspaceExport, { orgId, exportId }, { entityId: exportId })
-  if (jobId === null) deps.logger.warn({ orgId, exportId }, 'workspace.export enqueue returned no job id')
+  if (jobId === null) await releaseStrandedClaim(deps, orgId, exportId, key)
   return { ok: true, exportId }
+}
+
+/**
+ * The claim committed, and then no job came back. Left alone that is PERMANENT: `workspace.export` is
+ * the only thing that ever moves `export_state`, R16 refuses every future request while the row says
+ * `queued`, and the recovery would be hand-written SQL. So the claim is rolled back to `failed` —
+ * the state the owner can see and retry from, and the same one a worker-side failure lands — guarded
+ * on THIS request's own key, so a newer claim that has already taken the slot is never clobbered.
+ *
+ * The caller still reports `{ ok: true }`: the request WAS accepted, and the export then failed. That
+ * is where every export failure surfaces — `exportStatus`, which the screen is polling anyway — so
+ * there is no second failure channel to keep in step. (Task 11 replaces the log with
+ * `alert('export_failed', …)`.)
+ */
+async function releaseStrandedClaim(deps: LifecycleDeps, orgId: string, exportId: string, key: string): Promise<void> {
+  deps.logger.error(
+    { alert: true, kind: 'export_failed', orgId, exportId, reason: 'enqueue_returned_null' },
+    'workspace.requestExport: no job id came back; the export claim was rolled back to failed',
+  )
+  try {
+    await deps.api.withOrg(orgId, async (tx) => {
+      await tx.update(workspaces)
+        .set({ exportState: 'failed', exportReadyAt: null })
+        .where(and(eq(workspaces.orgId, orgId), eq(workspaces.exportState, 'queued'), eq(workspaces.exportKey, key)))
+      await audit(tx, {
+        actor: `system:${JOB_NAMES.workspaceExport}`, action: 'workspace.export_failed', entityType: 'workspace', entityId: orgId,
+        detail: { exportId, reason: 'enqueue_returned_null' },
+      })
+    })
+  } catch (err) {
+    // The alert above already fired, and it is the thing an operator acts on. A rollback that itself
+    // failed must not turn an accepted request into a 500 on top of everything else.
+    deps.logger.error({ err, alert: true, kind: 'export_failed', orgId, exportId, reason: 'rollback_failed' },
+      'workspace.requestExport: rolling the stranded export claim back failed')
+  }
 }
 
 export interface ExportStatusView {
   state: ExportState
   readyAt: Date | null
-  /** A time-limited download link, and ONLY while the bundle is `ready`. */
+  /** A time-limited download link — only while the bundle is `ready`, and only for the OWNER. */
   url: string | null
 }
 
-export async function exportStatus(deps: LifecycleDeps, orgId: string): Promise<ExportStatusView> {
+/**
+ * Whether the export finished is every teammate's business; the BUNDLE is not. `workspace.export`
+ * writes the COMPLETE `audit_log` — every action every colleague has ever taken, which no
+ * member-facing procedure exposes anywhere (the `activity` router gives a count) — plus the Stripe
+ * customer and subscription ids. So the state and the timestamp are readable by any member and the
+ * URL is minted for the OWNER alone, matching `requestExport`'s own rung. A non-owner gets
+ * `url: null`, never an error: they can see the export is ready, they just cannot take it.
+ *
+ * The rule lives HERE rather than in the router because the router's job is to map codes, and a
+ * second caller (the Phase 7 E2E drives these functions directly) must not be able to reach the URL
+ * by forgetting a check.
+ */
+export async function exportStatus(deps: LifecycleDeps, orgId: string, role: OrgRole): Promise<ExportStatusView> {
   const row = await deps.api.withOrg(orgId, async (tx) => {
     const [ws] = await tx.select({
       exportState: workspaces.exportState, exportKey: workspaces.exportKey, exportReadyAt: workspaces.exportReadyAt,
@@ -335,7 +411,7 @@ export async function exportStatus(deps: LifecycleDeps, orgId: string): Promise<
   })
 
   const state = row.exportState as ExportState
-  if (state !== 'ready' || !row.exportKey) return { state, readyAt: row.exportReadyAt, url: null }
+  if (state !== 'ready' || !row.exportKey || role !== 'owner') return { state, readyAt: row.exportReadyAt, url: null }
   return {
     state, readyAt: row.exportReadyAt,
     url: await deps.store.presignGet(row.exportKey, { expiresSeconds: EXPORT_URL_TTL_SECONDS }),

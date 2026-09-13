@@ -372,7 +372,7 @@ export const workspaceRouter = router({
    * the deletion outright rather than scheduling a purge on a card that keeps being charged. */
   requestDeletion: ownerProcedure.input(RequestDeletionInput).mutation(async ({ ctx, input }) => {
     const res = await requestDeletion(lifecycleDeps(ctx), ctx.orgId, input.confirm, lifecycleActor(ctx))
-    if (res.ok) return { purgeAfter: res.purgeAfter }
+    if (res.ok) return { purgeAfter: res.purgeAfter, subscriptionCancelled: res.subscriptionCancelled }
     switch (res.code) {
       case 'confirm_mismatch': throw new TRPCError({ code: 'BAD_REQUEST', message: WORKSPACE_ERROR_MESSAGES.confirm_mismatch })
       case 'deletion_pending': throw precondition(WORKSPACE_ERROR_MESSAGES.deletion_pending)
@@ -380,11 +380,12 @@ export const workspaceRouter = router({
     }
   }),
 
-  /** "Actually, keep it." Clears the stamps alone — the kill switch stays on and the agent stays
-   * off, for the owner to turn back on deliberately. */
+  /** "Actually, keep it." Clears the stamps alone — the kill switch stays on, the agent stays off,
+   * and the SUBSCRIPTION stays cancelled (Stripe ended it outright when the deletion was requested).
+   * `subscriptionCancelled` is what lets the screen point the owner at Billing to re-subscribe. */
   cancelDeletion: ownerProcedure.mutation(async ({ ctx }) => {
     const res = await cancelDeletion(lifecycleDeps(ctx), ctx.orgId, lifecycleActor(ctx))
-    if (res.ok) return { ok: true as const }
+    if (res.ok) return { ok: true as const, subscriptionCancelled: res.subscriptionCancelled }
     switch (res.code) {
       case 'not_pending': throw precondition(WORKSPACE_ERROR_MESSAGES.not_pending)
     }
@@ -403,6 +404,8 @@ export const workspaceRouter = router({
 
   /** The export screen's poll target — and the only way the bundle's bytes are ever reachable: a
    * presigned GET, valid for seven days, issued only once the worker has landed `ready`.
-   * `orgProcedure`, because knowing whether the export finished is not a privileged fact. */
-  exportStatus: orgProcedure.query(({ ctx }) => exportStatus(lifecycleDeps(ctx), ctx.orgId)),
+   * `orgProcedure` because knowing whether the export FINISHED is not a privileged fact — but the
+   * bundle carries the complete audit log and the Stripe ids, so the service mints the URL for the
+   * OWNER alone and hands every other member `url: null`. */
+  exportStatus: orgProcedure.query(({ ctx }) => exportStatus(lifecycleDeps(ctx), ctx.orgId, ctx.member.role)),
 })
