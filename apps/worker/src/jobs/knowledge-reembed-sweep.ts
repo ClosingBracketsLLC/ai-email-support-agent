@@ -128,7 +128,12 @@ export async function runKnowledgeReembedSweep(
     try {
       await deps.enqueueEmbedBatch(orgId, documentId)
     } catch (err) {
-      deps.logger.warn({ documentId, error: errorMessage(err) }, 'knowledge_reembed_sweep_enqueue_failed')
+      // Unlike every other enqueue failure in this file, this one is NOT self-healing: discovery's
+      // own predicate requires `embedding IS NOT NULL` (a document with vectors still to null), and
+      // this document's chunks are already null with nothing queued to refill them — a future run
+      // will never see it again. Narrow trigger, unrecoverable state; raised to `error` (Task 11's
+      // `alert()` does not exist yet, hence the flag) rather than left at one easy-to-miss `warn`.
+      deps.logger.error({ alert: true, kind: 'knowledge_reembed_stranded', orgId, documentId, error: errorMessage(err) }, 'knowledge_reembed_sweep_enqueue_failed')
     }
   }
 

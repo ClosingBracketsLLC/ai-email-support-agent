@@ -84,27 +84,43 @@ describe('knowledge.stuck-sweep', () => {
     expect(UPLOAD_ABANDON_HOURS).toBe(24)
   })
 
-  it('(a) a processing CRAWL source stuck past the lease, first attempt, is requeued: queued, claim_token null, sweep_attempts 1, a knowledge.crawl job enqueued', async () => {
+  it('(a) a processing CRAWL source stuck past the lease, first attempt, is requeued: queued, claim_token null, sweep_attempts 1, a knowledge.crawl job enqueued — and arm (2) does NOT also fire on the row arm (1) just requeued', async () => {
     const orgId = await newOrg()
+    // `created_at` is realistically OLDER than `updated_at`'s 11-minute staleness (created 30
+    // minutes ago, last touched 11 minutes ago) — every real `processing` source has this shape,
+    // since `created_at <= updated_at` always. A fixture that leaves `created_at` at "now" (the
+    // literal insert time) cannot exercise the regression this test pins: arm (2)'s own predicate
+    // ("queued, created over QUEUED_STALE_MINUTES ago") would need a REALISTIC age to accidentally
+    // match the row arm (1) is about to flip to `queued` in the SAME pass.
     const sourceId = await seedSource(orgId, {
       kind: 'crawl', status: 'processing', url: 'https://acme.test/', pastedText: null,
-      claimToken: randomUUID(), sweepAttempts: 0, updatedAt: minutesAgo(11),
+      claimToken: randomUUID(), sweepAttempts: 0, createdAt: minutesAgo(30), updatedAt: minutesAgo(11),
     })
 
     const result = await runKnowledgeStuckSweep(boss, makeDeps())
 
-    expect(result.requeued).toBe(1)
+    expect(result.requeued).toBe(1) // NOT 2 — arm (2) must not also count this row
     expect(result.failed).toBe(0)
     const row = await getSource(orgId, sourceId)
     expect(row.status).toBe('queued')
     expect(row.claimToken).toBeNull()
-    expect(row.sweepAttempts).toBe(1)
+    expect(row.sweepAttempts).toBe(1) // NOT 2 — only arm (1)'s bump landed
 
     const jobs = await queryJobs(JOB_NAMES.knowledgeCrawl)
-    expect(jobs.some((j) => (j.data as { sourceId: string }).sourceId === sourceId)).toBe(true)
+    expect(jobs.filter((j) => (j.data as { sourceId: string }).sourceId === sourceId)).toHaveLength(1)
 
+    // Exactly one requeue audit row, and it is arm (1)'s reason — never a second, false
+    // "the enqueue was presumed lost" row from arm (2) re-reading what arm (1) just wrote.
     const rows = await auditRows(orgId, sourceId, 'knowledge.source.requeued')
     expect(rows).toHaveLength(1)
+    expect(rows[0]!.detail).toMatchObject({ reason: 'stuck_processing' })
+
+    // This fixture's realistic `created_at` (needed to pin the regression above) leaves the row
+    // `queued`/`crawl`/old-`created_at` with `sweep_attempts` still under the bound — it would
+    // otherwise keep matching arm (2) on every later sweep call in this shared-database file,
+    // inflating THEIR aggregate counts. Clean it up now that this test's own assertions are done
+    // (`ticket-backstop-sweep.test.ts`'s header describes the same discipline).
+    await withOrg(app.db, orgId, (tx) => tx.delete(knowledgeSources).where(eq(knowledgeSources.id, sourceId)))
   })
 
   it('(b) a processing UPLOAD source stuck past the lease is requeued and a knowledge.ingest job is enqueued', async () => {
@@ -170,7 +186,10 @@ describe('knowledge.stuck-sweep', () => {
 
     expect(result.requeued).toBe(1)
     const stillQueued = await getSource(orgId, sourceId)
-    expect(stillQueued.status).toBe('queued') // the sweep only re-enqueues; it never writes the source itself here
+    // The sweep re-enqueues AND counts the attempt — it never flips this arm's status (already
+    // `queued`), but `sweep_attempts` is what bounds it (Finding 2: no infinite loop).
+    expect(stillQueued.status).toBe('queued')
+    expect(stillQueued.sweepAttempts).toBe(1)
 
     const jobs = await queryJobs(JOB_NAMES.knowledgeIngest)
     expect(jobs.some((j) => (j.data as { sourceId: string }).sourceId === sourceId)).toBe(true)
@@ -191,23 +210,38 @@ describe('knowledge.stuck-sweep', () => {
     expect(afterIngest.status).toBe('processing')
   })
 
-  it('a queued CRAWL source is also subject to the stale-queued re-enqueue arm', async () => {
+  it('a queued CRAWL source that never gets claimed is requeued STUCK_MAX_ATTEMPTS times, then fails outright — arm (2) does not loop forever', async () => {
     const orgId = await newOrg()
+    // Nothing in production ever claims this source (no fakeSite crawl runs here) and `created_at`
+    // never moves, so — before Finding 2's fix — this would have matched arm (2) and been
+    // "requeued" every 5 minutes forever, each time with a fresh, uncounted audit row.
     const sourceId = await seedSource(orgId, { kind: 'crawl', status: 'queued', url: 'https://acme.test/', pastedText: null, createdAt: minutesAgo(11) })
 
-    await runKnowledgeStuckSweep(boss, makeDeps())
-
+    for (let attempt = 1; attempt <= STUCK_MAX_ATTEMPTS; attempt += 1) {
+      const result = await runKnowledgeStuckSweep(boss, makeDeps())
+      expect(result.requeued).toBe(1)
+      expect(result.failed).toBe(0)
+      const row = await getSource(orgId, sourceId)
+      expect(row.status).toBe('queued')
+      expect(row.sweepAttempts).toBe(attempt)
+    }
+    // One job enqueued per requeue — this is the SAME source re-sent, not a growing pile from one call.
     const jobs = await queryJobs(JOB_NAMES.knowledgeCrawl)
-    expect(jobs.some((j) => (j.data as { sourceId: string }).sourceId === sourceId)).toBe(true)
-    const rows = await auditRows(orgId, sourceId, 'knowledge.source.requeued')
-    expect(rows).toHaveLength(1)
+    expect(jobs.filter((j) => (j.data as { sourceId: string }).sourceId === sourceId)).toHaveLength(STUCK_MAX_ATTEMPTS)
 
-    // Nothing in production ever claims this source (no fakeSite crawl runs here) — its `created_at`
-    // never moves, so left as `queued` it would keep matching this SAME arm on every later sweep
-    // call in this shared-database file. Simulate the real claim a `knowledge.crawl` run would make,
-    // so later tests' aggregate counts are not inflated by this fixture (the same discipline
-    // `ticket-backstop-sweep.test.ts`'s header describes for a shared-database test file).
-    await withOrg(app.db, orgId, (tx) => tx.update(knowledgeSources).set({ status: 'processing', claimToken: randomUUID() }).where(eq(knowledgeSources.id, sourceId)))
+    // The (STUCK_MAX_ATTEMPTS + 1)th sighting fails it outright — never a 4th requeue.
+    const finalResult = await runKnowledgeStuckSweep(boss, makeDeps())
+    expect(finalResult.requeued).toBe(0)
+    expect(finalResult.failed).toBe(1)
+    const finalRow = await getSource(orgId, sourceId)
+    expect(finalRow.status).toBe('failed')
+    expect(finalRow.failureReason).toBe('stuck')
+
+    const failedRows = await auditRows(orgId, sourceId, 'knowledge.source.failed')
+    expect(failedRows).toHaveLength(1)
+    expect(failedRows[0]!.detail).toMatchObject({ reason: 'stuck', attempts: STUCK_MAX_ATTEMPTS })
+    // Terminal — no further job for a source nothing will ever retry again.
+    expect(await queryJobs(JOB_NAMES.knowledgeCrawl).then((rows) => rows.filter((j) => (j.data as { sourceId: string }).sourceId === sourceId))).toHaveLength(STUCK_MAX_ATTEMPTS)
   })
 
   it('a queued UPLOAD source stale past QUEUED_STALE_MINUTES is NOT re-enqueued by the paste/crawl arm (it waits on the browser, not a lost job)', async () => {

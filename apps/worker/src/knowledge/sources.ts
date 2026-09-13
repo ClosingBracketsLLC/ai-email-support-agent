@@ -79,27 +79,57 @@ export interface LandedSource {
 }
 
 /**
- * The terminal landing shared by the claiming jobs: `failed` + a reason the Knowledge screen can
- * label, a truncated detail, one audit row, and the claim released. Guarded on `processing` — and,
- * when the caller holds one, on its claim token — so a source an owner has already deleted or
- * re-queued, or one another attempt has since claimed, is left alone.
+ * The terminal landing shared by every caller that fails a source: `failed` + a reason the
+ * Knowledge screen can label, a truncated detail, one audit row, and the claim released. Guarded on
+ * whichever status(es) the caller read (`fromStatuses`) — and, when the caller holds one, on its
+ * claim token, and an optional extra `onlyWhen` predicate — so a source an owner has already
+ * deleted or re-queued, or one another attempt has since claimed, is left alone. Returns whether it
+ * actually landed, so a caller can count it.
+ *
+ * This is the tx-taking core `failSource` (below) wraps in its own `withOrg` — pulled out so a
+ * caller that ALREADY holds an `OrgTx` (a per-source SAVEPOINT under a `withPlatform` pass, say)
+ * can fail a source without opening a second, unrelated top-level transaction. Phase 7 ruling R1
+ * already forbade copying this block instead of parameterizing it.
+ */
+export async function failSourceTx(
+  tx: OrgTx,
+  p: {
+    sourceId: string
+    fromStatuses: KnowledgeSourceStatus[]
+    actor: AuditActor
+    reason: KnowledgeFailureReason
+    detail: string
+    now: Date
+    claimToken?: string
+    onlyWhen?: SQL
+    /** Extra fields merged into the audit row's `detail`, alongside `reason` — a caller-specific
+     *  debugging aid (e.g. how many attempts preceded this landing) that never changes the write. */
+    auditDetail?: Record<string, unknown>
+  },
+): Promise<boolean> {
+  const written = await guardedSourceWrite(tx, p.sourceId, p.fromStatuses, {
+    status: 'failed',
+    failureReason: p.reason,
+    failureDetail: p.detail.slice(0, FAILURE_DETAIL_MAX),
+    completedAt: p.now,
+    claimToken: null,
+  }, p.claimToken, p.onlyWhen)
+  if (!written) return false
+  await audit(tx, {
+    actor: p.actor, action: 'knowledge.source.failed', entityType: 'knowledge_source', entityId: p.sourceId,
+    detail: { reason: p.reason, ...p.auditDetail },
+  })
+  return true
+}
+
+/**
+ * The `withOrg` wrapper every claiming job (`knowledge.ingest`/`knowledge.crawl`/
+ * `knowledge.embed-batch`) calls directly: it never holds an `OrgTx` of its own, only an `orgId`.
+ * Guarded on `processing` — the shape every claiming job's own terminal failure takes.
  */
 export async function failSource(
   db: Db,
   p: { orgId: string; sourceId: string; actor: AuditActor; reason: KnowledgeFailureReason; detail: string; now: Date; claimToken?: string },
 ): Promise<void> {
-  await withOrg(db, p.orgId, async (tx) => {
-    const written = await guardedSourceWrite(tx, p.sourceId, ['processing'], {
-      status: 'failed',
-      failureReason: p.reason,
-      failureDetail: p.detail.slice(0, FAILURE_DETAIL_MAX),
-      completedAt: p.now,
-      claimToken: null,
-    }, p.claimToken)
-    if (!written) return
-    await audit(tx, {
-      actor: p.actor, action: 'knowledge.source.failed', entityType: 'knowledge_source', entityId: p.sourceId,
-      detail: { reason: p.reason },
-    })
-  })
+  await withOrg(db, p.orgId, (tx) => failSourceTx(tx, { ...p, fromStatuses: ['processing'] }))
 }
