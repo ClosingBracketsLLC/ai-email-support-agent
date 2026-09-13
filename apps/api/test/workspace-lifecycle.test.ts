@@ -23,9 +23,12 @@ import superjson from 'superjson'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { WORKSPACE_DELETE_GRACE_DAYS, exportObjectKey } from '@aesa/contracts'
 import { auditLog, billingSubscriptions, notifications, workspaces } from '@aesa/db'
+import { createMemoryStore, type ObjectStore } from '@aesa/knowledge/storage'
 import { JOB_NAMES } from '@aesa/queue'
 import type { EnqueueFn } from '../src/deps.ts'
 import type { AppRouter } from '../src/trpc/router.ts'
+import { createAppLogger } from '../src/logging.ts'
+import { requestDeletion, type LifecycleDeps } from '../src/workspace/lifecycle.ts'
 import { WEB, createTestApi, listen, signInWithOtp } from './helpers/app.ts'
 import { callsTo, createFakeStripe, type FakeStripe } from './helpers/fake-stripe.ts'
 
@@ -42,18 +45,27 @@ describe('workspace lifecycle', () => {
   let base: string
   let fake: FakeStripe
   let sent: Recorded[]
+  /** Every `presignGet` the api issued — the only way to pin the download URL's lifetime. */
+  let presigned: { key: string; expiresSeconds: number }[]
   let seq = 0
 
   beforeAll(async () => {
     fake = createFakeStripe()
     sent = []
     const enqueue: EnqueueFn = async (name, data, opts) => { sent.push({ name, data, opts }); return `job-${sent.length}` }
-    t = await createTestApi({}, { enqueue, stripe: fake.port })
+    presigned = []
+    const inner = createMemoryStore()
+    const store: ObjectStore = {
+      ...inner,
+      presignGet: async (key, opts) => { presigned.push({ key, expiresSeconds: opts.expiresSeconds }); return inner.presignGet(key, opts) },
+    }
+    t = await createTestApi({}, { enqueue, stripe: fake.port, store })
     base = await listen(t.app)
   })
   afterAll(async () => { await t.close() })
   beforeEach(() => {
     sent.length = 0
+    presigned.length = 0
     fake.calls.length = 0
     fake.failing.clear()
     for (const key of Object.keys(fake.onCall)) delete fake.onCall[key as keyof FakeStripe['onCall']]
@@ -234,6 +246,32 @@ describe('workspace lifecycle', () => {
     expect(callsTo(fake, 'cancelSubscription')).toHaveLength(2)
   })
 
+  it('an unconfigured Stripe cannot delete a workspace that still has a live subscription — it refuses and alerts', async () => {
+    const org = await setupOrg()
+    await giveSubscription(org.orgId, 'sub_live_unconfigured')
+
+    // Driven through the service so the deps can say what no `createTestApi` override can: a replica
+    // with STRIPE_* unset, holding a workspace whose card is still being charged. Scheduling a purge
+    // there would leave a billed customer with nothing left to cancel the subscription from.
+    const lines: string[] = []
+    const deps: LifecycleDeps = {
+      api: t.api, enqueue: async () => null,
+      logger: createAppLogger({ level: 'error', stream: { write: (line: string) => void lines.push(line) } }),
+      stripe: null, store: t.store,
+    }
+    const res = await requestDeletion(deps, org.orgId, 'Acme', { userId: org.userId, actor: `user:${org.userId}` })
+    expect(res).toEqual({ ok: false, code: 'billing_cancel_failed' })
+    expect(await readWorkspace(org.orgId)).toMatchObject({ deletionRequestedAt: null, killSwitch: false })
+    expect(await readAudit(org.orgId, 'workspace.deletion_requested')).toHaveLength(0)
+    expect(lines.join('')).toContain('"alert":true')
+    expect(lines.join('')).toContain('deletion_billing_unconfigured')
+
+    // The same deps delete a workspace that has no live subscription perfectly well.
+    const free = await setupOrg()
+    expect(await requestDeletion(deps, free.orgId, 'Acme', { userId: free.userId, actor: `user:${free.userId}` }))
+      .toMatchObject({ ok: true })
+  })
+
   it('a workspace with no live subscription is deleted without touching Stripe at all', async () => {
     const org = await setupOrg()
     const res = await org.c.workspace.requestDeletion.mutate({ confirm: 'Acme' })
@@ -307,6 +345,8 @@ describe('workspace lifecycle', () => {
     await t.api.withOrg(org.orgId, (tx) => tx.update(workspaces).set({ exportState: 'ready', exportReadyAt: readyAt }).where(eq(workspaces.orgId, org.orgId)))
     const status = await org.c.workspace.exportStatus.query()
     expect(status).toEqual({ state: 'ready', readyAt, url: `memory://${key}` })
+    // Exactly seven days — SigV4's own ceiling, and what the worker's "ready" notification promises.
+    expect(presigned).toEqual([{ key, expiresSeconds: 7 * 24 * 60 * 60 }])
 
     // And a finished export no longer blocks the next one.
     const second = await org.c.workspace.requestExport.mutate()
