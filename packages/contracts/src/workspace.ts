@@ -77,6 +77,9 @@ export function exportObjectKey(orgId: string, exportId: string): string {
 export const WORKSPACE_ERROR_MESSAGES = {
   confirm_mismatch: 'Type the workspace name exactly to confirm.',
   deletion_pending: 'Deletion is already scheduled.',
+  /** The mirror of `deletion_pending`: Cancel arriving at a workspace that is not scheduled — a
+   *  second tap, or the purge having already claimed it. */
+  not_pending: 'This workspace is not scheduled for deletion.',
   export_in_progress: 'An export is already running.',
   billing_cancel_failed: 'Could not cancel the subscription — deletion was not scheduled.',
 } as const

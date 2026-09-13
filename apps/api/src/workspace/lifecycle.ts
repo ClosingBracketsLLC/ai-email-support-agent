@@ -68,6 +68,11 @@ const clock = (deps: LifecycleDeps): Date => deps.now?.() ?? new Date()
  *  matches the copy in the "your export is ready" notification the worker sends. */
 export const EXPORT_URL_TTL_SECONDS = 7 * 24 * 60 * 60
 
+/** The UTC day every dedupe key in this codebase is scoped by (`escalation:${ticketId}:${day}`,
+ *  `billing:past_due:${orgId}:${day}`, …). Spelled locally, exactly as `billing/webhook.ts` and
+ *  `drafts/service.ts` spell it. */
+const utcDay = (d: Date): string => d.toISOString().slice(0, 10)
+
 /** `deletion_requested_at` + the grace period — the moment `workspace.purge` will actually run. */
 export const purgeAfterFor = (deletionRequestedAt: Date): Date =>
   new Date(deletionRequestedAt.getTime() + WORKSPACE_DELETE_GRACE_DAYS * 24 * 60 * 60_000)
@@ -218,11 +223,12 @@ export async function requestDeletion(
       .values({
         orgId, kind: 'workspace', title: 'Workspace deletion scheduled',
         body: 'Everything this workspace holds is erased after the grace period. Cancel any time before then in Settings → Workspace.',
-        // One page per workspace, ever — not per request and not per day. A deletion cancelled and
-        // asked for again is the same owner making the same decision twice; they are looking at the
-        // screen that told them, and a second push adds nothing. The row also outlives the cancel,
-        // so the outbox keeps the record of having warned them.
-        dedupeKey: `workspace:deletion:${orgId}`, payload: { kind: 'deletion_scheduled', purgeAfter: purgeAfter.toISOString() },
+        // Day-scoped, like every other notification here (ruling R19). Scheduling the destruction of
+        // a workspace is precisely the event that must always reach a human, so a deletion cancelled
+        // and asked for again on a LATER day pages again; the same day collapses, because that is one
+        // decision made twice in an afternoon by someone already looking at the screen that told them.
+        dedupeKey: `workspace:deletion:${orgId}:${utcDay(now)}`,
+        payload: { kind: 'deletion_scheduled', purgeAfter: purgeAfter.toISOString() },
       })
       .onConflictDoNothing({ target: notifications.dedupeKey })
       .returning({ id: notifications.id })

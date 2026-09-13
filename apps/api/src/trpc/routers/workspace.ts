@@ -85,11 +85,6 @@ const lifecycleActor = (ctx: LifecycleContext): LifecycleActor =>
  * one code the screen may offer a plain "try again" for. */
 const precondition = (message: string): TRPCError => new TRPCError({ code: 'PRECONDITION_FAILED', message })
 
-/** `not_pending` has no `WORKSPACE_ERROR_MESSAGES` entry because it is a pure race outcome — a
- * second Cancel tap, or the purge having already claimed the workspace — not a state the owner can
- * deliberately be in while the button they pressed is on screen. */
-const NOT_PENDING_MESSAGE = 'This workspace is not scheduled for deletion.'
-
 /** Better Auth owns the organization row; the slug is unique, so retry with a fresh suffix on collision. */
 async function createOrganizationWithFreshSlug(auth: Auth, headers: Headers, name: string): Promise<{ id: string }> {
   const base = slugify(name)
@@ -391,7 +386,7 @@ export const workspaceRouter = router({
     const res = await cancelDeletion(lifecycleDeps(ctx), ctx.orgId, lifecycleActor(ctx))
     if (res.ok) return { ok: true as const }
     switch (res.code) {
-      case 'not_pending': throw precondition(NOT_PENDING_MESSAGE)
+      case 'not_pending': throw precondition(WORKSPACE_ERROR_MESSAGES.not_pending)
     }
   }),
 

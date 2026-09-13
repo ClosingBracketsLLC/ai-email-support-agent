@@ -21,14 +21,14 @@ import { createTRPCClient, httpBatchLink } from '@trpc/client'
 import { eq } from 'drizzle-orm'
 import superjson from 'superjson'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
-import { WORKSPACE_DELETE_GRACE_DAYS, exportObjectKey } from '@aesa/contracts'
+import { WORKSPACE_DELETE_GRACE_DAYS, WORKSPACE_ERROR_MESSAGES, exportObjectKey } from '@aesa/contracts'
 import { auditLog, billingSubscriptions, notifications, workspaces } from '@aesa/db'
 import { createMemoryStore, type ObjectStore } from '@aesa/knowledge/storage'
 import { JOB_NAMES } from '@aesa/queue'
 import type { EnqueueFn } from '../src/deps.ts'
 import type { AppRouter } from '../src/trpc/router.ts'
 import { createAppLogger } from '../src/logging.ts'
-import { requestDeletion, type LifecycleDeps } from '../src/workspace/lifecycle.ts'
+import { cancelDeletion, requestDeletion, type LifecycleDeps } from '../src/workspace/lifecycle.ts'
 import { WEB, createTestApi, listen, signInWithOtp } from './helpers/app.ts'
 import { callsTo, createFakeStripe, type FakeStripe } from './helpers/fake-stripe.ts'
 
@@ -180,7 +180,9 @@ describe('workspace lifecycle', () => {
     const org = await setupOrg('Acme & Sons')
     await giveSubscription(org.orgId, 'sub_live_wrong_name')
 
-    await expect(org.c.workspace.requestDeletion.mutate({ confirm: 'wrong name' })).rejects.toMatchObject({ data: { code: 'BAD_REQUEST' } })
+    await expect(org.c.workspace.requestDeletion.mutate({ confirm: 'wrong name' })).rejects.toMatchObject({
+      message: WORKSPACE_ERROR_MESSAGES.confirm_mismatch, data: { code: 'BAD_REQUEST' },
+    })
     expect(callsTo(fake, 'cancelSubscription')).toHaveLength(0)
     expect(await readWorkspace(org.orgId)).toMatchObject({ deletionRequestedAt: null, deletionRequestedBy: null, killSwitch: false })
     expect(await readAudit(org.orgId, 'workspace.deletion_requested')).toHaveLength(0)
@@ -216,14 +218,16 @@ describe('workspace lifecycle', () => {
     expect(audits[0]!.detail).toMatchObject({ subscriptionCancelled: true })
 
     const [note] = await t.api.withOrg(org.orgId, (tx) => tx.select().from(notifications).where(eq(notifications.orgId, org.orgId)))
-    expect(note).toMatchObject({ kind: 'workspace', dedupeKey: `workspace:deletion:${org.orgId}` })
+    expect(note).toMatchObject({ kind: 'workspace', dedupeKey: `workspace:deletion:${org.orgId}:${ws!.deletionRequestedAt!.toISOString().slice(0, 10)}` })
     expect(note!.payload).toMatchObject({ kind: 'deletion_scheduled' })
     expect(sent.filter((s) => s.name === JOB_NAMES.notifyDispatch)).toEqual([
       { name: JOB_NAMES.notifyDispatch, data: { orgId: org.orgId, notificationId: note!.id }, opts: { entityId: note!.id } },
     ])
 
     // A second request finds the stamp already set and refuses — and never calls Stripe again.
-    await expect(org.c.workspace.requestDeletion.mutate({ confirm: 'Acme & Sons' })).rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' } })
+    await expect(org.c.workspace.requestDeletion.mutate({ confirm: 'Acme & Sons' })).rejects.toMatchObject({
+      message: WORKSPACE_ERROR_MESSAGES.deletion_pending, data: { code: 'PRECONDITION_FAILED' },
+    })
     expect(callsTo(fake, 'cancelSubscription')).toHaveLength(1)
     expect(await readAudit(org.orgId, 'workspace.deletion_requested')).toHaveLength(1)
   })
@@ -233,7 +237,9 @@ describe('workspace lifecycle', () => {
     await giveSubscription(org.orgId, 'sub_live_boom')
     fake.failing.add('cancelSubscription')
 
-    await expect(org.c.workspace.requestDeletion.mutate({ confirm: 'Acme' })).rejects.toMatchObject({ data: { code: 'BAD_GATEWAY' } })
+    await expect(org.c.workspace.requestDeletion.mutate({ confirm: 'Acme' })).rejects.toMatchObject({
+      message: WORKSPACE_ERROR_MESSAGES.billing_cancel_failed, data: { code: 'BAD_GATEWAY' },
+    })
     expect(callsTo(fake, 'cancelSubscription')).toHaveLength(1)
     expect(await readWorkspace(org.orgId)).toMatchObject({ deletionRequestedAt: null, deletionRequestedBy: null, killSwitch: false })
     expect(await readAudit(org.orgId, 'workspace.deletion_requested')).toHaveLength(0)
@@ -282,7 +288,11 @@ describe('workspace lifecycle', () => {
 
   it('cancelDeletion clears the stamps and audits, but leaves the kill switch on and the agent off; a workspace that is not pending is PRECONDITION_FAILED', async () => {
     const org = await setupOrg()
-    await expect(org.c.workspace.cancelDeletion.mutate()).rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' } })
+    // Ruling R18: the sentence is `@aesa/contracts`', not the router's — one place to reword it, and
+    // the one string Settings → Workspace keys its own copy on.
+    await expect(org.c.workspace.cancelDeletion.mutate()).rejects.toMatchObject({
+      message: WORKSPACE_ERROR_MESSAGES.not_pending, data: { code: 'PRECONDITION_FAILED' },
+    })
 
     await org.c.workspace.setAgentEnabled.mutate({ enabled: true })
     await org.c.workspace.requestDeletion.mutate({ confirm: 'Acme' })
@@ -300,6 +310,44 @@ describe('workspace lifecycle', () => {
     expect(view.purgeAfter).toBeNull()
 
     await expect(org.c.workspace.cancelDeletion.mutate()).rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' } })
+  })
+
+  it('the deletion page is day-scoped (ruling R19): a re-request on a LATER day pages again, the same day does not', async () => {
+    const org = await setupOrg()
+    // Driven through the service so `now` can move — the dedupe key has to be a function of the day,
+    // and a wall-clock test could never tell a day-scoped key from a lifetime one.
+    const day1 = new Date('2026-03-01T09:00:00.000Z')
+    const day2 = new Date('2026-03-02T09:00:00.000Z')
+    let now = day1
+    const deps: LifecycleDeps = {
+      api: t.api, logger: createAppLogger({ level: 'silent' }), stripe: fake.port, store: t.store,
+      enqueue: async (name, data, opts) => { sent.push({ name, data, opts }); return `job-${sent.length}` },
+      now: () => now,
+    }
+    const actor = { userId: org.userId, actor: `user:${org.userId}` as const }
+    const notes = () => t.api.withOrg(org.orgId, (tx) => tx.select().from(notifications).where(eq(notifications.orgId, org.orgId)))
+
+    expect(await requestDeletion(deps, org.orgId, 'Acme', actor)).toMatchObject({ ok: true })
+    expect((await notes()).map((n) => n.dedupeKey)).toEqual([`workspace:deletion:${org.orgId}:2026-03-01`])
+    expect(sent.filter((s) => s.name === JOB_NAMES.notifyDispatch)).toHaveLength(1)
+
+    // Same day, cancelled and asked for again: one decision made twice in an afternoon — one page.
+    expect(await cancelDeletion(deps, org.orgId, actor)).toEqual({ ok: true })
+    expect(await requestDeletion(deps, org.orgId, 'Acme', actor)).toMatchObject({ ok: true })
+    expect(await notes()).toHaveLength(1)
+    expect(sent.filter((s) => s.name === JOB_NAMES.notifyDispatch)).toHaveLength(1)
+
+    // A LATER day is a fresh decision to destroy the workspace, and must reach a human again.
+    expect(await cancelDeletion(deps, org.orgId, actor)).toEqual({ ok: true })
+    now = day2
+    expect(await requestDeletion(deps, org.orgId, 'Acme', actor)).toMatchObject({ ok: true })
+    const after = await notes()
+    expect(after.map((n) => n.dedupeKey).sort()).toEqual([
+      `workspace:deletion:${org.orgId}:2026-03-01`, `workspace:deletion:${org.orgId}:2026-03-02`,
+    ])
+    const dispatched = sent.filter((s) => s.name === JOB_NAMES.notifyDispatch)
+    expect(dispatched).toHaveLength(2)
+    expect(dispatched[1]!.data.notificationId).toBe(after.find((n) => n.dedupeKey.endsWith('2026-03-02'))!.id)
   })
 
   it('workspace.get carries purgeAfter while a deletion is pending', async () => {
@@ -336,7 +384,9 @@ describe('workspace lifecycle', () => {
 
     // R16: moving `export_key` under a job that is still queued would make that job fail the OWNER's
     // new request, so a second request is refused while the first is outstanding.
-    await expect(org.c.workspace.requestExport.mutate()).rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' } })
+    await expect(org.c.workspace.requestExport.mutate()).rejects.toMatchObject({
+      message: WORKSPACE_ERROR_MESSAGES.export_in_progress, data: { code: 'PRECONDITION_FAILED' },
+    })
     expect(await readWorkspace(org.orgId)).toMatchObject({ exportKey: key })
     expect(sent.filter((s) => s.name === JOB_NAMES.workspaceExport)).toHaveLength(1)
 

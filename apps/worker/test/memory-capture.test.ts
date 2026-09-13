@@ -2,7 +2,7 @@
  * `runMemoryCapture` against real Postgres with the deterministic hash embedder — no pg-boss. One
  * `it` per behavior in the task brief's `memory.capture` bullet list.
  */
-import { randomBytes } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { and, eq } from 'drizzle-orm'
 import pino from 'pino'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
@@ -422,6 +422,39 @@ describe('memory.capture — "Remember this reply" (messageId)', () => {
     const skipped = await auditRows(messageId, 'memory.skipped')
     expect(skipped).toHaveLength(1)
     expect(skipped[0]!.detail).toMatchObject({ reason: 'no_question' })
+  })
+
+  it('every load-time refusal audits its own reason — an inbound id, a purged body, a never-sent reply and an unknown id (ruling R20)', async () => {
+    // Task 7's review and Task 8's own concern found the same hole from both sides: these four all
+    // landed a silent `skipped` with no record at all, on a path a human just tapped. The api's
+    // `rememberReply` refuses the first three at request time, so reaching the job means something
+    // changed underneath the tap — which is exactly when the audit row earns its keep.
+    const deps = makeDeps()
+
+    const { ticketId } = await seedOutboundReply()
+    const [inbound] = await withOrg(app.db, fx.orgId, (tx) =>
+      tx.select({ id: messages.id }).from(messages)
+        .where(and(eq(messages.ticketId, ticketId), eq(messages.direction, 'inbound'))))
+    expect(await runRemember(deps, inbound!.id)).toBe('skipped')
+    expect((await auditRows(inbound!.id, 'memory.skipped'))[0]!.detail).toMatchObject({ reason: 'not_outbound' })
+
+    const purged = await seedOutboundReply()
+    await withOrg(app.db, fx.orgId, (tx) =>
+      tx.update(messages).set({ bodyText: null, bodyPurgedAt: NOW }).where(eq(messages.id, purged.messageId)))
+    expect(await runRemember(deps, purged.messageId)).toBe('skipped')
+    expect((await auditRows(purged.messageId, 'memory.skipped'))[0]!.detail).toMatchObject({ reason: 'empty' })
+
+    const unsent = await seedOutboundReply()
+    await withOrg(app.db, fx.orgId, (tx) =>
+      tx.update(messages).set({ sentAt: null }).where(eq(messages.id, unsent.messageId)))
+    expect(await runRemember(deps, unsent.messageId)).toBe('skipped')
+    expect((await auditRows(unsent.messageId, 'memory.skipped'))[0]!.detail).toMatchObject({ reason: 'not_sent' })
+
+    const unknown = randomUUID()
+    expect(await runRemember(deps, unknown)).toBe('skipped')
+    expect((await auditRows(unknown, 'memory.skipped'))[0]!.detail).toMatchObject({ reason: 'not_found' })
+
+    expect(await allAnswers()).toHaveLength(0)
   })
 
   it('the payload refine rejects both-or-neither ids', () => {

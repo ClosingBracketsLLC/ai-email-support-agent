@@ -12,7 +12,11 @@
  *    `resolved_answers_source_message_uidx` (org_id, source_message_id): a second run of the SAME
  *    message is a clean `'skipped'`, never a duplicate-key throw — the job checks first (so the
  *    common case never even reaches the insert) and the guarded re-check at write time is what
- *    makes a genuine race land the same way.
+ *    makes a genuine race land the same way. Since ruling R20, EVERY refusal on this path writes a
+ *    `memory.skipped` audit row naming its own reason (`not_found`, `not_outbound`, `not_sent`,
+ *    `empty`, `no_question`, `already_remembered`, `embed_cap`, `empty_after_scrub`): the api
+ *    screens what it cheaply can at request time, but a tap that got this far and found the world
+ *    changed underneath it must still leave a record.
  *
  * Runs on the `agent` role (it embeds). Every write is a short `withOrg` transaction; the embed call
  * is network I/O and always sits strictly BETWEEN two of them, never inside one (CLAUDE.md
@@ -213,11 +217,15 @@ interface LoadedRemember {
   atEmbedCap: boolean
 }
 
+/** Every non-`ok` load carries the REASON it refused, and every one of them is audited (ruling R20).
+ *  The four the api's `rememberReply` screens at request time are still here as a backstop: reaching
+ *  the job means something changed between the tap and the run (a body purged by `retention.sweep`, a
+ *  message deleted), and that is exactly when the record earns its keep. */
+type RememberSkip = 'not_found' | 'not_outbound' | 'not_sent' | 'empty' | 'no_question' | 'already_remembered'
+
 type RememberLoad =
   | { status: 'ok'; data: LoadedRemember }
-  | { status: 'not_found' }
-  | { status: 'already_remembered' }
-  | { status: 'no_question' }
+  | { status: 'skip'; reason: RememberSkip }
 
 /**
  * The read half. Checks the unique index's target FIRST — "the job checks first" — so the common
@@ -228,24 +236,30 @@ async function loadRemember(db: Db, orgId: string, messageId: string, day: strin
   return withOrg(db, orgId, async (tx) => {
     const [already] = await tx.select({ id: resolvedAnswers.id }).from(resolvedAnswers)
       .where(and(eq(resolvedAnswers.orgId, orgId), eq(resolvedAnswers.sourceMessageId, messageId)))
-    if (already) return { status: 'already_remembered' }
+    if (already) return { status: 'skip', reason: 'already_remembered' }
 
     const [m] = await tx.select({
       id: messages.id, ticketId: messages.ticketId, direction: messages.direction,
       bodyText: messages.bodyText, sentAt: messages.sentAt,
     }).from(messages).where(eq(messages.id, messageId))
-    if (!m || m.direction !== 'outbound' || m.bodyText === null || m.sentAt === null) return { status: 'not_found' }
+    // One check per line, each with its own reason: "this is not a reply", "this reply never went
+    // out", "there is no text left" and "there is no such message" are four different answers to the
+    // owner who tapped Remember this reply, and lumping them was the silence R20 closes.
+    if (!m) return { status: 'skip', reason: 'not_found' }
+    if (m.direction !== 'outbound') return { status: 'skip', reason: 'not_outbound' }
+    if (m.sentAt === null) return { status: 'skip', reason: 'not_sent' }
+    if (m.bodyText === null) return { status: 'skip', reason: 'empty' }
 
     const [t] = await tx.select({ customerEmail: tickets.customerEmail, customerName: tickets.customerName })
       .from(tickets).where(eq(tickets.id, m.ticketId))
-    if (!t) return { status: 'not_found' }
+    if (!t) return { status: 'skip', reason: 'not_found' }
 
     // The latest inbound STRICTLY BEFORE this reply — never the ticket's overall latest inbound,
     // which could be a message that arrived AFTER this reply was sent (a chasing customer).
     const [inbound] = await tx.select({ bodyText: messages.bodyText }).from(messages)
       .where(and(eq(messages.ticketId, m.ticketId), eq(messages.direction, 'inbound'), lt(messages.sentAt, m.sentAt)))
       .orderBy(sql`${messages.sentAt} DESC NULLS LAST`, sql`${messages.createdAt} DESC`).limit(1)
-    if (!inbound || inbound.bodyText === null) return { status: 'no_question' }
+    if (!inbound || inbound.bodyText === null) return { status: 'skip', reason: 'no_question' }
 
     const [counter] = await tx.select({ value: usageCounters.value }).from(usageCounters)
       .where(and(eq(usageCounters.day, day), eq(usageCounters.meter, KNOWLEDGE_METERS.embedTokens)))
@@ -263,7 +277,9 @@ async function loadRemember(db: Db, orgId: string, messageId: string, day: strin
   })
 }
 
-async function skipRemember(deps: MemoryCaptureDeps, orgId: string, messageId: string, reason: string): Promise<'skipped'> {
+async function skipRemember(
+  deps: MemoryCaptureDeps, orgId: string, messageId: string, reason: RememberSkip | 'embed_cap' | 'empty_after_scrub',
+): Promise<'skipped'> {
   await withOrg(deps.db, orgId, (tx) =>
     audit(tx, { actor: ACTOR, action: 'memory.skipped', entityType: 'message', entityId: messageId, detail: { reason } }))
   return 'skipped'
@@ -274,12 +290,9 @@ async function captureFromMessage(deps: MemoryCaptureDeps, orgId: string, messag
   const day = utcDayString(now)
   const loaded = await loadRemember(deps.db, orgId, messageId, day, now)
 
-  // `not_found` is silent — the same shape the draft path's own `load()` returning null takes for a
-  // basic validity failure. The api's `rememberReply` (Task 8) already screens `not_outbound`/`empty`
-  // at request time, so this is a defensive backstop, not the primary surface.
-  if (loaded.status === 'not_found') return 'skipped'
-  if (loaded.status === 'already_remembered') return skipRemember(deps, orgId, messageId, 'already_remembered')
-  if (loaded.status === 'no_question') return skipRemember(deps, orgId, messageId, 'no_question')
+  // Ruling R20: a human tap must not vanish. EVERY refusal is audited under its own reason — there
+  // is no silent branch left on this path.
+  if (loaded.status === 'skip') return skipRemember(deps, orgId, messageId, loaded.reason)
 
   const { message, ticket, questionBody, atEmbedCap } = loaded.data
   // Same rule as the draft path: at cap, skip rather than spend — there is no per-message stamp to
