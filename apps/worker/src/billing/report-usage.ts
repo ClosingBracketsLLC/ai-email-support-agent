@@ -364,7 +364,23 @@ export async function runBillingReportUsage(deps: ReportUsageDeps): Promise<Repo
     try {
       pending = await recordForOrg(deps, plan)
     } catch (err) {
-      deps.logger.warn({ orgId: plan.orgId, error: errorMessage(err) }, 'billing_report_usage_org_write_failed')
+      if (plan.overageDone) {
+        // THE one money-losing state in this file, and the reason the report-then-record ordering
+        // needs an operator behind it. Stripe has ACCEPTED the meter event but the watermark did not
+        // move, so tomorrow's pass recomputes the delta from a stale `overage_reported`. If usage
+        // moved at all in between, the identifier differs (`…:10` vs `…:15`) and Stripe's 24-hour
+        // dedupe does not apply — the overlapping units bill twice. Losing overage outright is still
+        // worse, so the ordering stands; what must not happen is it passing silently.
+        // Task 11 replaces this with `alert('stripe_report_failed', { orgId, op: 'record' })`.
+        deps.logger.error(
+          { alert: true, kind: 'stripe_report_failed', orgId: plan.orgId, op: 'record', error: errorMessage(err) },
+          'billing.report-usage: the overage was REPORTED to Stripe but the watermark did not record; the next pass may re-report it',
+        )
+      } else {
+        // Nothing was reported, so nothing can be double-billed: the notices and the quantity row
+        // are simply re-derived tomorrow.
+        deps.logger.warn({ orgId: plan.orgId, error: errorMessage(err) }, 'billing_report_usage_org_write_failed')
+      }
       continue
     }
     result.trialNotices += pending.length

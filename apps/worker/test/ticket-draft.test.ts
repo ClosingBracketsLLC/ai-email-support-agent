@@ -30,6 +30,7 @@ import {
   createFakeProvider, LlmError, withMeta, withMetering,
   type Capabilities, type ChatRequest, type ChatResult, type LlmProvider,
 } from '@aesa/llm'
+import type { AdmissionPool } from '../src/drafting/admission.ts'
 import { runTicketDraft, STOP_LOSS_BYOK_OUTPUT_TOKENS, STOP_LOSS_MICROS, type TicketDraftDeps } from '../src/jobs/ticket-draft.ts'
 import { staticRefusal, staticResolver } from '../src/provider-resolver.ts'
 
@@ -230,6 +231,34 @@ async function seedRuns(n: number, over: Partial<typeof agentRuns.$inferInsert> 
         status: 'succeeded', startedAt: NOW, ...over,
       })),
     ))
+}
+
+/**
+ * An `AdmissionPool` that records what the job asked of it. `slots: 'none'` is the timeout case the
+ * whole module is built around — `acquire` resolving null, which must NOT cost the draft.
+ */
+function countingAdmission(slots: 'slot' | 'none' = 'slot'): { pool: AdmissionPool; calls: { acquired: number; released: number } } {
+  const calls = { acquired: 0, released: 0 }
+  return {
+    calls,
+    pool: {
+      acquire: async () => {
+        calls.acquired += 1
+        if (slots === 'none') return null
+        return { release: async () => { calls.released += 1 } }
+      },
+    },
+  }
+}
+
+/** A pino-shaped logger that keeps every structured line, for the `alert: true` assertions. */
+function spyLogger(): { logger: TicketDraftDeps['logger']; errors: Record<string, unknown>[] } {
+  const errors: Record<string, unknown>[] = []
+  const base = pino({ level: 'silent' })
+  const logger = Object.assign(Object.create(base) as typeof base, {
+    error: (obj: Record<string, unknown>) => void errors.push(obj),
+  }) as unknown as TicketDraftDeps['logger']
+  return { logger, errors }
 }
 
 /** A `DetailedRetriever` whose answers leg returns exactly one active answer (Phase 5's memory). */
@@ -1704,6 +1733,85 @@ describe('runTicketDraft', () => {
       const [draft] = await draftsFor(ticketId)
       expect(draft).toMatchObject({ decision: 'send', decisionReason: 'ok' })
       expect(draft!.confidenceBreakdown).toMatchObject({ blockers: { allowance: { used: 0, exhausted: false } } })
+    })
+  })
+
+  // --- Phase 7: the admission pool's rule, pinned where it is USED --------------------------------
+
+  describe('20. a draft is never lost to admission control', () => {
+    it('a managed call that gets NO slot still lands its draft, and alerts admission_slot_timeout', async () => {
+      const ticketId = await seedDraftableTicket()
+      const provider = createFakeProvider([{ parsed: REPLY }])
+      const { logger, errors } = spyLogger()
+      // The pool's own failure mode, injected: `acquire` resolves null for the whole run.
+      const { deps } = makeDeps(provider, { logger, admission: { acquire: async () => null } })
+
+      await run(deps, ticketId)
+
+      // The rule the module exists for: the model was still called and the draft still landed.
+      expect(provider.calls).toHaveLength(1)
+      const [draft] = await draftsFor(ticketId)
+      expect(draft).toMatchObject({ status: 'pending', body: CLEAN_BODY })
+      expect((await getTicket(ticketId)).status).toBe('awaiting_review')
+      const [run1] = await runsFor(ticketId)
+      expect(run1!.status).toBe('succeeded')
+      // …and an operator hears about it (Task 11 replaces the placeholder with `alert()`).
+      const alert = errors.find((e) => e.alert === true && e.kind === 'admission_slot_timeout')
+      expect(alert).toBeDefined()
+      expect(alert!.orgId).toBe(fx.orgId)
+      expect(alert!.runId).toBe(run1!.id)
+    })
+
+    it('a successful managed call takes exactly one slot and RELEASES it', async () => {
+      const ticketId = await seedDraftableTicket()
+      const provider = createFakeProvider([{ parsed: REPLY }])
+      const admission = countingAdmission()
+      const { deps } = makeDeps(provider, { admission: admission.pool })
+
+      await run(deps, ticketId)
+
+      expect(admission.calls).toEqual({ acquired: 1, released: 1 })
+      expect((await draftsFor(ticketId))[0]).toMatchObject({ status: 'pending', body: CLEAN_BODY })
+    })
+
+    it('a BYOK call never enters the pool at all — its budget is the per-credential limiter', async () => {
+      const credentialId = await seedCredential()
+      const ticketId = await seedDraftableTicket()
+      const provider = createFakeProvider([{ parsed: REPLY }])
+      const admission = countingAdmission()
+      const { deps } = makeDeps(provider, {
+        providers: staticResolver(provider, byokConfig(credentialId)),
+        admission: admission.pool,
+      })
+
+      await run(deps, ticketId)
+
+      expect(provider.calls).toHaveLength(1)
+      expect(admission.calls).toEqual({ acquired: 0, released: 0 })
+    })
+
+    it('the guardrail redraft takes a SECOND slot and releases it too — one per model call', async () => {
+      const ticketId = await seedDraftableTicket()
+      // Attempt 1 hard-fails the guardrails (html), attempt 2 comes back clean.
+      const provider = createFakeProvider([{ parsed: reply({ body: HTML_BODY }) }, { parsed: REPLY }])
+      const admission = countingAdmission()
+      const { deps } = makeDeps(provider, { admission: admission.pool })
+
+      await run(deps, ticketId)
+
+      expect(provider.calls).toHaveLength(2)
+      expect(admission.calls).toEqual({ acquired: 2, released: 2 })
+    })
+
+    it('a slot is released even when the model call THROWS', async () => {
+      const ticketId = await seedDraftableTicket()
+      const provider = createFakeProvider([{ error: new LlmError('502 bad gateway', 'transient', true) }])
+      const admission = countingAdmission()
+      const { deps } = makeDeps(provider, { admission: admission.pool })
+
+      await expect(run(deps, ticketId)).rejects.toThrow()
+
+      expect(admission.calls).toEqual({ acquired: 1, released: 1 })
     })
   })
 })

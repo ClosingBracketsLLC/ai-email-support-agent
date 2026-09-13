@@ -249,6 +249,68 @@ describe('billing.report-usage: overage as meter-event deltas', () => {
     expect(await auditRows('billing.overage_reported')).toEqual([])
   })
 
+  it('a phase-3 write failure AFTER a successful meter event alerts stripe_report_failed with op record', async () => {
+    await seedBilling()
+    await setManagedUsed(601)
+
+    // The one money-losing state: Stripe accepted the charge and the watermark could not record it.
+    // The database goes away between phase 2 and phase 3 — `Object.create` puts one overriding
+    // `transaction` on a wrapper whose prototype IS the real handle, the same trick `withOrgIdentity`
+    // uses, so phase 1 (already committed) is untouched and only the recording transaction fails.
+    let down = false
+    const brittleDb = Object.create(app.db) as typeof app.db
+    brittleDb.transaction = (async (...args: Parameters<typeof app.db.transaction>) => {
+      if (down) throw new Error('connection terminated unexpectedly')
+      return app.db.transaction(...args)
+    }) as typeof app.db.transaction
+
+    const h = makeDeps(DAY1)
+    const inner = h.deps.stripe!
+    const deps: ReportUsageDeps = {
+      ...h.deps,
+      db: brittleDb,
+      stripe: {
+        reportOverage: async (p) => { await inner.reportOverage(p); down = true },
+        setDomainQuantity: (p) => inner.setDomainQuantity(p),
+      },
+    }
+
+    const result = await runBillingReportUsage(deps)
+
+    // The meter event DID land — that is exactly why this is an alert and not a warn.
+    expect(result.reported).toBe(1)
+    expect(usageCallsTo(h.fake, 'reportOverage')).toHaveLength(1)
+    const alert = h.errors.find((e) => e.alert === true && e.kind === 'stripe_report_failed' && e.op === 'record')
+    expect(alert).toBeDefined()
+    expect(alert!.orgId).toBe(orgId)
+    // The watermark really did stay behind the charge: that is the state the operator is being told about.
+    down = false
+    expect((await billingRow()).overageReported).toBe(0)
+  })
+
+  it('a phase-3 write failure with NOTHING reported stays a plain warn — nothing can be double-billed', async () => {
+    // A trial makes no Stripe call at all, so a failed write is only work redone tomorrow. Phase 1 is
+    // the FIRST transaction of the pass and phase 3 the second, so failing everything after the
+    // first fails exactly the recording one.
+    await seedBilling({ plan: 'trial', status: 'trialing', trialEndsAt: new Date('2026-06-17T09:00:00Z') })
+
+    let seen = 0
+    const brittleDb = Object.create(app.db) as typeof app.db
+    brittleDb.transaction = (async (...args: Parameters<typeof app.db.transaction>) => {
+      seen += 1
+      if (seen > 1) throw new Error('connection terminated unexpectedly')
+      return app.db.transaction(...args)
+    }) as typeof app.db.transaction
+
+    const h = makeDeps(DAY1)
+    const result = await runBillingReportUsage({ ...h.deps, db: brittleDb })
+
+    expect(result.reported).toBe(0)
+    expect(result.trialNotices).toBe(0)
+    expect(h.errors.filter((e) => e.kind === 'stripe_report_failed')).toEqual([])
+    expect(h.warns.some((w) => w.orgId === orgId)).toBe(true)
+  })
+
   it('a port that throws alerts stripe_report_failed and leaves the row untouched — the write only follows a success', async () => {
     await seedBilling()
     await setManagedUsed(601)
