@@ -22,7 +22,10 @@ export interface DraftPromptInput extends DraftUserInput {
   /** The opt-in 5-minute breakpoint on the last `agent` block — worth its write cost only above
    * ~12 drafts/hour for the org (spec §Prompt blocks → caching); the job counts and decides. */
   cacheAgentBlocks: boolean
-  effort: 'medium' | 'high'
+  effort: 'low' | 'medium' | 'high'
+  /** Phase 6: the model this call goes to — the agent's resolved BYOK model, or `DRAFT_MODEL` for a
+   *  managed one. The CALLER decides; this package no longer hard-codes it. */
+  model: string
 }
 
 /** Aliases `@aesa/contracts`'s `DRAFT_MODEL_ID` — the ONE source, so the api (which may not
@@ -41,7 +44,7 @@ export function buildDraftRequest(input: DraftPromptInput, meta: ChatMeta, signa
   ]
 
   return {
-    model: DRAFT_MODEL,
+    model: input.model,
     system,
     messages: [{ role: 'user', content: buildUserMessage(input) }],
     output: { name: 'draft_decision', schema: DraftDecision },

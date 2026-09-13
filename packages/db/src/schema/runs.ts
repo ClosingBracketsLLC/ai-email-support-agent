@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm'
-import { bigint, bigserial, index, integer, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core'
+import { bigint, bigserial, boolean, index, integer, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core'
 import { createdAt, id, orgId, tenantPolicies, updatedAt } from './helpers.ts'
 import { agents, tickets } from './support.ts'
 
@@ -39,7 +39,10 @@ export const agentRunEvents = pgTable('agent_run_events', {
   ...tenantPolicies(t.orgId, 'agent_run_events'),
 ])
 
-/** One row per LLM API call, for metering and cost; runId/agentId are loose FKs — metering must never fail on a missing parent. */
+/** One row per LLM API call, for metering and cost; runId/agentId/credentialId are loose FKs —
+ * metering must never fail on a missing (or since-deleted) parent. `mode`/`credentialId` are
+ * Phase 6's BYOK routing (which meter — managed or byok — the cost bump goes to); `costUnknown`
+ * marks a call whose model matched no pricing row (so `cost_micros` is 0, not a real zero). */
 export const llmCalls = pgTable('llm_calls', {
   id: id(), orgId: orgId(),
   runId: uuid('run_id'), agentId: uuid('agent_id'),                         // loose: metering must never fail on a missing parent
@@ -50,9 +53,13 @@ export const llmCalls = pgTable('llm_calls', {
   apiCalls: integer('api_calls').notNull(), costMicros: bigint('cost_micros', { mode: 'number' }).notNull(),
   latencyMs: integer('latency_ms').notNull(), finish: text('finish').notNull(), parseStrategy: text('parse_strategy').notNull(),
   errorCode: text('error_code'),
+  credentialId: uuid('credential_id'),                                      // loose: no FK — metering must never fail on a deleted credential
+  mode: text('mode').notNull().default('managed'),                         // 'managed' | 'byok' (CHECK, 0020)
+  costUnknown: boolean('cost_unknown').notNull().default(false),
   createdAt: createdAt(),
 }, (t) => [
   uniqueIndex('llm_calls_idempotency_uidx').on(t.idempotencyKey),
   index('llm_calls_org_created_idx').on(t.orgId, t.createdAt),
+  index('llm_calls_org_credential_idx').on(t.orgId, t.credentialId, t.createdAt),
   ...tenantPolicies(t.orgId, 'llm_calls'),
 ])

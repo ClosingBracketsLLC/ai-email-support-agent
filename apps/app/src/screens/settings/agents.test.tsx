@@ -10,6 +10,7 @@ const AGENT_2_ID = '33333333-3333-4333-8333-333333333333'
 type Agent = {
   id: string; connectionId: string; address: string; personaPreset: string
   priority: number; status: 'pending_verification' | 'active' | 'disabled'
+  model: { mode: string; provider: string; model: string; credentialLabel: string | null }
 }
 
 // Every variable the jest.mock() factory below closes over must be prefixed `mock` (case-insensitive)
@@ -39,8 +40,10 @@ jest.mock('@/lib/trpc', () => ({
 
 function twoAgentsSameConnection(): Agent[] {
   return [
-    { id: AGENT_1_ID, connectionId: CONNECTION_ID, address: 'support@acme.com', personaPreset: 'support', priority: 0, status: 'active' },
-    { id: AGENT_2_ID, connectionId: CONNECTION_ID, address: 'sales@acme.com', personaPreset: 'sales', priority: 1, status: 'active' },
+    { id: AGENT_1_ID, connectionId: CONNECTION_ID, address: 'support@acme.com', personaPreset: 'support', priority: 0, status: 'active',
+      model: { mode: 'managed', provider: 'anthropic', model: 'claude-opus-5', credentialLabel: null } },
+    { id: AGENT_2_ID, connectionId: CONNECTION_ID, address: 'sales@acme.com', personaPreset: 'sales', priority: 1, status: 'active',
+      model: { mode: 'byok', provider: 'openai', model: 'gpt-5', credentialLabel: 'Production key' } },
   ]
 }
 
@@ -72,6 +75,9 @@ test('renders one row per agent with reorder buttons, and pressing a row navigat
 
   expect(screen.getByText('support@acme.com')).toBeTruthy()
   expect(screen.getByText('sales@acme.com')).toBeTruthy()
+  // Phase 6: each row says which model writes its replies — Managed AI, or the connection's own name.
+  expect(screen.getByText('Support · Managed AI')).toBeTruthy()
+  expect(screen.getByText('Sales · Production key')).toBeTruthy()
   // First row: no "up" (top of its group), has "down". Second row: has "up", no "down" (bottom).
   expect(screen.getByTestId(`agent-up-${AGENT_1_ID}`).props.accessibilityState.disabled).toBe(true)
   expect(screen.getByTestId(`agent-down-${AGENT_1_ID}`).props.accessibilityState.disabled).toBe(false)

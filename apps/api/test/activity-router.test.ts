@@ -127,6 +127,10 @@ describe('activity router', () => {
       await insertUsage(o.orgId, today, SEND_METERS.aiHandledConversations, 3)
       await insertUsage(o.orgId, oldDay, LLM_METERS.costMicros, 5000)
       await insertUsage(o.orgId, oldDay, SEND_METERS.aiHandledConversations, 7)
+      // Phase 6: the tenant's own spend rides its own meter, windowed the same way and returned
+      // beside `costMicros` (which stays the MANAGED number) so the screen can show the total.
+      await insertUsage(o.orgId, today, LLM_METERS.costMicrosByok, 250)
+      await insertUsage(o.orgId, oldDay, LLM_METERS.costMicrosByok, 4000)
 
       return { sentUnchanged, sentEditedOld, tUnchanged, tEdited, dUnchanged, dEdited }
     }
@@ -137,7 +141,7 @@ describe('activity router', () => {
     const week = await org.c.activity.summary.query({ days: 7 })
     expect(week).toMatchObject({
       days: 7, drafted: 1, approvedUnchanged: 1, approvedEdited: 2, rejected: 1, sent: 1, escalated: 1, autoSent: 0,
-      costMicros: 1000, aiHandledConversations: 3,
+      costMicros: 1000, byokCostMicros: 250, aiHandledConversations: 3,
     })
     expect(week.recent).toHaveLength(2)
     expect(week.recent[0]).toMatchObject({
@@ -157,14 +161,14 @@ describe('activity router', () => {
     const month = await org.c.activity.summary.query({ days: 30 })
     expect(month).toMatchObject({
       days: 30, drafted: 8, approvedUnchanged: 2, approvedEdited: 2, rejected: 2, sent: 2, escalated: 2, autoSent: 0,
-      costMicros: 6000, aiHandledConversations: 10,
+      costMicros: 6000, byokCostMicros: 4250, aiHandledConversations: 10,
     })
     expect(month.recent).toHaveLength(2)
 
     // The other org's identical seed never moves this org's numbers, and vice versa is exercised by
     // the fact `other`'s own set was seeded with the exact same shape as `org`'s.
     const otherWeek = await other.c.activity.summary.query({ days: 7 })
-    expect(otherWeek).toMatchObject({ drafted: 1, sent: 1, escalated: 1, costMicros: 1000, aiHandledConversations: 3 })
+    expect(otherWeek).toMatchObject({ drafted: 1, sent: 1, escalated: 1, costMicros: 1000, byokCostMicros: 250, aiHandledConversations: 3 })
   })
 
   // Phase 5: `autoSent` was a hard-coded literal 0 until `auto` mode became reachable. The two
@@ -210,7 +214,7 @@ describe('activity router', () => {
     const res = await org.c.activity.summary.query({ days: 7 })
     expect(res).toEqual({
       days: 7, drafted: 0, approvedUnchanged: 0, approvedEdited: 0, rejected: 0, sent: 0, escalated: 0, autoSent: 0,
-      costMicros: 0, aiHandledConversations: 0, recent: [],
+      costMicros: 0, byokCostMicros: 0, aiHandledConversations: 0, recent: [],
     })
   })
 

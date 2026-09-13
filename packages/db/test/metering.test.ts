@@ -22,6 +22,8 @@ function makeRecord(orgId: string, overrides: Partial<MeterRecord> = {}): MeterR
     finish: 'stop',
     parseStrategy: 'native',
     errorCode: null,
+    mode: 'managed',
+    credentialId: null,
     ...overrides,
   }
 }
@@ -147,5 +149,23 @@ describe('createMeterSink', () => {
 
     const rows = await withOrg(app.db, orgId, (tx) => tx.select().from(llmCalls).where(eq(llmCalls.idempotencyKey, rec.idempotencyKey)))
     expect(rows).toHaveLength(0)
+  })
+
+  it('a byok record bumps llm_cost_micros_byok, leaves llm_cost_micros untouched, and the row carries credential_id + cost_unknown', async () => {
+    const now = new Date()
+    const sink = createMeterSink(app.db, { now: () => now })
+    const credentialId = randomBytes(16).toString('hex').replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5')
+    const managedCostBefore = (await meterRow(LLM_METERS.costMicros))?.value ?? 0
+    const byokCostBefore = (await meterRow(LLM_METERS.costMicrosByok))?.value ?? 0
+    const rec = makeRecord(orgId, { mode: 'byok', credentialId, costMicros: 777, costUnknown: true })
+
+    await sink.record(rec)
+
+    const rows = await withOrg(app.db, orgId, (tx) => tx.select().from(llmCalls).where(eq(llmCalls.idempotencyKey, rec.idempotencyKey)))
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ mode: 'byok', credentialId, costUnknown: true })
+
+    expect((await meterRow(LLM_METERS.costMicrosByok))?.value).toBe(byokCostBefore + 777)
+    expect((await meterRow(LLM_METERS.costMicros))?.value ?? 0).toBe(managedCostBefore)
   })
 })

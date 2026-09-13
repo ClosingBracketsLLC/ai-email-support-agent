@@ -29,23 +29,24 @@ import {
   agents, audit, bumpMeter, categories, drafts, GUIDANCE_METERS, guidanceSuggestions, orgSettings,
   platformState, usageCounters, withOrg, workspaces, type Db,
 } from '@aesa/db'
-import type { LlmProvider } from '@aesa/llm'
-import { defineJob, JOB_NAMES, registerJob, type JobDefinition } from '@aesa/queue'
+import { defineJob, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
 import { utcDayString } from '../date-utils.ts'
+import type { ProviderResolver } from '../provider-resolver.ts'
 
 export const GuidanceSuggestPayload = z.object({ orgId: z.string(), draftId: z.string() })
 export type GuidanceSuggestPayload = z.infer<typeof GuidanceSuggestPayload>
 
-export const guidanceSuggestJob: JobDefinition<GuidanceSuggestPayload> = defineJob({
+export const guidanceSuggestJob: RegisteredJobDefinition<GuidanceSuggestPayload> = defineJob({
   name: JOB_NAMES.guidanceSuggest, schema: GuidanceSuggestPayload,
-  // retryLimit 1: a redelivery re-reads the same draft and the sourceDraftId gate in step 1 makes a
-  // successful first attempt's retry a no-op anyway; there is no transient-failure budget worth
-  // spending an extra Haiku call on.
-  queue: { policy: 'short', expireInSeconds: 120, retryLimit: 1 },
+  // retryLimit 1 (QUEUE_OPTIONS): a redelivery re-reads the same draft and the sourceDraftId gate in
+  // step 1 makes a successful first attempt's retry a no-op anyway; there is no transient-failure
+  // budget worth spending an extra Haiku call on.
   handler: async () => { throw new Error('guidance.suggest: register it through registerGuidanceSuggest(boss, deps)') },
 })
 
-export interface GuidanceSuggestDeps { db: Db; provider: LlmProvider; logger: pino.Logger; now?: () => Date }
+/** `providers` is Phase 6's per-tenant resolver — this job runs on the agent's TRIAGE model (a
+ *  small, cheap one), so a BYOK workspace's edited reply never leaves its own provider. */
+export interface GuidanceSuggestDeps { db: Db; providers: ProviderResolver; logger: pino.Logger; now?: () => Date }
 const ACTOR = `system:${JOB_NAMES.guidanceSuggest}` as const
 /** Below this edit-distance ratio, an edit is tone/wording/punctuation only — never worth a model call. */
 const COSMETIC_RATIO_MIN = 0.05
@@ -132,17 +133,32 @@ export async function runGuidanceSuggest(
   const loaded = await load(deps.db, orgId, draftId)
   if (!loaded) return 'skipped'
 
+  // Phase 6: the agent's own TRIAGE model. Resolved BEFORE the cap gate — a workspace whose key is
+  // gone must not spend a suggestion slot to discover it. There is no ticket here and nothing to
+  // escalate: the owner's edit is already saved, so a refusal is a silent, audited skip.
+  const resolved = await deps.providers.resolve(orgId, loaded.agentId, 'triage')
+  if (!resolved.ok) {
+    deps.logger.warn({ orgId, draftId, refusal: resolved.reason }, 'guidance.suggest: no model provider for this agent; skipping')
+    await withOrg(deps.db, orgId, (tx) =>
+      audit(tx, {
+        actor: ACTOR, action: 'guidance.skipped', entityType: 'draft', entityId: draftId,
+        detail: { reason: 'provider_unavailable', refusal: resolved.reason },
+      }))
+    return 'skipped'
+  }
+
   if (await gateAndBumpCap(deps.db, orgId, day)) return 'capped'
 
   // ── the model call, outside every transaction ──
   const result = await runGuidanceSuggestCall(
-    deps.provider,
+    resolved.provider,
     {
       original: loaded.original, edited: loaded.edited, categoryLabel: loaded.categoryLabel,
       workspaceGuidance: loaded.workspaceGuidance, agentGuidance: loaded.agentGuidance, businessName: loaded.businessName,
     },
     { orgId, agentId: loaded.agentId ?? undefined, role: 'guidance_suggest', idempotencyKey: `guidance:${draftId}` },
     signal,
+    resolved.config.model,
   )
   if (result.suggestion === null) return 'none'
   const text = result.suggestion

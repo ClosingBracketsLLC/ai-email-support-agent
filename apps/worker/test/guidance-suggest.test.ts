@@ -13,8 +13,9 @@ import {
 } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
-import { createFakeProvider } from '@aesa/llm'
+import { createFakeProvider, type LlmProvider } from '@aesa/llm'
 import { runGuidanceSuggest, type GuidanceSuggestDeps } from '../src/jobs/guidance-suggest.ts'
+import { staticRefusal, staticResolver } from '../src/provider-resolver.ts'
 import { utcDayString } from '../src/date-utils.ts'
 
 const rand = () => randomBytes(4).toString('hex')
@@ -104,8 +105,8 @@ const allSuggestions = async () => withOrg(app.db, fx.orgId, (tx) => tx.select()
 const auditRows = async (entityId: string, action: string) =>
   withOrg(app.db, fx.orgId, (tx) => tx.select().from(auditLog).where(and(eq(auditLog.entityId, entityId), eq(auditLog.action, action))))
 
-function makeDeps(provider: GuidanceSuggestDeps['provider'], over: Partial<GuidanceSuggestDeps> = {}): GuidanceSuggestDeps {
-  return { db: app.db, provider, logger: pino({ level: 'silent' }), now: () => NOW, ...over }
+function makeDeps(provider: LlmProvider, over: Partial<GuidanceSuggestDeps> = {}): GuidanceSuggestDeps {
+  return { db: app.db, providers: staticResolver(provider), logger: pino({ level: 'silent' }), now: () => NOW, ...over }
 }
 
 const run = (deps: GuidanceSuggestDeps, draftId: string) =>
@@ -225,5 +226,34 @@ describe('guidance.suggest', () => {
     expect(provider.calls).toHaveLength(0)
     expect(await allSuggestions()).toHaveLength(0)
     expect(await meter('guidance_suggest_calls')).toBe(0)
+  })
+
+  it('P6 the suggestion runs on the agent\'s resolved TRIAGE model', async () => {
+    const draftId = await seedApprovedDraft({ editDistanceRatio: 0.4 })
+    const provider = createFakeProvider([], {
+      byRole: { guidance_suggest: [{ parsed: { suggestion: 'Ship within two days.', rationale: 'r' } }] },
+    })
+    const deps = makeDeps(provider, {
+      providers: staticResolver(provider, { mode: 'byok', credentialId: crypto.randomUUID(), provider: 'deepseek', model: 'deepseek-chat' }),
+    })
+
+    expect(await run(deps, draftId)).toBe('suggested')
+    expect(provider.calls[0]!.model).toBe('deepseek-chat')
+  })
+
+  it('P6 a resolver refusal skips the call, the cap bump and the row, and audits guidance.skipped/provider_unavailable', async () => {
+    const draftId = await seedApprovedDraft({ editDistanceRatio: 0.4 })
+    const provider = createFakeProvider([], {
+      byRole: { guidance_suggest: [{ parsed: { suggestion: 'Never reached.', rationale: 'r' } }] },
+    })
+    const deps = makeDeps(provider, { providers: staticRefusal('credential_dead', { mode: 'byok', provider: 'openai' }) })
+
+    expect(await run(deps, draftId)).toBe('skipped')
+    expect(provider.calls).toHaveLength(0)
+    expect(await meter('guidance_suggest_calls')).toBe(0)
+    expect(await allSuggestions()).toHaveLength(0)
+    const skipped = await auditRows(draftId, 'guidance.skipped')
+    expect(skipped).toHaveLength(1)
+    expect(skipped[0]!.detail).toMatchObject({ reason: 'provider_unavailable' })
   })
 })

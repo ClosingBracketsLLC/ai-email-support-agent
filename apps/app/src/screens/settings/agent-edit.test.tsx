@@ -30,6 +30,28 @@ jest.mock('expo-router', () => ({
 
 jest.mock('@/lib/trpc', () => ({
   useTRPC: () => ({
+    workspace: {
+      get: { queryOptions: () => ({ queryKey: ['workspace', 'get'], queryFn: () => Promise.resolve({ businessName: 'Acme', role: 'owner' }) }) },
+    },
+    // <ModelCard/> (Task 9) sits between the reply-from card and Save; it is covered by its own
+    // test file, and only has to mount cleanly here.
+    llm: {
+      list: {
+        queryOptions: () => ({ queryKey: ['llm', 'list'], queryFn: () => Promise.resolve({ credentials: [] }) }),
+        queryKey: () => ['llm', 'list'],
+      },
+      agentModel: {
+        queryOptions: (input: { agentId: string }) => ({
+          queryKey: ['llm', 'agentModel', input.agentId],
+          queryFn: () => Promise.resolve({
+            draft: { mode: 'managed', credentialId: null, provider: 'anthropic', model: 'claude-opus-5', effort: null, fallbackToManaged: false, tier: 'calibrated', modelGeneration: 1, modelGenerationAt: null, credential: null },
+            triage: { mode: 'managed', credentialId: null, provider: 'anthropic', model: 'claude-haiku-4-5', effort: null, fallbackToManaged: false, tier: 'calibrated', modelGeneration: 1, modelGenerationAt: null, credential: null },
+          }),
+        }),
+        queryKey: (input: { agentId: string }) => ['llm', 'agentModel', input.agentId],
+      },
+      setAgentModel: { mutationOptions: (o: object) => ({ mutationFn: () => Promise.resolve({ ok: true, generationBumped: false, demoted: 0 }), ...o }) },
+    },
     agents: {
       list: {
         queryOptions: () => ({ queryKey: ['agents', 'list'], queryFn: () => Promise.resolve({ agents: mockAgents }) }),

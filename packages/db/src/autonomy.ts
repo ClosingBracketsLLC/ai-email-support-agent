@@ -60,6 +60,7 @@ const DEMOTION_COPY: Record<DemotionReason, string> = {
   flags: 'Two auto-sent replies were flagged as "should not have sent".',
   hold_then_edit: 'An auto-send was held and then changed.',
   edit_rate: 'More than 30% of recent drafts needed edits.',
+  model_changed: "The agent's model was changed.",
 }
 
 /** Guarded `auto → review` (and on `org_id`, see `readDemotionSignals`); zero rows means a concurrent

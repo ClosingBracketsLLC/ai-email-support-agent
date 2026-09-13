@@ -1,5 +1,5 @@
 import PgBoss from 'pg-boss'
-import { createQueueRetrying, JOB_NAMES } from '@aesa/queue'
+import { createQueueRetrying, JOB_NAMES, queueOptionsFor } from '@aesa/queue'
 
 /**
  * A send-only pg-boss client for the api. The worker (apps/worker) owns every job handler and every
@@ -23,26 +23,29 @@ export async function createSendOnlyBoss(connectionString: string): Promise<PgBo
   // 15's finding). Create every queue this api will ever send to right after start, so a send from a
   // cold-booted api replica — one that raced ahead of the worker's own queue creation, or is running
   // against a brand-new database in a test — never silently no-ops.
-  // The policy must match `defineJob`'s `queue.policy`; pg-boss `createQueue` ignores a second call, so
-  // the FIRST process to boot decides. `options.name` below is redundant with the positional `name`
-  // arg — pg-boss's own `PgBoss.Queue` type requires it, but `manager.js`'s `createQueue` ignores it
-  // at runtime (`name = name || options.name`) — it's here only to satisfy the type.
-  await createQueueRetrying(boss, JOB_NAMES.keysProvision)
-  await createQueueRetrying(boss, JOB_NAMES.storeCredentials)
-  await createQueueRetrying(boss, JOB_NAMES.revokeMailbox)
-  await createQueueRetrying(boss, JOB_NAMES.mailboxSync)
-  await createQueueRetrying(boss, JOB_NAMES.ticketDraft, { name: JOB_NAMES.ticketDraft, policy: 'short' })
-  await createQueueRetrying(boss, JOB_NAMES.agentSandbox, { name: JOB_NAMES.agentSandbox, policy: 'short' })
-  await createQueueRetrying(boss, JOB_NAMES.sendExecute, { name: JOB_NAMES.sendExecute, policy: 'short' })
-  await createQueueRetrying(boss, JOB_NAMES.notifyDispatch, { name: JOB_NAMES.notifyDispatch, policy: 'short' })
-  await createQueueRetrying(boss, JOB_NAMES.knowledgeIngest, { name: JOB_NAMES.knowledgeIngest, policy: 'short' })
-  await createQueueRetrying(boss, JOB_NAMES.knowledgeCrawl, { name: JOB_NAMES.knowledgeCrawl, policy: 'short' })
-  await createQueueRetrying(boss, JOB_NAMES.knowledgeEmbedBatch, { name: JOB_NAMES.knowledgeEmbedBatch, policy: 'short' })
+  // Every option below comes from `QUEUE_OPTIONS` (`packages/queue/src/queue-options.ts`) via
+  // `queueOptionsFor` — the ONE table a queue's policy/retry/expiry values are read from, so this
+  // list and `apps/worker/src/index.ts`'s can never drift from what each job's OWN `defineJob` call
+  // resolves to. pg-boss `createQueue` ignores a second call, so the FIRST process to boot decides.
+  await createQueueRetrying(boss, JOB_NAMES.keysProvision, queueOptionsFor(JOB_NAMES.keysProvision))
+  await createQueueRetrying(boss, JOB_NAMES.storeCredentials, queueOptionsFor(JOB_NAMES.storeCredentials))
+  await createQueueRetrying(boss, JOB_NAMES.revokeMailbox, queueOptionsFor(JOB_NAMES.revokeMailbox))
+  await createQueueRetrying(boss, JOB_NAMES.mailboxSync, queueOptionsFor(JOB_NAMES.mailboxSync))
+  await createQueueRetrying(boss, JOB_NAMES.ticketDraft, queueOptionsFor(JOB_NAMES.ticketDraft))
+  await createQueueRetrying(boss, JOB_NAMES.agentSandbox, queueOptionsFor(JOB_NAMES.agentSandbox))
+  await createQueueRetrying(boss, JOB_NAMES.sendExecute, queueOptionsFor(JOB_NAMES.sendExecute))
+  await createQueueRetrying(boss, JOB_NAMES.notifyDispatch, queueOptionsFor(JOB_NAMES.notifyDispatch))
+  await createQueueRetrying(boss, JOB_NAMES.knowledgeIngest, queueOptionsFor(JOB_NAMES.knowledgeIngest))
+  await createQueueRetrying(boss, JOB_NAMES.knowledgeCrawl, queueOptionsFor(JOB_NAMES.knowledgeCrawl))
+  await createQueueRetrying(boss, JOB_NAMES.knowledgeEmbedBatch, queueOptionsFor(JOB_NAMES.knowledgeEmbedBatch))
   // Phase 5: `approveDraft` sends guidance.suggest after an edited approval — the api IS that
   // producer. It never sends memory.capture (the worker's send.execute does, from its onSent seam),
   // but the four-places rule is literal: every queue is pre-created on both processes regardless.
-  await createQueueRetrying(boss, JOB_NAMES.guidanceSuggest, { name: JOB_NAMES.guidanceSuggest, policy: 'short' })
-  await createQueueRetrying(boss, JOB_NAMES.memoryCapture, { name: JOB_NAMES.memoryCapture, policy: 'short' })
+  await createQueueRetrying(boss, JOB_NAMES.guidanceSuggest, queueOptionsFor(JOB_NAMES.guidanceSuggest))
+  await createQueueRetrying(boss, JOB_NAMES.memoryCapture, queueOptionsFor(JOB_NAMES.memoryCapture))
+  // Phase 6: the api's `llm.addCredential`/`probeCredential` send it on every key added or
+  // re-probed by hand, and the worker's own `llm.reprobe-sweep` cron sends it every six hours.
+  await createQueueRetrying(boss, JOB_NAMES.llmProbe, queueOptionsFor(JOB_NAMES.llmProbe))
 
   return boss
 }

@@ -21,7 +21,7 @@ export const SetCategoryPolicyInput = z.object({
 export type SetCategoryPolicyInput = z.infer<typeof SetCategoryPolicyInput>
 
 /** Why a category went Auto → Review (spec §Learning loop "Demotion is automatic"), in evaluation order. */
-export const DEMOTION_REASONS = ['rejections', 'flags', 'hold_then_edit', 'edit_rate'] as const
+export const DEMOTION_REASONS = ['rejections', 'flags', 'hold_then_edit', 'edit_rate', 'model_changed'] as const
 export type DemotionReason = (typeof DEMOTION_REASONS)[number]
 
 /** The push category whose device actions are Review / Hold (`draft_review` keeps Review only). */

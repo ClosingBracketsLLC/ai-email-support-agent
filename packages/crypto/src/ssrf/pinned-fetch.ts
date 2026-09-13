@@ -11,7 +11,7 @@ export function validateOutboundUrl(input: string, opts: { allowNonstandardPort?
   return url
 }
 
-export type PinnedFetchErrorCode = 'redirect_not_followed' | 'body_too_large'
+export type PinnedFetchErrorCode = 'redirect_not_followed' | 'body_too_large' | 'unsupported_body'
 
 export class PinnedFetchError extends Error {
   readonly code: PinnedFetchErrorCode
@@ -43,6 +43,8 @@ export interface PinnedTransportInit {
   method?: string
   headers?: Record<string, string>
   body?: string
+  /** The caller's own cancellation, combined with (never replacing) this transport's `timeoutMs`. */
+  signal?: AbortSignal
   timeoutMs?: number
   /** Hard cap on the response body; the read aborts and the connection is destroyed past it. */
   maxBodyBytes?: number
@@ -72,6 +74,7 @@ const DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024
  */
 export async function fetchThroughPinnedDispatcher(url: URL, dispatcher: Dispatcher, init: PinnedTransportInit = {}): Promise<Response> {
   const maxBodyBytes = init.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES
+  const timeoutMs = init.timeoutMs ?? 30_000
   try {
     const res = await undiciFetch(url, {
       method: init.method ?? 'GET',
@@ -79,7 +82,9 @@ export async function fetchThroughPinnedDispatcher(url: URL, dispatcher: Dispatc
       body: init.body,
       dispatcher,
       redirect: 'manual',
-      signal: AbortSignal.timeout(init.timeoutMs ?? 30_000),
+      // The caller's signal never REPLACES the deadline: a request must still die at `timeoutMs`
+      // even when its caller passed a signal that never fires.
+      signal: init.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
     })
     if (res.status >= 300 && res.status < 400) {
       if ((init.redirect ?? 'error') === 'error') {
@@ -127,4 +132,54 @@ export async function pinnedFetch(input: string, init: PinnedFetchInit = {}): Pr
   const url = validateOutboundUrl(input, { allowNonstandardPort: init.allowNonstandardPort })
   const { address, family } = await resolvePublic(url.hostname, { resolver: init.resolver })
   return fetchThroughPinnedDispatcher(url, buildPinnedDispatcher(address, family), init)
+}
+
+export interface CreatePinnedFetchOptions {
+  resolver?: Resolver
+  allowNonstandardPort?: boolean
+  timeoutMs?: number
+  maxBodyBytes?: number
+  /**
+   * TEST-ONLY seam. `resolvePublic` refuses loopback, so a test can never drive the full path
+   * against a local origin; substituting the transport lets a test capture what this function
+   * would have sent, or point the real `fetchThroughPinnedDispatcher` at 127.0.0.1. Production
+   * callers never pass it — the default IS the real transport.
+   */
+  transport?: typeof fetchThroughPinnedDispatcher
+}
+
+/**
+ * A `fetch`-shaped function for an SDK's `fetch` option (the OpenAI and Anthropic clients both take
+ * one): every request is validated (https, hostname, no credentials), resolved to a public address
+ * and pinned to it — DNS rebinding between the api's write-time check and this call cannot swap the
+ * target, because the resolve happens on EVERY call, not once at construction — and never follows a
+ * redirect. Headers arrive as a `Headers`, an array or a record and are normalized; the SDKs send
+ * string bodies. A URL object (or a `Request`) is accepted for the same reason.
+ */
+export function createPinnedFetch(opts: CreatePinnedFetchOptions = {}): typeof fetch {
+  const transport = opts.transport ?? fetchThroughPinnedDispatcher
+  const fn = async (input: string | URL | Request, init: RequestInit = {}): Promise<Response> => {
+    const href = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+    const url = validateOutboundUrl(href, { allowNonstandardPort: opts.allowNonstandardPort })
+    // The SDKs send string bodies; anything else (a stream, FormData, a Blob) is not something this
+    // transport can pin. Dropping it silently would send a bodyless POST and turn a caller's mistake
+    // into an endpoint's confusing 400, so it is refused loudly instead, before anything is sent.
+    const body = init.body ?? undefined
+    if (body !== undefined && typeof body !== 'string') throw new PinnedFetchError('unsupported body type', 'unsupported_body')
+    const { address, family } = await resolvePublic(url.hostname, { resolver: opts.resolver })
+    const headers: Record<string, string> = {}
+    new Headers(init.headers ?? undefined).forEach((value, key) => {
+      headers[key] = value
+    })
+    return transport(url, buildPinnedDispatcher(address, family), {
+      method: init.method ?? 'GET',
+      headers,
+      ...(body === undefined ? {} : { body }),
+      ...(init.signal ? { signal: init.signal } : {}),
+      ...(opts.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }),
+      ...(opts.maxBodyBytes === undefined ? {} : { maxBodyBytes: opts.maxBodyBytes }),
+      redirect: 'error',
+    })
+  }
+  return fn as typeof fetch
 }

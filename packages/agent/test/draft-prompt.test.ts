@@ -63,6 +63,7 @@ const BASE: DraftPromptInput = {
   knowledge: { chunks: [], answers: [] },
   cacheAgentBlocks: false,
   effort: 'medium',
+  model: DRAFT_MODEL,
 }
 
 const SIGNAL = new AbortController().signal
@@ -266,6 +267,13 @@ describe('knowledgeBlock (f)', () => {
 })
 
 describe('buildDraftRequest — request shape (g)', () => {
+  // Phase 6: the model is the CALLER's (the agent's resolved BYOK model, or the managed default);
+  // `DRAFT_MODEL` is only what every managed caller happens to pass.
+  it('takes the model from the input, not from DRAFT_MODEL', () => {
+    const req = buildDraftRequest({ ...BASE, model: 'qwen3:32b' }, META, SIGNAL)
+    expect(req.model).toBe('qwen3:32b')
+  })
+
   it('passes effort, the agent cache breakpoint, the model, the output schema name and the token cap through', () => {
     const input: DraftPromptInput = { ...BASE, effort: 'high', cacheAgentBlocks: true }
     const req = buildDraftRequest(input, META, SIGNAL)

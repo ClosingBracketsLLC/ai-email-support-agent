@@ -78,9 +78,9 @@ describe('worker config', () => {
     })
 
     it('does NOT throw in production when the sync role is not active, even with neither configured', () => {
-      // VOYAGE_API_KEY rides along because the `agent` role's own production gate (Task 8) now needs
-      // it too — this case is about the SYNC guards staying quiet, not about the agent's.
-      const config = loadConfig({ DATABASE_URL, NODE_ENV: 'production', WORKER_ROLES: 'agent', ANTHROPIC_API_KEY: 'sk-ant-x', VOYAGE_API_KEY: 'pa-x' })
+      // `send` is the one role loadConfig gates on nothing at all — the `agent` role this case used
+      // to name now has a KEK gate of its own (Phase 6), which would mask the thing being asserted.
+      const config = loadConfig({ DATABASE_URL, NODE_ENV: 'production', WORKER_ROLES: 'send' })
       expect(config.kekRing).toBeNull()
       expect(config.platformSender).toBeNull()
     })
@@ -89,6 +89,23 @@ describe('worker config', () => {
       const config = loadConfig({ DATABASE_URL, WORKER_ROLES: 'sync' })
       expect(config.kekRing).toBeNull()
       expect(config.platformSender).toBeNull()
+    })
+  })
+
+  describe('production + WORKER_ROLES=agent KEK guard', () => {
+    it('throws when the KEK ring is missing', () => {
+      expect(() => loadConfig({ DATABASE_URL, NODE_ENV: 'production', WORKER_ROLES: 'agent', ANTHROPIC_API_KEY: 'sk-ant-x', VOYAGE_API_KEY: 'pa-x' }))
+        .toThrow(/AESA_KEK_V<n> and AESA_KEK_ACTIVE are required in production when WORKER_ROLES includes `agent`/)
+    })
+
+    it('boots cleanly in production when agent is active and the ring is configured', () => {
+      const config = loadConfig({ DATABASE_URL, NODE_ENV: 'production', WORKER_ROLES: 'agent', ANTHROPIC_API_KEY: 'sk-ant-x', VOYAGE_API_KEY: 'pa-x', ...kekEnv })
+      expect(config.kekRing?.active).toBe(1)
+    })
+
+    it('does NOT throw in development/test when the agent role is active without a ring', () => {
+      const config = loadConfig({ DATABASE_URL, WORKER_ROLES: 'agent' })
+      expect(config.kekRing).toBeNull()
     })
   })
 
@@ -115,7 +132,7 @@ describe('worker config', () => {
     })
 
     it('does NOT throw in production without the cron role — that replica never sends platform mail', () => {
-      expect(loadConfig({ DATABASE_URL, NODE_ENV: 'production', WORKER_ROLES: 'agent', ANTHROPIC_API_KEY: 'sk-ant-x', VOYAGE_API_KEY: 'pa-x' }).mail.transport).toBe('devsink')
+      expect(loadConfig({ DATABASE_URL, NODE_ENV: 'production', WORKER_ROLES: 'agent', ANTHROPIC_API_KEY: 'sk-ant-x', VOYAGE_API_KEY: 'pa-x', ...kekEnv }).mail.transport).toBe('devsink')
     })
 
     it('builds the resend transport config in production when the cron role is fully configured', () => {
@@ -177,7 +194,7 @@ describe('worker config', () => {
     })
 
     it('throws in production when the agent role is active and VOYAGE_API_KEY is missing', () => {
-      expect(() => loadConfig({ DATABASE_URL, NODE_ENV: 'production', WORKER_ROLES: 'agent', ANTHROPIC_API_KEY: 'sk-ant-x' }))
+      expect(() => loadConfig({ DATABASE_URL, NODE_ENV: 'production', WORKER_ROLES: 'agent', ANTHROPIC_API_KEY: 'sk-ant-x', ...kekEnv }))
         .toThrow(/VOYAGE_API_KEY is required in production when WORKER_ROLES includes `agent` or `knowledge`/)
     })
 

@@ -5,15 +5,9 @@ import { createManagedProvider, MANAGED_MAX_CONCURRENT_PER_MODEL } from '../src/
 import { createLlmLimiter } from '../src/core/limiter.ts'
 import type { ChatRequest } from '../src/core/types.ts'
 import type { MeterRecord, MeterSink } from '../src/metering/types.ts'
+import { jsonResponse } from './helpers/fetch-stub.ts'
 
 const OUTPUT_SCHEMA = z.object({ category: z.enum(['toys', 'other']), is_spam: z.boolean() })
-
-function jsonResponse(body: unknown, init?: { status?: number; headers?: Record<string, string> }): Response {
-  return new Response(JSON.stringify(body), {
-    status: init?.status ?? 200,
-    headers: { 'content-type': 'application/json', ...init?.headers },
-  })
-}
 
 function anthropicMessage(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {

@@ -21,6 +21,7 @@ import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
 import type { Retriever } from '@aesa/agent'
 import { createFakeProvider, LlmError, type LlmProvider } from '@aesa/llm'
 import { runAgentSandbox, type AgentSandboxDeps, type SandboxOutput } from '../src/jobs/agent-sandbox.ts'
+import { staticRefusal, staticResolver } from '../src/provider-resolver.ts'
 import { createWorkerLogger } from '../src/logging.ts'
 
 const rand = () => randomBytes(4).toString('hex')
@@ -131,7 +132,7 @@ async function ticketAndDraftCounts(): Promise<{ tickets: number; drafts: number
 function makeDeps(provider: LlmProvider, over: Partial<AgentSandboxDeps> = {}): AgentSandboxDeps {
   return {
     db: app.db,
-    provider,
+    providers: staticResolver(provider),
     retriever: emptyRetriever,
     logger: pino({ level: 'silent' }),
     now: () => NOW,
@@ -451,5 +452,65 @@ describe('runAgentSandbox', () => {
     const escalated = await seedSandboxRun()
     await run(makeDeps(createFakeProvider([{ parsed: ESCALATE }])), escalated)
     expect(((await getRun(escalated)).output as SandboxOutput).evidence).toBeNull()
+  })
+
+  // --- Phase 6: the resolved provider, the tier cap, and the refusal landing --------------------
+
+  it('P6 the run row is restamped with the RESOLVED provider/model, the call uses that model, and the output carries the tier', async () => {
+    const runId = await seedSandboxRun()
+    const provider = createFakeProvider([{ parsed: REPLY }])
+    const deps = makeDeps(provider, {
+      providers: staticResolver(provider, { mode: 'byok', credentialId: crypto.randomUUID(), provider: 'openai', model: 'gpt-5', tier: 'standard' }),
+    })
+
+    await run(deps, runId)
+
+    const row = await getRun(runId)
+    expect(row.provider).toBe('openai')
+    expect(row.model).toBe('gpt-5')
+    expect(provider.calls[0]!.model).toBe('gpt-5')
+    const output = row.output as SandboxOutput
+    expect(output.tier).toBe('standard')
+  })
+
+  it('P6 the tier caps the model term of the evidence the owner is shown', async () => {
+    const answerId = crypto.randomUUID()
+    const runId = await seedSandboxRun()
+    const provider = createFakeProvider([{ parsed: reply({ confidence: 0.95, usedAnswerIds: [answerId] }) }])
+    const deps = makeDeps(provider, {
+      retriever: answerRetriever({ id: answerId, score: 0.92, approvals: 3 }),
+      providers: staticResolver(provider, { tier: 'limited' }),
+    })
+
+    await run(deps, runId)
+
+    // memory 1 × capped model 0.6 — a `calibrated` run would have shown 0.95.
+    expect(((await getRun(runId)).output as SandboxOutput).evidence).toBeCloseTo(0.6, 6)
+  })
+
+  it('P6 a resolver refusal fails the run as provider_unavailable, before any prompt event or model call', async () => {
+    const runId = await seedSandboxRun()
+    const provider = createFakeProvider([{ parsed: REPLY }])
+    const deps = makeDeps(provider, { providers: staticRefusal('no_managed_key') })
+
+    await run(deps, runId)
+
+    const row = await getRun(runId)
+    expect(row.status).toBe('failed')
+    expect(row.errorCode).toBe('provider_unavailable')
+    expect(provider.calls).toHaveLength(0)
+    expect((await eventsFor(runId)).map((e) => e.kind)).toEqual(['error'])
+  })
+
+  it('P6 the agent\'s configured effort reaches the call and the prompt event — a "Try it" run is what the real first attempt would do', async () => {
+    const runId = await seedSandboxRun()
+    const provider = createFakeProvider([{ parsed: REPLY }])
+    const deps = makeDeps(provider, { providers: staticResolver(provider, { effort: 'low' }) })
+
+    await run(deps, runId)
+
+    expect(provider.calls[0]!.effort).toBe('low')
+    const prompt = (await eventsFor(runId)).find((e) => e.kind === 'prompt')
+    expect(prompt!.payload).toMatchObject({ effort: 'low' })
   })
 })

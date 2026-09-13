@@ -11,7 +11,7 @@ import type pino from 'pino'
 import { z } from 'zod'
 import { PUSH_DAILY_CAP } from '@aesa/contracts'
 import { notificationDevices, notifications, tickets, usageCounters, withOrg, type Db, type OrgTx } from '@aesa/db'
-import { defineJob, enqueue, registerJob, JOB_NAMES, type JobDefinition } from '@aesa/queue'
+import { defineJob, enqueue, registerJob, JOB_NAMES, type RegisteredJobDefinition } from '@aesa/queue'
 import { utcDayString } from '../date-utils.ts'
 import type { SendPush } from '../push.ts'
 
@@ -27,13 +27,12 @@ export type NotifyDispatchPayload = z.infer<typeof NotifyDispatchPayload>
  * ever reads `.name`/`.schema`, never the handler. `registerNotifyDispatch` below builds the real,
  * deps-bound definition and registers THAT.
  */
-export const notifyDispatchJob: JobDefinition<NotifyDispatchPayload> = defineJob({
+export const notifyDispatchJob: RegisteredJobDefinition<NotifyDispatchPayload> = defineJob({
   name: JOB_NAMES.notifyDispatch,
   schema: NotifyDispatchPayload,
-  // `short`: one delivery per notification id while the job is still `created` — the producers'
-  // dedupe-keyed re-insert and the poll sweep's stuck-pending retry both re-enqueue the same id
-  // (fix wave W8: `singletonKey` dedupes nothing on `standard`).
-  queue: { policy: 'short', expireInSeconds: 60, retryLimit: 2 },
+  // policy: 'short' (QUEUE_OPTIONS): one delivery per notification id while the job is still
+  // `created` — the producers' dedupe-keyed re-insert and the poll sweep's stuck-pending retry both
+  // re-enqueue the same id (fix wave W8: `singletonKey` dedupes nothing on `standard`).
   handler: async () => {
     throw new Error('notify.dispatch: this definition has no bound deps — register it through registerNotifyDispatch(boss, deps)')
   },
@@ -47,7 +46,7 @@ export interface NotifyDispatchDeps {
 }
 
 export async function registerNotifyDispatch(boss: PgBoss, deps: NotifyDispatchDeps): Promise<void> {
-  const wired: JobDefinition<NotifyDispatchPayload> = {
+  const wired: RegisteredJobDefinition<NotifyDispatchPayload> = {
     ...notifyDispatchJob,
     handler: async (ctx) => {
       await runNotifyDispatch(deps, ctx.data)

@@ -52,7 +52,7 @@ export function SettingsIndexScreen() {
       <ListRow title="Knowledge" subtitle="Website crawl, documents, pasted FAQs, guidance" onPress={() => router.push('/settings/knowledge')} testID="settings-knowledge" />
       <ListRow title="Autopilot" subtitle="Off / Review / Auto per category" onPress={() => router.push('/settings/autopilot')} testID="settings-autopilot" />
       <ListRow title="Learned answers" subtitle="What the agent learned from your approvals" onPress={() => router.push('/settings/memory')} testID="settings-memory" />
-      <ListRow title="AI" subtitle="Managed AI or your own provider" badge="Phase 6" />
+      <ListRow title="AI" subtitle="Managed AI or your own provider" onPress={() => router.push('/settings/ai')} testID="settings-ai" />
       <ListRow title="Billing" subtitle="Plan, domains, usage" badge="Phase 7" />
       {organizations && organizations.length > 1 ? (
         <>

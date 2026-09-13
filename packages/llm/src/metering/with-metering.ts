@@ -31,6 +31,8 @@ export function withMetering(inner: LlmProvider, sink: MeterSink, opts?: { prici
       return inner.capabilities(model)
     },
 
+    ...(inner.listModels ? { listModels: (signal?: AbortSignal) => inner.listModels!(signal) } : {}),
+
     async chat<T>(req: ChatRequest<T>): Promise<ChatResult<T>> {
       const start = performance.now()
       try {
@@ -51,6 +53,8 @@ export function withMetering(inner: LlmProvider, sink: MeterSink, opts?: { prici
           finish: result.finish,
           parseStrategy: result.parseStrategy,
           errorCode: null,
+          mode: req.meta.mode ?? 'managed',
+          credentialId: req.meta.credentialId ?? null,
         })
         return result
       } catch (err) {
@@ -73,6 +77,8 @@ export function withMetering(inner: LlmProvider, sink: MeterSink, opts?: { prici
           finish: 'error',
           parseStrategy: 'none',
           errorCode: err instanceof LlmError ? err.code : 'permanent',
+          mode: req.meta.mode ?? 'managed',
+          credentialId: req.meta.credentialId ?? null,
         })
         throw err
       }

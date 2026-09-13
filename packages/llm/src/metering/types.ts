@@ -19,6 +19,12 @@ export interface MeterRecord {
   finish: ChatResult<unknown>['finish'] | 'error'
   parseStrategy: ParseStrategy
   errorCode: LlmErrorCode | null
+  /** Phase 6 BYOK routing, from `req.meta.mode` (default `'managed'`) — which meter the sink's
+   * cost bump goes to. */
+  mode: 'managed' | 'byok'
+  /** The `llm_credentials` row this call was made under, from `req.meta.credentialId`; null for
+   * a managed call. */
+  credentialId: string | null
 }
 
 /** Implementations never throw — `withMetering` guards the call anyway (never trust it blindly). */

@@ -55,6 +55,12 @@ export const activityRouter = router({
 
       const [costRow] = await tx.select({ total: sum(usageCounters.value) }).from(usageCounters)
         .where(and(eq(usageCounters.orgId, orgId), eq(usageCounters.meter, LLM_METERS.costMicros), gte(usageCounters.day, cutoffDay)))
+      // Phase 6: a BYOK call prices the OWNER's spend and so bumps its own meter, never
+      // `llm_cost_micros` (which is what the platform's daily cap reads). Both are returned: the
+      // screen's headline is the TOTAL — a workspace fully on its own key read "$0.00" while it was
+      // spending real money (review D-I3) — and `costMicros` stays the managed number on its own.
+      const [byokCostRow] = await tx.select({ total: sum(usageCounters.value) }).from(usageCounters)
+        .where(and(eq(usageCounters.orgId, orgId), eq(usageCounters.meter, LLM_METERS.costMicrosByok), gte(usageCounters.day, cutoffDay)))
       const [aiHandledRow] = await tx.select({ total: sum(usageCounters.value) }).from(usageCounters)
         .where(and(eq(usageCounters.orgId, orgId), eq(usageCounters.meter, SEND_METERS.aiHandledConversations), gte(usageCounters.day, cutoffDay)))
 
@@ -81,6 +87,7 @@ export const activityRouter = router({
         escalated: escalatedRow?.value ?? 0,
         autoSent: autoSentRow?.value ?? 0,
         costMicros: Number(costRow?.total ?? 0),
+        byokCostMicros: Number(byokCostRow?.total ?? 0),
         aiHandledConversations: Number(aiHandledRow?.total ?? 0),
         recent,
       }

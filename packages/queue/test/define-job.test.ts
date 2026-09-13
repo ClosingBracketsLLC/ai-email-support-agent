@@ -1,9 +1,12 @@
 import type PgBoss from 'pg-boss'
+import { DrizzleQueryError } from 'drizzle-orm/errors'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import { JOB_SIGNAL_MARGIN_SECONDS } from '@aesa/core'
-import { defineJob, registerJob } from '../src/define-job.ts'
+import { defineJob, registerJob, scrubJobError } from '../src/define-job.ts'
 import { enqueue } from '../src/enqueue.ts'
+import { JOB_NAMES } from '../src/names.ts'
+import { QUEUE_OPTIONS } from '../src/queue-options.ts'
 import { deleteAllJobs, queryJobs, startTestBoss, uniqueName } from './helpers/boss.ts'
 
 describe('defineJob / enqueue', () => {
@@ -15,6 +18,27 @@ describe('defineJob / enqueue', () => {
   it('refuses expireInSeconds at or below the signal margin', () => {
     expect(() => defineJob({ name: 'x', schema: z.object({ orgId: z.uuid() }), queue: { expireInSeconds: JOB_SIGNAL_MARGIN_SECONDS }, handler: async () => {} }))
       .toThrow(/expireInSeconds/)
+  })
+
+  it('resolves a JOB_NAMES name with no `queue` from QUEUE_OPTIONS', () => {
+    // The whole point of the table: a job file that names a real queue and passes no options gets
+    // that queue's options, `policy: 'short'` included — pg-boss's singleton index depends on it.
+    const def = defineJob({ name: JOB_NAMES.ticketDraft, schema: z.object({ orgId: z.uuid() }), handler: async () => {} })
+    expect(def.queue).toEqual(QUEUE_OPTIONS[JOB_NAMES.ticketDraft])
+    expect(def.queue.policy).toBe('short')
+  })
+
+  it('refuses a name that is in neither QUEUE_OPTIONS nor the call', () => {
+    expect(() => defineJob({ name: 'nope.unknown', schema: z.object({ orgId: z.uuid() }), handler: async () => {} }))
+      .toThrow(/no queue options/)
+  })
+
+  it('registerJob scrubs a DrizzleQueryError before pg-boss records it', () => {
+    const err = new DrizzleQueryError('insert into "t" ("secret") values ($1)', ['customer text'], Object.assign(new Error('dup'), { code: '23505' }))
+    const scrubbed = scrubJobError(err) as Error
+    expect(scrubbed.message).toBe('Failed query: [redacted] (pg 23505)')
+    expect(scrubbed.message).not.toContain('customer text')
+    expect(scrubJobError(new Error('plain'))).toEqual(new Error('plain'))
   })
 
   it('enqueue validates the payload and sets the org-scoped singletonKey', async () => {

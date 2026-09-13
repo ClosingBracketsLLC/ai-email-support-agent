@@ -8,13 +8,13 @@
 import { TRPCError } from '@trpc/server'
 import { and, asc, count, eq, gte, isNotNull, sql, sum } from 'drizzle-orm'
 import {
-  AgentIdInput, DEFAULT_AUTO_SEND_THRESHOLD, DRAFT_MODEL_ID, SandboxOutputView, SandboxRunInput, SandboxStartInput,
+  AgentIdInput, DEFAULT_AUTO_SEND_THRESHOLD, SandboxOutputView, SandboxRunInput, SandboxStartInput,
   SetCategoryPolicyInput, UpdateAgentInput,
 } from '@aesa/contracts'
 import { COLD_START_DECISIONS, resolveSetting } from '@aesa/core'
 import {
   agentCategoryPolicies, agentRuns, agents, audit, bumpMeter, categories, countHumanDecisions, drafts, mailboxConnections,
-  categoryStatsDaily, SANDBOX_METERS, usageCounters,
+  categoryStatsDaily, resolveModelConfig, SANDBOX_METERS, usageCounters,
 } from '@aesa/db'
 import { JOB_NAMES } from '@aesa/queue'
 import { loadOrgSettings } from '../../org-settings.ts'
@@ -49,8 +49,8 @@ export const agentsRouter = router({
    * from radios were previously display-only with no way to actually flip the choice).
    */
   list: orgProcedure.query(async ({ ctx }) => {
-    const rows = await ctx.deps.api.withOrg(ctx.orgId, (tx) =>
-      tx.select({
+    const rows = await ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
+      const found = await tx.select({
         id: agents.id, connectionId: agents.connectionId, address: agents.address, replyFromAddress: agents.replyFromAddress,
         connectionEmailAddress: mailboxConnections.emailAddress,
         domain: agents.domain, displayName: agents.displayName, signature: agents.signature, personaPreset: agents.personaPreset,
@@ -60,8 +60,20 @@ export const agentsRouter = router({
         .from(agents)
         .innerJoin(mailboxConnections, eq(mailboxConnections.id, agents.connectionId))
         .where(eq(agents.orgId, ctx.orgId))
-        .orderBy(asc(agents.connectionId), asc(agents.priority)),
-    )
+        .orderBy(asc(agents.connectionId), asc(agents.priority))
+
+      // Phase 6: the agent card's Model line, through the SAME reader the worker resolves every
+      // call with, so the list can never claim Managed AI for a BYOK agent. One call per agent,
+      // inside this transaction — a workspace has a handful of addresses, not a page of them, and
+      // the alternative (a join) would have to re-implement `resolveModelConfig`'s fallbacks.
+      // Deliberately the DRAFT role alone: that is the model that writes the replies.
+      const withModel = []
+      for (const row of found) {
+        const cfg = await resolveModelConfig(tx, row.id, 'draft')
+        withModel.push({ ...row, model: { mode: cfg.mode, provider: cfg.provider, model: cfg.model, credentialLabel: cfg.credential?.label ?? null } })
+      }
+      return withModel
+    })
     return { agents: rows }
   }),
 
@@ -292,8 +304,12 @@ export const agentsRouter = router({
         throw new TRPCError({ code: 'TOO_MANY_REQUESTS', message: 'sandbox.daily_cap reached for today' })
       }
 
+      // Phase 6: the agent's own choice, through the SAME reader the worker resolves with. The job
+      // re-resolves and restamps these before it calls — an owner can change the model between the
+      // click and the run — but the row must never claim Managed AI for a BYOK agent even for a moment.
+      const cfg = await resolveModelConfig(tx, input.agentId, 'draft')
       const [run] = await tx.insert(agentRuns).values({
-        orgId: ctx.orgId, kind: 'sandbox', agentId: input.agentId, provider: 'anthropic', model: DRAFT_MODEL_ID,
+        orgId: ctx.orgId, kind: 'sandbox', agentId: input.agentId, provider: cfg.provider, model: cfg.model,
         status: 'running', input: { subject: input.subject, question: input.question },
       }).returning({ id: agentRuns.id })
 

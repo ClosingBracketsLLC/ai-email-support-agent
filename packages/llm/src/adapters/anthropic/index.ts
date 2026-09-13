@@ -20,12 +20,19 @@
  * `output_config.format` (built from `zodOutputFormat` for the envelope's JSON Schema) and parses
  * the returned text block itself with `envelope.safeParse`, exactly like the forced-tool path
  * already re-parses `tool_use.input` — one no-throw contract for both structured-output rungs.
+ *
+ * Phase 6: the error/scrub/envelope helpers moved to `core/shared.ts` so the OpenAI-compatible
+ * adapter runs the SAME implementation (the scrub's key pattern now covers every provider's key
+ * prefix, not just `sk-`), and `listModels` was added for the BYOK probe. Verified against the
+ * installed `@anthropic-ai/sdk` 0.124.0: `client.models.list(params?, options?)` returns a
+ * `PagePromise<ModelInfosPage, ModelInfo>` whose awaited page carries `data: ModelInfo[]`, and
+ * `ModelInfo.id` is the model id.
  */
 import Anthropic from '@anthropic-ai/sdk'
 import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod'
 import type { Secret } from '@aesa/crypto'
-import { z } from 'zod'
 import { LlmError } from '../../core/errors.ts'
+import { CONTEXT_LENGTH_PATTERN, envelopeSchema, parseRetryAfterMs, scrubSecrets, toJsonObjectSchema, withCauseMessage } from '../../core/shared.ts'
 import { estimateTokens } from '../../core/tokens.ts'
 import type { Capabilities, ChatRequest, ChatResult, ChatUsage, LlmProvider, ParseStrategy, Stability, StructuredMode } from '../../core/types.ts'
 import { ANTHROPIC_MODELS, UNKNOWN_ANTHROPIC_MODEL } from './models.ts'
@@ -33,42 +40,6 @@ import { ANTHROPIC_MODELS, UNKNOWN_ANTHROPIC_MODEL } from './models.ts'
 export interface CreateAnthropicProviderOptions {
   apiKey: Secret
   fetchFn?: typeof fetch
-}
-
-/** Strips the API key itself, and a Bearer-header tail carrying one, out of any error message
- * before it can reach a log or bubble up to a caller — the raw key must never appear in either. */
-const API_KEY_PATTERN = /sk-[A-Za-z0-9_-]+/g
-const BEARER_PATTERN = /Bearer\s+\S+/gi
-
-function scrubSecrets(message: string): string {
-  return message.replace(API_KEY_PATTERN, '[redacted]').replace(BEARER_PATTERN, 'Bearer [redacted]')
-}
-
-/** "400 whose message mentions context/token length" (task brief) — Anthropic's own wording for
- * an over-long prompt varies ("prompt is too long", "exceeds ... maximum context length", ...),
- * so this matches the concept rather than one exact phrase. */
-const CONTEXT_LENGTH_PATTERN = /(context|token).{0,40}length|too long|maximum context/i
-
-function parseRetryAfterMs(header: string | null | undefined): number | undefined {
-  if (!header) return undefined
-  const seconds = Number(header)
-  if (!Number.isFinite(seconds) || seconds < 0) return undefined
-  return seconds * 1000
-}
-
-/**
- * The SDK collapses every raw `fetch` failure into `Anthropic.APIConnectionError` with the fixed,
- * uninformative message "Connection error." — the actual failure (including anything a lower
- * layer put in ITS message, which could itself embed a secret, e.g. a proxy echoing back the
- * request line) survives only on `err.cause`. Folding it in here, before scrubbing, is what makes
- * this adapter's scrub cover a raw network throw and not just the SDK's own HTTP-error messages.
- */
-function withCauseMessage(err: Error): string {
-  const cause = err.cause
-  if (cause instanceof Error && cause.message && cause.message !== err.message) {
-    return `${err.message}: ${cause.message}`
-  }
-  return err.message
 }
 
 /**
@@ -119,27 +90,6 @@ function mapFinish(stopReason: Anthropic.Message['stop_reason']): ChatResult<unk
 
 function capabilitiesFor(model: string): Capabilities {
   return ANTHROPIC_MODELS[model] ?? UNKNOWN_ANTHROPIC_MODEL
-}
-
-/** Both structured-output rungs (the forced tool and native `output_config.format`) ask for this
- * shape, never the caller's schema directly — the API rejects a top-level `oneOf`/`anyOf` without
- * `type: 'object'`, which a discriminated-union caller schema produces. Unwrapped again in
- * `buildResult` below. */
-function envelopeSchema<T>(schema: z.ZodType<T>): z.ZodType<{ decision: T }> {
-  return z.object({ decision: schema })
-}
-
-/** zod 4's `z.toJSONSchema` emits a `$schema` meta key; this adapter strips it before it reaches
- * the request body. No live Anthropic credentials were available to confirm empirically whether
- * the API rejects `$schema` on `input_schema` — stripping is the defensive default either way,
- * since `$schema` describes the schema document itself, not the tool's parameter shape, and
- * carries no information Claude needs to fill in `tool_use.input`. Verified via the fetchFn-stub
- * test that the emitted request body never carries it. */
-function toJsonObjectSchema(schema: z.ZodType<unknown>): Record<string, unknown> {
-  const jsonSchema = z.toJSONSchema(schema) as Record<string, unknown> & { type: 'object' }
-  const { $schema, ...rest } = jsonSchema
-  void $schema
-  return rest
 }
 
 const STABILITY_RANK: Record<Stability, number> = { static: 0, agent: 1, volatile: 2 }
@@ -270,6 +220,18 @@ export function createAnthropicProvider(opts: CreateAnthropicProviderOptions): L
 
     capabilities(model: string): Capabilities {
       return capabilitiesFor(model)
+    },
+
+    /** `models.list` (SDK 0.124.0: `list(params?, options?)` returning a `PagePromise<ModelInfosPage,
+     * ModelInfo>`) — one page of at most 100 is plenty for a picker, and `await`ing the PagePromise
+     * yields that first page rather than walking every page. */
+    async listModels(signal?: AbortSignal): Promise<string[]> {
+      try {
+        const page = await client.models.list({ limit: 100 }, { signal })
+        return page.data.map((m) => m.id)
+      } catch (err) {
+        throw mapError(err)
+      }
     },
 
     async chat<T>(req: ChatRequest<T>): Promise<ChatResult<T>> {

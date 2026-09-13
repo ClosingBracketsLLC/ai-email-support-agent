@@ -29,6 +29,8 @@ export function pathForNotification(data: Record<string, unknown> | undefined | 
 
   if (kind === 'escalation' || kind === 'draft_review' || kind === 'auto_send') return ticketId ? `/ticket/${ticketId}` : '/inbox'
   if (kind === 'mailbox_reauth') return '/settings/mailboxes'
+  // Phase 6: a BYOK provider key was rejected — the fix is on the AI settings screen, not a ticket.
+  if (kind === 'provider_health') return '/settings/ai'
   if (kind === 'digest') return '/inbox'
   // Phase 5's three learning-loop pushes are about a SETTING, not a ticket: a category that earned
   // (or lost) Autopilot, and the weekly nudge to check what the agent has been remembering.

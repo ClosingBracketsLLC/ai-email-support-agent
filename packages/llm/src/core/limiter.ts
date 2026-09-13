@@ -77,6 +77,8 @@ export function withLimiter(inner: LlmProvider, limiter: LlmLimiter, keyFor?: (r
       return inner.capabilities(model)
     },
 
+    ...(inner.listModels ? { listModels: (signal?: AbortSignal) => inner.listModels!(signal) } : {}),
+
     async chat<T>(req: ChatRequest<T>): Promise<ChatResult<T>> {
       const key = keyFor ? keyFor(req as ChatRequest<unknown>) : `managed:${inner.kind}:${req.model}`
       const release = await limiter.acquire(key)

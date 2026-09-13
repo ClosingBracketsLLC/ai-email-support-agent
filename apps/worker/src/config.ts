@@ -131,6 +131,12 @@ export function loadConfig(env: NodeJS.ProcessEnv): WorkerConfig {
   if (production && roles.has('sync') && !kekRing) {
     throw new Error('AESA_KEK_V<n> and AESA_KEK_ACTIVE are required in production when WORKER_ROLES includes `sync` (mailbox credentials)')
   }
+  // Phase 6: an `agent` replica opens a tenant's BYOK provider key under that org's DEK on every
+  // model call (`provider-resolver.ts`), and `llm.probe` re-wraps a freshly sealed key under it —
+  // without the ring every BYOK agent silently degrades to `provider_unavailable`, so refuse at boot.
+  if (production && roles.has('agent') && !kekRing) {
+    throw new Error('AESA_KEK_V<n> and AESA_KEK_ACTIVE are required in production when WORKER_ROLES includes `agent` (BYOK provider keys are opened under the org DEK)')
+  }
 
   // All-or-none, and it throws on a half-configured deploy — read from the ALREADY-PARSED values so
   // the six names are documented in EnvSchema above rather than only inside `parseS3Env`.

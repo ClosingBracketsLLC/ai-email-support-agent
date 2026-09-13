@@ -40,7 +40,7 @@ import {
   getAccessToken, ProviderAuthError, ProviderRateLimitError, runSync, type MailboxClient, type MailboxProvider,
 } from '@aesa/mail'
 import type { MailLimiter } from '@aesa/mail'
-import { defineJob, enqueue, registerJob, JOB_NAMES, type JobDefinition } from '@aesa/queue'
+import { defineJob, enqueue, registerJob, JOB_NAMES, type RegisteredJobDefinition } from '@aesa/queue'
 import type { WorkerConfig } from '../config.ts'
 import { utcDayString } from '../date-utils.ts'
 import { errorMessage } from '../err-message.ts'
@@ -65,15 +65,14 @@ export type MailboxSyncPayload = z.infer<typeof MailboxSyncPayload>
  * this file's own poll-sweep/rate-limit re-enqueues, `enqueue()` against this — which only ever reads
  * `.name`/`.schema` — never against a handler bound to no deps.
  */
-export const mailboxSyncJob: JobDefinition<MailboxSyncPayload> = defineJob({
+export const mailboxSyncJob: RegisteredJobDefinition<MailboxSyncPayload> = defineJob({
   name: JOB_NAMES.mailboxSync,
   schema: MailboxSyncPayload,
-  // No retryLimit/retryBackoff: the handler below always catches and returns normally (never
-  // rethrows), so pg-boss never sees a failed job to retry — this queue config would be dead
-  // weight. The real retry layer is consecutive_failures/backoff_until on mailbox_connections
-  // (step 5 below) plus mailbox.poll-sweep's (a), which re-polls any connection backoff_until has
-  // cleared for (final-review Important).
-  queue: { expireInSeconds: 300 },
+  // No retryLimit/retryBackoff (QUEUE_OPTIONS): the handler below always catches and returns
+  // normally (never rethrows), so pg-boss never sees a failed job to retry — that queue config
+  // would be dead weight. The real retry layer is consecutive_failures/backoff_until on
+  // mailbox_connections (step 5 below) plus mailbox.poll-sweep's (a), which re-polls any
+  // connection backoff_until has cleared for (final-review Important).
   handler: async () => {
     throw new Error('mailbox.sync: this definition has no bound deps — register it through registerMailboxSync(boss, deps)')
   },
@@ -283,7 +282,7 @@ export async function runMailboxSync(boss: PgBoss, deps: MailboxSyncDeps, payloa
 }
 
 export async function registerMailboxSync(boss: PgBoss, deps: MailboxSyncDeps): Promise<void> {
-  const wired: JobDefinition<MailboxSyncPayload> = {
+  const wired: RegisteredJobDefinition<MailboxSyncPayload> = {
     ...mailboxSyncJob,
     handler: async (ctx) => {
       await runMailboxSync(boss, deps, ctx.data)

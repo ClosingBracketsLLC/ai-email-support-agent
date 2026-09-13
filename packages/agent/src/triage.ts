@@ -9,7 +9,7 @@
  * This package has NO database dependency: the worker job (`apps/worker/src/jobs/ticket-triage.ts`)
  * owns every read and write; this module only builds the prompt and makes the one model call.
  */
-import type { ChatMeta, LlmProvider, SystemBlock } from '@aesa/llm'
+import type { ChatMeta, ChatResult, LlmProvider, SystemBlock } from '@aesa/llm'
 import { ESCALATION_FLAGS, TriageVerdict } from '@aesa/contracts'
 
 export const TRIAGE_MODEL = 'claude-haiku-4-5'
@@ -76,27 +76,37 @@ export function buildTriagePrompt(input: TriageInput): { system: SystemBlock[]; 
   return { system, user }
 }
 
+export interface TriageCallResult {
+  verdict: TriageVerdict
+  /** The raw call, for the job's `agent_runs` bookkeeping (usage, cost, finish, the model actually used). */
+  result: ChatResult<TriageVerdict>
+}
+
 /**
  * One `chat()` call, output forced to the `TriageVerdict` schema under the tool name `triage`.
  * The caller's `signal` (the job's own deadline) is merged with this call's own `TRIAGE_TIMEOUT_MS`
  * budget via `AbortSignal.any` — whichever fires first aborts the call.
  *
+ * `model` defaults to `TRIAGE_MODEL`, the MANAGED default; Phase 6's `ticket.triage` passes the
+ * agent's resolved model instead, so a BYOK workspace triages on its own provider.
+ *
  * `parsed === null` (the model's tool call didn't validate against `TriageVerdict`) throws rather
  * than returning a sentinel — ported stance from doge-buddy's `parseTriageVerdict`: the caller (the
  * `ticket.triage` job) counts this exactly like a timeout or a network failure — one failed attempt.
  */
-export async function runTriageCall(
+export async function runTriageCallDetailed(
   provider: LlmProvider,
   input: TriageInput,
   meta: ChatMeta,
   signal: AbortSignal,
-): Promise<TriageVerdict> {
+  model: string = TRIAGE_MODEL,
+): Promise<TriageCallResult> {
   const { system, user } = buildTriagePrompt(input)
   const timeoutSignal = AbortSignal.timeout(TRIAGE_TIMEOUT_MS)
   const combinedSignal = AbortSignal.any([signal, timeoutSignal])
 
   const result = await provider.chat({
-    model: TRIAGE_MODEL,
+    model,
     system,
     messages: [{ role: 'user', content: user }],
     output: { name: 'triage', schema: TriageVerdict },
@@ -106,5 +116,16 @@ export async function runTriageCall(
   })
 
   if (result.parsed === null) throw new Error('triage: unparsable verdict')
-  return result.parsed
+  return { verdict: result.parsed, result }
+}
+
+/** The verdict alone, for a caller with no run row to bookkeep. */
+export async function runTriageCall(
+  provider: LlmProvider,
+  input: TriageInput,
+  meta: ChatMeta,
+  signal: AbortSignal,
+  model: string = TRIAGE_MODEL,
+): Promise<TriageVerdict> {
+  return (await runTriageCallDetailed(provider, input, meta, signal, model)).verdict
 }

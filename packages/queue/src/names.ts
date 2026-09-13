@@ -18,6 +18,7 @@ export const JOB_NAMES = {
   knowledgeEmbedBatch: 'knowledge.embed-batch',
   memoryCapture: 'memory.capture',
   guidanceSuggest: 'guidance.suggest',
+  llmProbe: 'llm.probe',
 } as const
 
 export type JobName = (typeof JOB_NAMES)[keyof typeof JOB_NAMES]

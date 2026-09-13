@@ -1,12 +1,15 @@
 import { assertInvariants, loadDotEnv } from '@aesa/core'
+import { loadModelPricing } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createMailLimiter } from '@aesa/mail'
 import { createMailTransport } from '@aesa/platform-mail'
-import { createQueueRetrying, JOB_NAMES, startBoss } from '@aesa/queue'
+import { createQueueRetrying, JOB_NAMES, queueOptionsFor, startBoss } from '@aesa/queue'
 import { maybeRegisterAgentRole } from './agent-role.ts'
 import { loadConfig } from './config.ts'
 import { registerKeysProvision } from './jobs/keys-provision.ts'
 import { enqueueKnowledgeEmbedBatch } from './jobs/knowledge-embed-batch.ts'
+import { enqueueLlmProbe } from './jobs/llm-probe.ts'
+import { registerLlmReprobeSweep } from './jobs/llm-reprobe-sweep.ts'
 import { enqueueMemoryCapture } from './jobs/memory-capture.ts'
 import { registerRevokeMailbox, registerStoreCredentials } from './jobs/mailbox-credentials.ts'
 import { registerMailboxPollSweep } from './jobs/mailbox-poll-sweep.ts'
@@ -30,6 +33,10 @@ const config = loadConfig(process.env)
 assertInvariants()
 const logger = createWorkerLogger(config.logLevel)
 const { db, pool } = createDb(config.databaseUrl, { role: 'app' })
+// The platform price table, read ONCE at boot and handed to every metered provider. An empty table
+// (nothing seeded, or a database that predates 0020) is passed as `undefined` so `withMetering`
+// stays on its code-seeded `PRICING_SEED` rather than costing every call at zero.
+const pricing = await loadModelPricing(db)
 const boss = await startBoss(config.databaseUrl)
 logger.info({ roles: [...config.roles], kekActive: config.kekRing?.active ?? null }, 'worker up')
 
@@ -42,32 +49,35 @@ logger.info({ roles: [...config.roles], kekActive: config.kekRing?.active ?? nul
 // `ticket.triage` regardless; the same gap hits mailbox.sync on a `sync`-role replica missing the KEK
 // ring or MAIL_FROM, which mailbox.poll-sweep's (a) enqueues into unconditionally too, agent.sandbox
 // (whose producer is the API's sandbox-start mutation, on a process that runs no worker roles at all),
-// and send.execute (whose producer is the API's approve mutation, same story). Create all nine
+// and send.execute (whose producer is the API's approve mutation, same story). Create all twelve
 // unconditionally at boot, before any role-gated registration, so a send never silently no-ops on a
 // role-partitioned or under-configured replica.
-// The policy must match `defineJob`'s `queue.policy`; pg-boss `createQueue` ignores a second call, so
-// the FIRST process to boot decides. ticket.triage and mailbox.sync stay optionless — they are
-// `standard` on purpose (CLAUDE.md Jobs: their burst source is a push webhook, deduped instead through
-// `enqueue`'s `debounceSeconds`). `options.name` below is redundant with the positional `name` arg —
-// pg-boss's own `PgBoss.Queue` type requires it, but `manager.js`'s `createQueue` ignores it at
-// runtime (`name = name || options.name`) — it's here only to satisfy the type.
-await createQueueRetrying(boss, JOB_NAMES.notifyDispatch, { name: JOB_NAMES.notifyDispatch, policy: 'short' })
-await createQueueRetrying(boss, JOB_NAMES.ticketTriage)
-await createQueueRetrying(boss, JOB_NAMES.ticketDraft, { name: JOB_NAMES.ticketDraft, policy: 'short' })
-await createQueueRetrying(boss, JOB_NAMES.agentSandbox, { name: JOB_NAMES.agentSandbox, policy: 'short' })
-await createQueueRetrying(boss, JOB_NAMES.mailboxSync)
-await createQueueRetrying(boss, JOB_NAMES.sendExecute, { name: JOB_NAMES.sendExecute, policy: 'short' })
+// Every option below comes from `QUEUE_OPTIONS` (`packages/queue/src/queue-options.ts`) via
+// `queueOptionsFor` — the ONE table a queue's policy/retry/expiry values are read from, so this list
+// and `apps/api/src/boss.ts`'s can never drift from what each job's OWN `defineJob` call resolves
+// to. pg-boss `createQueue` ignores a second call, so the FIRST process to boot decides.
+// ticket.triage and mailbox.sync stay `standard` on purpose (CLAUDE.md Jobs: their burst source is
+// a push webhook, deduped instead through `enqueue`'s `debounceSeconds`).
+await createQueueRetrying(boss, JOB_NAMES.notifyDispatch, queueOptionsFor(JOB_NAMES.notifyDispatch))
+await createQueueRetrying(boss, JOB_NAMES.ticketTriage, queueOptionsFor(JOB_NAMES.ticketTriage))
+await createQueueRetrying(boss, JOB_NAMES.ticketDraft, queueOptionsFor(JOB_NAMES.ticketDraft))
+await createQueueRetrying(boss, JOB_NAMES.agentSandbox, queueOptionsFor(JOB_NAMES.agentSandbox))
+await createQueueRetrying(boss, JOB_NAMES.mailboxSync, queueOptionsFor(JOB_NAMES.mailboxSync))
+await createQueueRetrying(boss, JOB_NAMES.sendExecute, queueOptionsFor(JOB_NAMES.sendExecute))
 // Phase 4's three: the api's knowledge router sends all three (completeUpload/paste → ingest,
 // startCrawl → crawl, unflagChunk → embed-batch) and the crawl/ingest jobs send embed-batch
 // themselves — none of which may depend on a `knowledge`-role replica having booted first.
-await createQueueRetrying(boss, JOB_NAMES.knowledgeIngest, { name: JOB_NAMES.knowledgeIngest, policy: 'short' })
-await createQueueRetrying(boss, JOB_NAMES.knowledgeCrawl, { name: JOB_NAMES.knowledgeCrawl, policy: 'short' })
-await createQueueRetrying(boss, JOB_NAMES.knowledgeEmbedBatch, { name: JOB_NAMES.knowledgeEmbedBatch, policy: 'short' })
+await createQueueRetrying(boss, JOB_NAMES.knowledgeIngest, queueOptionsFor(JOB_NAMES.knowledgeIngest))
+await createQueueRetrying(boss, JOB_NAMES.knowledgeCrawl, queueOptionsFor(JOB_NAMES.knowledgeCrawl))
+await createQueueRetrying(boss, JOB_NAMES.knowledgeEmbedBatch, queueOptionsFor(JOB_NAMES.knowledgeEmbedBatch))
 // Phase 5's two: send.execute's onSent seam sends memory.capture from THIS process (worker-only —
 // the api never sends it); the api's approve mutation sends guidance.suggest after an edited
 // approval. Pre-created here regardless of producer, same as every queue above.
-await createQueueRetrying(boss, JOB_NAMES.memoryCapture, { name: JOB_NAMES.memoryCapture, policy: 'short' })
-await createQueueRetrying(boss, JOB_NAMES.guidanceSuggest, { name: JOB_NAMES.guidanceSuggest, policy: 'short' })
+await createQueueRetrying(boss, JOB_NAMES.memoryCapture, queueOptionsFor(JOB_NAMES.memoryCapture))
+await createQueueRetrying(boss, JOB_NAMES.guidanceSuggest, queueOptionsFor(JOB_NAMES.guidanceSuggest))
+// Phase 6: the api's `llm.addCredential`/`probeCredential` and the worker's own `llm.reprobe-sweep`
+// both send it.
+await createQueueRetrying(boss, JOB_NAMES.llmProbe, queueOptionsFor(JOB_NAMES.llmProbe))
 
 // notify.dispatch's producers span every role (ticket.triage's escalations under `agent`,
 // mailbox.sync/renew-watch's reauth notices and mailbox.poll-sweep's stuck-pending retry under
@@ -86,6 +96,11 @@ if (config.roles.has('cron')) {
   await registerTicketBackstopSweep(boss, { db, logger })
   await registerSweepsDaily(boss, { db, logger })
   await registerStatsRollup(boss, { db, logger })
+  // Phase 6: every six hours, re-ask each live BYOK credential whether it still works — a key can be
+  // revoked or rotated at any time, and without this the workspace finds out from a failed draft.
+  await registerLlmReprobeSweep(boss, {
+    db, logger, enqueueProbe: (orgId, credentialId, opts) => enqueueLlmProbe(boss, orgId, credentialId, opts),
+  })
 }
 
 await maybeRegisterAgentRole({
@@ -95,6 +110,7 @@ await maybeRegisterAgentRole({
   // The auto landing's send. `enqueueSendExecute` resolves the pg-boss job id (or null when the
   // `short` queue collapsed a duplicate); the draft job only needs "it was handed over".
   enqueueSend: (orgId, sendId, opts) => enqueueSendExecute(boss, orgId, sendId, opts).then(() => undefined),
+  ...(pricing.length > 0 ? { pricing } : {}),
 })
 
 await maybeRegisterKnowledgeRole({

@@ -65,7 +65,7 @@ import {
   buildReferences, getAccessToken, MARKER_HEADER, MessageGoneError, ProviderAuthError,
   type MailboxClient, type MailboxProvider, type MailLimiter,
 } from '@aesa/mail'
-import { defineJob, enqueue, JOB_NAMES, registerJob, type JobDefinition } from '@aesa/queue'
+import { defineJob, enqueue, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
 import type { WorkerConfig } from '../config.ts'
 import { utcDayString } from '../date-utils.ts'
 import { buildReplyPolicy, personaFor } from '../drafting/policy.ts'
@@ -147,15 +147,13 @@ export type SendExecutePayload = z.infer<typeof SendExecutePayload>
  * re-entry scans for the marker first, so a retry can never duplicate a delivered reply. The last
  * attempt dead-letters (step 12) rather than disappearing into pg-boss's `failed` state.
  */
-export const sendExecuteJob: JobDefinition<SendExecutePayload> = defineJob({
+export const sendExecuteJob: RegisteredJobDefinition<SendExecutePayload> = defineJob({
   name: JOB_NAMES.sendExecute,
   schema: SendExecutePayload,
-  // `policy: 'short'` — pg-boss's default `standard` ignores `singletonKey` outright (fix wave W8),
-  // so the backstop sweep's every-minute re-enqueue of a due send piled up duplicate jobs.
-  queue: {
-    policy: 'short', expireInSeconds: INVARIANTS.SEND_QUEUE_EXPIRE_SECONDS, retryLimit: 5,
-    retryDelay: INVARIANTS.SEND_RETRY_DELAY_SECONDS, retryBackoff: true,
-  },
+  // policy: 'short' (QUEUE_OPTIONS) — pg-boss's default `standard` ignores `singletonKey` outright
+  // (fix wave W8), so the backstop sweep's every-minute re-enqueue of a due send piled up duplicate
+  // jobs. expireInSeconds/retryDelay there are `INVARIANTS.SEND_QUEUE_EXPIRE_SECONDS`/
+  // `INVARIANTS.SEND_RETRY_DELAY_SECONDS`.
   handler: async () => {
     throw new Error('send.execute: this definition has no bound deps — register it through registerSendExecute(boss, deps)')
   },
@@ -191,7 +189,7 @@ export interface SendExecuteContext {
 }
 
 export async function registerSendExecute(boss: PgBoss, deps: SendExecuteDeps): Promise<void> {
-  const wired: JobDefinition<SendExecutePayload> = {
+  const wired: RegisteredJobDefinition<SendExecutePayload> = {
     ...sendExecuteJob,
     handler: async (ctx) => {
       const retryCount = ctx.job.retryCount ?? 0

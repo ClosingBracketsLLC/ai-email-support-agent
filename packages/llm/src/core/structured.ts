@@ -1,14 +1,17 @@
 /**
  * The structured-output ladder (task brief §core/structured.ts): native structured output ->
- * forced-tool json_mode -> one low-effort repair call -> local balanced-brace extraction -> give
+ * forced-tool json_mode -> (Phase 6, for a model with NEITHER: one plain-text JSON request) -> one
+ * low-effort repair call -> local balanced-brace extraction -> give
  * up. Each rung that calls the model suffixes `meta.idempotencyKey` (`:native`, `:json_mode`,
- * `:repair`) so `withMetering`, wrapped INSIDE this ladder in the registry, records one distinct
+ * `:plain`, `:repair`) so `withMetering`, wrapped INSIDE this ladder in the registry, records one distinct
  * `llm_calls` row per rung. A `finish: 'refusal'` result from any model call is returned
  * immediately — the model has already declined; asking again would just waste a call. An
  * `LlmError` thrown by any rung is not caught here — it propagates to the caller unchanged; retry
- * policy belongs to the job layer (spec §Budgets), not this package.
+ * policy belongs to the job layer (spec §Budgets), not this package. The ONE exception is rung 1:
+ * a `permanent` error from the NATIVE rung is a rejected rung, not a failed request (see there).
  */
 import { z } from 'zod'
+import { LlmError } from './errors.ts'
 import type { ChatRequest, ChatResult, ChatUsage, LlmProvider, StructuredMode } from './types.ts'
 
 export const REPAIR_MAX_OUTPUT_TOKENS = 1024
@@ -116,6 +119,8 @@ export function withStructuredLadder(inner: LlmProvider): LlmProvider {
       return inner.capabilities(model)
     },
 
+    ...(inner.listModels ? { listModels: (signal?: AbortSignal) => inner.listModels!(signal) } : {}),
+
     async chat<T>(req: ChatRequest<T>): Promise<ChatResult<T>> {
       const output = req.output
       if (!output) return inner.chat(req)
@@ -139,12 +144,31 @@ export function withStructuredLadder(inner: LlmProvider): LlmProvider {
 
       // Rung 1: the model's own structured-output feature — only when it has one.
       if (caps.structuredOutput === 'native') {
-        const result = await callRung('native', 'native')
-        usage = sumUsage(usage, result.usage)
-        latencyMs += result.latencyMs
-        last = result
-        if (isRefusal(result)) return { ...result, usage, latencyMs }
-        if (result.parsed !== null) return { ...result, usage, latencyMs }
+        /**
+         * The one caught rung. `native` is no longer only a hand-curated fact about a model this
+         * platform ships against: Phase 6's probe RAISES it onto any OpenAI-compatible endpoint that
+         * honoured `json_schema` once, per CREDENTIAL, and that verdict is then applied to every
+         * model on it. A server that does not honour the rung for THIS model answers 400, which
+         * `mapError` calls `permanent` — not retryable, not a `FALLBACK_CODE`, so without this catch
+         * a raised verdict would fail every draft and triage on that credential outright. A rejected
+         * rung is exactly the `parsed: null` case: fall through to json_mode below, which runs for
+         * every `!== 'none'` model anyway. Only `permanent`, and only here — every other code (`auth`,
+         * `rate_limit`, `context_too_long`, …) describes the credential or the request as a whole and
+         * still propagates unchanged, from this rung as from every other.
+         */
+        let result: ChatResult<T> | null = null
+        try {
+          result = await callRung('native', 'native')
+        } catch (err) {
+          if (!(err instanceof LlmError) || err.code !== 'permanent') throw err
+        }
+        if (result) {
+          usage = sumUsage(usage, result.usage)
+          latencyMs += result.latencyMs
+          last = result
+          if (isRefusal(result)) return { ...result, usage, latencyMs }
+          if (result.parsed !== null) return { ...result, usage, latencyMs }
+        }
       }
 
       // Rung 2: the forced-tool fallback — whenever the model can take structured output at all
@@ -160,20 +184,31 @@ export function withStructuredLadder(inner: LlmProvider): LlmProvider {
       }
 
       if (!last) {
-        // caps.structuredOutput === 'none': the model has neither native structured output nor
-        // tool support, so neither rung above could run and no provider call was ever made.
-        // There is nothing to repair or extract from, so the ladder stops here rather than
-        // spending a call the model has no way to fulfil.
-        return {
-          text: '',
-          parsed: null,
-          parseStrategy: 'none',
-          usage,
-          finish: 'unknown',
-          provider: inner.kind,
-          model: req.model,
-          latencyMs,
-        }
+        // caps.structuredOutput === 'none' (Phase 6, ruling ledger 74): neither adapter rung
+        // exists, so ask in plain text — the instruction rides as one more VOLATILE system block
+        // so the adapter's stability ordering holds — and parse the reply here. A direct parse is
+        // `plain`; anything else falls through to the repair + extract rungs below exactly as a
+        // failed json_mode reply would.
+        const plainSchema = JSON.stringify(z.toJSONSchema(output.schema))
+        const plain = await inner.chat<T>({
+          ...req,
+          output: undefined,
+          system: [
+            ...req.system,
+            {
+              id: 'json-instruction',
+              stability: 'volatile',
+              text: `Reply with ONE JSON object that satisfies this JSON schema exactly, and nothing else — no prose, no code fence.\n${plainSchema}`,
+            },
+          ],
+          meta: { ...req.meta, idempotencyKey: `${baseKey}:plain` },
+        })
+        usage = sumUsage(usage, plain.usage)
+        latencyMs += plain.latencyMs
+        last = plain
+        if (isRefusal(plain)) return { ...plain, usage, latencyMs }
+        const direct = tryParse(plain.text, output.schema)
+        if (direct !== undefined) return { ...plain, usage, latencyMs, parsed: direct, parseStrategy: 'plain' }
       }
 
       // Rung 3: one repair call — plain text in, plain text out, no `output`/tools, so the ladder

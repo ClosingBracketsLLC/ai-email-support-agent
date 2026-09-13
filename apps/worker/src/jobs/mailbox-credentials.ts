@@ -27,7 +27,7 @@ import {
   auditLog, loadOrgDek, mailboxConnections, mailboxCredentials, openSealedForOrg, withOrg, withPlatform, type Db,
 } from '@aesa/db'
 import type { MailboxProvider } from '@aesa/mail'
-import { defineJob, registerJob, JOB_NAMES, type JobDefinition } from '@aesa/queue'
+import { defineJob, registerJob, JOB_NAMES, type RegisteredJobDefinition } from '@aesa/queue'
 import type { WorkerConfig } from '../config.ts'
 import { errorMessage } from '../err-message.ts'
 import { resolveMailProvider } from '../mail-provider.ts'
@@ -39,10 +39,9 @@ import { resolveMailProvider } from '../mail-provider.ts'
 export const StoreCredentialsPayload = z.object({ orgId: z.string(), connectionId: z.string(), sealed: z.string() })
 export type StoreCredentialsPayload = z.infer<typeof StoreCredentialsPayload>
 
-export const storeCredentialsJob: JobDefinition<StoreCredentialsPayload> = defineJob({
+export const storeCredentialsJob: RegisteredJobDefinition<StoreCredentialsPayload> = defineJob({
   name: JOB_NAMES.storeCredentials,
   schema: StoreCredentialsPayload,
-  queue: { expireInSeconds: 60, retryLimit: 5, retryBackoff: true },
   handler: async () => {
     throw new Error('mailbox.store-credentials: this definition has no bound deps — register it through registerStoreCredentials(boss, deps)')
   },
@@ -69,7 +68,7 @@ export async function runStoreCredentials(deps: StoreCredentialsDeps, payload: S
 }
 
 export async function registerStoreCredentials(boss: PgBoss, deps: StoreCredentialsDeps): Promise<void> {
-  const wired: JobDefinition<StoreCredentialsPayload> = {
+  const wired: RegisteredJobDefinition<StoreCredentialsPayload> = {
     ...storeCredentialsJob,
     handler: async (ctx) => {
       await runStoreCredentials(deps, ctx.data)
@@ -85,10 +84,9 @@ export async function registerStoreCredentials(boss: PgBoss, deps: StoreCredenti
 export const RevokeMailboxPayload = z.object({ orgId: z.string(), connectionId: z.string() })
 export type RevokeMailboxPayload = z.infer<typeof RevokeMailboxPayload>
 
-export const revokeMailboxJob: JobDefinition<RevokeMailboxPayload> = defineJob({
+export const revokeMailboxJob: RegisteredJobDefinition<RevokeMailboxPayload> = defineJob({
   name: JOB_NAMES.revokeMailbox,
   schema: RevokeMailboxPayload,
-  queue: { expireInSeconds: 120, retryLimit: 3, retryBackoff: true },
   handler: async () => {
     throw new Error('mailbox.revoke: this definition has no bound deps — register it through registerRevokeMailbox(boss, deps)')
   },
@@ -188,7 +186,7 @@ export async function runRevokeMailbox(deps: RevokeMailboxDeps, payload: RevokeM
 }
 
 export async function registerRevokeMailbox(boss: PgBoss, deps: RevokeMailboxDeps): Promise<void> {
-  const wired: JobDefinition<RevokeMailboxPayload> = {
+  const wired: RegisteredJobDefinition<RevokeMailboxPayload> = {
     ...revokeMailboxJob,
     handler: async (ctx) => {
       await runRevokeMailbox(deps, ctx.data)

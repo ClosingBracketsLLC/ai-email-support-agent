@@ -10,6 +10,7 @@ export const NEEDS_OWNER_REASONS = [
   'tripwire', 'triage_flags', 'sentiment_angry', 'triage_failed', 'triage_cap',
   'agent_escalated', 'agent_failed', 'agent_run_cap', 'guardrail_failed', 'redraft_limit_reached',
   'redraft_unfulfilled', 'owner_handling', 'orphaned', 'draft_expired', 'send_failed', 'category_off', 'no_agent',
+  'provider_unavailable',
 ] as const
 export type NeedsOwnerReason = (typeof NEEDS_OWNER_REASONS)[number]
 

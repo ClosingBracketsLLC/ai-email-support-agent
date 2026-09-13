@@ -1,7 +1,7 @@
 /**
  * `index.ts` calls `createQueueRetrying` for `JOB_NAMES.notifyDispatch`/`ticketTriage`/`ticketDraft`/
  * `agentSandbox`/`mailboxSync`/`sendExecute`, Phase 4's three `knowledge.*` queues and Phase 5's
- * `memoryCapture`/`guidanceSuggest` unconditionally at boot, before any role-gated `registerJob` call —
+ * `memoryCapture`/`guidanceSuggest` and Phase 6's `llmProbe` unconditionally at boot, before any role-gated `registerJob` call —
  * because pg-boss 10's `insertJob` SQL INNER JOINs a new job against the queue table and silently
  * returns a `null` id (no error) when the named queue doesn't exist yet (fix review, Important 2: a
  * role-partitioned replica, or a dev box missing ANTHROPIC_API_KEY/the KEK ring/MAIL_FROM, would
@@ -16,7 +16,7 @@ import { createQueueRetrying, defineJob, enqueue, JOB_NAMES } from '@aesa/queue'
 import { deleteJobsForOrgs, startTestBoss } from './helpers/boss.ts'
 
 describe('worker boot: pre-created queues accept sends with no registrations', () => {
-  it.each([JOB_NAMES.notifyDispatch, JOB_NAMES.ticketTriage, JOB_NAMES.ticketDraft, JOB_NAMES.agentSandbox, JOB_NAMES.mailboxSync, JOB_NAMES.sendExecute, JOB_NAMES.knowledgeIngest, JOB_NAMES.knowledgeCrawl, JOB_NAMES.knowledgeEmbedBatch, JOB_NAMES.memoryCapture, JOB_NAMES.guidanceSuggest])('enqueue(%s) returns a non-null id once the queue is pre-created, before any registerJob call', async (name) => {
+  it.each([JOB_NAMES.notifyDispatch, JOB_NAMES.ticketTriage, JOB_NAMES.ticketDraft, JOB_NAMES.agentSandbox, JOB_NAMES.mailboxSync, JOB_NAMES.sendExecute, JOB_NAMES.knowledgeIngest, JOB_NAMES.knowledgeCrawl, JOB_NAMES.knowledgeEmbedBatch, JOB_NAMES.memoryCapture, JOB_NAMES.guidanceSuggest, JOB_NAMES.llmProbe])('enqueue(%s) returns a non-null id once the queue is pre-created, before any registerJob call', async (name) => {
     const boss: PgBoss = await startTestBoss()
     const orgId = crypto.randomUUID()
     try {
@@ -47,7 +47,7 @@ describe('worker boot: pre-created queues accept sends with no registrations', (
    *  worker suites use those queues concurrently, and deleting/recreating one mid-run would break them.
    *  The real four names carrying `{ policy: 'short' }` at boot is proven by reading index.ts's and
    *  boss.ts's pre-create lists directly — there is no cheaper runtime assertion than that. */
-  it.each([JOB_NAMES.ticketDraft, JOB_NAMES.sendExecute, JOB_NAMES.agentSandbox, JOB_NAMES.notifyDispatch, JOB_NAMES.knowledgeIngest, JOB_NAMES.knowledgeCrawl, JOB_NAMES.knowledgeEmbedBatch, JOB_NAMES.memoryCapture, JOB_NAMES.guidanceSuggest])('pre-creating %s carries policy short', async (name) => {
+  it.each([JOB_NAMES.ticketDraft, JOB_NAMES.sendExecute, JOB_NAMES.agentSandbox, JOB_NAMES.notifyDispatch, JOB_NAMES.knowledgeIngest, JOB_NAMES.knowledgeCrawl, JOB_NAMES.knowledgeEmbedBatch, JOB_NAMES.memoryCapture, JOB_NAMES.guidanceSuggest, JOB_NAMES.llmProbe])('pre-creating %s carries policy short', async (name) => {
     const boss: PgBoss = await startTestBoss()
     const queueName = `preflight-policy-${name}-${crypto.randomUUID().slice(0, 8)}`
     try {

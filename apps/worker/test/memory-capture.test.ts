@@ -9,7 +9,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { MEMORY_EXPIRY_DAYS } from '@aesa/core'
 import {
   agents, auditLog, categories, customerHash, drafts, ensureCustomerHashSalt, ensureDefaultCategories,
-  mailboxConnections, messages, resolvedAnswers, tickets, user, withOrg, workspaces,
+  KNOWLEDGE_METERS, mailboxConnections, messages, orgSettings, resolvedAnswers, tickets, usageCounters,
+  user, withOrg, workspaces,
 } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
@@ -129,6 +130,26 @@ function makeDeps(over: Partial<MemoryCaptureDeps> = {}): MemoryCaptureDeps {
 
 const run = (deps: MemoryCaptureDeps, draftId: string) =>
   runMemoryCapture(deps, { orgId: fx.orgId, draftId }, new AbortController().signal)
+
+const TODAY = NOW.toISOString().slice(0, 10)
+
+async function setOrgSetting(key: string, value: unknown): Promise<void> {
+  await withOrg(app.db, fx.orgId, (tx) =>
+    tx.insert(orgSettings).values({ orgId: fx.orgId, key, value })
+      .onConflictDoUpdate({ target: [orgSettings.orgId, orgSettings.key], set: { value } }))
+}
+
+async function setEmbedTokens(value: number): Promise<void> {
+  await withOrg(app.db, fx.orgId, (tx) =>
+    tx.insert(usageCounters).values({ orgId: fx.orgId, day: TODAY, meter: KNOWLEDGE_METERS.embedTokens, value })
+      .onConflictDoUpdate({ target: [usageCounters.orgId, usageCounters.day, usageCounters.meter], set: { value } }))
+}
+
+async function embedTokens(): Promise<number> {
+  const [row] = await withOrg(app.db, fx.orgId, (tx) =>
+    tx.select().from(usageCounters).where(and(eq(usageCounters.day, TODAY), eq(usageCounters.meter, KNOWLEDGE_METERS.embedTokens))))
+  return row?.value ?? 0
+}
 
 describe('memory.capture', () => {
   it('a human-approved, unchanged draft that used no answer becomes ONE active answer: scrubbed question and body, embedded, approvals 1, expires in 365 d, customer hash set, knowledge_version from the grounding', async () => {
@@ -272,5 +293,39 @@ describe('memory.capture', () => {
     const draft = await getDraft(draftId)
     expect(draft.memoryCapturedAt).toBeNull()
     expect(await allAnswers()).toHaveLength(0)
+  })
+
+  it('P6 a successful capture bumps the embed_tokens meter by the embed\'s own tokens', async () => {
+    const { draftId } = await seedSentDraft()
+    const counting: Embedder = {
+      model: 'hash-v1', version: 1, dimensions: 1024,
+      embed: async () => ({ vectors: [Array.from({ length: 1024 }, () => 0.01)], tokens: 137 }),
+    }
+
+    expect(await run(makeDeps({ embedder: counting }), draftId)).toBe('captured')
+
+    expect(await embedTokens()).toBe(137)
+  })
+
+  it('P6 at knowledge.daily_embed_tokens_cap the draft is stamped and audited memory.skipped/embed_cap, with no embed and no answer', async () => {
+    await setOrgSetting('knowledge.daily_embed_tokens_cap', 1000)
+    await setEmbedTokens(1000)
+    const { draftId } = await seedSentDraft()
+    let embedded = 0
+    const counting: Embedder = {
+      model: 'hash-v1', version: 1, dimensions: 1024,
+      embed: async () => { embedded += 1; return { vectors: [[]], tokens: 1 } },
+    }
+
+    expect(await run(makeDeps({ embedder: counting }), draftId)).toBe('skipped')
+
+    expect(embedded).toBe(0)
+    expect(await allAnswers()).toHaveLength(0)
+    expect((await getDraft(draftId)).memoryCapturedAt).toEqual(NOW)
+    const skipped = await auditRows(draftId, 'memory.skipped')
+    expect(skipped).toHaveLength(1)
+    expect(skipped[0]!.detail).toMatchObject({ reason: 'embed_cap' })
+    // The cap was not moved by a capture that never happened.
+    expect(await embedTokens()).toBe(1000)
   })
 })

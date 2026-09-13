@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import { createFakeProvider } from '@aesa/llm'
 import { LlmError } from '@aesa/llm'
-import { buildTriagePrompt, runTriageCall, TRIAGE_MAX_BODY_CHARS, TRIAGE_MODEL, type TriageInput } from '../src/triage.ts'
+import {
+  buildTriagePrompt, runTriageCall, runTriageCallDetailed, TRIAGE_MAX_BODY_CHARS, TRIAGE_MODEL, type TriageInput,
+} from '../src/triage.ts'
 
 const META = { orgId: '11111111-1111-1111-1111-111111111111', role: 'triage' as const, idempotencyKey: 'test-key' }
 
@@ -72,6 +74,21 @@ describe('runTriageCall', () => {
     expect(provider.calls[0]!.maxOutputTokens).toBe(1024)
     expect(provider.calls[0]!.output?.name).toBe('triage')
     expect(provider.calls[0]!.meta).toEqual(META)
+  })
+
+  // Phase 6: a BYOK agent triages on its own model; TRIAGE_MODEL is only the managed default.
+  it('runTriageCallDetailed returns the raw result beside the verdict and honours a model override', async () => {
+    const verdict = {
+      categoryKey: 'other', language: 'en', sentiment: 'neutral' as const,
+      isSpam: false, isAutomated: false, escalationFlags: [], questions: [],
+    }
+    const provider = createFakeProvider([{ parsed: verdict }])
+
+    const out = await runTriageCallDetailed(provider, BASE_INPUT, META, new AbortController().signal, 'gpt-5-mini')
+
+    expect(out.verdict).toEqual(verdict)
+    expect(out.result.usage.apiCalls).toBe(1)
+    expect(provider.calls[0]!.model).toBe('gpt-5-mini')
   })
 
   it('throws when the provider returns an unparsable verdict (parsed: null)', async () => {

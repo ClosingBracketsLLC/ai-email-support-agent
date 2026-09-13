@@ -7,17 +7,21 @@ import { and, eq, inArray, sql } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import { z } from 'zod'
-import { MEMORY_EXPIRY_DAYS, MEMORY_STRIKES_TO_RETIRE } from '@aesa/core'
-import { audit, customerHash, drafts, ensureCustomerHashSalt, messages, resolvedAnswers, tickets, withOrg, type Db } from '@aesa/db'
+import { MEMORY_EXPIRY_DAYS, MEMORY_STRIKES_TO_RETIRE, resolveSetting } from '@aesa/core'
+import {
+  audit, bumpMeter, customerHash, drafts, ensureCustomerHashSalt, KNOWLEDGE_METERS, messages,
+  resolvedAnswers, tickets, usageCounters, withOrg, type Db,
+} from '@aesa/db'
 import { scrubForMemory, type Embedder } from '@aesa/knowledge'
-import { defineJob, enqueue, JOB_NAMES, registerJob, type JobDefinition } from '@aesa/queue'
+import { defineJob, enqueue, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
+import { utcDayString } from '../date-utils.ts'
+import { loadOrgSettings } from '../knowledge/sources.ts'
 
 export const MemoryCapturePayload = z.object({ orgId: z.string(), draftId: z.string() })
 export type MemoryCapturePayload = z.infer<typeof MemoryCapturePayload>
 
-export const memoryCaptureJob: JobDefinition<MemoryCapturePayload> = defineJob({
+export const memoryCaptureJob: RegisteredJobDefinition<MemoryCapturePayload> = defineJob({
   name: JOB_NAMES.memoryCapture, schema: MemoryCapturePayload,
-  queue: { policy: 'short', expireInSeconds: 120, retryLimit: 3, retryDelay: 30, retryBackoff: true },
   handler: async () => { throw new Error('memory.capture: register it through registerMemoryCapture(boss, deps)') },
 })
 
@@ -37,9 +41,12 @@ interface Loaded {
   draft: { id: string; ticketId: string; agentId: string | null; categoryId: string | null; finalBody: string; decisionSource: string; editDistanceRatio: number; usedAnswerIds: string[]; citedChunkIds: string[]; knowledgeVersion: number }
   ticket: { customerEmail: string | null; customerName: string | null; triageQuestions: string[] }
   latestInboundBody: string
+  /** Phase 6: the org has already spent its daily embedding budget. Read HERE, in the same read
+   *  transaction as everything else, so the embed below is skipped rather than billed. */
+  atEmbedCap: boolean
 }
 
-async function load(db: Db, orgId: string, draftId: string): Promise<Loaded | null> {
+async function load(db: Db, orgId: string, draftId: string, day: string): Promise<Loaded | null> {
   return withOrg(db, orgId, async (tx) => {
     const [d] = await tx.select({
       id: drafts.id, ticketId: drafts.ticketId, agentId: drafts.agentId, categoryId: drafts.categoryId, status: drafts.status,
@@ -54,8 +61,15 @@ async function load(db: Db, orgId: string, draftId: string): Promise<Loaded | nu
     const [inbound] = await tx.select({ bodyText: messages.bodyText }).from(messages)
       .where(and(eq(messages.ticketId, d.ticketId), eq(messages.direction, 'inbound')))
       .orderBy(sql`${messages.sentAt} DESC NULLS LAST`, sql`${messages.createdAt} DESC`).limit(1)
+    // The SAME meter and the SAME per-org setting `knowledge.embed-batch` spends from — one
+    // workspace budget covers chunk vectors and answer vectors alike.
+    const [counter] = await tx.select({ value: usageCounters.value }).from(usageCounters)
+      .where(and(eq(usageCounters.day, day), eq(usageCounters.meter, KNOWLEDGE_METERS.embedTokens)))
+    const cap = resolveSetting('knowledge.daily_embed_tokens_cap', { org: await loadOrgSettings(tx, ['knowledge.daily_embed_tokens_cap']) })
+
     const grounding = (d.confidenceBreakdown as { grounding?: { knowledgeVersion?: unknown } }).grounding
     return {
+      atEmbedCap: (counter?.value ?? 0) >= cap,
       draft: {
         id: d.id, ticketId: d.ticketId, agentId: d.agentId, categoryId: d.categoryId, finalBody: d.finalBody, decisionSource: d.decisionSource,
         editDistanceRatio: d.editDistanceRatio ?? 0, usedAnswerIds: d.usedAnswerIds, citedChunkIds: d.citedChunkIds,
@@ -69,9 +83,23 @@ async function load(db: Db, orgId: string, draftId: string): Promise<Loaded | nu
 export async function runMemoryCapture(deps: MemoryCaptureDeps, payload: MemoryCapturePayload, signal: AbortSignal): Promise<'captured' | 'reinforced' | 'skipped'> {
   const { orgId, draftId } = payload
   const now = deps.now?.() ?? new Date()
-  const loaded = await load(deps.db, orgId, draftId)
+  const day = utcDayString(now)
+  const loaded = await load(deps.db, orgId, draftId, day)
   if (!loaded) return 'skipped'
   const { draft, ticket } = loaded
+
+  // At cap: stamp anyway. The alternative — leaving `memory_captured_at` null — would have the
+  // `short` queue's redelivery (and every later one) retry a draft the budget will still refuse,
+  // and this reply is not coming back tomorrow. One answer is worth less than a stuck queue.
+  if (loaded.atEmbedCap) {
+    return withOrg(deps.db, orgId, async (tx): Promise<'skipped'> => {
+      const stamped = await tx.update(drafts).set({ memoryCapturedAt: now })
+        .where(and(eq(drafts.id, draftId), sql`${drafts.memoryCapturedAt} IS NULL`)).returning({ id: drafts.id })
+      if (stamped.length === 0) return 'skipped'
+      await audit(tx, { actor: ACTOR, action: 'memory.skipped', entityType: 'draft', entityId: draftId, detail: { reason: 'embed_cap' } })
+      return 'skipped'
+    })
+  }
   const scrub = { customerName: ticket.customerName, customerEmail: ticket.customerEmail }
   const rawQuestion = ticket.triageQuestions.filter((q) => q.trim() !== '').join('\n') || loaded.latestInboundBody.slice(0, TEXT_QUESTION_CHARS)
   const question = scrubForMemory(rawQuestion, scrub)
@@ -81,9 +109,11 @@ export async function runMemoryCapture(deps: MemoryCaptureDeps, payload: MemoryC
 
   // ── the embed, between transactions; a throw leaves the draft unstamped for the retry ──
   let vector: number[] | null = null
+  let embedTokens = 0
   if (question.length > 0 && answer.length > 0) {
-    const { vectors } = await deps.embedder.embed([question], 'document', signal)
+    const { vectors, tokens } = await deps.embedder.embed([question], 'document', signal)
     vector = vectors[0] ?? null
+    embedTokens = tokens
   }
 
   return withOrg(deps.db, orgId, async (tx) => {
@@ -91,6 +121,8 @@ export async function runMemoryCapture(deps: MemoryCaptureDeps, payload: MemoryC
     const stamped = await tx.update(drafts).set({ memoryCapturedAt: now })
       .where(and(eq(drafts.id, draftId), sql`${drafts.memoryCapturedAt} IS NULL`)).returning({ id: drafts.id })
     if (stamped.length === 0) return 'skipped'
+    // Phase 6: what this capture actually cost, on the same meter `knowledge.embed-batch` bumps.
+    if (embedTokens > 0) await bumpMeter(tx, orgId, day, KNOWLEDGE_METERS.embedTokens, embedTokens)
     if (vector === null) {
       await audit(tx, { actor: ACTOR, action: 'memory.skipped', entityType: 'draft', entityId: draftId, detail: { reason: 'empty_after_scrub' } })
       return 'skipped'
