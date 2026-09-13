@@ -71,6 +71,12 @@ const CheckoutSessionSchema = z.object({
   client_reference_id: z.string().nullish(),
   metadata: z.object({ orgId: z.string().optional() }).partial().nullish(),
   subscription: z.union([z.string(), SubscriptionSchema]).nullish(),
+  /** `'paid' | 'unpaid' | 'no_payment_required'` in stripe@22 (`Checkout/Sessions.d.ts`, whose own
+   *  doc says "use this value to decide when to fulfill"). `.catch(undefined)` rather than a bare
+   *  enum because the SDK's union ends in `OtherString`: a value Stripe adds later must NOT fail the
+   *  whole parse and lose a real checkout — it falls through to the same not-yet-paid branch as
+   *  `'unpaid'`, which is the safe direction. */
+  payment_status: z.enum(['paid', 'unpaid', 'no_payment_required']).optional().catch(undefined),
 })
 
 /** An invoice's subscription id is at `parent.subscription_details.subscription` in stripe@22. */
@@ -189,6 +195,10 @@ interface Parsed {
   patch: BillingPatch
   /** True when `selectItems` could not match either configured price and read the items positionally. */
   fellBackToPosition: boolean
+  /** Set on a `checkout.session.completed` whose payment has NOT settled: the Stripe ids are
+   *  recorded but the plan and status are left alone. Carries the session's `payment_status` for
+   *  the log line. */
+  deferredFulfilment: { paymentStatus: string | null } | null
   auditDetail: Record<string, unknown>
 }
 
@@ -201,35 +211,47 @@ function parseEvent(event: StripeEvent, prices: PriceIds): Parsed | null {
       const s = parsed.data
       const patch: BillingPatch = {}
       let fellBackToPosition = false
-      if (typeof s.subscription === 'string') {
-        // A bare id — what an unexpanded webhook really sends. The session completing IS the
-        // activation and there is nothing else to go on, so it seeds the paid plan; the
-        // `customer.subscription.*` that follows within the second corrects it if the payment did
-        // not actually succeed.
-        patch.stripeSubscriptionId = s.subscription
-        patch.plan = 'standard'
-        patch.status = 'active'
-      } else if (s.subscription) {
+      let deferredFulfilment: { paymentStatus: string | null } | null = null
+
+      if (s.subscription && typeof s.subscription !== 'string') {
+        // The EXPANDED variant. The subscription's own status decides, not the session's arrival:
+        // `incomplete` (SCA still pending, or the card declined at completion) maps to null, and
+        // then neither the status nor the plan moves at all — the ids and the period are facts
+        // worth recording, but the workspace does not get the paid product until a payment
+        // actually succeeds.
         const fromSub = patchFromSubscription(s.subscription, prices)
         fellBackToPosition = fromSub.fellBackToPosition
         Object.assign(patch, fromSub)
-        // The SUBSCRIPTION's status decides, not the session's completion. `incomplete` (SCA still
-        // pending, or the card declined at completion) maps to null, and then neither the status nor
-        // the plan moves at all — the ids and the period are facts worth recording, but the
-        // workspace does not get the paid product until a payment actually succeeds.
         const mapped = statusOf(s.subscription.status)
         if (mapped) Object.assign(patch, mapped)
       } else {
-        // No subscription on the session at all: the completion is all we know.
-        patch.plan = 'standard'
-        patch.status = 'active'
+        // The BARE-ID variant — and the only one a real event takes: a webhook payload does not
+        // honour an `expand` passed at session creation, so `createCheckoutSession` cannot ask for
+        // the subscription object and every completion this platform produces arrives here.
+        //
+        // There is therefore no subscription status to read, and the session's ARRIVAL is not
+        // fulfilment: a subscription can initialise `incomplete`. `payment_status` is the signal
+        // Stripe provides for exactly this decision. The ids are recorded either way — they are
+        // facts, and the row needs them for the guard below — but the plan and the status move only
+        // once the money has settled. A deferred one is carried to `standard` by the matching
+        // `invoice.paid` (see `applyStripeEvent`), or expired by `incomplete_expired`.
+        if (typeof s.subscription === 'string') patch.stripeSubscriptionId = s.subscription
+        const settled = s.payment_status === 'paid' || s.payment_status === 'no_payment_required'
+        if (settled) {
+          patch.plan = 'standard'
+          patch.status = 'active'
+        } else {
+          deferredFulfilment = { paymentStatus: s.payment_status ?? null }
+        }
       }
+
       return {
         kind: 'checkout',
         customerId: s.customer,
         claimedOrgId: s.metadata?.orgId ?? s.client_reference_id ?? null,
         patch,
         fellBackToPosition,
+        deferredFulfilment,
         auditDetail: { subscriptionId: patch.stripeSubscriptionId ?? null },
       }
     }
@@ -251,6 +273,7 @@ function parseEvent(event: StripeEvent, prices: PriceIds): Parsed | null {
       }
       return {
         kind: 'subscription', customerId: sub.customer, claimedOrgId: null, patch, fellBackToPosition,
+        deferredFulfilment: null,
         auditDetail: { subscriptionId: sub.id, stripeStatus: sub.status },
       }
     }
@@ -261,15 +284,17 @@ function parseEvent(event: StripeEvent, prices: PriceIds): Parsed | null {
       const inv = parsed.data
       const raw = inv.parent?.subscription_details?.subscription
       const subscriptionId = typeof raw === 'string' ? raw : raw?.id
-      // An invoice moves the STATUS and nothing else. It never sets the plan: only the two
-      // subscription-shaped events establish that, and an invoice.paid that set `standard` would let
-      // a one-off charge (or a dunning payment on an old invoice) promote a trial workspace.
+      // An invoice moves the STATUS here. `invoice.paid` may ALSO establish the plan, but only
+      // under the subscription-match guard in `applyStripeEvent` — which cannot be evaluated
+      // without the row, so it is not decided at this layer. An unguarded `plan: 'standard'` would
+      // let a one-off charge, or a dunning payment on an old invoice, promote a trial workspace.
       const patch: BillingPatch = event.type === 'invoice.paid'
         ? { status: 'active' }
         : { status: 'past_due' }
       if (subscriptionId) patch.stripeSubscriptionId = subscriptionId
       return {
         kind: 'invoice', customerId: inv.customer, claimedOrgId: null, patch, fellBackToPosition: false,
+        deferredFulfilment: null,
         auditDetail: { subscriptionId: subscriptionId ?? null },
       }
     }
@@ -359,6 +384,17 @@ export async function applyStripeEvent(deps: BillingServiceDeps, event: StripeEv
       return { result: 'ignored' }
     }
 
+    // `invoice.paid` for the row's OWN subscription is what carries a deferred Checkout (see the
+    // bare-id branch of `parseEvent`) from "ids recorded, still on trial" to the paid plan: the
+    // money has arrived for the subscription this workspace actually holds. It is deliberately
+    // narrower than the status move above — the row's id must be set AND equal, so the legitimate
+    // `invoice.paid`-beats-`checkout.session.completed` race (null id) moves the status only, and
+    // a workspace is never promoted by an invoice whose subscription we cannot vouch for.
+    const invoicePromotesPlan = event.type === 'invoice.paid'
+      && invoiceSubscriptionId !== undefined
+      && state.stripeSubscriptionId !== null
+      && invoiceSubscriptionId === state.stripeSubscriptionId
+
     // A subscription id different from the one on the row means this customer now has TWO live
     // subscriptions — two Checkout sessions started before either completed, typically. The newer
     // one is taken (last-write-wins, as everywhere else here, and Stripe treats the newer as
@@ -371,7 +407,12 @@ export async function applyStripeEvent(deps: BillingServiceDeps, event: StripeEv
       ? state.stripeSubscriptionId
       : undefined
 
-    const patch = { ...parsed.patch, stripeCustomerId: parsed.customerId, lastStripeEventCreated: event.created }
+    const patch = {
+      ...parsed.patch,
+      ...(invoicePromotesPlan ? { plan: 'standard' as const } : {}),
+      stripeCustomerId: parsed.customerId,
+      lastStripeEventCreated: event.created,
+    }
     const written = await tx.update(billingSubscriptions)
       .set(patch)
       .where(and(
@@ -420,6 +461,19 @@ export async function applyStripeEvent(deps: BillingServiceDeps, event: StripeEv
     deps.logger.error(
       { alert: true, kind: 'stripe_unknown_customer', eventId: event.id, type: event.type, customerId: parsed.customerId, claimedOrgId: parsed.claimedOrgId },
       'stripe webhook: claimed workspace already belongs to another customer',
+    )
+  }
+
+  if (outcome.result === 'applied' && parsed.deferredFulfilment) {
+    // Not a fault — a subscription that initialises unpaid is an ordinary SCA/decline outcome — but
+    // the workspace is now holding Stripe ids on the trial plan, and that state should be legible
+    // when someone asks why a customer who "subscribed" still has trial caps.
+    deps.logger.info(
+      {
+        eventId: event.id, orgId, subscriptionId: parsed.patch.stripeSubscriptionId ?? null,
+        paymentStatus: parsed.deferredFulfilment.paymentStatus,
+      },
+      'stripe.checkout_completed_unpaid',
     )
   }
 

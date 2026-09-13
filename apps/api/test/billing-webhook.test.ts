@@ -166,6 +166,7 @@ describe('stripe webhook', () => {
     const org = await seedOrg()
     expect(await applyStripeEvent(deps, event('checkout.session.completed', {
       customer: org.customerId, client_reference_id: org.orgId, subscription: 'sub_bare_1',
+      payment_status: 'paid',
     }))).toBe('applied')
     expect(await rowOf(org.orgId)).toMatchObject({ plan: 'standard', status: 'active', stripeSubscriptionId: 'sub_bare_1', domainQuantity: 0 })
 
@@ -263,10 +264,12 @@ describe('stripe webhook', () => {
 
     sent.length = 0
     expect(await applyStripeEvent(deps, event('invoice.paid', invoice, { created: T0 + 1 }))).toBe('applied')
-    // The STATUS moves; the PLAN does not. Only the two subscription-shaped events establish the
-    // plan — no `customer.subscription.*` has ever run for this org, so it is still on trial. An
-    // invoice.paid that set `standard` would let a one-off charge promote a trial workspace.
-    expect(await rowOf(org.orgId)).toMatchObject({ status: 'active', plan: 'trial' })
+    // The plan moves too, but ONLY because the invoice names the subscription the row already
+    // carries (`sub_inv`, recorded by the payment_failed above). That guard is the whole point: the
+    // "foreign invoice" and "row id still null" cases below/above prove an invoice we cannot vouch
+    // for never promotes anyone. This is what carries a deferred checkout to standard once the
+    // money actually arrives (ruling R10).
+    expect(await rowOf(org.orgId)).toMatchObject({ status: 'active', plan: 'standard' })
     expect(sent).toEqual([])
 
     // Back to past_due the same day: still ONE notification row (the dedupe key is per org per day).
@@ -389,11 +392,61 @@ describe('stripe webhook', () => {
     expect(await rowOf(org.orgId)).toMatchObject({ status: 'active' })
   })
 
-  it('an invoice arriving BEFORE the checkout (the row has no subscription yet) still applies', async () => {
+  it('an invoice arriving BEFORE the checkout (the row has no subscription yet) moves the status but NOT the plan', async () => {
     const org = await seedOrg()
     const invoice = { customer: org.customerId, parent: { subscription_details: { subscription: 'sub_early' } } }
     expect(await applyStripeEvent(deps, event('invoice.paid', invoice))).toBe('applied')
-    expect(await rowOf(org.orgId)).toMatchObject({ status: 'active', stripeSubscriptionId: 'sub_early' })
+    // The legitimate invoice.paid-beats-checkout race: the row had no subscription id to match
+    // against, so the promotion guard does not fire and the workspace stays on trial until the
+    // checkout (or a subsequent invoice for the now-recorded subscription) says otherwise.
+    expect(await rowOf(org.orgId)).toMatchObject({ status: 'active', plan: 'trial', stripeSubscriptionId: 'sub_early' })
+  })
+
+  it('ruling R10 — a bare-id checkout.session.completed with payment_status unpaid records the Stripe ids but leaves the workspace on trial, and the matching invoice.paid is what promotes it', async () => {
+    const org = await seedOrg()
+    const lines: string[] = []
+    const loud: BillingServiceDeps = { ...deps, logger: createAppLogger({ level: 'info', stream: { write: (l: string) => void lines.push(l) } }) }
+
+    // The ONLY shape a real completion takes: a bare subscription id (a webhook payload does not
+    // honour an `expand` passed at session creation), and a subscription that initialised unpaid.
+    expect(await applyStripeEvent(loud, event('checkout.session.completed', {
+      customer: org.customerId, client_reference_id: org.orgId,
+      subscription: 'sub_deferred', payment_status: 'unpaid',
+    }))).toBe('applied')
+
+    // The ids are facts and are recorded; the paid product is not handed over.
+    expect(await rowOf(org.orgId)).toMatchObject({
+      stripeCustomerId: org.customerId, stripeSubscriptionId: 'sub_deferred',
+      plan: 'trial', status: 'trialing',
+    })
+    expect(lines.join('')).toContain('stripe.checkout_completed_unpaid')
+
+    // The money arrives for THAT subscription — and that is what promotes the workspace.
+    const invoice = { customer: org.customerId, parent: { subscription_details: { subscription: 'sub_deferred' } } }
+    expect(await applyStripeEvent(deps, event('invoice.paid', invoice, { created: T0 + 1 }))).toBe('applied')
+    expect(await rowOf(org.orgId)).toMatchObject({ plan: 'standard', status: 'active' })
+  })
+
+  it('a bare-id checkout with payment_status paid (and with no_payment_required) fulfils immediately', async () => {
+    for (const [n, paymentStatus] of [['paid', 'paid'], ['free', 'no_payment_required']] as const) {
+      const org = await seedOrg()
+      expect(await applyStripeEvent(deps, event('checkout.session.completed', {
+        customer: org.customerId, client_reference_id: org.orgId,
+        subscription: `sub_${n}`, payment_status: paymentStatus,
+      }))).toBe('applied')
+      expect(await rowOf(org.orgId)).toMatchObject({ plan: 'standard', status: 'active', stripeSubscriptionId: `sub_${n}` })
+    }
+  })
+
+  it('a payment_status Stripe adds later does not fail the parse — it defers like unpaid rather than losing the checkout', async () => {
+    const org = await seedOrg()
+    expect(await applyStripeEvent(deps, event('checkout.session.completed', {
+      customer: org.customerId, client_reference_id: org.orgId,
+      subscription: 'sub_future', payment_status: 'something_stripe_invented',
+    }))).toBe('applied')
+    expect(await rowOf(org.orgId)).toMatchObject({
+      stripeSubscriptionId: 'sub_future', plan: 'trial', status: 'trialing',
+    })
   })
 
   it('checkout.session.completed on an INCOMPLETE subscription records the ids but moves neither the status nor the plan', async () => {
