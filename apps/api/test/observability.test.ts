@@ -62,19 +62,115 @@ describe('beforeSend — the PII boundary, tested directly rather than trusted t
     const event = { request: { data: { ssn: '123-45-6789' }, url: '/trpc/devices.list' } } as unknown as Sentry.ErrorEvent
     const out = beforeSend(event)
     expect(out.request?.data).toBeUndefined()
-    expect(out.request?.url).toBe('/trpc/devices.list')   // the rest of request survives
   })
 
-  it('deletes every scrub-listed key found in event.extra, keeping the rest', () => {
+  /**
+   * Critical 2: `requestDataIntegration` (a default integration) copies `request.headers` onto the
+   * event UNFILTERED — its own filtering helper only applies on the span path, not the event one —
+   * so a captured api error would otherwise hand Sentry the live Better Auth session cookie
+   * verbatim. `request.cookies` is a second, parsed copy of the same thing. Both must go, and a
+   * harmless header must survive so this isn't a "delete everything" test in disguise.
+   */
+  it('deletes request.cookies and strips sensitive request.headers, keeping harmless ones', () => {
+    const event = {
+      request: {
+        headers: { cookie: 'better-auth.session_token=SECRET', authorization: 'Bearer SECRET', 'x-api-key': 'sk-1', 'user-agent': 'curl/8' },
+        cookies: { 'better-auth.session_token': 'SECRET' },
+      },
+    } as unknown as Sentry.ErrorEvent
+    const out = beforeSend(event)
+    expect(out.request?.cookies).toBeUndefined()
+    expect(out.request?.headers?.cookie).toBeUndefined()
+    expect(out.request?.headers?.authorization).toBeUndefined()
+    expect(out.request?.headers?.['x-api-key']).toBeUndefined()
+    expect(out.request?.headers?.['user-agent']).toBe('curl/8')
+  })
+
+  /**
+   * Critical 2: the `/a/:draftId?t=` one-click review link's `t` query param IS the credential that
+   * approves and sends a customer reply — `request.url` and `request.query_string` both carry it on
+   * a captured review-route error (`review/routes.ts:175` calls `approveDraft(...)` with no
+   * try/catch), and `withIsolationScope` forking means this reaches `captureWithOrg`'s events too,
+   * not only Fastify's own `onError` path.
+   */
+  it('redacts the action token out of request.url and request.query_string, in every QueryParams shape', () => {
+    const asString = beforeSend({
+      request: { url: '/a/draft-123?t=SECRET_ACTION_TOKEN', query_string: 't=SECRET_ACTION_TOKEN' },
+    } as unknown as Sentry.ErrorEvent)
+    expect(asString.request?.url).not.toContain('SECRET_ACTION_TOKEN')
+    expect(asString.request?.url).toBe('/a/draft-123?t=[redacted]')
+    expect(asString.request?.query_string).toBe('t=[redacted]')
+
+    const asObject = beforeSend({
+      request: { query_string: { t: 'SECRET_ACTION_TOKEN' } },
+    } as unknown as Sentry.ErrorEvent)
+    expect(JSON.stringify(asObject.request?.query_string)).not.toContain('SECRET_ACTION_TOKEN')
+    expect(asObject.request?.query_string).toEqual({ t: '[redacted]' })
+
+    const asPairs = beforeSend({
+      request: { query_string: [['t', 'SECRET_ACTION_TOKEN']] },
+    } as unknown as Sentry.ErrorEvent)
+    expect(JSON.stringify(asPairs.request?.query_string)).not.toContain('SECRET_ACTION_TOKEN')
+    expect(asPairs.request?.query_string).toEqual([['t', '[redacted]']])
+  })
+
+  /**
+   * Critical 1: by the time an event reaches `beforeSend`, Sentry has already turned the thrown
+   * Error into a plain `{ type, value }` pair — there is no `instanceof DrizzleQueryError` left to
+   * check, only the `.message` STRING, which for a real `DrizzleQueryError` is exactly
+   * `Failed query: <sql>\nparams: <bound values>` (for `drafts`, that bound value can be
+   * `final_body`: customer reply text). This is the event-level backstop for every path into
+   * Sentry that does NOT go through `captureWithOrg` at all — `setupFastifyErrorHandler`'s own
+   * `onError` hook (neither `review/routes.ts`'s `approveDraft(...)` call nor the Stripe webhook
+   * route's `applyStripeEvent(...)` call sits inside a try/catch) and the default
+   * `onUncaughtException`/`onUnhandledRejection` integrations both call `Sentry.captureException`
+   * on the raw error directly. Reuses `apps/api/src/logging.ts`'s own `redactText` — the SAME rule
+   * the local pino `err` serializer already applies, not a second one.
+   */
+  it("redacts a 'Failed query:' exception value the same way the local log path already does", () => {
+    const event = {
+      exception: {
+        values: [{
+          type: 'DrizzleQueryError',
+          value: 'Failed query: insert into "drafts" ("final_body") values ($1)\nparams: Dear customer, here is our refund policy...',
+        }],
+      },
+    } as unknown as Sentry.ErrorEvent
+    const out = beforeSend(event)
+    const message = out.exception?.values?.[0]?.value
+    expect(message).toBe('Failed query: [redacted]')
+    expect(message).not.toContain('refund policy')
+  })
+
+  it('masks a bare URL found inside any other exception message (the same redactText rule, not only "Failed query:")', () => {
+    const event = {
+      exception: { values: [{ type: 'Error', value: 'fetch failed: https://example.com/x?token=SECRET123456789012345678901234' }] },
+    } as unknown as Sentry.ErrorEvent
+    const out = beforeSend(event)
+    expect(out.exception?.values?.[0]?.value).not.toContain('SECRET123456789012345678901234')
+  })
+
+  it('deletes every scrub-listed key found in event.extra, case-insensitively, keeping the rest', () => {
     const event = {
       extra: {
         body: 'the customer wrote...', bodyText: 'plain', detail: { x: 1 }, payload: { y: 2 },
-        apiKey: 'sk-live-xxx', key: 'k', token: 'tok', cookie: 'sess=1', authorization: 'Bearer x',
+        apiKey: 'sk-live-xxx', key: 'k', token: 'tok', cookie: 'sess=1', Authorization: 'Bearer x',
         safe: 'this survives',
       },
     } as unknown as Sentry.ErrorEvent
     const out = beforeSend(event)
     expect(out.extra).toEqual({ safe: 'this survives' })
+  })
+
+  /** Minor: `SCRUB_KEYS` used to be one level deep, so `extra.request = { body: … }` survived. */
+  it('scrubs one level into a nested plain object too, not only the top level', () => {
+    const event = {
+      extra: { request: { body: 'sensitive customer text', ok: 'fine' }, safe: 'x' },
+    } as unknown as Sentry.ErrorEvent
+    const out = beforeSend(event)
+    expect((out.extra?.request as Record<string, unknown> | undefined)?.body).toBeUndefined()
+    expect((out.extra?.request as Record<string, unknown> | undefined)?.ok).toBe('fine')
+    expect(out.extra?.safe).toBe('x')
   })
 
   it('deletes every scrub-listed key found inside EACH context entry, keeping the rest', () => {
@@ -98,6 +194,24 @@ describe('beforeSend — the PII boundary, tested directly rather than trusted t
     expect(out.breadcrumbs?.[0]?.message).toHaveLength(200)
     expect(out.breadcrumbs?.[0]?.message).toBe(long.slice(0, 200))
     expect(out.breadcrumbs?.[1]?.message).toBe('short')
+  })
+
+  /**
+   * Important 5: the default `consoleIntegration` records `data.arguments` — the raw argument array
+   * — beside the formatted message, so `console.error(...)` (`apps/api/src/boss.ts`) would otherwise
+   * put a raw pg error object (a `DatabaseError`'s `detail`/`where` can repeat the offending row
+   * value) into breadcrumb data untruncated — truncating only `message` never touches it.
+   */
+  it('drops breadcrumb.data entirely (a console breadcrumb can carry the raw argument array, DB error detail included)', () => {
+    const event = {
+      breadcrumbs: [{
+        message: 'pg-boss connection error', category: 'console',
+        data: { arguments: ['pg-boss', { detail: 'Key (email)=(customer@example.com) already exists.' }] },
+      }],
+    } as unknown as Sentry.ErrorEvent
+    const out = beforeSend(event)
+    expect(out.breadcrumbs?.[0]?.data).toBeUndefined()
+    expect(out.breadcrumbs?.[0]?.message).toBe('pg-boss connection error')   // the rest of the breadcrumb survives
   })
 
   it('is a pass-through on an event carrying none of the above', () => {
@@ -128,19 +242,25 @@ describe('initObservability with a DSN, transport stubbed (Sentry.init({ transpo
     return payload as Record<string, unknown>
   }
 
-  it('initObservability({ sentry: { dsn, environment } }) returns true and initialises Sentry', () => {
+  it('initObservability({ sentry: { dsn, environment } }) returns true, initialises Sentry, and ACTUALLY wires beforeSend', () => {
     const result = initObservability({
       sentry: { dsn: new Secret('https://abc123@o0.ingest.sentry.io/1'), environment: 'test' },
       release: 'test-sha',
     })
+    expect(result).toBe(true)
+    expect(Sentry.isInitialized()).toBe(true)
+    // Important 4: both this test file's OTHER tests and the real production pipeline rely on
+    // initObservability's own Sentry.init call passing `beforeSend` through — assert that BEFORE
+    // the re-init below (which passes `beforeSend` explicitly again) would otherwise make this
+    // assertion pass even if initObservability's own options object had dropped it.
+    expect(Sentry.getClient()?.getOptions().beforeSend).toBe(beforeSend)
+
     // Swap in the fake transport AFTER init (NodeOptions.transport is a factory the SDK calls once
     // at init time) — re-init with the stub so nothing here ever reaches the network.
     Sentry.init({
       dsn: 'https://abc123@o0.ingest.sentry.io/1', environment: 'test', release: 'test-sha',
       transport: () => fakeTransport, beforeSend,
     })
-    expect(result).toBe(true)
-    expect(Sentry.isInitialized()).toBe(true)
   })
 
   it('alert() captures a message whose tags carry org_id and kind', async () => {
@@ -157,15 +277,13 @@ describe('initObservability with a DSN, transport stubbed (Sentry.init({ transpo
     expect(event.tags).toMatchObject({ org_id: 'org-42', kind: 'deletion_billing_unconfigured' })
   })
 
-  it('captureWithOrg() captures the exception with org_id (and path) tags, and beforeSend scrubs it', async () => {
+  it('captureWithOrg() captures the exception with org_id (and path) tags', async () => {
     captured.length = 0
     captureWithOrg(new Error('kaboom'), { orgId: 'org-77', path: 'devices.list' })
     await Sentry.flush(3000)
 
     const event = lastEvent()
     expect(event.tags).toMatchObject({ org_id: 'org-77', path: 'devices.list' })
-    // beforeSend ran on the REAL captured event, same as the direct unit tests above assert in isolation.
-    expect((event.request as { data?: unknown } | undefined)?.data).toBeUndefined()
   })
 
   it('captureWithOrg() is a no-op only when Sentry is NOT initialised — now that it is, it captures', async () => {
@@ -181,9 +299,14 @@ describe('initObservability with a DSN, transport stubbed (Sentry.init({ transpo
    * `pgboss.job.output`. Sentry is an EXTERNAL service, so `captureWithOrg` must scrub it too,
    * whatever the caller (the tRPC `onError` passes `error.cause`, which CAN be a raw
    * DrizzleQueryError from a `withOrg` query) — this asserts it end to end, through the real Sentry
-   * pipeline, not just against the `scrubJobError` unit in isolation.
+   * pipeline, not just against the `scrubJobError` unit in isolation. TWO layers apply here:
+   * `captureWithOrg`'s own `scrubJobError` call turns it into `Failed query: [redacted] (pg 23505)`
+   * first, then `beforeSend`'s event-level redaction (unit-tested directly above) collapses
+   * everything from `Failed query:` onward again — coarser, but it is the layer that has to hold
+   * even when a raw DrizzleQueryError reaches Sentry a DIFFERENT way (Fastify's `onError`, the
+   * global uncaught-exception handler), which is why the final value carries no `(pg 23505)` suffix.
    */
-  it('captureWithOrg() scrubs a raw DrizzleQueryError before it ever reaches Sentry', async () => {
+  it('captureWithOrg() scrubs a raw DrizzleQueryError before it ever reaches Sentry (both layers)', async () => {
     captured.length = 0
     const err = new DrizzleQueryError(
       'insert into "t" ("secret") values ($1)', ['customer text'],
@@ -194,8 +317,35 @@ describe('initObservability with a DSN, transport stubbed (Sentry.init({ transpo
 
     const event = lastEvent()
     const message = (event.exception as { values?: { value?: string }[] } | undefined)?.values?.[0]?.value
-    expect(message).toBe('Failed query: [redacted] (pg 23505)')
+    expect(message).toBe('Failed query: [redacted]')
     expect(message).not.toContain('customer text')
     expect(message).not.toContain('insert into')
+    expect(message).not.toContain('23505')
+  })
+
+  /**
+   * Minor: `alert()`/`captureWithOrg()`'s own Sentry calls are wrapped in try/catch (matching
+   * `notifyJobFailure`'s seam) so a failure ANYWHERE inside the protected block can never turn an
+   * already-handled failure into an unhandled one — `lifecycle.ts`'s rollback catch is one such
+   * site. `@sentry/node`'s own named exports are frozen ESM bindings vitest cannot `vi.spyOn`
+   * (confirmed empirically: "Module namespace is not configurable in ESM"), so this proves the
+   * try/catch a different way — a throwing GETTER on `ctx.orgId`, read a second time only INSIDE
+   * the protected block (`alert()`'s pino line reads it once, unprotected, first — that access must
+   * still succeed and log) — rather than by hoping Sentry's own internals happen not to throw.
+   */
+  describe('the Sentry half never escapes, even when something inside it throws', () => {
+    it("alert() does not throw when ctx.orgId's SECOND read (inside the Sentry half) throws — the pino line's own read still succeeds", () => {
+      const { logger, lines } = loggedLines()
+      let reads = 0
+      const evilCtx = { get orgId() { reads += 1; if (reads > 1) throw new Error('boom'); return 'org-1' }, exportId: 'exp-1' }
+      expect(() => alert(logger, 'export_failed', evilCtx as unknown as { orgId?: string | null } & Record<string, string | number | boolean | null>)).not.toThrow()
+      expect(lines()[0]).toMatchObject({ alert: true, kind: 'export_failed', orgId: 'org-1' })
+      expect(reads).toBeGreaterThan(1)   // proves the second, protected read actually happened and threw
+    })
+
+    it("captureWithOrg() does not throw when ctx.orgId's read (inside the Sentry half) throws", () => {
+      const evilCtx = { get orgId(): string { throw new Error('boom') } }
+      expect(() => captureWithOrg(new Error('boom'), evilCtx as unknown as { orgId?: string | null })).not.toThrow()
+    })
   })
 })

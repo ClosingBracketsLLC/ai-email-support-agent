@@ -1,3 +1,4 @@
+import * as Sentry from '@sentry/node'
 import { assertInvariants, loadDotEnv } from '@aesa/core'
 import { loadModelPricing } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
@@ -203,5 +204,14 @@ if (config.roles.has('sync')) {
 }
 
 for (const sig of ['SIGTERM', 'SIGINT'] as const) {
-  process.on(sig, async () => { await boss.stop({ graceful: true, wait: true }); await pool.end(); process.exit(0) })
+  process.on(sig, async () => {
+    await boss.stop({ graceful: true, wait: true })
+    await pool.end()
+    // Important 3: the transport buffers and sends asynchronously — without this, an event raised
+    // during the shutdown window itself (the job failure that triggered the deploy, an alert()
+    // fired seconds earlier) is dropped rather than delivered. A no-op when Sentry was never
+    // initialised (Sentry.flush resolves `false` immediately with no client).
+    await Sentry.flush(2000)
+    process.exit(0)
+  })
 }

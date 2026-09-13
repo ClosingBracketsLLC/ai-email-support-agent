@@ -1,3 +1,4 @@
+import * as Sentry from '@sentry/node'
 import { assertInvariants, loadDotEnv } from '@aesa/core'
 import { audit } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
@@ -60,5 +61,15 @@ const app = buildServer({ config, auth, api, mail, logger, enqueue, store, strip
 
 await app.listen({ port: config.port, host: config.host })
 for (const sig of ['SIGTERM', 'SIGINT'] as const) {
-  process.on(sig, async () => { await app.close(); await boss.stop({ graceful: true, wait: true }); await handle.pool.end(); process.exit(0) })
+  process.on(sig, async () => {
+    await app.close()
+    await boss.stop({ graceful: true, wait: true })
+    await handle.pool.end()
+    // Important 3: the transport buffers and sends asynchronously — without this, an event raised
+    // during the shutdown window itself (the very failure that triggered the deploy, an alert()
+    // fired seconds earlier) is dropped rather than delivered. A no-op when Sentry was never
+    // initialised (Sentry.flush resolves `false` immediately with no client).
+    await Sentry.flush(2000)
+    process.exit(0)
+  })
 }
