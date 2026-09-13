@@ -237,4 +237,70 @@ describe('retention.sweep', () => {
     expect(remaining).toBe(0)
     expect(await armAudits(orgId, 'messages')).toEqual([{ count: total, detail: { arm: 'messages', count: total } }])
   })
+
+  /**
+   * Ruling R15. The pass used to take `ORDER BY org_id ASC LIMIT 500` in ONE transaction, which meant
+   * that past 500 workspaces the same lexicographically-first 500 were swept every night and the tail
+   * never was — silently, with `orgs` reporting a healthy 500. A starved rollup org loses a day of
+   * statistics; a starved retention org never has its retention promise kept at all.
+   *
+   * Seeded deliberately past the old window so the assertion cannot pass vacuously: the workspace
+   * this checks is the one with the HIGHEST `org_id` in the whole database, i.e. the last one the old
+   * ordering would ever have reached.
+   */
+  it('sweeps EVERY workspace — no window — and takes one short transaction per org', async () => {
+    const BULK = 501
+    const slug = `bulk-${rand()}`
+    await app.pool.query(
+      `INSERT INTO organization (name, slug)
+       SELECT 'Bulk ' || g, $1 || '-' || g FROM generate_series(1, $2) g`, [slug, BULK])
+    await withPlatform(app.db, 'test:bulk-workspaces', (tx) => tx.execute(sql`
+      INSERT INTO workspaces (org_id, business_name, timezone, retention_days)
+      SELECT o.id, 'Bulk', 'UTC', 30 FROM organization o
+      WHERE o.slug LIKE ${`${slug}-%`} AND NOT EXISTS (SELECT 1 FROM workspaces w WHERE w.org_id = o.id)
+    `))
+
+    // The workspace the OLD `ORDER BY org_id ASC LIMIT 500` would have reached last, if ever.
+    const lastOrgId = await withPlatform(app.db, 'test:last-org', async (tx) => {
+      const res = await tx.execute<{ org_id: string }>(sql`SELECT org_id FROM workspaces ORDER BY org_id DESC LIMIT 1`)
+      return res.rows[0]!.org_id
+    })
+    connectionByOrg.set(lastOrgId, await withOrg(app.db, lastOrgId, async (tx) => {
+      const [conn] = await tx.insert(mailboxConnections).values({
+        orgId: lastOrgId, provider: 'gmail', providerAccountId: `acct-${rand()}`, emailAddress: `tail-${rand()}@acme.test`,
+        status: 'connected', connectedByUserId: userId,
+      }).returning({ id: mailboxConnections.id })
+      return conn!.id
+    }))
+    const tailTicket = await seedTicket(lastOrgId)
+    const tailMessage = await seedMessage(lastOrgId, tailTicket, 200)
+
+    const countWorkspaces = async (): Promise<number> =>
+      withPlatform(app.db, 'test:count-workspaces', async (tx) => {
+        const res = await tx.execute<{ c: number }>(sql`SELECT count(*)::int AS c FROM workspaces`)
+        return Number(res.rows[0]!.c)
+      })
+    /** Every `withPlatform(db, 'cron:retention.sweep')` call writes one of these. */
+    const countSweepAccess = async (): Promise<number> =>
+      withPlatform(app.db, 'test:count-access', async (tx) => {
+        const res = await tx.execute<{ c: number }>(sql`
+          SELECT count(*)::int AS c FROM audit_log
+          WHERE org_id IS NULL AND action = 'platform.access' AND actor = 'system:cron:retention.sweep'`)
+        return Number(res.rows[0]!.c)
+      })
+
+    const workspaceCount = await countWorkspaces()
+    expect(workspaceCount).toBeGreaterThan(500)
+    const accessBefore = await countSweepAccess()
+
+    const result = await runRetentionSweep(makeDeps())
+
+    // Every workspace visited, not the first 500.
+    expect(result.orgs).toBe(workspaceCount)
+    // ONE short transaction per org, plus the single one the three platform-wide arms share.
+    expect(await countSweepAccess() - accessBefore).toBe(workspaceCount + 1)
+    // And the proof that matters: the LAST workspace by org_id actually had its body purged.
+    expect((await readMessage(lastOrgId, tailMessage)).bodyText).toBeNull()
+    expect(await armAudits(lastOrgId, 'messages')).toEqual([{ count: 1, detail: { arm: 'messages', count: 1 } }])
+  }, 120_000)
 })

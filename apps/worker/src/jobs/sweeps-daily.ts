@@ -89,26 +89,41 @@ interface ExpiredDraftRow {
 }
 
 /**
- * One audit row per DISTINCT `orgId` among `rows`, each carrying that org's own count — never one
- * row per touched row, and never one cross-tenant row for the whole arm. A no-op when `rows` is
- * empty (an arm that touched nothing writes nothing).
+ * One audit row per DISTINCT org, each carrying that org's own count — never one row per touched
+ * row, and never one cross-tenant row for the whole arm. A no-op when there is nothing to report (an
+ * arm that touched nothing writes nothing).
  *
  * Exported and actor-parameterized for Phase 7's `retention.sweep`, which is the same shape: a
  * platform-wide pass whose per-org effects each want ONE audit row. `actor` is the caller's because
  * the two passes are different jobs, and an audit trail that named the wrong one would be worse than
- * no trail at all. `rows` deliberately carries only `orgId`, so any `RETURNING { orgId }` fits.
+ * no trail at all.
+ *
+ * `counts` takes EITHER form, because the two callers genuinely have different things in hand and
+ * neither should have to fake the other's: this file's arms hold the rows they updated (a
+ * `RETURNING { orgId }`, which is why the array form carries only that field), while a bulk
+ * `UPDATE … WHERE org_id = $1` arm already knows its count and has no rows to show — making it
+ * materialise one object per purged row just to have them counted back down was the allocation the
+ * map form removes. There is still exactly ONE implementation of the grouping rule.
  */
 export async function auditPerOrgArm(
-  tx: PlatformTx, actor: AuditActor, arm: string, action: string, rows: { orgId: string }[],
+  tx: PlatformTx, actor: AuditActor, arm: string, action: string,
+  counts: { orgId: string }[] | ReadonlyMap<string, number>,
 ): Promise<void> {
-  if (rows.length === 0) return
+  const byOrg = Array.isArray(counts) ? tallyByOrg(counts) : counts
+  // A zero count writes NO row: "an arm that touched nothing writes nothing" has to keep holding for
+  // the map form, where a caller naturally hands over `{ org → 0 }` rather than an empty collection.
+  // The array form can never produce a zero (a row counts one), so this changes nothing for it.
+  const values = [...byOrg.entries()]
+    .filter(([, cnt]) => cnt > 0)
+    .map(([orgId, cnt]) => ({ orgId, actor, action, entityType: 'workspace', entityId: orgId, detail: { arm, count: cnt } }))
+  if (values.length === 0) return
+  await tx.insert(auditLog).values(values)
+}
+
+function tallyByOrg(rows: { orgId: string }[]): Map<string, number> {
   const counts = new Map<string, number>()
   for (const r of rows) counts.set(r.orgId, (counts.get(r.orgId) ?? 0) + 1)
-  await tx.insert(auditLog).values(
-    [...counts.entries()].map(([orgId, cnt]) => ({
-      orgId, actor, action, entityType: 'workspace', entityId: orgId, detail: { arm, count: cnt },
-    })),
-  )
+  return counts
 }
 
 export async function runSweepsDaily(

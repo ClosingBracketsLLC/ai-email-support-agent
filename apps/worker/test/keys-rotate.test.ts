@@ -125,15 +125,22 @@ describe('keys.rotate', () => {
     expect(audits2).toHaveLength(1)
   })
 
-  it('throws — and leaves the row untouched — when the ring cannot unwrap the version the row carries', async () => {
+  it('throws, ALERTS, and leaves the row untouched when the ring cannot unwrap the version the row carries', async () => {
     const { orgId } = await seedOrg()
     const before = await readKeyRow(orgId)
+    const alerts: Record<string, unknown>[] = []
+    const logger = pino({ level: 'error' }, { write: (line: string) => void alerts.push(JSON.parse(line) as Record<string, unknown>) })
 
-    await expect(runKeysRotate(deps(ringWithoutV1), { orgId })).rejects.toThrow(/KEK version 1 is not configured/)
+    await expect(runKeysRotate({ ...deps(ringWithoutV1), logger }, { orgId })).rejects.toThrow(/KEK version 1 is not configured/)
 
     const after = await readKeyRow(orgId)
     expect(after.kekVersion).toBe(1)
     expect(after.wrappedDek.equals(before.wrappedDek)).toBe(true)
+
+    // This is the "same ring on every replica" failure, and it must never be just a pg-boss retry
+    // record: the org's data is one KEK away from unreadable and an operator has to know.
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0]).toMatchObject({ alert: true, kind: 'keys_rotate_failed', orgId, ringActive: 2 })
   })
 
   it('selectOrgsNeedingRotate returns exactly the orgs whose CURRENT key version is not on the active KEK', async () => {

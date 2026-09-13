@@ -19,12 +19,24 @@
  * predicate is `body_purged_at IS NULL`, not "is the body empty".
  *
  * Every delete and every purge runs in `RETENTION_BATCH` slices (`id IN (SELECT id … LIMIT n)`) so a
- * workspace with a decade of mail is never one statement against the 30 s `statement_timeout`. The
- * per-org half follows the `stats.rollup` idiom exactly — ONE `withPlatform` pass, one SAVEPOINT per
- * org lent that org's identity — and every read and write inside it carries an EXPLICIT `org_id`
- * predicate, because `withOrgIdentity` sets no `app.org_id` and switches no role: nothing here may
- * lean on RLS. An omitted predicate would purge every tenant's bodies at the strictest tenant's
- * setting, which is the one mistake this file cannot afford.
+ * workspace with a decade of mail is never one statement against the 30 s `statement_timeout`.
+ *
+ * **The per-org half takes ONE SHORT TRANSACTION PER WORKSPACE, and visits every workspace — there
+ * is no `LIMIT` (ruling R15).** It began as `stats.rollup`'s shape (one transaction, a SAVEPOINT per
+ * org, `ORDER BY org_id LIMIT 500`) and that was wrong here in two ways that compound. The window
+ * has no rotation, so past 500 workspaces the same lexicographically-first 500 were swept nightly
+ * and the tail never was — silently, with the result reporting a healthy 500; and a starved rollup
+ * org loses a day of statistics, while a starved retention org never has its retention promise kept
+ * at all, which is the promise the privacy policy makes. The single transaction was also the one
+ * long WRITE transaction in the codebase's nightly work. One `withPlatform` per org fixes both.
+ * Accepted cost, so nobody optimises it back: one `platform.access` audit row per workspace per
+ * night, which `sweeps.daily`'s arm (h) prunes at 30 days, so it reaches a steady state. The per-org
+ * work is two partial-index scans that usually match nothing.
+ *
+ * Every read and write inside an org's transaction carries an EXPLICIT `org_id` predicate: it runs
+ * as `aesa_platform` with RLS bypassed and no `app.org_id` set, so nothing here may lean on RLS. An
+ * omitted predicate would purge every tenant's bodies at the strictest tenant's setting, which is
+ * the one mistake this file cannot afford.
  *
  * `escalations` and everything else a ticket carries are untouched: this sweep only ever nulls the
  * four body columns named below and deletes from the three tables named above.
@@ -43,10 +55,11 @@ export const LLM_CALLS_RETENTION_DAYS = 400
 export const NOTIFICATION_RETENTION_DAYS = 90
 /** The tenant audit trail a compliance question actually reaches for: two years. */
 export const AUDIT_RETENTION_DAYS = 730
-/** Bound on how many workspaces one nightly pass visits — `stats.rollup`'s bound, same reasoning. */
-export const RETENTION_ORGS_PER_RUN = 500
-/** Rows per slice. Big enough that a normal night is one or two statements, small enough that the
- *  worst-case one still finishes far inside the app role's 30 s `statement_timeout`. */
+/** There is deliberately NO per-run workspace bound here (ruling R15) — see the file header: a
+ *  `LIMIT` with no rotation is a workspace whose retention promise is simply never kept. */
+
+/** Rows per slice. Big enough that a normal night is one or two statements per arm, small enough
+ *  that the worst-case one still finishes far inside the app role's 30 s `statement_timeout`. */
 export const RETENTION_BATCH = 5_000
 
 const RETENTION_ACTOR: AuditActor = 'system:cron:retention.sweep'
@@ -133,11 +146,6 @@ async function purgeDraftBodies(tx: PlatformTx, orgId: string, cutoff: Date, now
   }
 }
 
-/** `auditPerOrgArm` (imported from `sweeps.daily` — ONE implementation of "one audit row per org per
- *  arm", never a second copy) counts the rows an arm returned; a bulk `UPDATE` arm already knows the
- *  count. This is the adapter between the two, and the array it builds is transient. */
-const arm = (orgId: string, count: number): { orgId: string }[] => Array.from({ length: count }, () => ({ orgId }))
-
 const daysBefore = (now: Date, days: number): Date => new Date(now.getTime() - days * 24 * 60 * 60_000)
 
 export async function runRetentionSweep(deps: RetentionSweepDeps): Promise<RetentionSweepResult> {
@@ -146,45 +154,42 @@ export async function runRetentionSweep(deps: RetentionSweepDeps): Promise<Reten
     orgs: 0, messagesPurged: 0, draftsPurged: 0, llmCallsDeleted: 0, notificationsDeleted: 0, auditDeleted: 0,
   }
 
-  await withPlatform(deps.db, 'cron:retention.sweep', async (tx) => {
-    // --- The three platform-wide arms, first: they are unscoped by org and need no identity.
+  // --- ONE transaction for the three platform-wide arms (unscoped by org) and the workspace list.
+  const orgRows = await withPlatform(deps.db, 'cron:retention.sweep', async (tx) => {
     result.llmCallsDeleted = await deleteAged(tx, 'llm_calls', daysBefore(now, LLM_CALLS_RETENTION_DAYS))
     result.notificationsDeleted = await deleteAged(tx, 'notifications', daysBefore(now, NOTIFICATION_RETENTION_DAYS))
     // `org_id IS NOT NULL` is load-bearing: the NULL rows are `sweeps.daily` arm (h)'s 30-day
     // `platform.access` trail, including the row THIS transaction just wrote for itself.
     result.auditDeleted = await deleteAged(tx, 'audit_log', daysBefore(now, AUDIT_RETENTION_DAYS), sql`org_id IS NOT NULL`)
 
-    // --- The per-org body purge, driven by each workspace's own retention_days.
-    const orgRows = await tx
+    // No LIMIT: every workspace, every night (R15). The list is org_id + a small int per row.
+    return tx
       .select({ orgId: workspaces.orgId, retentionDays: workspaces.retentionDays })
       .from(workspaces)
       .orderBy(asc(workspaces.orgId))
-      .limit(RETENTION_ORGS_PER_RUN)
-
-    for (const { orgId, retentionDays } of orgRows) {
-      result.orgs += 1
-      const cutoff = daysBefore(now, retentionDays)
-      try {
-        // One SAVEPOINT per org, exactly like `stats.rollup`: one workspace's failure rolls that
-        // workspace back and leaves the pass running for everyone else.
-        await tx.transaction(async (savepoint) => {
-          // drizzle types a `transaction()` callback on the UNBRANDED handle, but a SAVEPOINT of a
-          // `withPlatform` transaction is the same session: still `aesa_platform`, still RLS-bypassed.
-          // Unlike `stats.rollup` this pass borrows no org IDENTITY (`withOrgIdentity`): every
-          // statement below names `org_id` itself and `auditPerOrgArm` takes it from the rows.
-          const platformTx = savepoint as PlatformTx
-          const purgedMessages = await purgeMessageBodies(platformTx, orgId, cutoff, now)
-          const purgedDrafts = await purgeDraftBodies(platformTx, orgId, cutoff, now)
-          await auditPerOrgArm(platformTx, RETENTION_ACTOR, 'messages', 'retention.purged', arm(orgId, purgedMessages))
-          await auditPerOrgArm(platformTx, RETENTION_ACTOR, 'drafts', 'retention.purged', arm(orgId, purgedDrafts))
-          result.messagesPurged += purgedMessages
-          result.draftsPurged += purgedDrafts
-        })
-      } catch (err) {
-        deps.logger.warn({ orgId, error: errorMessage(err) }, 'retention_sweep_org_failed')
-      }
-    }
   })
+
+  // --- The per-org body purge, one SHORT transaction each, driven by that workspace's retention_days.
+  for (const { orgId, retentionDays } of orgRows) {
+    result.orgs += 1
+    const cutoff = daysBefore(now, retentionDays)
+    try {
+      await withPlatform(deps.db, 'cron:retention.sweep', async (tx) => {
+        const purgedMessages = await purgeMessageBodies(tx, orgId, cutoff, now)
+        const purgedDrafts = await purgeDraftBodies(tx, orgId, cutoff, now)
+        // The map form of `auditPerOrgArm` (`sweeps.daily`, ONE implementation of "one audit row per
+        // org per arm"): a bulk UPDATE already knows its count and has no rows to hand over.
+        await auditPerOrgArm(tx, RETENTION_ACTOR, 'messages', 'retention.purged', new Map([[orgId, purgedMessages]]))
+        await auditPerOrgArm(tx, RETENTION_ACTOR, 'drafts', 'retention.purged', new Map([[orgId, purgedDrafts]]))
+        result.messagesPurged += purgedMessages
+        result.draftsPurged += purgedDrafts
+      })
+    } catch (err) {
+      // One workspace failing costs only that workspace this night; the next pass re-derives its
+      // work list from `body_purged_at`, so nothing is lost.
+      deps.logger.warn({ orgId, error: errorMessage(err) }, 'retention_sweep_org_failed')
+    }
+  }
 
   return result
 }

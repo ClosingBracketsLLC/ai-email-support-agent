@@ -60,6 +60,12 @@ describe('workspace.purge', () => {
     return { db: app.db, store, logger: pino({ level: 'silent' }), now: () => NOW, ...overrides }
   }
 
+  /** A logger that keeps every error-level line, so a test can assert on the operator alerts. */
+  function alertLogger(): { logger: pino.Logger; alerts: Record<string, unknown>[] } {
+    const alerts: Record<string, unknown>[] = []
+    return { alerts, logger: pino({ level: 'error' }, { write: (line: string) => void alerts.push(JSON.parse(line) as Record<string, unknown>) }) }
+  }
+
   /** One tenant with rows across the FK spine, its two uploaded objects in the store, an export
    *  object, and its Better Auth organization/member/invitation/session rows. */
   async function seedWorkspace(
@@ -231,6 +237,62 @@ describe('workspace.purge', () => {
     expect(await runWorkspacePurge(makeDeps(store), { orgId: a.orgId }, AbortSignal.timeout(30_000))).toBe('purged')
     expect(await countRows('workspaces', a.orgId)).toBe(0)
     expect(await countAuth('organization', a.orgId)).toBe(0)
+  })
+
+  it('refuses to delete an object key outside its own orgs/<orgId>/ prefix, and alerts instead', async () => {
+    const store = makeStore()
+    const a = await seedWorkspace(store, 'foreign-a', daysAgo(31))
+    // No current path writes a foreign key into `storage_key`, which is exactly why this is the
+    // place the explicit predicate is the whole safety: if one ever did, the purge must not be the
+    // thing that acts on it. `orgs/<other>/…` is another tenant's object; `../` is not a prefix at all.
+    const foreignKeys = ['orgs/00000000-0000-4000-8000-000000000000/uploads/theirs/secret.pdf', 'exports/../../etc/passwd']
+    await withOrg(app.db, a.orgId, async (tx) => {
+      for (const key of foreignKeys) {
+        await tx.insert(knowledgeSources).values({ orgId: a.orgId, kind: 'upload', title: key, storageKey: key, mime: 'application/pdf' })
+      }
+    })
+    for (const key of foreignKeys) await store.put(key, new Uint8Array([9]), 'application/pdf')
+
+    const { logger, alerts } = alertLogger()
+    expect(await runWorkspacePurge(makeDeps(store, { logger }), { orgId: a.orgId }, AbortSignal.timeout(30_000))).toBe('purged')
+
+    // The org's OWN objects are gone; the two foreign keys were never handed to `delete`.
+    for (const key of [...a.storageKeys, a.exportKey]) expect(await store.head(key)).toBeNull()
+    for (const key of foreignKeys) expect(await store.head(key)).not.toBeNull()
+
+    expect(alerts).toHaveLength(foreignKeys.length)
+    expect(alerts.map((l) => l.key).sort()).toEqual([...foreignKeys].sort())
+    for (const line of alerts) expect(line).toMatchObject({ alert: true, kind: 'purge_failed', orgId: a.orgId })
+  })
+
+  it('alerts when the ROW purge itself throws — the objects are already gone, so this cannot pass quietly', async () => {
+    const store = makeStore()
+    const a = await seedWorkspace(store, 'rowfail-a', daysAgo(31))
+    const { logger, alerts } = alertLogger()
+
+    // Fault injection with no production seam: phase 1's read is the first `db.transaction` call and
+    // phase 3's row purge is the second.
+    let transactions = 0
+    const failingDb = new Proxy(app.db, {
+      get(target, prop, receiver) {
+        if (prop !== 'transaction') return Reflect.get(target, prop, receiver) as unknown
+        return (...args: unknown[]) => {
+          transactions += 1
+          if (transactions === 2) return Promise.reject(new Error('row purge exploded'))
+          return (Reflect.get(target, prop, receiver) as (...a: unknown[]) => unknown).apply(target, args)
+        }
+      },
+    }) as typeof app.db
+
+    await expect(runWorkspacePurge(makeDeps(store, { db: failingDb, logger }), { orgId: a.orgId }, AbortSignal.timeout(30_000)))
+      .rejects.toThrow(/row purge exploded/)
+
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0]).toMatchObject({ alert: true, kind: 'purge_failed', orgId: a.orgId, phase: 'rows' })
+    // The half-purged state the alert exists for: the bucket is empty, the rows are not.
+    for (const key of [...a.storageKeys, a.exportKey]) expect(await store.head(key)).toBeNull()
+    expect(await countRows('workspaces', a.orgId)).toBe(1)
+    expect(await countRows('messages', a.orgId)).toBe(1)
   })
 
   it('refuses an org still inside its 30-day grace period, and deletes nothing', async () => {

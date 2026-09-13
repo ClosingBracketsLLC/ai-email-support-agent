@@ -34,7 +34,15 @@
  * `queued` (a cancelled export, a newer request, this job's own completed first attempt) is a quiet
  * `skipped`; a row that is `queued` for a DIFFERENT key is not — that can only be a programming error
  * between the two sides, so it lands `failed` and alerts rather than leaving the owner on a spinner.
- * The landing write is guarded on `queued` again. A failure lands `failed`, deletes the partial object and pages the
+ * The landing write is guarded on `queued` again.
+ *
+ * **THE API CONTRACT THAT MAKES THE MISMATCH BRANCH CORRECT (ruling R16): `workspace.requestExport`
+ * MUST refuse while `export_state = 'queued'`** — that is what `WORKSPACE_ERROR_MESSAGES
+ * .export_in_progress` exists for. Only under that rule can `export_key` never move while a `queued`
+ * job is outstanding, and only then is "this row is queued for a key that is not mine" necessarily a
+ * bug rather than a race. Relax it — let a second request overwrite `export_key` while the first job
+ * is still in flight — and this branch starts failing the NEW request on the OLD job's arrival. So a
+ * change to that api rule is a breaking change HERE, and has to change this branch with it. A failure lands `failed`, deletes the partial object and pages the
  * owner under the SAME dedupe key the success would have used, so one request pages once either way.
  */
 import { and, asc, eq, gt, isNotNull, sql } from 'drizzle-orm'

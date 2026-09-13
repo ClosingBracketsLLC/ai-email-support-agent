@@ -23,6 +23,7 @@ import { z } from 'zod'
 import type { KekRing } from '@aesa/crypto'
 import { audit, rewrapOrgDek, withOrg, type AuditActor, type Db } from '@aesa/db'
 import { defineJob, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
+import { errorMessage } from '../err-message.ts'
 
 export const KeysRotatePayload = z.object({ orgId: z.string() })
 export type KeysRotatePayload = z.infer<typeof KeysRotatePayload>
@@ -46,18 +47,33 @@ export interface KeysRotateDeps {
 }
 
 export async function runKeysRotate(deps: KeysRotateDeps, payload: KeysRotatePayload): Promise<'rewrapped' | 'current' | 'lost_race'> {
-  const outcome = await withOrg(deps.db, payload.orgId, async (tx) => {
-    const result = await rewrapOrgDek(tx, deps.ring)
-    if (result.outcome === 'rewrapped') {
-      // Inside the SAME transaction as the re-wrap: an audit row claiming a rotate that rolled back
-      // would be worse than no row, and this is the only record that the KEK behind an org changed.
-      await audit(tx, {
-        actor: ROTATE_ACTOR, action: 'keys.rotated', entityType: 'workspace', entityId: payload.orgId,
-        detail: { from: result.fromVersion, to: result.toVersion },
-      })
-    }
-    return result
-  })
+  let outcome: Awaited<ReturnType<typeof rewrapOrgDek>>
+  try {
+    outcome = await withOrg(deps.db, payload.orgId, async (tx) => {
+      const result = await rewrapOrgDek(tx, deps.ring)
+      if (result.outcome === 'rewrapped') {
+        // Inside the SAME transaction as the re-wrap: an audit row claiming a rotate that rolled back
+        // would be worse than no row, and this is the only record that the KEK behind an org changed.
+        await audit(tx, {
+          actor: ROTATE_ACTOR, action: 'keys.rotated', entityType: 'workspace', entityId: payload.orgId,
+          detail: { from: result.fromVersion, to: result.toVersion },
+        })
+      }
+      return result
+    })
+  } catch (err) {
+    // Task 11 replaces this with `alert('keys_rotate_failed', { orgId })`. This is the one job whose
+    // failure means a tenant's data is one KEK away from unreadable — most likely because this
+    // replica's ring cannot unwrap the version the row carries, the exact "same ring on every
+    // replica" failure the header warns about — so it must never be just a pg-boss retry record that
+    // nobody reads until three backed-off attempts have gone by. Rethrown unchanged: the retry is
+    // still worth having, in case the ring was mid-rollout.
+    deps.logger.error(
+      { alert: true, kind: 'keys_rotate_failed', orgId: payload.orgId, ringActive: deps.ring.active, error: errorMessage(err) },
+      'keys.rotate: re-wrapping this workspace\'s data key failed — check that every replica holds the same KEK ring',
+    )
+    throw err
+  }
 
   if (outcome.outcome === 'lost_race') {
     deps.logger.warn(

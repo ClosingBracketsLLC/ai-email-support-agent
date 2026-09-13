@@ -18,10 +18,13 @@
  *  2. **objects** — the store deletes, outside every transaction, best-effort. A key that will not
  *     delete is logged at error level WITH the key: nothing else will ever sweep it, so the runbook
  *     needs the list to finish the job by hand. It never aborts the row purge — customer rows in a
- *     database the owner asked to be emptied are the bigger exposure.
+ *     database the owner asked to be emptied are the bigger exposure. A key that is not under
+ *     `orgs/<orgId>/` is not deleted at all: an irreversible delete is the last operation that
+ *     should act on a key it cannot account for, so it is skipped and paged instead.
  *  3. **rows** — one platform transaction: every tenant table, then `workspaces`, then the auth rows,
  *     then ONE platform audit row (`org_id NULL`). The tenant trail is gone by design — it is tenant
- *     data — so the platform keeps the fact that the purge happened, and nothing else.
+ *     data — so the platform keeps the fact that the purge happened, and nothing else. A throw here
+ *     leaves the workspace HALF purged (objects gone, rows present), so it alerts before rethrowing.
  *
  * The job is idempotent by construction: phase 1 finds no `workspaces` row on a second run and
  * returns `skipped`, which is also what makes pg-boss's retries safe.
@@ -66,10 +69,17 @@ export interface WorkspacePurgeSweepDeps {
   now?: () => Date
 }
 
-/** Phase 1's answer: `null` when this org must not be purged, the object keys to delete otherwise. */
+/** Phase 1's answer: `null` when this org must not be purged. */
 interface PurgePlan {
+  /** Keys this org demonstrably owns — every one under `orgs/<orgId>/`. Only these are deleted. */
   objectKeys: string[]
+  /** Keys stored against this org that are NOT under its own prefix. Never deleted; always paged. */
+  foreignKeys: string[]
 }
+
+/** Every object a workspace owns is keyed under this — `uploadKey` and `exportObjectKey` both build
+ *  it — so a stored key that does not start with it is not this tenant's to delete. */
+const orgKeyPrefix = (orgId: string): string => `orgs/${orgId}/`
 
 export async function runWorkspacePurge(
   deps: WorkspacePurgeDeps,
@@ -103,9 +113,19 @@ export async function runWorkspacePurge(
       .select({ storageKey: knowledgeSources.storageKey })
       .from(knowledgeSources)
       .where(and(eq(knowledgeSources.orgId, orgId), isNotNull(knowledgeSources.storageKey)))
-    const objectKeys = sources.map((s) => s.storageKey).filter((k): k is string => k !== null)
-    if (ws.exportKey) objectKeys.push(ws.exportKey)
-    return { objectKeys }
+    const stored = sources.map((s) => s.storageKey).filter((k): k is string => k !== null)
+    if (ws.exportKey) stored.push(ws.exportKey)
+
+    // The explicit prefix check is the WHOLE safety of the delete that follows, not a redundant
+    // brace — the same reasoning `assertSameOrg` applies to a retrieval set, and the same response:
+    // a key outside this org's own prefix is evidence something upstream is broken, so it is never
+    // acted on and never passed over in silence. No current path writes a foreign key into
+    // `knowledge_sources.storage_key` or `workspaces.export_key`; this is what keeps it that way.
+    const prefix = orgKeyPrefix(orgId)
+    const objectKeys: string[] = []
+    const foreignKeys: string[] = []
+    for (const key of stored) (key.startsWith(prefix) ? objectKeys : foreignKeys).push(key)
+    return { objectKeys, foreignKeys }
   })
   if (!plan) return 'skipped'
 
@@ -113,6 +133,16 @@ export async function runWorkspacePurge(
   // that ran out of time half way would leave the objects gone and the rows behind. Stopping here
   // costs nothing — the retry (and tomorrow's sweep) re-reads exactly the same plan.
   signal.throwIfAborted()
+
+  for (const key of plan.foreignKeys) {
+    // Task 11 replaces this with `alert('purge_failed', { orgId, key })`. An irreversible delete is
+    // the last operation that should act on a key it cannot account for, so the key is left alone
+    // and an operator is told which row points where.
+    deps.logger.error(
+      { alert: true, kind: 'purge_failed', orgId, key },
+      'workspace.purge: a stored object key is outside this workspace\'s own prefix — NOT deleted; find out which row wrote it',
+    )
+  }
 
   // --- Phase 2: objects, outside every transaction. Best-effort, but never silently.
   const failedKeys: string[] = []
@@ -134,16 +164,31 @@ export async function runWorkspacePurge(
   }
 
   // --- Phase 3: rows. Tenant tables, then workspaces, then the auth rows (see the header for why).
-  await withPlatform(deps.db, 'job:workspace.purge', async (tx) => {
-    const rows = await purgeWorkspace(tx, orgId)
-    await purgeAuthRows(tx, orgId)
-    // org_id NULL: this row must survive the purge it describes, and it is a platform fact, not a
-    // tenant one. `detail.rows` is the per-table count map — numbers only, never content.
-    await tx.insert(auditLog).values({
-      orgId: null, actor: PURGE_ACTOR, action: 'workspace.purged', entityType: 'workspace', entityId: orgId,
-      detail: { rows, objectsDeleted: plan.objectKeys.length - failedKeys.length, objectsFailed: failedKeys.length },
+  try {
+    await withPlatform(deps.db, 'job:workspace.purge', async (tx) => {
+      const rows = await purgeWorkspace(tx, orgId)
+      await purgeAuthRows(tx, orgId)
+      // org_id NULL: this row must survive the purge it describes, and it is a platform fact, not a
+      // tenant one. `detail.rows` is the per-table count map — numbers only, never content.
+      await tx.insert(auditLog).values({
+        orgId: null, actor: PURGE_ACTOR, action: 'workspace.purged', entityType: 'workspace', entityId: orgId,
+        detail: {
+          rows, objectsDeleted: plan.objectKeys.length - failedKeys.length,
+          objectsFailed: failedKeys.length, objectsForeign: plan.foreignKeys.length,
+        },
+      })
     })
-  })
+  } catch (err) {
+    // Task 11 replaces this with `alert('purge_failed', { orgId, phase: 'rows' })`. By this point
+    // phase 2 has already emptied the bucket, so a throw here leaves the workspace HALF purged —
+    // objects gone, rows present — which the retry will finish but which nobody should learn about
+    // only from a pg-boss failure record. Rethrown unchanged so the retry still happens.
+    deps.logger.error(
+      { alert: true, kind: 'purge_failed', orgId, phase: 'rows', error: errorMessage(err) },
+      'workspace.purge: the row purge failed AFTER the objects were deleted — this workspace is half purged',
+    )
+    throw err
+  }
 
   deps.logger.info({ orgId, objects: plan.objectKeys.length }, 'workspace_purged')
   return 'purged'
