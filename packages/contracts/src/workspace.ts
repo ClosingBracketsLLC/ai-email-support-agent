@@ -45,6 +45,32 @@ export const OPERATING_GUIDANCE_MAX = 8000
 export const UpdateGuidanceInput = z.object({ operatingGuidance: z.string().trim().max(OPERATING_GUIDANCE_MAX) })
 export type UpdateGuidanceInput = z.infer<typeof UpdateGuidanceInput>
 
+export const SetKillSwitchInput = z.object({ on: z.boolean() })
+export type SetKillSwitchInput = z.infer<typeof SetKillSwitchInput>
+
+export const RETENTION_DAYS_MIN = 30
+export const RETENTION_DAYS_MAX = 730
+export const SetRetentionDaysInput = z.object({ retentionDays: z.number().int().min(RETENTION_DAYS_MIN).max(RETENTION_DAYS_MAX) })
+export type SetRetentionDaysInput = z.infer<typeof SetRetentionDaysInput>
+
+/** Must equal the business name exactly — the service checks that, not this schema. */
+export const RequestDeletionInput = z.object({ confirm: z.string().trim().min(1).max(120) })
+export type RequestDeletionInput = z.infer<typeof RequestDeletionInput>
+
+/** Days a deleted workspace's data is retained before `workspace.purge` runs it for real. */
+export const WORKSPACE_DELETE_GRACE_DAYS = 30
+
+export const EXPORT_STATES = ['none', 'queued', 'ready', 'failed'] as const
+export type ExportState = (typeof EXPORT_STATES)[number]
+
+export const WORKSPACE_ERROR_MESSAGES = {
+  confirm_mismatch: 'Type the workspace name exactly to confirm.',
+  deletion_pending: 'Deletion is already scheduled.',
+  export_in_progress: 'An export is already running.',
+  billing_cancel_failed: 'Could not cancel the subscription — deletion was not scheduled.',
+} as const
+export type WorkspaceErrorKey = keyof typeof WORKSPACE_ERROR_MESSAGES
+
 /** Base for the Better Auth organization slug; the api appends a random suffix and retries on collision. */
 export function slugify(name: string): string {
   const base = name

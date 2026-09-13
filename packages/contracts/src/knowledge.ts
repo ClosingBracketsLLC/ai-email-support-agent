@@ -11,6 +11,10 @@ export const KNOWLEDGE_UPLOAD_MIMES = [
 export type KnowledgeUploadMime = (typeof KNOWLEDGE_UPLOAD_MIMES)[number]
 export const KNOWLEDGE_FAILURE_REASONS = [
   'too_large', 'wrong_type', 'parse_failed', 'parse_timeout', 'no_text', 'embed_failed', 'crawl_failed', 'crawl_no_pages', 'cap_reached',
+  /** A queued upload whose bytes never arrived. */
+  'abandoned',
+  /** Re-queued three times without landing. */
+  'stuck',
 ] as const
 export type KnowledgeFailureReason = (typeof KNOWLEDGE_FAILURE_REASONS)[number]
 

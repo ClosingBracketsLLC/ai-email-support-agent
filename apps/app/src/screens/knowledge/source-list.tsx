@@ -40,6 +40,8 @@ const FAILURE_LABEL: Record<KnowledgeFailureReason, string> = {
   crawl_failed: 'The crawl failed',
   crawl_no_pages: 'No pages were found to crawl',
   cap_reached: 'The source limit was reached mid-crawl',
+  abandoned: 'The upload never arrived',
+  stuck: 'This kept failing and was stopped',
 }
 
 function chipLabel(s: SourceRow): string {

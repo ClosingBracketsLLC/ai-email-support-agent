@@ -14,6 +14,8 @@ export const MemoryListInput = z.object({ tab: z.enum(MEMORY_TABS).default('to_c
 export type MemoryListInput = z.infer<typeof MemoryListInput>
 export const AnswerIdInput = z.object({ answerId: z.uuid() })
 export const DeleteByCustomerInput = z.object({ email: z.email().max(254) })
+export const RememberReplyInput = z.object({ messageId: z.uuid() })
+export type RememberReplyInput = z.infer<typeof RememberReplyInput>
 
 export const GUIDANCE_SUGGESTION_STATUSES = ['pending', 'accepted', 'dismissed'] as const
 export const GUIDANCE_SUGGESTION_MAX = 300
