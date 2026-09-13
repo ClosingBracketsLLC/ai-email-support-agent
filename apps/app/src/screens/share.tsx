@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Redirect, useRouter } from 'expo-router'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Platform, Pressable, StyleSheet, View } from 'react-native'
 import { StartCrawlInput } from '@aesa/contracts'
 import { Banner } from '@/components/banner'
@@ -11,7 +11,7 @@ import { Loading } from '@/components/loading'
 import { Screen } from '@/components/screen'
 import { TextField } from '@/components/text-field'
 import { Body, Heading, Muted } from '@/components/typography'
-import { defaultMaxPages } from '@/screens/knowledge/source-cards'
+import { defaultMaxPages, UPLOAD_REASON_LABEL } from '@/screens/knowledge/source-cards'
 import { useUpload } from '@/screens/knowledge/use-upload'
 import { useShareIntentSafe } from '@/lib/share-intent'
 import { hrefFor } from '@/lib/session-gate'
@@ -233,16 +233,36 @@ function TextCard({ text, maxSources, onDone }: { text: string; maxSources: numb
   )
 }
 
+/**
+ * `useUpload().start()` resolves `{ stoppedBy: 'cap' | null }` ONLY — a per-file refusal (wrong
+ * type, too large, an unreadable size, or the PUT itself failing) lands on the pending ENTRY, not on
+ * that return value, so `stoppedBy === null` does NOT mean success (task 10 fix round 1, finding 2:
+ * the earlier version treated any non-cap outcome as success and navigated away, silently discarding
+ * a refused file). The fix reads the entry `start()` itself produced instead of trusting its return
+ * value — `upload.pending[0]` is safe to key on because this card's OWN `useUpload()` instance never
+ * holds more than the one file it ever submits (`setPending` in `use-upload.ts` REPLACES the array on
+ * every `start()` call, so a retry after a failure never leaves a stale entry behind either).
+ */
 function FileCard({ file, maxSources, onDone }: { file: ShareFile; maxSources: number; onDone: () => void }) {
   const upload = useUpload()
-  const [capReached, setCapReached] = useState(false)
-  const busy = upload.pending.some((p) => p.progress === 'signing' || p.progress === 'uploading')
+  const entry = upload.pending[0] ?? null
+  const busy = entry !== null && (entry.progress === 'signing' || entry.progress === 'uploading')
+  const capReached = entry !== null && entry.progress === 'failed' && entry.reason === 'cap'
+  const failureReason = entry !== null && entry.progress === 'failed' && entry.reason !== null && entry.reason !== 'cap' ? entry.reason : null
 
-  async function submit() {
-    setCapReached(false)
-    const outcome = await upload.start([{ name: file.fileName, mime: file.mimeType, size: file.size, uri: file.path }])
-    if (outcome.stoppedBy === 'cap') { setCapReached(true); return }
-    onDone()
+  // Reacting to the LATEST `entry` on every render — never computed once inside `submit` itself —
+  // is what avoids the stale-closure trap: `submit`'s own closure is fixed to the render that was
+  // current when the button was pressed, and `upload.pending` keeps updating on renders after that.
+  const doneOnce = useRef(false)
+  useEffect(() => {
+    if (entry?.progress === 'queued' && !doneOnce.current) {
+      doneOnce.current = true
+      onDone()
+    }
+  }, [entry, onDone])
+
+  function submit() {
+    void upload.start([{ name: file.fileName, mime: file.mimeType, size: file.size, uri: file.path }])
   }
 
   return (
@@ -250,8 +270,9 @@ function FileCard({ file, maxSources, onDone }: { file: ShareFile; maxSources: n
       <Heading>Upload this file</Heading>
       <Body>{file.fileName}</Body>
       <Muted>{formatBytes(file.size)}</Muted>
-      <Button label="Upload" onPress={() => void submit()} loading={busy} disabled={busy} testID="share-upload" />
+      <Button label="Upload" onPress={submit} loading={busy} disabled={busy} testID="share-upload" />
       {capReached ? <Banner tone="error" testID="knowledge-cap-error">{capBannerText(maxSources)}</Banner> : null}
+      {failureReason ? <Banner tone="error" testID="share-upload-error">{UPLOAD_REASON_LABEL[failureReason]}</Banner> : null}
     </Card>
   )
 }

@@ -34,9 +34,12 @@ const UPLOAD_PROGRESS_LABEL: Record<PendingUpload['progress'], string> = {
   signing: 'Preparing…', uploading: 'Uploading…', queued: 'Queued for processing', failed: 'Failed',
 }
 /** In the owner's own words — never a bare error code (same discipline as `source-list.tsx`'s
- * `FAILURE_LABEL`). The shared cap banner (below) carries the plan's actual number; this per-file
- * line stays short since it sits next to several others. */
-const UPLOAD_REASON_LABEL: Record<UploadFailureReason, string> = {
+ * `FAILURE_LABEL`, which is keyed on the server's `KnowledgeFailureReason` — a different, broader
+ * enum this one shares no type with despite two overlapping string values). The shared cap banner
+ * (below) carries the plan's actual number; this per-file line stays short since it sits next to
+ * several others. Exported for `screens/share.tsx`'s File card, which hits the exact same
+ * `UploadFailureReason`s through the same `useUpload()` and must not invent its own copy for them. */
+export const UPLOAD_REASON_LABEL: Record<UploadFailureReason, string> = {
   too_large: `Over the ${Math.round(KNOWLEDGE_MAX_UPLOAD_BYTES / 1024 / 1024)} MB limit`,
   wrong_type: 'Not a supported file type',
   unknown_size: "Couldn't read this file's size",

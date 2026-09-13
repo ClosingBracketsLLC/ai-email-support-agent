@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider, notifyManager } from '@tanstack/react-query'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react-native'
-import type { ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { Platform } from 'react-native'
 import { ShareScreen } from './share'
 
@@ -33,9 +33,31 @@ const mockResetShareIntent = jest.fn()
 const mockUseShareIntentSafe = jest.fn(() => ({ hasShareIntent: mockShareIntent !== null, shareIntent: mockShareIntent, resetShareIntent: mockResetShareIntent }))
 jest.mock('@/lib/share-intent', () => ({ useShareIntentSafe: () => mockUseShareIntentSafe() }))
 
+// A REAL (if tiny) `useState`-backed hook, not a fixed `{ start, pending: [] }` object — `FileCard`
+// (finding 2's fix) reads the entry `start()` produces off `pending` itself, on a LATER render, not
+// off `start()`'s own return value, so the mock has to actually re-render its caller when `pending`
+// changes for that fix to be exercised at all rather than trivially vacuous.
+interface MockPendingItem { id: string; name: string; progress: 'signing' | 'uploading' | 'queued' | 'failed'; reason: string | null }
+type MockUploadResult = { progress: 'queued' } | { progress: 'failed'; reason: string }
+let mockUploadResult: MockUploadResult = { progress: 'queued' }
 const mockUploadStartCalls: unknown[] = []
-let mockUploadStartImpl: (files: unknown[]) => Promise<{ stoppedBy: 'cap' | null }> = (files) => { mockUploadStartCalls.push(files); return Promise.resolve({ stoppedBy: null }) }
-const mockUseUpload = jest.fn(() => ({ start: (files: unknown[]) => mockUploadStartImpl(files), pending: [] as unknown[] }))
+function useMockUpload() {
+  const [pending, setPending] = useState<MockPendingItem[]>([])
+  return {
+    pending,
+    start: (files: { name: string }[]) => {
+      mockUploadStartCalls.push(files)
+      const name = files[0]!.name
+      if (mockUploadResult.progress === 'queued') {
+        setPending([{ id: 'mock-1', name, progress: 'queued', reason: null }])
+        return Promise.resolve({ stoppedBy: null })
+      }
+      setPending([{ id: 'mock-1', name, progress: 'failed', reason: mockUploadResult.reason }])
+      return Promise.resolve({ stoppedBy: mockUploadResult.reason === 'cap' ? ('cap' as const) : null })
+    },
+  }
+}
+const mockUseUpload = jest.fn(() => useMockUpload())
 jest.mock('@/screens/knowledge/use-upload', () => ({ useUpload: () => mockUseUpload() }))
 
 const DEFAULT_CAPS = { maxSources: 100, maxCrawlPages: 200 }
@@ -82,7 +104,7 @@ beforeEach(() => {
   mockUseTRPC.mockClear()
   mockResetShareIntent.mockClear()
   mockUploadStartCalls.length = 0
-  mockUploadStartImpl = (files) => { mockUploadStartCalls.push(files); return Promise.resolve({ stoppedBy: null }) }
+  mockUploadResult = { progress: 'queued' }
   mockListData = { caps: DEFAULT_CAPS, canManage: true }
   mockListImpl = () => Promise.resolve(mockListData)
   mockStartCrawlCalls.length = 0
@@ -218,8 +240,8 @@ describe('a file intent', () => {
     expect(mockReplace).toHaveBeenCalledWith('/settings/knowledge')
   })
 
-  test('a cap refusal (stoppedBy: "cap") shows the shared cap banner and never navigates away', async () => {
-    mockUploadStartImpl = (files) => { mockUploadStartCalls.push(files); return Promise.resolve({ stoppedBy: 'cap' }) }
+  test('a cap refusal (the pending entry lands failed/cap) shows the shared cap banner and never navigates away', async () => {
+    mockUploadResult = { progress: 'failed', reason: 'cap' }
     mockShareIntent = { files: [{ fileName: 'faq.pdf', mimeType: 'application/pdf', path: 'file:///tmp/faq.pdf', size: 1024 }] }
     mockListData = { caps: { maxSources: 2, maxCrawlPages: 200 }, canManage: true }
     await setup()
@@ -227,6 +249,24 @@ describe('a file intent', () => {
     await fireEvent.press(screen.getByTestId('share-upload'))
     await waitFor(() => expect(screen.getByTestId('knowledge-cap-error')).toBeTruthy())
     expect(screen.getByText('Your plan allows 2 sources. Delete one to add another.')).toBeTruthy()
+    expect(mockResetShareIntent).not.toHaveBeenCalled()
+    expect(mockReplace).not.toHaveBeenCalled()
+  })
+
+  // Finding 2 (fix round 1): `start()` resolves `{ stoppedBy: 'cap' | null }` only — a per-file
+  // refusal for any OTHER reason (wrong type, too large, an unreadable size, the PUT itself failing)
+  // used to read as `stoppedBy: null`, which the old FileCard treated as success: it reset the
+  // intent and navigated away, silently discarding the file. This pins the fix: a `wrong_type`
+  // entry shows its OWN reason (never the cap banner) and the intent is left untouched.
+  test('a non-cap failure (wrong_type) shows its own reason — never the cap banner — and does not reset or navigate', async () => {
+    mockUploadResult = { progress: 'failed', reason: 'wrong_type' }
+    mockShareIntent = { files: [{ fileName: 'archive.zip', mimeType: 'application/zip', path: 'file:///tmp/archive.zip', size: 4096 }] }
+    await setup()
+    await waitFor(() => expect(screen.getByTestId('file-card')).toBeTruthy())
+    await fireEvent.press(screen.getByTestId('share-upload'))
+    await waitFor(() => expect(screen.getByTestId('share-upload-error')).toBeTruthy())
+    expect(screen.getByText('Not a supported file type')).toBeTruthy()
+    expect(screen.queryByTestId('knowledge-cap-error')).toBeNull()
     expect(mockResetShareIntent).not.toHaveBeenCalled()
     expect(mockReplace).not.toHaveBeenCalled()
   })
