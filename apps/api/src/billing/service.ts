@@ -37,6 +37,12 @@ export interface BillingServiceDeps {
   stripe: StripePort | null
   /** The Expo web origin: the base of Checkout's success/cancel URLs and the Portal's return URL. */
   appWebOrigin: string
+  /** The two configured price ids (`config.stripe`), null when `STRIPE_*` is unset. `startCheckout`
+   *  never needs them — the port holds its own copy for the line items — but the WEBHOOK does: it is
+   *  how `selectItems` tells the licensed domain item from the metered overage item, instead of
+   *  trusting the order Stripe happened to return them in. */
+  priceDomain: string | null
+  priceOverage: string | null
   /** Test seam; production leaves it unset and reads the wall clock per call. */
   now?: () => Date
 }

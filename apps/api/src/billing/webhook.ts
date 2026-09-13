@@ -39,7 +39,8 @@ export type StripeApplyOutcome = 'applied' | 'duplicate' | 'stale' | 'unknown_cu
 
 /** One subscription item. The PERIOD lives here, not on the subscription (stripe@22's
  *  `SubscriptionItems.d.ts` carries `current_period_start`/`current_period_end`; `Subscriptions.d.ts`
- *  does not) — `items.data[0]` is the licensed domain line, which is the one we bill the period on. */
+ *  does not). `price.id` is load-bearing: it is how `selectItems` tells the licensed domain line from
+ *  the metered overage line — `Subscription.items` is an `ApiList` with no ordering guarantee. */
 const ItemSchema = z.object({
   id: z.string(),
   price: z.object({ id: z.string() }),
@@ -80,12 +81,23 @@ const InvoiceSchema = z.object({
   }).nullish(),
 })
 
-/** Stripe's subscription status → the platform's four. `incomplete` maps to nothing: the customer is
- *  mid-3DS, and writing `past_due` there would page the owner for a payment that has not failed. */
-function statusOf(stripeStatus: string): { status: 'active' | 'past_due' | 'canceled'; plan?: 'trial' } | null {
+/**
+ * Stripe's subscription status → the platform's status AND plan. The two subscription-shaped events
+ * (`checkout.session.completed`, `customer.subscription.*`) are the ONLY things that establish the
+ * plan — an invoice may move the status and nothing else — so the plan rides along here rather than
+ * being seeded independently: a live subscription in any state is `standard`, a gone one is back on
+ * `trial`.
+ *
+ * `incomplete` maps to NOTHING, and the null is the point: the customer is mid-SCA or their card was
+ * declined at completion, so neither the status nor the plan may move. Landing `active`/`standard`
+ * there would hand the workspace the paid product before the first payment succeeded; landing
+ * `past_due` would page the owner for a payment that has not failed. The row simply keeps its
+ * trial state until the `customer.subscription.updated` that resolves the payment arrives.
+ */
+function statusOf(stripeStatus: string): { status: 'active' | 'past_due' | 'canceled'; plan: 'trial' | 'standard' } | null {
   switch (stripeStatus) {
-    case 'active': case 'trialing': return { status: 'active' }
-    case 'past_due': case 'unpaid': case 'paused': return { status: 'past_due' }
+    case 'active': case 'trialing': return { status: 'active', plan: 'standard' }
+    case 'past_due': case 'unpaid': case 'paused': return { status: 'past_due', plan: 'standard' }
     case 'canceled': case 'incomplete_expired': return { status: 'canceled', plan: 'trial' }
     default: return null   // 'incomplete' and anything Stripe adds later
   }
@@ -116,15 +128,45 @@ interface BillingPatch {
 
 const unixToDate = (seconds: number | undefined): Date | undefined => (seconds === undefined ? undefined : new Date(seconds * 1000))
 
+/** The two configured price ids, threaded down from `config.stripe`. Null on an api with no
+ *  `STRIPE_*` at all, where position is the only thing left to go on. */
+export interface PriceIds { domain: string | null; overage: string | null }
+
+/**
+ * Which item is the licensed domain line and which is the metered overage line, BY PRICE. Stripe's
+ * `Subscription.items` is an `ApiList` with no documented ordering, and reading it positionally
+ * fails silently in two ways at once if it ever comes back overage-first: the two item ids are
+ * stored swapped, and `domainQuantity` stops updating entirely (a metered item carries no
+ * `quantity`, so the guard below simply skips it) — a billed domain count frozen at whatever it was.
+ *
+ * Position survives only as a FALLBACK for when NEITHER configured price matches: a subscription
+ * created against a price id that has since been retired or rotated must stay readable. That
+ * fallback is logged (`fellBackToPosition`) because it means the deploy's `STRIPE_PRICE_*` no longer
+ * describe this customer's subscription. A PARTIAL match deliberately leaves the unmatched side
+ * untouched rather than guessing — the column keeps the id it already had.
+ */
+function selectItems(sub: SubscriptionPayload, prices: PriceIds): {
+  domain: z.infer<typeof ItemSchema> | undefined
+  overage: z.infer<typeof ItemSchema> | undefined
+  fellBackToPosition: boolean
+} {
+  const items = sub.items?.data ?? []
+  const domain = prices.domain === null ? undefined : items.find((i) => i.price.id === prices.domain)
+  const overage = prices.overage === null ? undefined : items.find((i) => i.price.id === prices.overage)
+  if (domain !== undefined || overage !== undefined) return { domain, overage, fellBackToPosition: false }
+  // Nothing matched. Only interesting enough to log when prices were configured AND there was
+  // something to match against — an unconfigured api (or an empty item list) has no other option.
+  const configured = prices.domain !== null || prices.overage !== null
+  return { domain: items[0], overage: items[1], fellBackToPosition: configured && items.length > 0 }
+}
+
 /** The item ids, the billed quantity and the period, taken off a subscription object's items. The
- *  DOMAIN line (`items.data[0]`, the licensed one) is the quantity and the period; the second line is
- *  the metered overage price, which has no quantity of its own. */
-function patchFromSubscription(sub: SubscriptionPayload): BillingPatch {
+ *  DOMAIN line (the licensed one) carries the quantity and the period; the overage line is the
+ *  metered price, which has no quantity of its own. */
+function patchFromSubscription(sub: SubscriptionPayload, prices: PriceIds): BillingPatch & { fellBackToPosition: boolean } {
   const patch: BillingPatch = { stripeSubscriptionId: sub.id }
   if (sub.cancel_at_period_end !== undefined) patch.cancelAtPeriodEnd = sub.cancel_at_period_end
-  const items = sub.items?.data ?? []
-  const domain = items[0]
-  const overage = items[1]
+  const { domain, overage, fellBackToPosition } = selectItems(sub, prices)
   if (domain) {
     patch.stripeDomainItemId = domain.id
     if (domain.quantity !== undefined) patch.domainQuantity = domain.quantity
@@ -134,36 +176,60 @@ function patchFromSubscription(sub: SubscriptionPayload): BillingPatch {
     if (end) patch.currentPeriodEnd = end
   }
   if (overage) patch.stripeOverageItemId = overage.id
-  return patch
+  return { ...patch, fellBackToPosition }
 }
 
 interface Parsed {
+  /** Which family this event belongs to. `invoice` events are the only ones whose subscription id is
+   *  re-checked against the row before anything is written (see `applyStripeEvent`). */
+  kind: 'checkout' | 'subscription' | 'invoice'
   customerId: string
   /** Only `checkout.session.completed` may claim an org it was not resolved to — see `resolveOrg`. */
   claimedOrgId: string | null
   patch: BillingPatch
+  /** True when `selectItems` could not match either configured price and read the items positionally. */
+  fellBackToPosition: boolean
   auditDetail: Record<string, unknown>
 }
 
 /** Returns null when this event is not one we act on, or when its object does not match the shape. */
-function parseEvent(event: StripeEvent): Parsed | null {
+function parseEvent(event: StripeEvent, prices: PriceIds): Parsed | null {
   switch (event.type) {
     case 'checkout.session.completed': {
       const parsed = CheckoutSessionSchema.safeParse(event.data.object)
       if (!parsed.success) return null
       const s = parsed.data
-      const patch: BillingPatch = { plan: 'standard', status: 'active' }
-      if (typeof s.subscription === 'string') patch.stripeSubscriptionId = s.subscription
-      else if (s.subscription) {
-        Object.assign(patch, patchFromSubscription(s.subscription))
-        // The session's own completion is the activation; the subscription's status only narrows it.
+      const patch: BillingPatch = {}
+      let fellBackToPosition = false
+      if (typeof s.subscription === 'string') {
+        // A bare id — what an unexpanded webhook really sends. The session completing IS the
+        // activation and there is nothing else to go on, so it seeds the paid plan; the
+        // `customer.subscription.*` that follows within the second corrects it if the payment did
+        // not actually succeed.
+        patch.stripeSubscriptionId = s.subscription
+        patch.plan = 'standard'
+        patch.status = 'active'
+      } else if (s.subscription) {
+        const fromSub = patchFromSubscription(s.subscription, prices)
+        fellBackToPosition = fromSub.fellBackToPosition
+        Object.assign(patch, fromSub)
+        // The SUBSCRIPTION's status decides, not the session's completion. `incomplete` (SCA still
+        // pending, or the card declined at completion) maps to null, and then neither the status nor
+        // the plan moves at all — the ids and the period are facts worth recording, but the
+        // workspace does not get the paid product until a payment actually succeeds.
         const mapped = statusOf(s.subscription.status)
         if (mapped) Object.assign(patch, mapped)
+      } else {
+        // No subscription on the session at all: the completion is all we know.
+        patch.plan = 'standard'
+        patch.status = 'active'
       }
       return {
+        kind: 'checkout',
         customerId: s.customer,
         claimedOrgId: s.metadata?.orgId ?? s.client_reference_id ?? null,
         patch,
+        fellBackToPosition,
         auditDetail: { subscriptionId: patch.stripeSubscriptionId ?? null },
       }
     }
@@ -172,7 +238,7 @@ function parseEvent(event: StripeEvent): Parsed | null {
       const parsed = SubscriptionSchema.safeParse(event.data.object)
       if (!parsed.success) return null
       const sub = parsed.data
-      const patch = patchFromSubscription(sub)
+      const { fellBackToPosition, ...patch } = patchFromSubscription(sub, prices)
       if (event.type === 'customer.subscription.deleted') {
         // A gone subscription is a workspace back on the trial plan with nothing scheduled — the
         // `cancel_at_period_end` flag the UI renders as "ends on …" would be a lie from here on.
@@ -183,7 +249,10 @@ function parseEvent(event: StripeEvent): Parsed | null {
         const mapped = statusOf(sub.status)
         if (mapped) Object.assign(patch, mapped)
       }
-      return { customerId: sub.customer, claimedOrgId: null, patch, auditDetail: { subscriptionId: sub.id, stripeStatus: sub.status } }
+      return {
+        kind: 'subscription', customerId: sub.customer, claimedOrgId: null, patch, fellBackToPosition,
+        auditDetail: { subscriptionId: sub.id, stripeStatus: sub.status },
+      }
     }
     case 'invoice.payment_failed':
     case 'invoice.paid': {
@@ -192,11 +261,17 @@ function parseEvent(event: StripeEvent): Parsed | null {
       const inv = parsed.data
       const raw = inv.parent?.subscription_details?.subscription
       const subscriptionId = typeof raw === 'string' ? raw : raw?.id
+      // An invoice moves the STATUS and nothing else. It never sets the plan: only the two
+      // subscription-shaped events establish that, and an invoice.paid that set `standard` would let
+      // a one-off charge (or a dunning payment on an old invoice) promote a trial workspace.
       const patch: BillingPatch = event.type === 'invoice.paid'
-        ? { status: 'active', plan: 'standard' }
+        ? { status: 'active' }
         : { status: 'past_due' }
       if (subscriptionId) patch.stripeSubscriptionId = subscriptionId
-      return { customerId: inv.customer, claimedOrgId: null, patch, auditDetail: { subscriptionId: subscriptionId ?? null } }
+      return {
+        kind: 'invoice', customerId: inv.customer, claimedOrgId: null, patch, fellBackToPosition: false,
+        auditDetail: { subscriptionId: subscriptionId ?? null },
+      }
     }
     default:
       return null
@@ -221,7 +296,7 @@ export async function applyStripeEvent(deps: BillingServiceDeps, event: StripeEv
   const isNew = await deps.api.recordWebhookEvent('stripe', event.id, { type: event.type, created: event.created })
   if (!isNew) return 'duplicate'
 
-  const parsed = parseEvent(event)
+  const parsed = parseEvent(event, { domain: deps.priceDomain, overage: deps.priceOverage })
   if (!parsed) {
     // A type we do not act on is routine; a type we DO act on whose object did not parse is a
     // shape change worth a line. Both ack.
@@ -242,8 +317,23 @@ export async function applyStripeEvent(deps: BillingServiceDeps, event: StripeEv
     return 'unknown_customer'
   }
 
+  if (parsed.fellBackToPosition) {
+    // The deploy's STRIPE_PRICE_* no longer describe this customer's subscription (a rotated or
+    // retired price). The items were read positionally, which is a guess — worth knowing about
+    // before it becomes a swapped item id.
+    deps.logger.warn(
+      { eventId: event.id, type: event.type, orgId, priceDomain: deps.priceDomain, priceOverage: deps.priceOverage },
+      'stripe.items_read_positionally',
+    )
+  }
+
   const now = deps.now?.() ?? new Date()
-  const outcome = await deps.api.withOrg<{ result: StripeApplyOutcome; notificationId?: string }>(orgId, async (tx) => {
+  const outcome = await deps.api.withOrg<{
+    result: StripeApplyOutcome
+    notificationId?: string
+    /** Set when this event named a subscription other than the one the row already carries. */
+    displacedSubscriptionId?: string
+  }>(orgId, async (tx) => {
     await ensureBillingRow(tx)
     const state = await readBillingState(tx, now)
 
@@ -257,6 +347,29 @@ export async function applyStripeEvent(deps: BillingServiceDeps, event: StripeEv
     if (state.lastStripeEventCreated !== null && event.created < state.lastStripeEventCreated) {
       return { result: 'stale' }
     }
+
+    // An INVOICE only speaks for the subscription it belongs to. A dunning-recovery payment on an
+    // old open invoice, or any unrelated one-off charge on the same customer, carries a genuinely
+    // newer `created` — so the monotonic guard above lets it through, and without this it would
+    // resurrect a canceled workspace to `active`. A null id on the row is the legitimate race where
+    // `invoice.paid` beats `checkout.session.completed`, and still applies.
+    const invoiceSubscriptionId = parsed.patch.stripeSubscriptionId
+    if (parsed.kind === 'invoice' && invoiceSubscriptionId !== undefined
+        && state.stripeSubscriptionId !== null && invoiceSubscriptionId !== state.stripeSubscriptionId) {
+      return { result: 'ignored' }
+    }
+
+    // A subscription id different from the one on the row means this customer now has TWO live
+    // subscriptions — two Checkout sessions started before either completed, typically. The newer
+    // one is taken (last-write-wins, as everywhere else here, and Stripe treats the newer as
+    // current), but the older one keeps billing the customer while being invisible to the platform,
+    // so an operator has to be told which id to cancel. Collected here, alerted after the commit.
+    const displaced = parsed.kind !== 'invoice'
+      && parsed.patch.stripeSubscriptionId !== undefined
+      && state.stripeSubscriptionId !== null
+      && parsed.patch.stripeSubscriptionId !== state.stripeSubscriptionId
+      ? state.stripeSubscriptionId
+      : undefined
 
     const patch = { ...parsed.patch, stripeCustomerId: parsed.customerId, lastStripeEventCreated: event.created }
     const written = await tx.update(billingSubscriptions)
@@ -292,7 +405,11 @@ export async function applyStripeEvent(deps: BillingServiceDeps, event: StripeEv
         .returning({ id: notifications.id })
       notificationId = row?.id
     }
-    return { result: 'applied', ...(notificationId ? { notificationId } : {}) }
+    return {
+      result: 'applied',
+      ...(notificationId ? { notificationId } : {}),
+      ...(displaced ? { displacedSubscriptionId: displaced } : {}),
+    }
   })
 
   // The claim was refused inside the transaction (the org's row already names a different Stripe
@@ -303,6 +420,24 @@ export async function applyStripeEvent(deps: BillingServiceDeps, event: StripeEv
     deps.logger.error(
       { alert: true, kind: 'stripe_unknown_customer', eventId: event.id, type: event.type, customerId: parsed.customerId, claimedOrgId: parsed.claimedOrgId },
       'stripe webhook: claimed workspace already belongs to another customer',
+    )
+  }
+
+  if (outcome.result === 'ignored' && parsed.kind === 'invoice') {
+    deps.logger.warn(
+      { eventId: event.id, type: event.type, orgId, invoiceSubscriptionId: parsed.patch.stripeSubscriptionId },
+      'stripe.invoice_for_another_subscription',
+    )
+  }
+
+  if (outcome.displacedSubscriptionId) {
+    deps.logger.error(
+      {
+        alert: true, kind: 'stripe_double_subscription', eventId: event.id, type: event.type, orgId,
+        previousSubscriptionId: outcome.displacedSubscriptionId,
+        incomingSubscriptionId: parsed.patch.stripeSubscriptionId,
+      },
+      'stripe webhook: workspace has a second live subscription; cancel the previous one',
     )
   }
 
@@ -322,6 +457,8 @@ export async function applyStripeEvent(deps: BillingServiceDeps, event: StripeEv
 const serviceDeps = (deps: ServerDeps): BillingServiceDeps => ({
   api: deps.api, enqueue: deps.enqueue, logger: deps.logger,
   stripe: deps.stripe, appWebOrigin: deps.config.appWebOrigin,
+  priceDomain: deps.config.stripe?.priceDomain ?? null,
+  priceOverage: deps.config.stripe?.priceOverage ?? null,
 })
 
 export function registerStripeWebhook(routes: FastifyInstance, deps: ServerDeps): void {

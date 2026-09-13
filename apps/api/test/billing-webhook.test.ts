@@ -36,34 +36,41 @@ interface Recorded { name: string; data: Record<string, unknown>; opts: { entity
 /** Unix seconds — what `event.created` and the item periods are in. */
 const T0 = 1_800_000_000
 
+/** The deploy's configured price ids — what `selectItems` matches subscription items against. The
+ *  fixtures below default to these, so the by-price path is the one normally exercised. */
+const PRICE_DOMAIN = 'price_domain_cfg'
+const PRICE_OVERAGE = 'price_overage_cfg'
+
 const subscriptionObject = (p: {
   id: string; customer: string; status: string; quantity?: number
   domainItemId?: string; overageItemId?: string; priceDomain?: string; priceOverage?: string
   periodStart?: number; periodEnd?: number; cancelAtPeriodEnd?: boolean; orgId?: string
-}) => ({
-  id: p.id,
-  customer: p.customer,
-  status: p.status,
-  cancel_at_period_end: p.cancelAtPeriodEnd ?? false,
-  ...(p.orgId ? { metadata: { orgId: p.orgId } } : {}),
-  items: {
-    data: [
-      {
-        id: p.domainItemId ?? 'si_domain_1',
-        price: { id: p.priceDomain ?? 'price_domain' },
-        quantity: p.quantity ?? 2,
-        current_period_start: p.periodStart ?? T0,
-        current_period_end: p.periodEnd ?? T0 + 2_592_000,
-      },
-      {
-        id: p.overageItemId ?? 'si_overage_1',
-        price: { id: p.priceOverage ?? 'price_overage' },
-        current_period_start: p.periodStart ?? T0,
-        current_period_end: p.periodEnd ?? T0 + 2_592_000,
-      },
-    ],
-  },
-})
+  /** Stripe's `items` is an `ApiList` with no ordering guarantee — this flips the order so a test
+   *  can prove the reader identifies items BY PRICE and not by position. */
+  overageFirst?: boolean
+}) => {
+  const domain = {
+    id: p.domainItemId ?? 'si_domain_1',
+    price: { id: p.priceDomain ?? PRICE_DOMAIN },
+    quantity: p.quantity ?? 2,
+    current_period_start: p.periodStart ?? T0,
+    current_period_end: p.periodEnd ?? T0 + 2_592_000,
+  }
+  const overage = {
+    id: p.overageItemId ?? 'si_overage_1',
+    price: { id: p.priceOverage ?? PRICE_OVERAGE },
+    current_period_start: p.periodStart ?? T0,
+    current_period_end: p.periodEnd ?? T0 + 2_592_000,
+  }
+  return {
+    id: p.id,
+    customer: p.customer,
+    status: p.status,
+    cancel_at_period_end: p.cancelAtPeriodEnd ?? false,
+    ...(p.orgId ? { metadata: { orgId: p.orgId } } : {}),
+    items: { data: p.overageFirst ? [overage, domain] : [domain, overage] },
+  }
+}
 
 const event = (type: string, object: unknown, opts: { id?: string; created?: number } = {}): StripeEvent => ({
   id: opts.id ?? `evt_${randomUUID()}`,
@@ -86,7 +93,10 @@ describe('stripe webhook', () => {
     const enqueue: EnqueueFn = async (name, data, opts) => { sent.push({ name, data, opts }); return `job-${sent.length}` }
     t = await createTestApi({}, { enqueue, stripe: fake.port })
     base = await listen(t.app)
-    deps = { api: t.api, enqueue, logger: createAppLogger({ level: 'silent' }), stripe: fake.port, appWebOrigin: WEB }
+    deps = {
+      api: t.api, enqueue, logger: createAppLogger({ level: 'silent' }), stripe: fake.port, appWebOrigin: WEB,
+      priceDomain: PRICE_DOMAIN, priceOverage: PRICE_OVERAGE,
+    }
   })
   afterAll(async () => { await t.close() })
   beforeEach(() => { sent.length = 0; fake.calls.length = 0; fake.rawBodies.length = 0; fake.failing.clear() })
@@ -253,7 +263,10 @@ describe('stripe webhook', () => {
 
     sent.length = 0
     expect(await applyStripeEvent(deps, event('invoice.paid', invoice, { created: T0 + 1 }))).toBe('applied')
-    expect(await rowOf(org.orgId)).toMatchObject({ status: 'active', plan: 'standard' })
+    // The STATUS moves; the PLAN does not. Only the two subscription-shaped events establish the
+    // plan — no `customer.subscription.*` has ever run for this org, so it is still on trial. An
+    // invoice.paid that set `standard` would let a one-off charge promote a trial workspace.
+    expect(await rowOf(org.orgId)).toMatchObject({ status: 'active', plan: 'trial' })
     expect(sent).toEqual([])
 
     // Back to past_due the same day: still ONE notification row (the dedupe key is per org per day).
@@ -313,6 +326,125 @@ describe('stripe webhook', () => {
     expect(await applyStripeEvent(deps, event('customer.subscription.updated', subscriptionObject({
       id: 'sub_meta', customer: 'cus_unknown_meta', status: 'active', orgId: fresh.orgId,
     })))).toBe('unknown_customer')
+  })
+
+  // ---- finding 1: items are identified by price, never by position -------------------------
+
+  it('a subscription whose items come back OVERAGE FIRST still lands both ids in the right columns and still updates domainQuantity', async () => {
+    const org = await seedOrg()
+    expect(await applyStripeEvent(deps, event('customer.subscription.updated', subscriptionObject({
+      id: 'sub_order', customer: org.customerId, status: 'active', quantity: 6,
+      domainItemId: 'si_dom_ordered', overageItemId: 'si_ovg_ordered', overageFirst: true,
+    })))).toBe('applied')
+
+    // Read positionally, this would store the two ids swapped AND silently stop updating the
+    // quantity (a metered item carries none), freezing the billed domain count.
+    expect(await rowOf(org.orgId)).toMatchObject({
+      stripeDomainItemId: 'si_dom_ordered',
+      stripeOverageItemId: 'si_ovg_ordered',
+      domainQuantity: 6,
+    })
+  })
+
+  it('a subscription on RETIRED price ids falls back to position and says so at warn — an old subscription stays readable', async () => {
+    const org = await seedOrg()
+    const lines: string[] = []
+    const loud: BillingServiceDeps = { ...deps, logger: createAppLogger({ level: 'warn', stream: { write: (l: string) => void lines.push(l) } }) }
+
+    expect(await applyStripeEvent(loud, event('customer.subscription.updated', subscriptionObject({
+      id: 'sub_retired', customer: org.customerId, status: 'active', quantity: 9,
+      priceDomain: 'price_retired_domain', priceOverage: 'price_retired_overage',
+      domainItemId: 'si_dom_old', overageItemId: 'si_ovg_old',
+    })))).toBe('applied')
+
+    expect(await rowOf(org.orgId)).toMatchObject({
+      stripeDomainItemId: 'si_dom_old', stripeOverageItemId: 'si_ovg_old', domainQuantity: 9,
+    })
+    expect(lines.join('')).toContain('stripe.items_read_positionally')
+  })
+
+  // ---- finding 2: an invoice speaks only for its own subscription ---------------------------
+
+  it('invoice.paid naming a subscription other than the row`s is ignored — a dunning payment on an old invoice cannot resurrect a canceled workspace', async () => {
+    const org = await seedOrg()
+    await applyStripeEvent(deps, event('checkout.session.completed', {
+      customer: org.customerId, client_reference_id: org.orgId,
+      subscription: subscriptionObject({ id: 'sub_current', customer: org.customerId, status: 'active' }),
+    }))
+    expect(await applyStripeEvent(deps, event('customer.subscription.deleted', subscriptionObject({
+      id: 'sub_current', customer: org.customerId, status: 'canceled',
+    }), { created: T0 + 1 }))).toBe('applied')
+    expect(await rowOf(org.orgId)).toMatchObject({ status: 'canceled', plan: 'trial', stripeSubscriptionId: 'sub_current' })
+
+    // A genuinely NEWER event (so the monotonic guard lets it through) for a DIFFERENT subscription.
+    const foreign = { customer: org.customerId, parent: { subscription_details: { subscription: 'sub_someone_elses' } } }
+    expect(await applyStripeEvent(deps, event('invoice.paid', foreign, { created: T0 + 99 }))).toBe('ignored')
+    expect(await rowOf(org.orgId)).toMatchObject({
+      status: 'canceled', plan: 'trial', stripeSubscriptionId: 'sub_current', lastStripeEventCreated: T0 + 1,
+    })
+
+    // The matching subscription's own invoice still applies.
+    const mine = { customer: org.customerId, parent: { subscription_details: { subscription: 'sub_current' } } }
+    expect(await applyStripeEvent(deps, event('invoice.paid', mine, { created: T0 + 100 }))).toBe('applied')
+    expect(await rowOf(org.orgId)).toMatchObject({ status: 'active' })
+  })
+
+  it('an invoice arriving BEFORE the checkout (the row has no subscription yet) still applies', async () => {
+    const org = await seedOrg()
+    const invoice = { customer: org.customerId, parent: { subscription_details: { subscription: 'sub_early' } } }
+    expect(await applyStripeEvent(deps, event('invoice.paid', invoice))).toBe('applied')
+    expect(await rowOf(org.orgId)).toMatchObject({ status: 'active', stripeSubscriptionId: 'sub_early' })
+  })
+
+  it('checkout.session.completed on an INCOMPLETE subscription records the ids but moves neither the status nor the plan', async () => {
+    const org = await seedOrg()
+    expect(await applyStripeEvent(deps, event('checkout.session.completed', {
+      customer: org.customerId, client_reference_id: org.orgId,
+      subscription: subscriptionObject({ id: 'sub_sca', customer: org.customerId, status: 'incomplete', quantity: 2 }),
+    }))).toBe('applied')
+
+    // SCA still pending (or the card declined at completion): the workspace must NOT get the paid
+    // product yet. The facts are recorded; the state is not moved.
+    expect(await rowOf(org.orgId)).toMatchObject({
+      plan: 'trial', status: 'trialing',
+      stripeSubscriptionId: 'sub_sca', stripeDomainItemId: 'si_domain_1', domainQuantity: 2,
+    })
+
+    // The payment then succeeds, and THAT is what promotes the workspace.
+    expect(await applyStripeEvent(deps, event('customer.subscription.updated', subscriptionObject({
+      id: 'sub_sca', customer: org.customerId, status: 'active', quantity: 2,
+    }), { created: T0 + 1 }))).toBe('applied')
+    expect(await rowOf(org.orgId)).toMatchObject({ plan: 'standard', status: 'active' })
+  })
+
+  // ---- finding 3: two live subscriptions are taken, and paged ------------------------------
+
+  it('a SECOND completed checkout takes the newer subscription id and alerts with BOTH ids so the orphan can be cancelled', async () => {
+    const org = await seedOrg()
+    const lines: string[] = []
+    const loud: BillingServiceDeps = { ...deps, logger: createAppLogger({ level: 'error', stream: { write: (l: string) => void lines.push(l) } }) }
+
+    const completed = (subscriptionId: string, created: number) => event('checkout.session.completed', {
+      customer: org.customerId, client_reference_id: org.orgId,
+      subscription: subscriptionObject({ id: subscriptionId, customer: org.customerId, status: 'active' }),
+    }, { created })
+
+    expect(await applyStripeEvent(loud, completed('sub_first', T0))).toBe('applied')
+    expect(lines.join('')).not.toContain('stripe_double_subscription')
+
+    // Two tabs: both sessions complete, Stripe now bills TWO subscriptions.
+    expect(await applyStripeEvent(loud, completed('sub_second', T0 + 5))).toBe('applied')
+
+    // Last-write-wins, as everywhere else here — Stripe treats the newer as current.
+    expect(await rowOf(org.orgId)).toMatchObject({ stripeSubscriptionId: 'sub_second' })
+
+    // ...but silence is not an option: the line names the orphan AND the survivor.
+    const line = lines.join('')
+    expect(line).toContain('"alert":true')
+    expect(line).toContain('stripe_double_subscription')
+    expect(line).toContain('sub_first')
+    expect(line).toContain('sub_second')
+    expect(line).toContain(org.orgId)
   })
 
   it('HTTP: a bad signature is 400 and records nothing; the route is 404 when stripe is null; the body reaches constructEvent as the RAW string (assert the fake saw the exact bytes, including whitespace)', async () => {

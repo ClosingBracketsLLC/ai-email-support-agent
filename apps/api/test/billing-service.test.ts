@@ -28,6 +28,10 @@ const client = (base: string, cookie?: string) => createTRPCClient<AppRouter>({
 
 interface Recorded { name: string; data: Record<string, unknown>; opts: { entityId: string } }
 
+/** The two configured price ids. Only the webhook reads them, but they ride on the same deps. */
+const PRICE_DOMAIN = 'price_domain_cfg'
+const PRICE_OVERAGE = 'price_overage_cfg'
+
 describe('billing service', () => {
   let t: Awaited<ReturnType<typeof createTestApi>>
   let base: string
@@ -45,6 +49,7 @@ describe('billing service', () => {
     deps = {
       api: t.api, enqueue, logger: createAppLogger({ level: 'silent' }),
       stripe: fake.port, appWebOrigin: WEB,
+      priceDomain: PRICE_DOMAIN, priceOverage: PRICE_OVERAGE,
     }
   })
   afterAll(async () => { await t.close() })

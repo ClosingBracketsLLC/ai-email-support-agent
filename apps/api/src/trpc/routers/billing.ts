@@ -25,7 +25,8 @@ import { orgProcedure, ownerProcedure, router } from '../init.ts'
 interface BillingContext {
   deps: {
     api: ApiFacade; enqueue: EnqueueFn; logger: pino.Logger
-    stripe: StripePort | null; config: { appWebOrigin: string }
+    stripe: StripePort | null
+    config: { appWebOrigin: string; stripe: { priceDomain: string; priceOverage: string } | null }
   }
   user: { id: string; email: string }
   actor: AuditActor
@@ -36,6 +37,10 @@ interface BillingContext {
 const serviceDeps = (ctx: BillingContext): BillingServiceDeps => ({
   api: ctx.deps.api, enqueue: ctx.deps.enqueue, logger: ctx.deps.logger,
   stripe: ctx.deps.stripe, appWebOrigin: ctx.deps.config.appWebOrigin,
+  // Unused by every procedure in this router — the webhook is what reads them (see
+  // `BillingServiceDeps`) — but they belong to the same deps object, so they are filled in here too.
+  priceDomain: ctx.deps.config.stripe?.priceDomain ?? null,
+  priceOverage: ctx.deps.config.stripe?.priceOverage ?? null,
 })
 
 /** The signed-in owner's email is what a brand-new Stripe customer is created with — Stripe emails
