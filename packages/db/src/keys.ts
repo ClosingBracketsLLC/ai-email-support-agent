@@ -1,5 +1,7 @@
-import { decrypt, encrypt, generateBoxKeypair, generateDek, openSealed, unwrapDek, wrapDek, type KekRing } from '@aesa/crypto'
-import { desc, eq } from 'drizzle-orm'
+import {
+  decrypt, encrypt, generateBoxKeypair, generateDek, openSealed, rewrapDek, unwrapDek, wrapDek, type KekRing,
+} from '@aesa/crypto'
+import { and, desc, eq } from 'drizzle-orm'
 import { orgDataKeys, workspaces } from './schema/index.ts'
 import type { OrgTx } from './tenant.ts'
 
@@ -45,6 +47,38 @@ export async function getOrgBoxPublicKey(tx: OrgTx): Promise<Buffer> {
 export async function getOrgBoxPublicKeyOrNull(tx: OrgTx): Promise<Buffer | null> {
   const [ws] = await tx.select({ pk: workspaces.boxPublicKey }).from(workspaces).where(eq(workspaces.orgId, tx.orgId))
   return ws?.pk ?? null
+}
+
+/**
+ * Re-wraps the org's CURRENT (max-version) DEK under `ring.active`, guarded on the EXACT
+ * `wrapped_dek` bytes and `kek_version` this call read (the `llm.probe` re-wrap's bytes-guard idea,
+ * `apps/worker/src/jobs/llm-probe.ts`) — a concurrent re-key that lands between the read and the
+ * write leaves a different blob behind, and this call must not clobber it. `opts.beforeWrite` is a
+ * test-only seam: it runs after the read and before the guarded UPDATE, so a test can mutate the row
+ * through a second connection to force that race deterministically.
+ */
+export async function rewrapOrgDek(
+  tx: OrgTx, ring: KekRing, opts?: { beforeWrite?: () => Promise<void> },
+): Promise<{ outcome: 'rewrapped' | 'current' | 'lost_race'; fromVersion: number; toVersion: number }> {
+  const [row] = await tx.select().from(orgDataKeys).orderBy(desc(orgDataKeys.version)).limit(1)
+  if (!row) throw new Error(`org ${tx.orgId} has no data key`)
+  if (row.kekVersion === ring.active) {
+    return { outcome: 'current', fromVersion: row.kekVersion, toVersion: row.kekVersion }
+  }
+  const next = rewrapDek(row.wrappedDek, row.kekVersion, ring, tx.orgId)
+  await opts?.beforeWrite?.()
+  const updated = await tx
+    .update(orgDataKeys)
+    .set({ wrappedDek: next.wrapped, kekVersion: next.kekVersion })
+    .where(and(
+      eq(orgDataKeys.orgId, tx.orgId),
+      eq(orgDataKeys.version, row.version),
+      eq(orgDataKeys.wrappedDek, row.wrappedDek),
+      eq(orgDataKeys.kekVersion, row.kekVersion),
+    ))
+    .returning({ orgId: orgDataKeys.orgId })
+  if (updated.length === 0) return { outcome: 'lost_race', fromVersion: row.kekVersion, toVersion: next.kekVersion }
+  return { outcome: 'rewrapped', fromVersion: row.kekVersion, toVersion: next.kekVersion }
 }
 
 /** Worker side: open a secret the api sealed to the org's public key. */

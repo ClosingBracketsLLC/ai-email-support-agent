@@ -1,4 +1,4 @@
-import { sql } from 'drizzle-orm'
+import { and, eq, gte, lt, sql } from 'drizzle-orm'
 import type { MeterRecord, MeterSink } from '@aesa/llm'
 import type { Db } from './client.ts'
 import { llmCalls, usageCounters } from './schema/index.ts'
@@ -29,6 +29,11 @@ export const SEND_METERS = {
   reviewSends: 'review_sends',
   aiHandledConversations: 'ai_handled_conversations',
   autoSends: 'auto_sends',
+  /** Phase 7: each TICKET a MANAGED-model reply handled, at most once per calendar month — the
+   *  billing allowance's own meter, distinct from `aiHandledConversations` (which counts every
+   *  handled ticket regardless of provider) because a BYOK reply must never count against a
+   *  workspace's included Managed-AI conversations. */
+  aiHandledManaged: 'ai_handled_conversations_managed',
 } as const
 
 /** The one `usage_counters` meter `agents.sandboxStart` (Task 18) bumps under `sandbox.daily_cap` —
@@ -64,6 +69,22 @@ export async function bumpMeter(tx: OrgTx, orgId: string, day: string, meter: st
       target: [usageCounters.orgId, usageCounters.day, usageCounters.meter],
       set: { value: sql`${usageCounters.value} + ${delta}` },
     })
+}
+
+/**
+ * `sum(usage_counters.value)` for one meter over `[fromDay, toDayExclusive)` — plain `YYYY-MM-DD`
+ * strings, the same shape `usage_counters.day` stores, so a caller with a period's `Date`s converts
+ * them itself (see `countManagedConversations`, which does exactly that). `toDayExclusive` omitted
+ * sums everything from `fromDay` onward.
+ */
+export async function sumMeter(tx: OrgTx, meter: string, fromDay: string, toDayExclusive?: string): Promise<number> {
+  const conditions = [eq(usageCounters.orgId, tx.orgId), eq(usageCounters.meter, meter), gte(usageCounters.day, fromDay)]
+  if (toDayExclusive !== undefined) conditions.push(lt(usageCounters.day, toDayExclusive))
+  const [row] = await tx
+    .select({ total: sql<number>`coalesce(sum(${usageCounters.value}), 0)` })
+    .from(usageCounters)
+    .where(and(...conditions))
+  return Number(row?.total ?? 0)
 }
 
 /**

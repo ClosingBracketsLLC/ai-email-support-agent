@@ -24,6 +24,8 @@ export const knowledgeSources = pgTable('knowledge_sources', {
   chunkCount: integer('chunk_count').notNull().default(0),
   failureReason: text('failure_reason'),              // contracts KNOWLEDGE_FAILURE_REASONS
   failureDetail: text('failure_detail'),
+  /** A later task's retry counter for a source stuck mid-pipeline — free-standing, no CHECK. */
+  sweepAttempts: integer('sweep_attempts').notNull().default(0),
   // Fresh per claim (knowledge.ingest / knowledge.crawl), cleared on every terminal landing; the
   // same shape outbound_sends uses. Every guarded write a claiming run makes carries it, so a late
   // write from an attempt whose lease has lapsed matches nothing instead of clobbering the holder.
