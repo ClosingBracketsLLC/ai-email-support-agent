@@ -246,8 +246,18 @@ describe('workspace lifecycle', () => {
     expect(note!.body).toMatch(/subscription/i)
     expect(note!.body).toMatch(/re-?subscrib/i)
 
-    // …and Cancel says so too, so the Workspace screen can point at Billing.
-    expect(await subscribed.c.workspace.cancelDeletion.mutate()).toEqual({ ok: true, subscriptionCancelled: true })
+    // Cancel answers a DIFFERENT question (ruling R23): not "did this call cancel your plan" but
+    // "are you off a plan and holding one on file". Straight after the request the billing row still
+    // reads `active` — Stripe's `customer.subscription.deleted` has not landed — so it honestly says
+    // no. The owner was told what happened to their money at the moment it happened, above.
+    expect(await subscribed.c.workspace.cancelDeletion.mutate()).toEqual({ ok: true, needsResubscribe: false })
+
+    // Once the webhook lands, the same call flips — because the flag tracks the billing STATE
+    // (`isBillingActive`), not a memory of who cancelled what.
+    await t.api.withOrg(subscribed.orgId, (tx) => tx.update(billingSubscriptions)
+      .set({ status: 'canceled' }).where(eq(billingSubscriptions.orgId, subscribed.orgId)))
+    await subscribed.c.workspace.requestDeletion.mutate({ confirm: 'Acme' })
+    expect(await subscribed.c.workspace.cancelDeletion.mutate()).toEqual({ ok: true, needsResubscribe: true })
 
     // A workspace that never had a subscription is told none of that, on either call.
     const free = await setupOrg()
@@ -255,7 +265,27 @@ describe('workspace lifecycle', () => {
     const [freeNote] = await t.api.withOrg(free.orgId, (tx) =>
       tx.select().from(notifications).where(eq(notifications.orgId, free.orgId)))
     expect(freeNote!.body).not.toMatch(/subscription/i)
-    expect(await free.c.workspace.cancelDeletion.mutate()).toEqual({ ok: true, subscriptionCancelled: false })
+    expect(await free.c.workspace.cancelDeletion.mutate()).toEqual({ ok: true, needsResubscribe: false })
+  })
+
+  it('a workspace cancelled through the Stripe Portal weeks ago: this deletion cancelled nothing, and yet the plan still needs re-subscribing (ruling R23)', async () => {
+    const org = await setupOrg()
+    // What `customer.subscription.deleted` leaves behind: status `canceled`, the subscription id
+    // still on the row — NO path in this repo ever nulls it. That row is why the two calls cannot
+    // share one field: `subscriptionCancelled` would have to lie in one direction or the other.
+    await giveSubscription(org.orgId, 'sub_portal_cancelled')
+    await t.api.withOrg(org.orgId, (tx) => tx.update(billingSubscriptions)
+      .set({ status: 'canceled' }).where(eq(billingSubscriptions.orgId, org.orgId)))
+
+    // Nothing live to cancel, so Stripe is not called and this deletion cancelled nothing.
+    const requested = await org.c.workspace.requestDeletion.mutate({ confirm: 'Acme' })
+    expect(requested.subscriptionCancelled).toBe(false)
+    expect(callsTo(fake, 'cancelSubscription')).toHaveLength(0)
+    const [note] = await t.api.withOrg(org.orgId, (tx) => tx.select().from(notifications).where(eq(notifications.orgId, org.orgId)))
+    expect(note!.body).not.toMatch(/subscription/i)
+
+    // …and yet the owner IS off their plan with one on file, which is exactly what Cancel must say.
+    expect(await org.c.workspace.cancelDeletion.mutate()).toEqual({ ok: true, needsResubscribe: true })
   })
 
   it('a failing Stripe cancel refuses the deletion outright (BAD_GATEWAY) and writes nothing', async () => {
@@ -323,8 +353,8 @@ describe('workspace lifecycle', () => {
     await org.c.workspace.setAgentEnabled.mutate({ enabled: true })
     await org.c.workspace.requestDeletion.mutate({ confirm: 'Acme' })
 
-    // A workspace that never subscribed is told so — the subscription half is pinned by its own case.
-    expect(await org.c.workspace.cancelDeletion.mutate()).toEqual({ ok: true, subscriptionCancelled: false })
+    // A workspace that never subscribed is told so — the billing half is pinned by its own cases.
+    expect(await org.c.workspace.cancelDeletion.mutate()).toEqual({ ok: true, needsResubscribe: false })
     expect(await readWorkspace(org.orgId)).toMatchObject({
       deletionRequestedAt: null, deletionRequestedBy: null,
       // Deliberate: the owner turns these back on themselves, one considered tap at a time.

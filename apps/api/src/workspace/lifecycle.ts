@@ -32,6 +32,7 @@ import { randomUUID } from 'node:crypto'
 import { and, eq, isNotNull, isNull } from 'drizzle-orm'
 import type pino from 'pino'
 import { WORKSPACE_DELETE_GRACE_DAYS, exportObjectKey, type ExportState, type OrgRole } from '@aesa/contracts'
+import { isBillingActive } from '@aesa/core'
 import { audit, notifications, readBillingState, workspaces, type AuditActor } from '@aesa/db'
 import type { ObjectStore } from '@aesa/knowledge/storage'
 import { JOB_NAMES } from '@aesa/queue'
@@ -253,7 +254,7 @@ export async function requestDeletion(
 }
 
 export type CancelDeletionResult =
-  | { ok: true; subscriptionCancelled: boolean }
+  | { ok: true; needsResubscribe: boolean }
   | { ok: false; code: 'not_pending' }
 
 /**
@@ -261,17 +262,26 @@ export type CancelDeletionResult =
  * restore, and the owner has to know about all three:
  *  - the KILL SWITCH stays on and the AGENT stays off — both have customer-visible consequences, so
  *    the owner turns each back on deliberately, from its own control;
- *  - the SUBSCRIPTION stays cancelled, and unlike the other two nothing here could bring it back:
- *    `requestDeletion` called Stripe's `subscriptions.cancel`, which ends the subscription outright
+ *  - the SUBSCRIPTION, if `requestDeletion` cancelled one, stays cancelled — and unlike the other two
+ *    nothing here could bring it back: Stripe's `subscriptions.cancel` ends a subscription outright
  *    rather than at the period end. Re-subscribing is a Checkout session in Billing.
  *
- * `subscriptionCancelled` is what lets the Workspace screen say that last part out loud. It reads
- * "this workspace holds a Stripe subscription id", which is exactly the right question: a workspace
- * only reaches here past `requestDeletion`, which REFUSES unless a live subscription was successfully
- * cancelled — so a non-null id means the subscription was ended, either by that call or by the owner
- * earlier through the Portal. Either way the answer to "am I still on a plan?" is no. It deliberately
- * does NOT read `status`, which still says `active` until Stripe's `customer.subscription.deleted`
- * webhook lands.
+ * `needsResubscribe` is a DIFFERENT FACT from `requestDeletion`'s `subscriptionCancelled`, and the
+ * two names exist because one word cannot carry both (ruling R23). `subscriptionCancelled` is
+ * causal — "this call ended your plan". This one is a state — "you are not on an active plan and you
+ * have one on file" — and it makes no claim about who ended it. That distinction is reachable, not
+ * theoretical: a workspace cancelled through the Stripe Customer Portal weeks ago keeps its
+ * `stripe_subscription_id` (`customer.subscription.deleted` sets `status` and nothing in this repo
+ * ever nulls the id), so `requestDeletion` correctly reports `subscriptionCancelled: false` while
+ * this call correctly reports `needsResubscribe: true`.
+ *
+ * Read through `isBillingActive` on `readBillingState`'s derived state — the same path every other
+ * billing surface uses, so `trial_expired` and `past_due` are judged the way they are judged
+ * everywhere else — never a raw `status` comparison. One consequence, deliberate: straight after a
+ * deletion cancelled a LIVE subscription the row still reads `active` (Stripe's
+ * `customer.subscription.deleted` has not landed), so this answers `false` for that window. The owner
+ * is not left uninformed — they were told at the moment it happened, by `requestDeletion`'s own
+ * result and by the notification — and the flag corrects itself when the webhook arrives.
  *
  * Guarded on the stamp being set, so the nightly purge having already claimed the workspace reads as
  * `not_pending` rather than as a cancel that did nothing.
@@ -291,7 +301,7 @@ export async function cancelDeletion(
       detail: {}, ip: actor.ip, userAgent: actor.userAgent,
     })
     const billing = await readBillingState(tx, now)
-    return { ok: true, subscriptionCancelled: billing.stripeSubscriptionId !== null }
+    return { ok: true, needsResubscribe: !isBillingActive(billing.state) && billing.stripeSubscriptionId !== null }
   })
 }
 

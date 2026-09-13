@@ -381,11 +381,12 @@ export const workspaceRouter = router({
   }),
 
   /** "Actually, keep it." Clears the stamps alone — the kill switch stays on, the agent stays off,
-   * and the SUBSCRIPTION stays cancelled (Stripe ended it outright when the deletion was requested).
-   * `subscriptionCancelled` is what lets the screen point the owner at Billing to re-subscribe. */
+   * and a subscription Stripe ended when the deletion was requested stays ended. `needsResubscribe`
+   * is what lets the screen point the owner at Billing; it is a STATE ("no active plan, one on
+   * file"), deliberately not `requestDeletion`'s causal `subscriptionCancelled` (ruling R23). */
   cancelDeletion: ownerProcedure.mutation(async ({ ctx }) => {
     const res = await cancelDeletion(lifecycleDeps(ctx), ctx.orgId, lifecycleActor(ctx))
-    if (res.ok) return { ok: true as const, subscriptionCancelled: res.subscriptionCancelled }
+    if (res.ok) return { ok: true as const, needsResubscribe: res.needsResubscribe }
     switch (res.code) {
       case 'not_pending': throw precondition(WORKSPACE_ERROR_MESSAGES.not_pending)
     }
