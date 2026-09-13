@@ -28,7 +28,7 @@ import { asc, sql } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import type { OverageMode, PlanId } from '@aesa/contracts'
-import { overageOf } from '@aesa/core'
+import { isAllowanceExhausted, overageOf } from '@aesa/core'
 import {
   audit, billingSubscriptions, countActiveDomains, countManagedConversations, notifications,
   readBillingState, withOrg, withOrgIdentity, withPlatform, type AuditActor, type Db,
@@ -209,12 +209,22 @@ function planNotices(orgId: string, billing: BillingFacts, used: number, now: Da
     })
   }
 
-  // Once per PERIOD: the counter resets with the period, and so should the page.
-  if (billing.overageMode === 'blocked' && used >= billing.allowance) {
+  // Controller ruling R11: the page follows `isAllowanceExhausted` — the SAME predicate that stopped
+  // the sending in `ticket.draft` — and not the overage mode alone. Its `plan === 'trial'` arm is
+  // what a `blocked`-only test missed: a trial under AUTOMATIC overage is still exhausted at its flat
+  // allowance, so Autopilot went quiet with nothing said. Everything else that stops the agent
+  // explains itself (a demotion, a held send, an escalation); this must not be the exception, and
+  // `trial_ending`/`trial_ended` do not cover it — they speak to the 14-day clock, not to
+  // conversations used. `mode: 'managed'` is a fact here, not an assumption: `used` IS the
+  // MANAGED-only meter (`countManagedConversations`), so a BYOK workspace counts zero and is never
+  // exhausted. Once per PERIOD: the counter resets with the period, and so does the page.
+  if (isAllowanceExhausted({ mode: 'managed', plan: billing.plan, overageMode: billing.overageMode, used, allowance: billing.allowance })) {
     out.push({
       dedupeKey: `billing:allowance:${orgId}:${billing.period.start.toISOString()}`,
       title: 'Included conversations used up',
-      body: `This workspace has used all ${billing.allowance} included conversations this period. Autopilot is paused until the next period or you allow overage.`,
+      body: billing.plan === 'trial'
+        ? `Automatic replies have paused: this trial's ${billing.allowance} included conversations are used up. Drafts keep arriving for review — subscribe to lift the limit and resume Autopilot.`
+        : `Automatic replies have paused: this workspace has used all ${billing.allowance} included conversations for this period. Drafts keep arriving for review — allow overage in Settings › Billing, or wait for the next period, to resume Autopilot.`,
     })
   }
 

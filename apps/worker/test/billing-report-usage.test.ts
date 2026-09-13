@@ -395,7 +395,13 @@ describe('billing.report-usage: the trial and allowance notices', () => {
     expect(await notificationRows()).toHaveLength(1)
   })
 
-  it('a blocked workspace at its allowance pages allowance_reached once per PERIOD', async () => {
+  /**
+   * Controller ruling R11: the page follows `isAllowanceExhausted`, so BOTH arms of that predicate
+   * page — `standard` + `blocked`, and `trial` (whose flat allowance stops it whatever the overage
+   * mode). `standard` + `automatic` is the one case that must stay silent: it is not exhausted, it
+   * simply bills overage.
+   */
+  it('a standard + blocked workspace at its allowance pages allowance_reached once per PERIOD', async () => {
     await seedBilling({ overageMode: 'blocked' })
     await setManagedUsed(600)
 
@@ -406,6 +412,10 @@ describe('billing.report-usage: the trial and allowance notices', () => {
     const rows = await notificationRows()
     expect(rows).toHaveLength(1)
     expect(rows[0]).toMatchObject({ kind: 'billing', dedupeKey: `billing:allowance:${orgId}:${PERIOD_START_ISO}` })
+    expect(rows[0]!.title).toBe('Included conversations used up')
+    expect(rows[0]!.body).toContain('Automatic replies have paused')
+    expect(rows[0]!.body).toContain('Drafts keep arriving for review')
+    expect(rows[0]!.body).toContain('allow overage')
     expect(h.notified).toEqual([rows[0]!.id])
 
     // A later day in the SAME period says nothing more.
@@ -414,7 +424,32 @@ describe('billing.report-usage: the trial and allowance notices', () => {
     expect(await notificationRows()).toHaveLength(1)
   })
 
-  it('a workspace on automatic overage past its allowance is NOT paged — it is simply billed', async () => {
+  it('a TRIAL at its flat 50 pages too, under AUTOMATIC overage — the same predicate that stopped its Autopilot', async () => {
+    await seedBilling({
+      plan: 'trial', status: 'trialing', overageMode: 'automatic', domainQuantity: 0,
+      stripeCustomerId: null, stripeSubscriptionId: null, stripeDomainItemId: null,
+      // Far enough out that `trial_ending` cannot fire and confuse the count.
+      trialEndsAt: new Date('2026-06-30T09:00:00Z'),
+    })
+    await setManagedUsed(50)          // BILLING_PRICING.trialIncludedConversations
+
+    const h = makeDeps(DAY1)
+    const result = await runBillingReportUsage(h.deps)
+
+    expect(result.trialNotices).toBe(1)
+    const rows = await notificationRows()
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ kind: 'billing', dedupeKey: `billing:allowance:${orgId}:${PERIOD_START_ISO}` })
+    expect(rows[0]!.title).toBe('Included conversations used up')
+    expect(rows[0]!.body).toContain('Automatic replies have paused')
+    expect(rows[0]!.body).toContain('subscribe')
+    expect(h.notified).toEqual([rows[0]!.id])
+
+    // Nothing was reported to Stripe: a trial is never billed for overage.
+    expect(usageCallsTo(h.fake, 'reportOverage')).toEqual([])
+  })
+
+  it('a STANDARD workspace on automatic overage past its allowance is NOT paged — it is simply billed', async () => {
     await seedBilling({ overageMode: 'automatic' })
     await setManagedUsed(700)
 
@@ -423,6 +458,8 @@ describe('billing.report-usage: the trial and allowance notices', () => {
 
     expect(result.trialNotices).toBe(0)
     expect(await notificationRows()).toEqual([])
+    // …and the overage that silence stands for really was reported.
+    expect(usageCallsTo(h.fake, 'reportOverage')[0]!.params).toMatchObject({ value: 100 })
   })
 })
 
