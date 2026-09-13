@@ -19,6 +19,9 @@ export const JOB_NAMES = {
   memoryCapture: 'memory.capture',
   guidanceSuggest: 'guidance.suggest',
   llmProbe: 'llm.probe',
+  workspaceExport: 'workspace.export',
+  workspacePurge: 'workspace.purge',
+  keysRotate: 'keys.rotate',
 } as const
 
 export type JobName = (typeof JOB_NAMES)[keyof typeof JOB_NAMES]

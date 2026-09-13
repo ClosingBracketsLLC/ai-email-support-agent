@@ -18,8 +18,10 @@ function isNotFound(err: unknown): boolean {
   return metadata?.httpStatusCode === 404
 }
 
-/** S3 (and S3-compatible — minio locally and in CI) `ObjectStore`. Every upload is a browser PUT
- * against a presigned URL this issues; the api/worker never proxy the file bytes themselves. */
+/** S3 (and S3-compatible — minio locally and in CI) `ObjectStore`. Every UPLOAD is a browser PUT
+ * against a presigned URL this issues; the api/worker never proxy an upload's bytes themselves. The
+ * Phase 7 export is the mirror case — the worker builds the bundle and `put`s it, the owner GETs it
+ * through `presignGet` — see `types.ts` for why that one is safe to call from the api. */
 export function createS3Store(cfg: CreateS3StoreOptions): ObjectStore {
   const client = new S3Client({
     endpoint: cfg.endpoint,
@@ -34,6 +36,9 @@ export function createS3Store(cfg: CreateS3StoreOptions): ObjectStore {
       const url = await getSignedUrl(client, command, { expiresIn: opts.expiresSeconds })
       return { url, headers: { 'content-type': opts.contentType } }
     },
+    async put(key, bytes, contentType) {
+      await client.send(new PutObjectCommand({ Bucket: cfg.bucket, Key: key, Body: bytes, ContentType: contentType }))
+    },
     async head(key) {
       try {
         const res = await client.send(new HeadObjectCommand({ Bucket: cfg.bucket, Key: key }))
@@ -47,6 +52,13 @@ export function createS3Store(cfg: CreateS3StoreOptions): ObjectStore {
       const res = await client.send(new GetObjectCommand({ Bucket: cfg.bucket, Key: key }))
       if (!res.Body) throw new Error(`s3: object body missing for key ${key}`)
       return res.Body.transformToByteArray()
+    },
+    async presignGet(key, opts) {
+      // No request is made: `getSignedUrl` installs a middleware that resolves the stack before the
+      // HTTP handler, and the credentials above are static, so nothing reaches IMDS/STS either.
+      // The api calls this inside a request (Task 8's `exportStatus`) and must not block on the net.
+      const command = new GetObjectCommand({ Bucket: cfg.bucket, Key: key })
+      return getSignedUrl(client, command, { expiresIn: opts.expiresSeconds })
     },
     async delete(key) {
       await client.send(new DeleteObjectCommand({ Bucket: cfg.bucket, Key: key }))

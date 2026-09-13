@@ -176,8 +176,10 @@ describe('knowledge router', () => {
     const presignCalls: { key: string; opts: { contentType: string; expiresSeconds: number } }[] = []
     const spyStore: ObjectStore = {
       presignPut: async (key, opts) => { presignCalls.push({ key, opts }); return inner.presignPut(key, opts) },
+      put: (key, bytes, contentType) => inner.put(key, bytes, contentType),
       head: (key) => inner.head(key),
       get: (key) => inner.get(key),
+      presignGet: (key, opts) => inner.presignGet(key, opts),
       delete: (key) => inner.delete(key),
     }
     const t2 = await createTestApi({}, { store: spyStore })
@@ -369,7 +371,7 @@ describe('knowledge router', () => {
     const org = await seedOrg()
     const upload = await org.c.knowledge.startUpload.mutate({ fileName: 'file.txt', mime: 'text/plain', byteSize: 5 })
     const [before] = await t.api.withOrg(org.orgId, (tx) => tx.select().from(knowledgeSources).where(eq(knowledgeSources.id, upload.sourceId)))
-    ;(t.store as TestObjectStore).put(before!.storageKey!, new Uint8Array([1, 2, 3]), 'text/plain')
+    await (t.store as TestObjectStore).put(before!.storageKey!, new Uint8Array([1, 2, 3]), 'text/plain')
     expect(await t.store.head(before!.storageKey!)).not.toBeNull()
 
     const beforeVersion = (await org.c.knowledge.list.query()).knowledgeVersion

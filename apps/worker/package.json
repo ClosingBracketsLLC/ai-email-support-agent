@@ -2,7 +2,7 @@
   "name": "@aesa/worker",
   "private": true,
   "type": "module",
-  "scripts": { "typecheck": "tsc --noEmit", "test": "vitest run", "dev": "tsx watch src/index.ts", "start": "tsx src/index.ts" },
+  "scripts": { "typecheck": "tsc --noEmit", "test": "vitest run", "dev": "tsx watch src/index.ts", "start": "tsx src/index.ts", "keys:rotate": "tsx scripts/keys-rotate.ts" },
   "dependencies": {
     "@aesa/agent": "workspace:*", "@aesa/contracts": "workspace:*", "@aesa/core": "workspace:*", "@aesa/crypto": "workspace:*",
     "@aesa/db": "workspace:*", "@aesa/knowledge": "workspace:*", "@aesa/llm": "workspace:*", "@aesa/mail": "workspace:*", "@aesa/platform-mail": "workspace:*", "@aesa/queue": "workspace:*",

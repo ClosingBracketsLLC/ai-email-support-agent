@@ -711,7 +711,7 @@ describe('Phase 4 close-out E2E (real pg-boss knowledge jobs + the real api know
     expect((started as { ok: true; url: string }).url).toBe(`memory://${key}`)
 
     // The browser's presigned PUT, as a direct write into the same store the job reads from.
-    store.put(key, Buffer.from(RETURNS_FAQ, 'utf8'), 'text/plain')
+    await store.put(key, Buffer.from(RETURNS_FAQ, 'utf8'), 'text/plain')
     expect(await completeUpload(service, orgC.orgId, actorFor(orgC), { sourceId })).toEqual({ ok: true })
 
     const ready = await waitForSource(orgC, sourceId, 'ready')
@@ -753,7 +753,7 @@ describe('Phase 4 close-out E2E (real pg-boss knowledge jobs + the real api know
     expect(started.ok).toBe(true)
     const sourceId = (started as { ok: true; sourceId: string }).sourceId
     const key = uploadKey(org.orgId, sourceId, fileName)
-    store.put(key, Buffer.alloc(KNOWLEDGE_MAX_UPLOAD_BYTES + 1), 'application/pdf')
+    await store.put(key, Buffer.alloc(KNOWLEDGE_MAX_UPLOAD_BYTES + 1), 'application/pdf')
     expect(await completeUpload(service, org.orgId, actorFor(org), { sourceId })).toEqual({ ok: true })
 
     const failed = await waitForSource(org, sourceId, 'failed')

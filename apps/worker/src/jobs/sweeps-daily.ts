@@ -25,17 +25,20 @@
  * (f)'s "does any cited chunk no longer exist" predicate has no drizzle query-builder shape (it
  * needs `unnest`), so it is raw SQL, same discipline `apps/api/src/knowledge/gaps.ts` uses for its
  * own hand-written query: every identifier is a literal table/column name, every value a bound
- * parameter. All three write their audit trail through `auditMemoryArm`, which groups the returned
+ * parameter. All three write their audit trail through `auditPerOrgArm`, which groups the returned
  * rows by `orgId` so a platform-wide sweep still leaves ONE audit row per ORG per arm, never one
- * giant cross-tenant row.
+ * giant cross-tenant row. That helper is EXPORTED (it is no longer memory-specific): Phase 7's
+ * `retention.sweep` is a second platform-wide pass with the same per-org audit shape, and it imports
+ * this one rather than carrying a copy that could drift from it.
  *
  * (g)/(h) — Phase 7's two age-based deletes — are plain guarded bulk `DELETE`s, unscoped by `orgId`
  * like the arms above them. (g) needs `agent_runs_started_idx` (migration 0021): the platform-wide
  * age scan does not lead with `org_id`, so the tenant-first indexes `agent_runs` already carries
  * (`agent_runs_org_ticket_idx`, `agent_runs_org_status_idx`) do not serve it. (h) targets exactly the
  * `platform.access` rows `withPlatform` stamps on every call — including this very sweep's own — and
- * leaves every tenant `audit_log` row alone regardless of age (that trail is `retention.sweep`'s,
- * still a Phase 7 carry-over, not this cron's).
+ * leaves every tenant `audit_log` row alone regardless of age. That trail is `retention.sweep`'s
+ * (730 days, `org_id IS NOT NULL`), and the two arms are deliberately disjoint on that column so
+ * neither cron can delete a row the other is responsible for.
  */
 import { and, eq, inArray, isNull, lt, sql } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
@@ -43,7 +46,7 @@ import type pino from 'pino'
 import { MEMORY_CANDIDATE_MAX_AGE_DAYS } from '@aesa/core'
 import {
   agentRunEvents, agentRuns, auditLog, draftActionTokens, drafts, escalateTicket, resolvedAnswers, withOrgIdentity, withPlatform,
-  type Db, type EscalateTicketParams, type OrgTx, type PlatformTx,
+  type AuditActor, type Db, type EscalateTicketParams, type OrgTx, type PlatformTx,
 } from '@aesa/db'
 import { registerCron } from '@aesa/queue'
 import { utcDayString } from '../date-utils.ts'
@@ -68,7 +71,7 @@ export const AGENT_RUN_RETENTION_DAYS = 90
  *  one) is kept (arm h): provenance for 30 days, then noise beside the 2-year tenant trail. */
 export const PLATFORM_ACCESS_AUDIT_RETENTION_DAYS = 30
 
-const SWEEP_ACTOR = 'system:cron:sweeps.daily' as const
+const SWEEP_ACTOR: AuditActor = 'system:cron:sweeps.daily'
 
 export interface SweepsDailyDeps {
   db: Db
@@ -85,18 +88,25 @@ interface ExpiredDraftRow {
   ticketId: string
 }
 
-/** One audit row per DISTINCT `orgId` among `rows`, each carrying that org's own count — never one
- *  row per updated answer, and never one cross-tenant row for the whole arm. A no-op when `rows` is
- *  empty (an arm that touched nothing writes nothing). */
-async function auditMemoryArm(
-  tx: PlatformTx, arm: string, action: 'memory.retired' | 'memory.needs_review', rows: { orgId: string }[],
+/**
+ * One audit row per DISTINCT `orgId` among `rows`, each carrying that org's own count — never one
+ * row per touched row, and never one cross-tenant row for the whole arm. A no-op when `rows` is
+ * empty (an arm that touched nothing writes nothing).
+ *
+ * Exported and actor-parameterized for Phase 7's `retention.sweep`, which is the same shape: a
+ * platform-wide pass whose per-org effects each want ONE audit row. `actor` is the caller's because
+ * the two passes are different jobs, and an audit trail that named the wrong one would be worse than
+ * no trail at all. `rows` deliberately carries only `orgId`, so any `RETURNING { orgId }` fits.
+ */
+export async function auditPerOrgArm(
+  tx: PlatformTx, actor: AuditActor, arm: string, action: string, rows: { orgId: string }[],
 ): Promise<void> {
   if (rows.length === 0) return
   const counts = new Map<string, number>()
   for (const r of rows) counts.set(r.orgId, (counts.get(r.orgId) ?? 0) + 1)
   await tx.insert(auditLog).values(
     [...counts.entries()].map(([orgId, cnt]) => ({
-      orgId, actor: SWEEP_ACTOR, action, entityType: 'workspace', entityId: orgId, detail: { arm, count: cnt },
+      orgId, actor, action, entityType: 'workspace', entityId: orgId, detail: { arm, count: cnt },
     })),
   )
 }
@@ -227,9 +237,9 @@ export async function runSweepsDaily(
     const sourceChangedRows = sourceChangedRawRows.map((r) => ({ id: r.id, orgId: r.org_id }))
     answersSourceChanged = sourceChangedRows.length
 
-    await auditMemoryArm(tx, 'expired', 'memory.retired', answersExpiredRows)
-    await auditMemoryArm(tx, 'unsampled', 'memory.retired', candidatesRetiredRows)
-    await auditMemoryArm(tx, 'source_changed', 'memory.needs_review', sourceChangedRows)
+    await auditPerOrgArm(tx, SWEEP_ACTOR, 'expired', 'memory.retired', answersExpiredRows)
+    await auditPerOrgArm(tx, SWEEP_ACTOR, 'unsampled', 'memory.retired', candidatesRetiredRows)
+    await auditPerOrgArm(tx, SWEEP_ACTOR, 'source_changed', 'memory.needs_review', sourceChangedRows)
   })
 
   for (const item of pendingNotify) {
