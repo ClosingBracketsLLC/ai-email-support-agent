@@ -1,9 +1,24 @@
 /**
- * `memory.capture` (spec §Learning loop, mechanism 1): one delivered reply becomes — or reinforces —
- * one resolved answer. Enqueued by `send.execute`'s post-commit `onSent` seam; runs on the `agent`
- * role because it embeds. Three short transactions with the embed strictly between the first two.
+ * `memory.capture` (spec §Learning loop, mechanism 1): a reply becomes — or reinforces — one
+ * resolved answer, on two independent paths carried by a refined payload (Phase 7 added the
+ * second):
+ *
+ *  - **`draftId`** — a DELIVERED draft, enqueued by `send.execute`'s post-commit `onSent` seam.
+ *    Unchanged from Phase 5.
+ *  - **`messageId`** — "Remember this reply" (deviation 16, the spec's Phase 7 backfill): an owner
+ *    turns an already-SENT outbound message into a learned answer on demand, with no draft behind it
+ *    at all — a hand-written reply, or one predating the agent entirely. Enqueued by the api's
+ *    `memory.rememberReply` (Task 8). Idempotent through the partial unique index
+ *    `resolved_answers_source_message_uidx` (org_id, source_message_id): a second run of the SAME
+ *    message is a clean `'skipped'`, never a duplicate-key throw — the job checks first (so the
+ *    common case never even reaches the insert) and the guarded re-check at write time is what
+ *    makes a genuine race land the same way.
+ *
+ * Runs on the `agent` role (it embeds). Every write is a short `withOrg` transaction; the embed call
+ * is network I/O and always sits strictly BETWEEN two of them, never inside one (CLAUDE.md
+ * Transactions).
  */
-import { and, eq, inArray, sql } from 'drizzle-orm'
+import { and, eq, inArray, lt, sql } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import { z } from 'zod'
@@ -16,7 +31,9 @@ import { scrubForMemory, type Embedder } from '@aesa/knowledge'
 import { defineJob, enqueue, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
 import { utcDayString } from '../date-utils.ts'
 
-export const MemoryCapturePayload = z.object({ orgId: z.string(), draftId: z.string() })
+export const MemoryCapturePayload = z.object({
+  orgId: z.string(), draftId: z.string().optional(), messageId: z.string().optional(),
+}).refine((p) => (p.draftId ? 1 : 0) + (p.messageId ? 1 : 0) === 1, 'exactly one of draftId or messageId')
 export type MemoryCapturePayload = z.infer<typeof MemoryCapturePayload>
 
 export const memoryCaptureJob: RegisteredJobDefinition<MemoryCapturePayload> = defineJob({
@@ -26,14 +43,21 @@ export const memoryCaptureJob: RegisteredJobDefinition<MemoryCapturePayload> = d
 
 export interface MemoryCaptureDeps { db: Db; embedder: Embedder; logger: pino.Logger; now?: () => Date }
 const ACTOR = `system:${JOB_NAMES.memoryCapture}` as const
-/** The first 1,000 chars of the latest inbound stand in for the question when triage asked nothing (the retriever's own rule). */
+/** The first 1,000 chars of the latest inbound stand in for the question when triage asked nothing
+ *  (the retriever's own rule) — and, since Phase 7, for "Remember this reply"'s question too. */
 const TEXT_QUESTION_CHARS = 1_000
 
 export async function registerMemoryCapture(boss: PgBoss, deps: MemoryCaptureDeps): Promise<void> {
   await registerJob(boss, { ...memoryCaptureJob, handler: async (ctx) => { await runMemoryCapture(deps, ctx.data, ctx.signal) } })
 }
+/** Unchanged from Phase 5. */
 export async function enqueueMemoryCapture(boss: PgBoss, orgId: string, draftId: string): Promise<void> {
   await enqueue(boss, memoryCaptureJob, { orgId, draftId }, { entityId: draftId })
+}
+/** "Remember this reply" (Task 8's `rememberReply`) — `entityId` is the message, the same
+ *  `short`-queue collapse-while-`created` shape the draft path already has. */
+export async function enqueueMemoryRemember(boss: PgBoss, orgId: string, messageId: string): Promise<void> {
+  await enqueue(boss, memoryCaptureJob, { orgId, messageId }, { entityId: messageId })
 }
 
 interface Loaded {
@@ -45,7 +69,7 @@ interface Loaded {
   atEmbedCap: boolean
 }
 
-async function load(db: Db, orgId: string, draftId: string, day: string, now: Date): Promise<Loaded | null> {
+async function loadDraft(db: Db, orgId: string, draftId: string, day: string, now: Date): Promise<Loaded | null> {
   return withOrg(db, orgId, async (tx) => {
     const [d] = await tx.select({
       id: drafts.id, ticketId: drafts.ticketId, agentId: drafts.agentId, categoryId: drafts.categoryId, status: drafts.status,
@@ -80,10 +104,18 @@ async function load(db: Db, orgId: string, draftId: string, day: string, now: Da
 }
 
 export async function runMemoryCapture(deps: MemoryCaptureDeps, payload: MemoryCapturePayload, signal: AbortSignal): Promise<'captured' | 'reinforced' | 'skipped'> {
-  const { orgId, draftId } = payload
+  const { orgId } = payload
+  if (payload.messageId !== undefined) return captureFromMessage(deps, orgId, payload.messageId, signal)
+  if (payload.draftId !== undefined) return captureFromDraft(deps, orgId, payload.draftId, signal)
+  // Defensive only: `registerJob` always re-validates against `MemoryCapturePayload` before a
+  // handler ever sees a payload, so this is unreachable from pg-boss — only a direct, bypassing call.
+  throw new Error('memory.capture: payload must carry exactly one of draftId or messageId')
+}
+
+async function captureFromDraft(deps: MemoryCaptureDeps, orgId: string, draftId: string, signal: AbortSignal): Promise<'captured' | 'reinforced' | 'skipped'> {
   const now = deps.now?.() ?? new Date()
   const day = utcDayString(now)
-  const loaded = await load(deps.db, orgId, draftId, day, now)
+  const loaded = await loadDraft(deps.db, orgId, draftId, day, now)
   if (!loaded) return 'skipped'
   const { draft, ticket } = loaded
 
@@ -165,6 +197,130 @@ export async function runMemoryCapture(deps: MemoryCaptureDeps, payload: MemoryC
     await audit(tx, {
       actor: ACTOR, action: 'memory.captured', entityType: 'draft', entityId: draftId,
       detail: { answerId: inserted!.id, status: auto ? 'candidate' : 'active', wasEdited: edited, supersedesId: supersedes?.id ?? null, questionChars: question.length, answerChars: answer.length },
+    })
+    return 'captured'
+  })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// "Remember this reply" (messageId) — Phase 7
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface LoadedRemember {
+  message: { id: string; ticketId: string; bodyText: string }
+  ticket: { customerEmail: string | null; customerName: string | null }
+  questionBody: string
+  atEmbedCap: boolean
+}
+
+type RememberLoad =
+  | { status: 'ok'; data: LoadedRemember }
+  | { status: 'not_found' }
+  | { status: 'already_remembered' }
+  | { status: 'no_question' }
+
+/**
+ * The read half. Checks the unique index's target FIRST — "the job checks first" — so the common
+ * case (a message nobody has remembered yet) never even reaches a validity check it would fail
+ * anyway, and a genuine duplicate short-circuits before touching `messages`/`tickets` at all.
+ */
+async function loadRemember(db: Db, orgId: string, messageId: string, day: string, now: Date): Promise<RememberLoad> {
+  return withOrg(db, orgId, async (tx) => {
+    const [already] = await tx.select({ id: resolvedAnswers.id }).from(resolvedAnswers)
+      .where(and(eq(resolvedAnswers.orgId, orgId), eq(resolvedAnswers.sourceMessageId, messageId)))
+    if (already) return { status: 'already_remembered' }
+
+    const [m] = await tx.select({
+      id: messages.id, ticketId: messages.ticketId, direction: messages.direction,
+      bodyText: messages.bodyText, sentAt: messages.sentAt,
+    }).from(messages).where(eq(messages.id, messageId))
+    if (!m || m.direction !== 'outbound' || m.bodyText === null || m.sentAt === null) return { status: 'not_found' }
+
+    const [t] = await tx.select({ customerEmail: tickets.customerEmail, customerName: tickets.customerName })
+      .from(tickets).where(eq(tickets.id, m.ticketId))
+    if (!t) return { status: 'not_found' }
+
+    // The latest inbound STRICTLY BEFORE this reply — never the ticket's overall latest inbound,
+    // which could be a message that arrived AFTER this reply was sent (a chasing customer).
+    const [inbound] = await tx.select({ bodyText: messages.bodyText }).from(messages)
+      .where(and(eq(messages.ticketId, m.ticketId), eq(messages.direction, 'inbound'), lt(messages.sentAt, m.sentAt)))
+      .orderBy(sql`${messages.sentAt} DESC NULLS LAST`, sql`${messages.createdAt} DESC`).limit(1)
+    if (!inbound || inbound.bodyText === null) return { status: 'no_question' }
+
+    const [counter] = await tx.select({ value: usageCounters.value }).from(usageCounters)
+      .where(and(eq(usageCounters.day, day), eq(usageCounters.meter, KNOWLEDGE_METERS.embedTokens)))
+    const cap = resolveSetting('knowledge.daily_embed_tokens_cap', await loadSettingSources(tx, ['knowledge.daily_embed_tokens_cap'], now))
+
+    return {
+      status: 'ok',
+      data: {
+        message: { id: m.id, ticketId: m.ticketId, bodyText: m.bodyText },
+        ticket: t,
+        questionBody: inbound.bodyText.slice(0, TEXT_QUESTION_CHARS),
+        atEmbedCap: (counter?.value ?? 0) >= cap,
+      },
+    }
+  })
+}
+
+async function skipRemember(deps: MemoryCaptureDeps, orgId: string, messageId: string, reason: string): Promise<'skipped'> {
+  await withOrg(deps.db, orgId, (tx) =>
+    audit(tx, { actor: ACTOR, action: 'memory.skipped', entityType: 'message', entityId: messageId, detail: { reason } }))
+  return 'skipped'
+}
+
+async function captureFromMessage(deps: MemoryCaptureDeps, orgId: string, messageId: string, signal: AbortSignal): Promise<'captured' | 'skipped'> {
+  const now = deps.now?.() ?? new Date()
+  const day = utcDayString(now)
+  const loaded = await loadRemember(deps.db, orgId, messageId, day, now)
+
+  // `not_found` is silent — the same shape the draft path's own `load()` returning null takes for a
+  // basic validity failure. The api's `rememberReply` (Task 8) already screens `not_outbound`/`empty`
+  // at request time, so this is a defensive backstop, not the primary surface.
+  if (loaded.status === 'not_found') return 'skipped'
+  if (loaded.status === 'already_remembered') return skipRemember(deps, orgId, messageId, 'already_remembered')
+  if (loaded.status === 'no_question') return skipRemember(deps, orgId, messageId, 'no_question')
+
+  const { message, ticket, questionBody, atEmbedCap } = loaded.data
+  // Same rule as the draft path: at cap, skip rather than spend — there is no per-message stamp to
+  // gate a retry on (unlike `drafts.memory_captured_at`), so a later run simply tries again once the
+  // day's budget resets; nothing here needs to remember that this attempt happened.
+  if (atEmbedCap) return skipRemember(deps, orgId, messageId, 'embed_cap')
+
+  const scrub = { customerName: ticket.customerName, customerEmail: ticket.customerEmail }
+  const question = scrubForMemory(questionBody, scrub)
+  const answer = scrubForMemory(message.bodyText, scrub)
+  if (question.length === 0 || answer.length === 0) return skipRemember(deps, orgId, messageId, 'empty_after_scrub')
+
+  // ── the embed, between transactions ──
+  const { vectors, tokens } = await deps.embedder.embed([question], 'document', signal)
+  const vector = vectors[0] ?? null
+  if (vector === null) return skipRemember(deps, orgId, messageId, 'empty_after_scrub')
+
+  return withOrg(deps.db, orgId, async (tx) => {
+    // The unique index is the hard guarantee; this re-check under the SAME transaction as the
+    // insert is what turns a genuine race into a clean 'skipped' rather than a constraint throw.
+    const [already] = await tx.select({ id: resolvedAnswers.id }).from(resolvedAnswers)
+      .where(and(eq(resolvedAnswers.orgId, orgId), eq(resolvedAnswers.sourceMessageId, messageId)))
+    if (already) {
+      await audit(tx, { actor: ACTOR, action: 'memory.skipped', entityType: 'message', entityId: messageId, detail: { reason: 'already_remembered' } })
+      return 'skipped'
+    }
+    if (tokens > 0) await bumpMeter(tx, orgId, day, KNOWLEDGE_METERS.embedTokens, tokens)
+    const salt = await ensureCustomerHashSalt(tx, orgId)
+    const sourceCustomerHash = ticket.customerEmail ? customerHash(salt, ticket.customerEmail) : null
+    const expiresAt = new Date(now.getTime() + MEMORY_EXPIRY_DAYS * 86_400_000)
+
+    const [inserted] = await tx.insert(resolvedAnswers).values({
+      orgId, agentId: null, categoryId: null, questionText: question, answerBody: answer,
+      questionEmbedding: vector, embeddingModel: deps.embedder.model, embeddingVersion: deps.embedder.version,
+      status: 'active', approvals: 1, wasEdited: false,
+      sourceTicketId: message.ticketId, sourceDraftId: null, sourceMessageId: messageId, sourceCustomerHash,
+      lastApprovedAt: now, expiresAt,
+    }).returning({ id: resolvedAnswers.id })
+    await audit(tx, {
+      actor: ACTOR, action: 'memory.captured', entityType: 'message', entityId: messageId,
+      detail: { answerId: inserted!.id, status: 'active', questionChars: question.length, answerChars: answer.length },
     })
     return 'captured'
   })
