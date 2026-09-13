@@ -1,6 +1,8 @@
 import { Stack } from 'expo-router/stack'
+import { ShareIntentProvider } from 'expo-share-intent'
 import * as SplashScreen from 'expo-splash-screen'
 import { useEffect } from 'react'
+import { Platform } from 'react-native'
 import { Providers } from '@/components/providers'
 import { useWindowDropGuard } from '@/lib/drop-guard'
 import { useBrandFonts } from '@/lib/fonts'
@@ -20,9 +22,13 @@ export default function RootLayout() {
   useWindowDropGuard()
   useEffect(() => { if (ready) SplashScreen.hideAsync().catch(() => {}) }, [ready])
   if (!ready) return null
-  return (
+  const app = (
     <Providers>
       <Stack screenOptions={{ headerShown: false }} />
     </Providers>
   )
+  // `expo-share-intent`'s native module has no web build (lib/share-intent.ts is the read side of
+  // this same split) — `ShareIntentProvider` wraps the WHOLE native tree, outermost, so the intent is
+  // already resolved by the time `(app)/_layout.tsx`'s `Shell` (useShareIntentRouting) reads it.
+  return Platform.select({ web: app, default: <ShareIntentProvider>{app}</ShareIntentProvider> })
 }

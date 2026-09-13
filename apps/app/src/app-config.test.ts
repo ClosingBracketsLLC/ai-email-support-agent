@@ -12,3 +12,19 @@ test('app.json references the generated assets and the brand tokens', () => {
   expect(plugin('expo-splash-screen')).toEqual({ backgroundColor: BRAND.dark.night, image: './assets/splash-icon.png', imageWidth: BRAND.mark.raster.splashImageWidth })
   expect(plugin('expo-notifications')).toEqual({ icon: './assets/notification-icon.png', color: BRAND.light.primary })
 })
+
+// Task brief's exact params, verbatim: the iOS share extension's activation rules (link, page,
+// plain text, one file) and the Android SEND intent-filter's mime types — the four
+// KNOWLEDGE_UPLOAD_MIMES plus "text/*" for a shared link or plain text (Android often shares a URL
+// as text/plain, not a distinct type).
+test('app.json configures the expo-share-intent plugin for a link, text or one file', () => {
+  expect(plugin('expo-share-intent')).toEqual({
+    iosActivationRules: {
+      NSExtensionActivationSupportsWebURLWithMaxCount: 1,
+      NSExtensionActivationSupportsWebPageWithMaxCount: 1,
+      NSExtensionActivationSupportsText: true,
+      NSExtensionActivationSupportsFileWithMaxCount: 1,
+    },
+    androidIntentFilters: ['text/*', 'application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'text/markdown', 'text/plain'],
+  })
+})

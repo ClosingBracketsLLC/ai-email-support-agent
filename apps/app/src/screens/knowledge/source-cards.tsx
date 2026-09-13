@@ -22,8 +22,10 @@ const PAGE_CAP_OPTIONS = [20, 50, 100] as const
 
 /** The largest offered option ≤ the plan cap, preferring the spec default (50) when it still fits —
  * `options` is `PAGE_CAP_OPTIONS` already filtered to `<= maxCrawlPages`; empty means even 20 is over
- * the plan cap, so the caller falls back to the cap itself (the "single fixed cap line" case). */
-function defaultMaxPages(options: readonly number[], maxCrawlPages: number): number {
+ * the plan cap, so the caller falls back to the cap itself (the "single fixed cap line" case).
+ * Exported for `screens/share.tsx`'s own, smaller page-cap control — the share-sheet Link card picks
+ * a default the same way this one does, off the SAME `PAGE_CAP_OPTIONS` shape. */
+export function defaultMaxPages(options: readonly number[], maxCrawlPages: number): number {
   if (options.length === 0) return maxCrawlPages
   return options.includes(KNOWLEDGE_DEFAULT_CRAWL_PAGES) ? KNOWLEDGE_DEFAULT_CRAWL_PAGES : options[options.length - 1]!
 }
