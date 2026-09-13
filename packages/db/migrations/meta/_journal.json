@@ -169,6 +169,13 @@
       "when": 1789275291747,
       "tag": "0023_billing_hardening",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1789275291748,
+      "tag": "0024_audit_retention_index",
+      "breakpoints": true
     }
   ]
 }
