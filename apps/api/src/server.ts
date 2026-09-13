@@ -5,6 +5,7 @@ import rateLimit from '@fastify/rate-limit'
 import { fastifyTRPCPlugin, type FastifyTRPCPluginOptions } from '@trpc/server/adapters/fastify'
 import { fromNodeHeaders } from 'better-auth/node'
 import Fastify, { type FastifyBaseLogger, type FastifyError, type FastifyInstance } from 'fastify'
+import { registerStripeWebhook } from './billing/webhook.ts'
 import { registerBrandAssets } from './brand/assets.ts'
 import { registerConnectRoutes } from './connect/routes.ts'
 import type { ServerDeps } from './deps.ts'
@@ -119,6 +120,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       // Mailbox OAuth (Gmail/Graph mail access), distinct from the sign-in providers above — the app
       // uses this to decide which "connect a mailbox" options to offer.
       mail: { gmail: deps.config.gmailOauth !== null, microsoft: deps.config.msOauth !== null },
+      // Phase 7: whether this deploy has STRIPE_* at all. The billing screen hides Subscribe when
+      // it is false rather than offering a button that can only answer `not_configured`.
+      billing: deps.stripe !== null,
     }))
 
     routes.get('/healthz', async (_req, reply) => {
@@ -151,6 +155,14 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // carries a session; each has its own trust anchor (the OIDC bearer token, clientState) instead.
     registerGmailWebhook(routes, deps)
     registerMicrosoftWebhook(routes, deps)
+
+    // Phase 7: POST /webhooks/stripe, in its OWN register() for the same class of reason the review
+    // pages below have one — Stripe verifies the RAW request bytes, so that route needs a parser
+    // that keeps the string, and the app-wide one (top of this function) hands every other route
+    // parsed JSON. One extra encapsulation keeps the swap where it belongs. @fastify/rate-limit's
+    // `global: true` still reaches inside: its onRoute hook lives on `app` and Fastify propagates
+    // onRoute into every descendant context (same note as the review block).
+    registerStripeWebhook(routes, deps)
 
     // Task 19: the session-less one-click review pages (review/routes.ts). Same "why here, not on
     // `app`" reasoning again — and the rate limit matters more here than anywhere else in this block:

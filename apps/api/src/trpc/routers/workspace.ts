@@ -2,11 +2,11 @@ import { TRPCError } from '@trpc/server'
 import { APIError } from 'better-auth/api'
 import { and, asc, count, desc, eq, inArray, sql } from 'drizzle-orm'
 import {
-  CreateWorkspaceInput, OPERATING_GUIDANCE_MAX, SetAgentEnabledInput, SuggestionIdInput, UpdateGuidanceInput,
+  BILLING_PRICING, CreateWorkspaceInput, OPERATING_GUIDANCE_MAX, SetAgentEnabledInput, SuggestionIdInput, UpdateGuidanceInput,
   deriveAllowedHosts, isOnboardingStep, nextOnboardingStep, slugify,
   UpdateProfileInput, type OnboardingStep, type Tone,
 } from '@aesa/contracts'
-import { agents, audit, categories, drafts, guidanceSuggestions, tickets, workspaces } from '@aesa/db'
+import { agents, audit, billingSubscriptions, categories, drafts, ensureBillingRow, guidanceSuggestions, tickets, workspaces } from '@aesa/db'
 import type { Auth } from '../../auth.ts'
 import { mapAuthError } from '../auth-errors.ts'
 import { authedProcedure, managerProcedure, orgProcedure, router } from '../init.ts'
@@ -82,6 +82,12 @@ export const workspaceRouter = router({
     }
     await ctx.deps.api.withOrg(org.id, async (tx) => {
       await tx.insert(workspaces).values({ orgId: org.id, businessName: input.businessName, timezone: input.timezone })
+      // Phase 7: every workspace owns a `billing_subscriptions` row from birth — on the trial plan,
+      // with no trial CLOCK yet (`trial_ends_at` is stamped by `setAgentEnabled`, below). A missing
+      // row already reads as a fresh trial through `readBillingState`, so this is not what makes
+      // billing work; it is what makes the row that Stripe's webhook and the overage sweep UPDATE
+      // exist before either of them needs it.
+      await ensureBillingRow(tx)
       await audit(tx, { actor: ctx.actor, action: 'workspace.create', entityType: 'workspace', entityId: org.id, detail: { businessName: input.businessName }, ip: ctx.ip, userAgent: ctx.userAgent })
     })
     return { orgId: org.id }
@@ -156,6 +162,20 @@ export const workspaceRouter = router({
       if (input.enabled) patch.agentEnabledAt = sql`COALESCE(${workspaces.agentEnabledAt}, now())`
 
       const [row] = await tx.update(workspaces).set(patch).where(eq(workspaces.orgId, ctx.orgId)).returning()
+
+      // Phase 7: enabling the agent is what starts the trial CLOCK — the same COALESCE idiom as
+      // `agentEnabledAt` above and for the same reason: the workspace's first-ever enable is the
+      // trial's start, and every later off/on flip leaves it alone (a trial cannot be restarted by
+      // toggling the switch). `ensureBillingRow` first, so a workspace created before Phase 7 has a
+      // row for the UPDATE to hit. `trialEndsAt` stays NULL until then, which `billingStateOf`
+      // reads as "trialing, no expiry yet" — a workspace that never went live never runs out.
+      if (input.enabled) {
+        await ensureBillingRow(tx)
+        await tx.update(billingSubscriptions)
+          .set({ trialEndsAt: sql`COALESCE(${billingSubscriptions.trialEndsAt}, now() + make_interval(days => ${BILLING_PRICING.trialDays}::int))` })
+          .where(eq(billingSubscriptions.orgId, ctx.orgId))
+      }
+
       await audit(tx, {
         actor: ctx.actor, action: input.enabled ? 'workspace.agent_enabled' : 'workspace.agent_disabled',
         entityType: 'workspace', entityId: ctx.orgId, detail: { onboardingStep }, ip: ctx.ip, userAgent: ctx.userAgent,

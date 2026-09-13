@@ -86,3 +86,14 @@ export const managerProcedure = orgProcedure.use(({ ctx, next }) => {
   if (!canManageWorkspace(ctx.member.role)) throw new TRPCError({ code: 'FORBIDDEN', message: 'owner or admin required' })
   return next()
 })
+
+/**
+ * Strictly narrower than `managerProcedure`: an ADMIN manages the workspace, but only the OWNER
+ * spends its money. Phase 7's `billing.startCheckout` / `openPortal` / `setOverageMode` are the
+ * whole reason this exists — an admin who can add a mailbox should not be able to put a card on
+ * file, open the Customer Portal (which can cancel the subscription) or turn metered overage on.
+ */
+export const ownerProcedure = orgProcedure.use(({ ctx, next }) => {
+  if (ctx.member.role !== 'owner') throw new TRPCError({ code: 'FORBIDDEN', message: 'owner required' })
+  return next()
+})

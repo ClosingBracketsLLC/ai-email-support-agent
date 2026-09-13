@@ -541,7 +541,10 @@ describe('Phase 4 close-out E2E (real pg-boss knowledge jobs + the real api know
     const listed = await listSources(service, orgA.orgId, true)
     expect(listed.knowledgeVersion).toBe(1)
     expect(listed.counts).toEqual({ sources: 1, readyChunks: 1, flaggedChunks: 0 })
-    expect(listed.caps).toEqual({ maxSources: 100, maxCrawlPages: 200 })
+    // 10 / 20 are the TRIAL plan's caps (`PLANS.trial`), which is what a fresh workspace is on since
+    // Phase 7 put `loadSettingSources` (org rows + the plan's defaults) behind every api
+    // `resolveSetting` — not the 100 / 200 settings-catalog defaults this pinned before.
+    expect(listed.caps).toEqual({ maxSources: 10, maxCrawlPages: 20 })
     expect(listed.canManage).toBe(true)
     expect(listed.sources[0]).toMatchObject({ id: pasteSourceId, kind: 'paste', status: 'ready', title: 'Returns FAQ', chunkCount: 1 })
   }, 120_000)

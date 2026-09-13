@@ -2,8 +2,9 @@ import { createTRPCClient, httpBatchLink } from '@trpc/client'
 import { eq } from 'drizzle-orm'
 import superjson from 'superjson'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { BILLING_ERROR_MESSAGES } from '@aesa/contracts'
 import { hashToken, hashesEqual } from '@aesa/crypto'
-import { agentCategoryPolicies, agents, auditLog, gmailAccessRequests } from '@aesa/db'
+import { agentCategoryPolicies, agents, auditLog, billingSubscriptions, gmailAccessRequests, mailboxConnections, oauthFlows, orgSettings } from '@aesa/db'
 import type { AppRouter } from '../src/trpc/router.ts'
 import { WEB, createTestApi, insertConnectedMailbox, listen, signInWithOtp } from './helpers/app.ts'
 
@@ -256,5 +257,69 @@ describe('mailboxes router: addresses, verification, consent, gmail access', () 
     } finally {
       await withMs.close()
     }
+  })
+
+  /**
+   * Phase 7: `mailboxes.max_connections`, resolved through `loadSettingSources` + `resolveSetting` —
+   * org override → the PLAN's default (`PLANS.trial.maxConnections` is 1, standard's is 5) → the
+   * settings-catalog default (5). Its own api, because `startConnect` refuses outright unless Gmail
+   * mailbox OAuth is configured, which the shared `t` above deliberately is not.
+   */
+  describe('the mailbox connection cap', () => {
+    let withOauth: Awaited<ReturnType<typeof createTestApi>>
+    let oauthBase: string
+    beforeAll(async () => {
+      withOauth = await createTestApi({ GMAIL_OAUTH_CLIENT_ID: 'g-client', GMAIL_OAUTH_CLIENT_SECRET: 'g-secret' })
+      oauthBase = await listen(withOauth.app)
+    })
+    afterAll(async () => { await withOauth.close() })
+
+    it('a TRIAL workspace gets one connection: the second startConnect is FORBIDDEN with the connection_limit message, and disconnecting frees the slot', async () => {
+      const signed = await signInWithOtp(withOauth.app, withOauth.mail, 'owner-cap@example.com', 'Owner')
+      const c = client(oauthBase, signed.cookie)
+      const { orgId } = await c.workspace.create.mutate({ businessName: 'Capped', timezone: 'UTC' })
+
+      const first = await insertConnectedMailbox(withOauth.api, orgId, signed.user.id, 'one@cap.test')
+
+      await expect(c.mailboxes.startConnect.mutate({ provider: 'gmail', platform: 'web' }))
+        .rejects.toMatchObject({ data: { code: 'FORBIDDEN' }, message: BILLING_ERROR_MESSAGES.connection_limit })
+      // Refused BEFORE anything is written: no oauth_flows row was created.
+      expect(await withOauth.api.withOrg(orgId, (tx) => tx.select().from(oauthFlows))).toEqual([])
+
+      // `status <> 'disabled'` is the live set, so disconnecting one frees its slot. The box key is
+      // not provisioned in this suite, so the next refusal is 'provisioning' — which is precisely
+      // the point: the cap is no longer what stops it.
+      await withOauth.api.withOrg(orgId, (tx) => tx.update(mailboxConnections)
+        .set({ status: 'disabled' }).where(eq(mailboxConnections.id, first)))
+      await expect(c.mailboxes.startConnect.mutate({ provider: 'gmail', platform: 'web' }))
+        .rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' }, message: 'provisioning' })
+    })
+
+    it('an org_settings override beats the plan default, and the standard plan lifts it to 5 without one', async () => {
+      const signed = await signInWithOtp(withOauth.app, withOauth.mail, 'owner-override-cap@example.com', 'Owner')
+      const c = client(oauthBase, signed.cookie)
+      const { orgId } = await c.workspace.create.mutate({ businessName: 'Override Cap', timezone: 'UTC' })
+      await withOauth.api.withOrg(orgId, (tx) =>
+        tx.insert(orgSettings).values({ orgId, key: 'mailboxes.max_connections', value: 3 }))
+
+      for (let i = 0; i < 3; i++) await insertConnectedMailbox(withOauth.api, orgId, signed.user.id, `m${i}@override.test`)
+      await expect(c.mailboxes.startConnect.mutate({ provider: 'gmail', platform: 'web' }))
+        .rejects.toMatchObject({ data: { code: 'FORBIDDEN' }, message: BILLING_ERROR_MESSAGES.connection_limit })
+
+      // The same workspace on the standard plan, with the override removed, gets that plan's 5.
+      const signed2 = await signInWithOtp(withOauth.app, withOauth.mail, 'owner-standard-cap@example.com', 'Owner')
+      const c2 = client(oauthBase, signed2.cookie)
+      const { orgId: orgId2 } = await c2.workspace.create.mutate({ businessName: 'Standard Cap', timezone: 'UTC' })
+      await withOauth.api.withOrg(orgId2, (tx) => tx.update(billingSubscriptions)
+        .set({ plan: 'standard', status: 'active' }).where(eq(billingSubscriptions.orgId, orgId2)))
+
+      for (let i = 0; i < 4; i++) await insertConnectedMailbox(withOauth.api, orgId2, signed2.user.id, `m${i}@standard.test`)
+      // Four of five used: the cap is not what refuses this one.
+      await expect(c2.mailboxes.startConnect.mutate({ provider: 'gmail', platform: 'web' }))
+        .rejects.toMatchObject({ data: { code: 'PRECONDITION_FAILED' }, message: 'provisioning' })
+      await insertConnectedMailbox(withOauth.api, orgId2, signed2.user.id, 'm4@standard.test')
+      await expect(c2.mailboxes.startConnect.mutate({ provider: 'gmail', platform: 'web' }))
+        .rejects.toMatchObject({ data: { code: 'FORBIDDEN' }, message: BILLING_ERROR_MESSAGES.connection_limit })
+    })
   })
 })

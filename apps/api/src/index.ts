@@ -3,6 +3,7 @@ import { audit } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createMemoryStore, createS3Store, type ObjectStore } from '@aesa/knowledge/storage'
 import { createAuth } from './auth.ts'
+import { createStripePort, type StripePort } from './billing/stripe.ts'
 import { createSendOnlyBoss } from './boss.ts'
 import { loadConfig } from './config.ts'
 import { createApiFacade, createEnqueue } from './deps.ts'
@@ -36,7 +37,16 @@ if (config.s3) {
   store = createMemoryStore()
 }
 
-const app = buildServer({ config, auth, api, mail, logger, enqueue, store })
+// The ONE place the Stripe SDK is constructed. Null outside a configured deploy — loadConfig already
+// refuses to boot a production api without STRIPE_*, so the warn below is reachable only in dev/test.
+let stripe: StripePort | null = null
+if (config.stripe) {
+  stripe = createStripePort(config.stripe)
+} else {
+  logger.warn('STRIPE_* missing; billing is off (Subscribe and Manage billing refuse, POST /webhooks/stripe 404s)')
+}
+
+const app = buildServer({ config, auth, api, mail, logger, enqueue, store, stripe })
 
 await app.listen({ port: config.port, host: config.host })
 for (const sig of ['SIGTERM', 'SIGINT'] as const) {

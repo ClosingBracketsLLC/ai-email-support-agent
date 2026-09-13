@@ -8,17 +8,18 @@
  */
 import { randomInt } from 'node:crypto'
 import { TRPCError } from '@trpc/server'
-import { and, count, eq } from 'drizzle-orm'
+import { and, count, eq, ne } from 'drizzle-orm'
 import {
-  AddAddressInput, AdminConsentInfoInput, ClaimConnectionInput, ConsentAddressInput, DisconnectInput,
+  AddAddressInput, AdminConsentInfoInput, BILLING_ERROR_MESSAGES, ClaimConnectionInput, ConsentAddressInput, DisconnectInput,
   MAX_AGENTS_PER_DOMAIN, RequestGmailAccessInput, ResendVerificationInput, StartConnectInput, emailDomain,
   type AgentStatus, type MailProvider,
 } from '@aesa/contracts'
+import { resolveSetting } from '@aesa/core'
+import { hashToken } from '@aesa/crypto'
 import {
   agentCategoryPolicies, agents, audit, categories, ensureDefaultCategories, getOrgBoxPublicKeyOrNull,
-  gmailAccessRequests, mailboxConnections, oauthFlows,
+  gmailAccessRequests, loadSettingSources, mailboxConnections, oauthFlows,
 } from '@aesa/db'
-import { hashToken } from '@aesa/crypto'
 import { JOB_NAMES } from '@aesa/queue'
 import { createFlow } from '../../connect/flows.ts'
 import { mailboxClaimedMail, verificationMail } from '../../mail/templates.ts'
@@ -57,6 +58,23 @@ export const mailboxesRouter = router({
     await ctx.deps.enqueue(JOB_NAMES.keysProvision, { orgId: ctx.orgId }, { entityId: 'keys', debounceSeconds: 30 })
 
     const { flowId, state } = await ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
+      // Phase 7: the plan's mailbox ceiling, checked BEFORE anything is written — an owner at the
+      // cap should be told so, not walked through a consent screen whose connection cannot land.
+      // It comes first for the same reason: "you are at your plan's limit" is a truer answer than
+      // "provisioning", which is what the box-key check below would say on a brand-new workspace.
+      // `status <> 'disabled'` is the live set: a disconnected mailbox frees its slot, a
+      // `reauth_required` one does not. That second half has a real edge: a workspace AT its cap
+      // whose only mailbox needs re-authorising is refused here, because this hop names no target
+      // (the provider decides which mailbox at callback time) and so cannot tell a reconnect from a
+      // new connection. Disconnecting the broken one first is the way through.
+      const sources = await loadSettingSources(tx, ['mailboxes.max_connections'])
+      const maxConnections = resolveSetting('mailboxes.max_connections', sources)
+      const [live] = await tx.select({ value: count() }).from(mailboxConnections)
+        .where(and(eq(mailboxConnections.orgId, ctx.orgId), ne(mailboxConnections.status, 'disabled')))
+      if ((live?.value ?? 0) >= maxConnections) {
+        throw new TRPCError({ code: 'FORBIDDEN', message: BILLING_ERROR_MESSAGES.connection_limit })
+      }
+
       const boxPublicKey = await getOrgBoxPublicKeyOrNull(tx)
       if (!boxPublicKey) throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'provisioning' })
 
