@@ -37,9 +37,13 @@ describe('isBillingActive', () => {
   })
 })
 
-describe('allowanceOf (trial: flat; standard: includedPerDomain × max(1, domains))', () => {
+describe('allowanceOf (trial: the flat BILLING_PRICING.trialIncludedConversations constant, field ignored; standard: includedPerDomain × max(1, domains))', () => {
   it.each([
     ['trial, 3 domains → the flat trial allowance regardless of domain count', row({ plan: 'trial', includedConversationsPerDomain: 50, domainQuantity: 3 }), 50],
+    // Ruling R6 regression: a trial row's `includedConversationsPerDomain` is what the workspace
+    // gets on SUBSCRIBING (the column default, 300) — it must never leak onto the trial's own
+    // allowance. A row-backed trial and a missing trial row must read identically.
+    ['trial with the column default (300) still reads the flat trial allowance, never 300', row({ plan: 'trial', includedConversationsPerDomain: 300, domainQuantity: 1 }), 50],
     ['standard, 0 domains → includedPerDomain × 1 (never zero)', row({ plan: 'standard', includedConversationsPerDomain: 300, domainQuantity: 0 }), 300],
     ['standard, 2 domains → includedPerDomain × 2', row({ plan: 'standard', includedConversationsPerDomain: 300, domainQuantity: 2 }), 600],
   ] as const)('%s', (_name, r, want) => {

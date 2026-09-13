@@ -39,10 +39,12 @@ export interface BillingStateView extends BillingStateRow {
   missingRow: boolean
 }
 
-/** A workspace with no row yet has never had `ensureBillingRow` run for it — the flat TRIAL
- *  allowance is the correct "never touched billing" reading (`allowanceOf` returns this field
- *  verbatim for `plan: 'trial'`), not the STANDARD per-domain rate a real row's column default
- *  carries for a paid plan. */
+/** A workspace with no row yet has never had `ensureBillingRow` run for it — every field here
+ *  matches that insert's column defaults exactly, so a missing row and a freshly-inserted one are
+ *  indistinguishable to every reader. `includedConversationsPerDomain` is `BILLING_PRICING.includedPerDomain`
+ *  (the STANDARD per-domain rate, matching the column default) — NOT the trial allowance:
+ *  `allowanceOf` (`@aesa/core`) ignores this field entirely on `plan: 'trial'` and returns the flat
+ *  `BILLING_PRICING.trialIncludedConversations` constant instead (controller ruling R6). */
 function defaultRow(orgId: string): BillingStateRow {
   return {
     orgId,
@@ -52,7 +54,7 @@ function defaultRow(orgId: string): BillingStateRow {
     currentPeriodStart: null,
     currentPeriodEnd: null,
     domainQuantity: 0,
-    includedConversationsPerDomain: BILLING_PRICING.trialIncludedConversations,
+    includedConversationsPerDomain: BILLING_PRICING.includedPerDomain,
     overageMode: 'automatic',
     overageUnitCents: BILLING_PRICING.overageUnitCents,
     stripeCustomerId: null,

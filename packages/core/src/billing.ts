@@ -23,12 +23,14 @@ export function billingStateOf(row: BillingRowLike, now: Date): BillingState {
 
 export const isBillingActive = (state: BillingState): boolean => state === 'trialing' || state === 'active'
 
-/** trial → the flat trial allowance (`row.includedConversationsPerDomain` is a flat PER-WORKSPACE
- *  number on the trial plan, not a per-domain rate — plan deviation 5 — so domain count never enters
- *  it); standard → `includedConversationsPerDomain` × max(1, domains), so a workspace with zero
- *  connected domains still gets one domain's worth. */
+/** trial → `BILLING_PRICING.trialIncludedConversations`, a flat PER-WORKSPACE constant (plan
+ *  deviation 5) — NOT `row.includedConversationsPerDomain`, which on a trial row is simply what the
+ *  workspace will get once it subscribes (the column default, 300) and must never be read here;
+ *  standard → `includedConversationsPerDomain` × max(1, domains), so a workspace with zero connected
+ *  domains still gets one domain's worth. (Controller ruling R6: a row-backed trial and a missing
+ *  trial row must read the identical allowance — the field only ever applies to the standard plan.) */
 export function allowanceOf(row: BillingRowLike): number {
-  if (row.plan === 'trial') return row.includedConversationsPerDomain
+  if (row.plan === 'trial') return BILLING_PRICING.trialIncludedConversations
   return row.includedConversationsPerDomain * Math.max(1, row.domainQuantity)
 }
 

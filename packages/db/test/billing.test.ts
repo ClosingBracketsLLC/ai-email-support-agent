@@ -45,6 +45,29 @@ describe('billing', () => {
     expect(rows).toHaveLength(1)
   })
 
+  // Ruling R6 regression: the missing-row default and a real trial row must read the SAME
+  // allowance. Before the fix, `ensureBillingRow`'s row carried the column default (300, the
+  // STANDARD per-domain rate) and `allowanceOf` read it verbatim for a trial, so a workspace with a
+  // row read 300 while one without still read 50 — a 6x leak against the trial's $10 LLM budget.
+  it('a trial org WITH a row (after ensureBillingRow) reads the same allowance as one without a row (both 50)', async () => {
+    const withRow = await mkOrg('Trial with row')
+    await withOrg(app.db, withRow, (tx) => ensureBillingRow(tx))
+    const now = new Date('2026-09-15T12:00:00Z')
+    const view = await withOrg(app.db, withRow, (tx) => readBillingState(tx, now))
+    expect(view.missingRow).toBe(false)
+    expect(view.plan).toBe('trial')
+    expect(view.allowance).toBe(50)
+  })
+
+  it('a trial row whose included_conversations_per_domain has been hand-set to 999 still reads allowance 50', async () => {
+    const handSet = await mkOrg('Trial hand-set 999')
+    await withOrg(app.db, handSet, (tx) =>
+      tx.insert(billingSubscriptions).values({ orgId: handSet, includedConversationsPerDomain: 999 }))
+    const view = await withOrg(app.db, handSet, (tx) => readBillingState(tx, new Date('2026-09-15T12:00:00Z')))
+    expect(view.plan).toBe('trial')
+    expect(view.allowance).toBe(50)
+  })
+
   it('trial_ends_at an hour in the past reads as trial_expired and inactive', async () => {
     const expired = await mkOrg('Expired')
     const now = new Date('2026-09-15T12:00:00Z')
