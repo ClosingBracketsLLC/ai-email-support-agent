@@ -21,8 +21,9 @@ import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
 import { loadKekRing } from '@aesa/crypto'
 import { createMemoryStore } from '@aesa/knowledge'
+import { exportObjectKey } from '@aesa/contracts'
 import {
-  EXPORT_MAX_BYTES, EXPORT_TABLE_NAMES, exportObjectKey, runWorkspaceExport, type WorkspaceExportDeps,
+  EXPORT_MAX_BYTES, EXPORT_TABLE_NAMES, runWorkspaceExport, type WorkspaceExportDeps,
 } from '../src/jobs/workspace-export.ts'
 
 const rand = () => randomBytes(4).toString('hex')
@@ -244,16 +245,52 @@ describe('workspace.export', () => {
     expect(await runWorkspaceExport(makeDeps(store), { orgId, exportId }, AbortSignal.timeout(60_000))).toBe('skipped')
   })
 
-  it('refuses when the workspace row names a DIFFERENT export id than the payload', async () => {
+  it('a row queued for a DIFFERENT key lands failed and alerts — a mismatch between the mint and the validate is never silent', async () => {
     const store = createMemoryStore()
-    const exportId = randomUUID()
-    const { orgId } = await seedOrg(exportId)
+    const storedExportId = randomUUID()
+    const payloadExportId = randomUUID()
+    const { orgId } = await seedOrg(storedExportId)
+    const alerts: Record<string, unknown>[] = []
+    const logger = pino({ level: 'error' }, { write: (line: string) => void alerts.push(JSON.parse(line) as Record<string, unknown>) })
 
-    const outcome = await runWorkspaceExport(makeDeps(store), { orgId, exportId: randomUUID() }, AbortSignal.timeout(60_000))
+    const outcome = await runWorkspaceExport(makeDeps(store, { logger }), { orgId, exportId: payloadExportId }, AbortSignal.timeout(60_000))
 
     expect(outcome).toBe('skipped')
     expect(store.objects.size).toBe(0)
-    expect((await readWorkspace(orgId)).exportState).toBe('queued')
+    // The owner sees a failure, not a spinner that never resolves.
+    const ws = await readWorkspace(orgId)
+    expect(ws.exportState).toBe('failed')
+    expect(ws.exportReadyAt).toBeNull()
+    expect(ws.exportKey).toBe(exportObjectKey(orgId, storedExportId))
+
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0]).toMatchObject({
+      alert: true, kind: 'export_failed', orgId, exportId: payloadExportId,
+      expectedKey: exportObjectKey(orgId, payloadExportId),
+      actualKey: exportObjectKey(orgId, storedExportId),
+    })
+
+    const audits = await withOrg(app.db, orgId, (tx) =>
+      tx.select({ detail: auditLog.detail }).from(auditLog).where(eq(auditLog.action, 'workspace.export_failed')))
+    expect(audits).toHaveLength(1)
+    expect(audits[0]!.detail).toEqual({ exportId: payloadExportId, error: 'export_key_mismatch' })
+  })
+
+  it('a row that is no longer queued is a QUIET skip — no alert, no state change', async () => {
+    const store = createMemoryStore()
+    const exportId = randomUUID()
+    const { orgId } = await seedOrg(exportId)
+    await withOrg(app.db, orgId, (tx) =>
+      tx.update(workspaces).set({ exportState: 'none' }).where(eq(workspaces.orgId, orgId)))
+    const alerts: Record<string, unknown>[] = []
+    const logger = pino({ level: 'error' }, { write: (line: string) => void alerts.push(JSON.parse(line) as Record<string, unknown>) })
+
+    const outcome = await runWorkspaceExport(makeDeps(store, { logger }), { orgId, exportId }, AbortSignal.timeout(60_000))
+
+    expect(outcome).toBe('skipped')
+    expect(alerts).toEqual([])
+    expect(store.objects.size).toBe(0)
+    expect((await readWorkspace(orgId)).exportState).toBe('none')
   })
 
   it('fails a bundle past EXPORT_MAX_BYTES: no object left behind, export_state failed, the owner paged', async () => {

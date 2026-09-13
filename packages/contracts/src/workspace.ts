@@ -63,6 +63,17 @@ export const WORKSPACE_DELETE_GRACE_DAYS = 30
 export const EXPORT_STATES = ['none', 'queued', 'ready', 'failed'] as const
 export type ExportState = (typeof EXPORT_STATES)[number]
 
+/**
+ * Where a workspace's data export lives in the object store. It lives HERE, in contracts, because
+ * two processes have to agree on it exactly: the api mints it into `workspaces.export_key` when it
+ * queues the export, and the worker's `workspace.export` job refuses any row whose stored key is not
+ * this exact string for the export id on its payload. Deriving it independently on either side is
+ * the drift this function exists to make impossible.
+ */
+export function exportObjectKey(orgId: string, exportId: string): string {
+  return `orgs/${orgId}/exports/${exportId}.ndjson`
+}
+
 export const WORKSPACE_ERROR_MESSAGES = {
   confirm_mismatch: 'Type the workspace name exactly to confirm.',
   deletion_pending: 'Deletion is already scheduled.',

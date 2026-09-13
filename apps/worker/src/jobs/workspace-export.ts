@@ -29,15 +29,19 @@
  * snapshot) for the length of the export.
  *
  * Guards, both ends: the job proceeds only if the row still says `export_state = 'queued'` AND its
- * `export_key` names THIS `exportId` (anything else — a cancelled export, a newer request that
- * overwrote the key, this job's own completed first attempt — is `skipped`), and the landing write
- * is guarded on `queued` again. A failure lands `failed`, deletes the partial object and pages the
+ * `export_key` is exactly `exportObjectKey(orgId, exportId)` — the ONE function `@aesa/contracts`
+ * holds, which the api mints the key with and this job validates it against. A row that is no longer
+ * `queued` (a cancelled export, a newer request, this job's own completed first attempt) is a quiet
+ * `skipped`; a row that is `queued` for a DIFFERENT key is not — that can only be a programming error
+ * between the two sides, so it lands `failed` and alerts rather than leaving the owner on a spinner.
+ * The landing write is guarded on `queued` again. A failure lands `failed`, deletes the partial object and pages the
  * owner under the SAME dedupe key the success would have used, so one request pages once either way.
  */
 import { and, asc, eq, gt, isNotNull, sql } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import { z } from 'zod'
+import { exportObjectKey } from '@aesa/contracts'
 import {
   agentCategoryPolicies, agentModelConfig, agents, audit, auditLog, billingSubscriptions, categories,
   categoryStatsDaily, drafts, guidanceSuggestions, knowledgeSources, llmCredentials, mailboxConnections,
@@ -59,12 +63,6 @@ export const EXPORT_MAX_BYTES = 200 * 1024 * 1024
 export const EXPORT_PAGE_ROWS = 1_000
 
 const EXPORT_ACTOR: AuditActor = 'system:job:workspace.export'
-
-/** Where a workspace's bundle lives. The api (Task 8) mints the SAME string into `export_key` when
- *  it queues the export, and this job refuses any row whose key does not end in its own export id. */
-export function exportObjectKey(orgId: string, exportId: string): string {
-  return `orgs/${orgId}/exports/${exportId}.ndjson`
-}
 
 // ---------------------------------------------------------------------------------------------
 // The allowlists. Read them as "what the owner gets", never as "the table minus …".
@@ -335,6 +333,12 @@ class ExportTooLarge extends Error {
   }
 }
 
+/** What the claim check found. `key_mismatch` is the only one that WRITES — see `runWorkspaceExport`. */
+type ExportClaim =
+  | { outcome: 'claimed' }
+  | { outcome: 'not_queued' }
+  | { outcome: 'key_mismatch'; actualKey: string | null }
+
 interface Bundle {
   bytes: Buffer
   rows: number
@@ -390,15 +394,44 @@ export async function runWorkspaceExport(
   const { orgId, exportId } = payload
   const key = exportObjectKey(orgId, exportId)
 
-  // --- Claim check. Anything but "still queued, and queued for THIS export id" is a no-op.
-  const claimed = await withOrg(deps.db, orgId, async (tx) => {
+  // --- Claim check. Anything but "still queued, and queued for THIS export id" stops here.
+  const claim = await withOrg<ExportClaim>(deps.db, orgId, async (tx) => {
     const [ws] = await tx
       .select({ exportState: workspaces.exportState, exportKey: workspaces.exportKey })
       .from(workspaces)
       .where(eq(workspaces.orgId, orgId))
-    return ws?.exportState === 'queued' && ws.exportKey === key
+    if (!ws || ws.exportState !== 'queued') return { outcome: 'not_queued' }
+    if (ws.exportKey === key) return { outcome: 'claimed' }
+    // `queued` for a DIFFERENT key than this payload implies. Both sides derive it from ONE function
+    // (`exportObjectKey`, `@aesa/contracts`), so this cannot happen by configuration — it is a
+    // programming error between the api that minted the key and this job. Land it `failed` in the
+    // SAME transaction, guarded, so the owner sees a failure instead of a spinner that never
+    // resolves; a silent skip here is a request that never completes and never says why.
+    const landed = await tx
+      .update(workspaces)
+      .set({ exportState: 'failed', exportReadyAt: null })
+      .where(and(eq(workspaces.orgId, orgId), eq(workspaces.exportState, 'queued')))
+      .returning({ orgId: workspaces.orgId })
+    if (landed.length > 0) {
+      await audit(tx, {
+        actor: EXPORT_ACTOR, action: 'workspace.export_failed', entityType: 'workspace', entityId: orgId,
+        detail: { exportId, error: 'export_key_mismatch' },
+      })
+    }
+    return { outcome: 'key_mismatch', actualKey: ws.exportKey }
   })
-  if (!claimed) {
+
+  if (claim.outcome === 'key_mismatch') {
+    // Task 11 replaces this with `alert('export_failed', { orgId, exportId })`. No push: the owner
+    // has nothing to act on, and the state they can already see reads `failed`. This line is for
+    // whoever has to fix the mint/validate pair, which is why it carries BOTH keys verbatim.
+    deps.logger.error(
+      { alert: true, kind: 'export_failed', orgId, exportId, expectedKey: key, actualKey: claim.actualKey },
+      'workspace.export: the workspace row names a different export key than this job\'s payload — landed failed',
+    )
+    return 'skipped'
+  }
+  if (claim.outcome === 'not_queued') {
     deps.logger.info({ orgId, exportId }, 'workspace_export_skipped')
     return 'skipped'
   }
