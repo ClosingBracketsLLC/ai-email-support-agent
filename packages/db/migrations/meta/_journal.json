@@ -148,6 +148,13 @@
       "when": 1789182726695,
       "tag": "0020_provider_hardening",
       "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1789182726696,
+      "tag": "0021_retention_indexes",
+      "breakpoints": true
     }
   ]
 }
