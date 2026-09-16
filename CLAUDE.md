@@ -200,8 +200,14 @@ instruction from him in the session.
   the lifecycle/export columns on `workspaces`, `drafts.body_purged_at`,
   `knowledge_sources.sweep_attempts`, `resolved_answers.source_message_id` (partial unique), the
   three age indexes (0021 `agent_runs (started_at)`, 0023 `llm_calls`/`notifications
-  (created_at)`, 0024 `audit_log (created_at)`) and `resolve_stripe_customer` (SECURITY DEFINER,
-  the api's ONE cross-org read; zero rows for an unknown customer) — plus `billing.ts`
+  (created_at)`, 0024 `audit_log (created_at)`), the fix wave's 0025 (0023's trial-row backfill
+  re-run under `SET ROLE aesa_platform` — the original ran as `aesa_owner`, which FORCE RLS filters
+  to nothing, so it inserted no rows; `migrations.test.ts` now refuses any tenant-table data write in
+  a migration without that pair) and `resolve_stripe_customer` (SECURITY DEFINER; zero rows for an
+  unknown customer — the FIFTH fixed-signature resolver of its kind, after
+  `resolve_mailbox_connection` and `resolve_mailbox_subscription` (0006), `resolve_oauth_flow`
+  (0009) and `resolve_draft_action_token` (0011), each the one cross-org read its webhook or
+  session-less route needs) — plus `billing.ts`
   (**`readBillingState`**, the ONE reader of a workspace's billing state — see the Billing rule
   below — `ensureBillingRow`, `countManagedConversations`, `countActiveDomains`), `settings.ts`
   (**`loadSettingSources`** / `SettingSources` — see the Plans rule), `metering.ts`'s
@@ -340,16 +346,26 @@ instruction from him in the session.
   them. The same holds for `llm_credential_secrets` (see the Provider credentials rule below).
   Phase 7 added `ownerProcedure` (`role === 'owner'`, above `managerProcedure` in `trpc/init.ts`) and
   the shape twice more: a `billing` router over `src/billing/service.ts` (`@aesa/api/billing` —
-  `getBilling`, `startCheckout`, `openPortal`, `setOverageMode`; `src/billing/stripe.ts` is the
-  `StripePort` and `src/billing/webhook.ts` is `applyStripeEvent` + `registerStripeWebhook`, the
-  raw-body `POST /webhooks/stripe` in its own encapsulated `register()` — signature over the bytes,
-  dedupe through `webhook_events`, the `last_stripe_event_created` watermark checked on the read AND
-  in the UPDATE's WHERE, items read by price, a foreign invoice refused, fulfilment on the session's
-  `payment_status`) and a `workspace` lifecycle service, `src/workspace/lifecycle.ts`
+  `getBilling`, `startCheckout` (which also refuses a Checkout still pending — a subscription id on
+  a `trialing` row — as `checkout_pending`, ruling R30), `openPortal`, `setOverageMode` — every
+  mutation `ownerProcedure`, `setOverageMode` included: a deliberate deviation from the plan's Roles
+  paragraph, which implied `managerProcedure`; a money mode is the owner's; `src/billing/stripe.ts`
+  is the `StripePort` (15 s timeout, 2 network retries, explicit) and `src/billing/webhook.ts` is
+  `applyStripeEvent` + `registerStripeWebhook`, the raw-body `POST /webhooks/stripe` in its own
+  encapsulated `register()` — signature over the bytes, dedupe through `webhook_events`, the
+  `last_stripe_event_created` watermark checked on the read AND in the UPDATE's WHERE, items read by
+  price, a foreign invoice refused, fulfilment on the session's `payment_status`, and since the fix
+  wave (rulings R30–R32) a `customer.subscription.*` for a subscription the row does not hold
+  ignored + alerted (`stripe_foreign_subscription_event`), any invoice on a `canceled` row ignored,
+  `incomplete_expired` moving nothing and `past_due`/`canceled` landing on a `standard` row alone)
+  and a `workspace` lifecycle service, `src/workspace/lifecycle.ts`
   (`@aesa/api/workspace` — `setKillSwitch`, `setRetentionDays`, `requestDeletion` with the Stripe
-  cancel BEFORE its write transaction, `cancelDeletion`, `requestExport`, `exportStatus` — every one
+  cancel — of ANY subscription the row holds, a deferred one included, on every status but
+  `canceled` — BEFORE its write transaction, `cancelDeletion`, `requestExport`, `exportStatus` — every one
   `ownerProcedure` except `exportStatus`'s state read); `memory.rememberReply`; `workspace.create`
-  inserts the billing row and `setAgentEnabled` stamps `trial_ends_at`; `mailboxes.startConnect`
+  inserts the billing row and `setAgentEnabled` stamps `trial_ends_at` as
+  `trialEndsAtFor(agent_enabled_at)` (the one formula) and refuses to switch the agent ON while a
+  deletion is pending; `mailboxes.startConnect`
   refuses beyond the plan's LIVE sync slots (`connected` + `pending_claim`); every `resolveSetting`
   on `loadSettingSources` (`src/org-settings.ts` is gone); and `src/observability.ts`
   (`initObservability`, `beforeSend`, `alert`, `captureWithOrg`, `ALERT_KINDS`) — see the
@@ -408,11 +424,17 @@ instruction from him in the session.
   `knowledge` role); `drafting/admission.ts` (the managed slot pool: `MANAGED_DRAFT_SLOTS`
   session-level advisory locks, a 60 s wait then PROCEED with an `admission_slot_timeout` alert — a
   draft is never lost to admission control; BYOK calls never enter it); `drafting/caps.ts` reading
-  the plan and the trial's total budget; `ticket.draft`/`agent.sandbox` passing
-  `readBillingState(...).active` and `isAllowanceExhausted(...)` into `decide()`; `send.execute`'s
-  eighth kill lever `subscription_inactive` (an AUTO send only — a human approval still sends) and
-  the managed conversations meter; `memory.capture`'s `messageId` payload variant with every skip
-  audited; `sweeps.daily`'s arms (g) `agent_runs` 90 d and (h) `platform.access` 30 d;
+  the plan and — for a genuine, unexpired trial only, summed from `agent_enabled_at` (ruling R27)
+  — the trial's total budget, whose refusal lands `needs_owner/trial_budget` through
+  `escalateTicket`; `ticket.draft` passing `readBillingState(...).active` and
+  `isAllowanceExhausted(...)` into `decide()` (`agent.sandbox` passes `.active` and a literal
+  `allowanceExhausted: false`, deliberately — a probe is never a billed conversation);
+  `send.execute`'s eighth kill lever `subscription_inactive` (an AUTO send only — a human approval
+  still sends) and the managed conversations meter, deduped per BILLING PERIOD
+  (`tickets.ai_handled_month` is the period start's date since ruling R26, with the legacy
+  `'YYYY-MM'` honoured by `handledPeriodStamps`); `memory.capture`'s `messageId` payload variant
+  with every skip audited; `sweeps.daily`'s arms (g) `agent_runs` 90 d (in `RETENTION_BATCH` slices
+  since the fix wave) and (h) `platform.access` 30 d;
   `drafting/outcomes.ts` now home to `escalateProviderUnavailable`/`killCredential`; and
   `src/observability.ts` (the api's twin; the job observer wired at boot).
 - `apps/app` — the Expo universal app (`@aesa/app`, SDK 57, Expo Router, `web.output` server):
@@ -421,8 +443,11 @@ instruction from him in the session.
   `(app)/settings/ai` (Managed AI vs provider connections: add, probe, remove, per-credential 30-day
   usage, the consent sentence), the agent edit screen's **Model** card, and the model each agent runs
   on in the agent list row. Phase 7 added **routes 26 and 27**: `(app)/settings/billing` (plan,
-  domains, allowance and usage, the period, Subscribe / Manage billing through Stripe in a popup
-  opened BEFORE the await, the overage-mode toggle for the owner) and `share` (the native share
+  domains, allowance and usage — "N of M conversations this month", not the period's dates —
+  Subscribe / Manage billing through Stripe in a popup opened BEFORE the await, the overage-mode
+  toggle for the owner; since the fix wave a `trial_expired`/`canceled` workspace reads as lapsed,
+  never as a priced plan, and the `?checkout=success` thanks is for an `active` state alone) and
+  `share` (the native share
   sheet's landing — a link crawls, text pastes, a file uploads; `lib/share-intent{,.web}.tsx` keep
   `expo-share-intent` out of the web bundle), plus the inbox `BillingBanner`, the owner-only danger
   zone on Settings → Workspace (kill switch, retention, export, delete with a typed confirmation),
@@ -462,8 +487,9 @@ instruction from him in the session.
   carries EIGHTEEN queues since Phase 7, TWELVE of them `short` — Phase 3's `ticket.draft`,
   `send.execute`, `agent.sandbox`, `notify.dispatch`,
   Phase 4's `knowledge.ingest`, `knowledge.crawl`, `knowledge.embed-batch`, Phase 5's
-  `memory.capture` (produced by the WORKER alone, from `send.execute`'s post-commit `onSent` seam)
-  and `guidance.suggest` (produced by the API alone, from `approveDraft` after an edited
+  `memory.capture` (a producer on BOTH sides since Phase 7's Task 8 — the worker's `send.execute`
+  from its post-commit `onSent` seam, AND the api's `rememberReply`, which sends the `messageId`
+  variant) and `guidance.suggest` (produced by the API alone, from `approveDraft` after an edited
   approval), Phase 6's `llm.probe` (a producer on BOTH sides, like `ticket.draft`,
   `send.execute` and `notify.dispatch` before it — the api's `addCredential`/`probeCredential` AND
   the worker's own `llm.reprobe-sweep` cron, so it sits in both pre-create lists with its
@@ -489,8 +515,9 @@ instruction from him in the session.
   lists carry the queue's `policy`** — `createQueue` ignores a second call, so whichever process
   boots first decides, and a `short` queue first created by an api-only boot with no options would
   stay `standard` until a worker replica ran `updateQueue`. The rule is LITERAL about "both
-  pre-create lists": `memory.capture` is in the api's list though the api never sends it, and
-  `guidance.suggest` is in the worker's though the worker never sends it. **Since Phase 6 the
+  pre-create lists": `guidance.suggest` is in the worker's list though the worker never sends it
+  (and `memory.capture` was in the api's for the same reason until `rememberReply` made the api a
+  producer of it too). **Since Phase 6 the
   OPTIONS for all three code places come from ONE table** — `QUEUE_OPTIONS` in
   `packages/queue/src/queue-options.ts` — so a queue's policy, retry, backoff and expiry are edited
   in one file and cannot drift between `defineJob` and the two pre-creates; `defineJob`'s `queue` is
@@ -514,7 +541,14 @@ instruction from him in the session.
   `provider_unavailable` landings (the resolver produced no provider; the tenant's key was rejected
   mid-call) write no verdict columns, so they go through `escalateTicket` — with the SAME
   reason-scoped `provider_unavailable:${ticketId}:${day}` key `ticket.draft` uses, so which job met
-  the dead key first cannot change whether the owner is paged.
+  the dead key first cannot change whether the owner is paged. Phase 7's fix wave added the
+  NINETEENTH `NEEDS_OWNER_REASONS` entry, `trial_budget` (ruling R27): a genuine trial that has
+  spent its total Managed-AI budget lands there through `escalateTicket`
+  (`trial_budget:${ticketId}:${day}`) rather than being left `triaged` for the backstop to re-enqueue
+  every minute, with ONE org-level `billing` notice (`llm_cap:trial:${orgId}`, no day) as the
+  durable gate behind the once-per-org operator alert. Every reason has its `escalationCopy` row and
+  the app's `REASON_CHIP`/`REASON_SENTENCE`/`REASON_TONE` entries — all `Record<NeedsOwnerReason, …>`,
+  so a missing one is a compile error.
 - **Guarded writes and the staleness anchor.** Every status write is guarded on the status it was
   read at (`WHERE ... AND status = <read value>`), and zero rows is a soft outcome the caller
   reports, never an error — that is what makes a concurrent owner, sweep or job simply win.
@@ -576,7 +610,8 @@ instruction from him in the session.
   `MEMORY_RETRIEVE_MIN_COSINE`, vector-only (the degraded/lexical path returns no answers at all).
   A `candidate` (every auto-send produces one) is therefore invisible until a human samples it.
   `memory.capture` is the ONLY writer of a new `resolved_answers` row, and it is idempotent on
-  `drafts.memory_captured_at`; `scrubForMemory` runs on every stored question and answer, and an
+  `drafts.memory_captured_at` (the `draftId` variant) and on `resolved_answers_source_message_uidx`
+  (the `messageId` variant `rememberReply` sends); `scrubForMemory` runs on every stored question and answer, and an
   empty result is a skip (`memory.skipped`, `empty_after_scrub`), never a stored empty string.
   `expires_at` is a FIXED 365 days from the human decision that set it — capture, a reinforcing
   approval, or `confirmCandidate` — and **nothing else moves it**: being retrieved into a prompt,
@@ -613,7 +648,9 @@ instruction from him in the session.
   `billing_subscriptions` is never WRITTEN in a transaction that holds a draft or a ticket:
   `readBillingState` is a read the draft job takes in its pre-claim transaction beside
   `org_settings` and `send.execute` takes in its claim transaction beside `workspaces`; its writers
-  are the api's billing service and webhook and the worker's report cron, each on its own.
+  are the api's billing service and webhook, the worker's report cron, `workspace.create`
+  (`ensureBillingRow`, the trial row from creation) and `setAgentEnabled` (`trial_ends_at`, once,
+  as `trialEndsAtFor(agent_enabled_at)`), each on its own.
 - **Secrets.** Never logged, never returned by an API. `Secret` serializes as `[redacted]`; the api
   error handler strips SQL parameters and redacts URLs before anything reaches a log or a client.
 - **App bundle.** `apps/app` never value-imports a server package — `@aesa/db`, `@aesa/core`,
@@ -624,7 +661,10 @@ instruction from him in the session.
   throughout (ESLint block for `apps/app/**`). Share types through `@aesa/contracts`. The two PURE
   `@aesa/knowledge` sub-paths are pure for the API's sake, not the app's: they still reach `node:*`
   and the AWS SDK. The Expo web export is **27 static routes** since Phase 7's
-  `(app)/settings/billing` and `share`. `expo-share-intent` is native-only and reaches the tree
+  `(app)/settings/billing` and `share` — `src/app/+native-intent.ts` (the fix wave's
+  `redirectSystemPath`, ruling R34, which sends the iOS share relaunch's `dataUrl=` url to `/` so
+  the shell mounts) is excluded from the route table by Expo Router itself and does not count.
+  `expo-share-intent` is native-only and reaches the tree
   through `src/lib/share-intent.tsx` with a `.web.tsx` twin that imports nothing from it — the
   emitted web bundle was grepped for the package name to prove the split (no lint rule enforces it
   yet; a carry).
@@ -703,9 +743,11 @@ instruction from him in the session.
   is no reconciliation sweep (a carry), so a missed delivery is repaired from the Dashboard.
 - **Plans.** `PLANS` (`@aesa/core`) is built from `BILLING_PRICING` (`@aesa/contracts`), and
   `planSettingDefaults(plan)` is the ONLY way a plan becomes a `resolveSetting` source —
-  `loadSettingSources(tx, keys)` (`@aesa/db`) is its only caller and returns `{ org, plan, planId }`
-  resolved org > plan > default. **No production code passes `{ org: … }` alone to
-  `resolveSetting`**: every one of the 22 sites (worker and api) takes `loadSettingSources`'s
+  `loadSettingSources(tx, keys)` (`@aesa/db`) is its only caller and returns
+  `{ org, plan, planId, billing }` resolved org > plan > default — `billing` being the whole
+  `readBillingState` view the plan came from (ruling R27), so a caller that needs the derived
+  STATE or the trial clock never reads the row a second time. **No production code passes
+  `{ org: … }` alone to `resolveSetting`**: every one of the 25 sites (worker and api) takes `loadSettingSources`'s
   result, both `loadOrgSettings` twins and `apps/api/src/org-settings.ts` are gone, and a grep for
   `resolveSetting(` with `{ org:` outside tests is a review failure. A plan change (a Checkout, a
   Portal cancel) therefore lowers or raises every cap at the next call with no restart.
@@ -741,7 +783,8 @@ instruction from him in the session.
   worker the local log line is protected one step earlier: `registerJob` runs `scrubJobError` on
   every job failure before pg-boss persists it or the observer sees it. Org
   attribution is a TAG (`org_id`, plus `job`/`path`) set inside `withIsolationScope`; `alert(kind)`
-  is one of the ELEVEN `ALERT_KINDS`, always a pino `error` line with `alert: true` and, when Sentry
+  is one of the TWELVE `ALERT_KINDS` (the fix wave added `stripe_foreign_subscription_event`,
+  ruling R31), always a pino `error` line with `alert: true` and, when Sentry
   is initialised, a `captureMessage` tagged `kind` — never a throw. `SENTRY_DSN` unset is a no-op
   everywhere. Never run either process with `--inspect` in production: Sentry's default
   `localVariablesIntegration` would attach stack-frame locals outside `beforeSend`'s reach.

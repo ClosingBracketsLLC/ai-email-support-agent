@@ -39,8 +39,9 @@ export async function createSendOnlyBoss(connectionString: string): Promise<PgBo
   await createQueueRetrying(boss, JOB_NAMES.knowledgeCrawl, queueOptionsFor(JOB_NAMES.knowledgeCrawl))
   await createQueueRetrying(boss, JOB_NAMES.knowledgeEmbedBatch, queueOptionsFor(JOB_NAMES.knowledgeEmbedBatch))
   // Phase 5: `approveDraft` sends guidance.suggest after an edited approval — the api IS that
-  // producer. It never sends memory.capture (the worker's send.execute does, from its onSent seam),
-  // but the four-places rule is literal: every queue is pre-created on both processes regardless.
+  // producer. memory.capture was the worker's alone (send.execute's onSent seam) until Phase 7's
+  // `rememberReply` made the api a producer of its messageId variant too; either way the four-places
+  // rule is literal: every queue is pre-created on both processes regardless.
   await createQueueRetrying(boss, JOB_NAMES.guidanceSuggest, queueOptionsFor(JOB_NAMES.guidanceSuggest))
   await createQueueRetrying(boss, JOB_NAMES.memoryCapture, queueOptionsFor(JOB_NAMES.memoryCapture))
   // Phase 6: the api's `llm.addCredential`/`probeCredential` send it on every key added or

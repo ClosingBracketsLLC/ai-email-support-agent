@@ -22,30 +22,57 @@ here that can make a tenant's data unreadable.
 | New runtime dependencies | `stripe@22.6.2` (api and worker), `@sentry/node@10.74.0` (api and worker), `expo-share-intent@8.0.1` (app) — all pinned exactly; a deploy needs `pnpm install` |
 | New queues | `workspace.export` (`short`, `knowledge` role), `workspace.purge` (`short`, `knowledge` role), `keys.rotate` (`standard`, `sync` role) — pre-created at boot by BOTH `apps/worker/src/index.ts` and `apps/api/src/boss.ts`, in `QUEUE_OPTIONS` and in the preflight test, per the four-places rule |
 | New crons | `billing.report-usage` `20 0 * * *` (`cron`), `retention.sweep` `45 3 * * *` (`cron`), `workspace.purge-sweep` `15 4 * * *` (`cron`), `knowledge.stuck-sweep` `*/5 * * * *` (`knowledge`), `knowledge.reembed-sweep` `*/10 * * * *` (`knowledge`) |
-| New migrations | `0021_retention_indexes.sql` (`agent_runs (started_at)`), `0022_lonely_zemo.sql` (generated: `billing_subscriptions`, the lifecycle/export columns on `workspaces`, `drafts.body_purged_at`, `knowledge_sources.sweep_attempts`, `resolved_answers.source_message_id`), `0023_billing_hardening.sql` (FORCE RLS, the two partial unique indexes on the Stripe ids, the trial-row backfill for every existing workspace, the retention work-list indexes, `notifications_kind_check` re-added with `billing`/`workspace`, `resolve_stripe_customer`), `0024_audit_retention_index.sql` (`audit_log (created_at)`) |
+| New migrations | `0021_retention_indexes.sql` (`agent_runs (started_at)`), `0022_lonely_zemo.sql` (generated: `billing_subscriptions`, the lifecycle/export columns on `workspaces`, `drafts.body_purged_at`, `knowledge_sources.sweep_attempts`, `resolved_answers.source_message_id`), `0023_billing_hardening.sql` (FORCE RLS, the two partial unique indexes on the Stripe ids, a trial-row backfill that **silently did nothing** — see below, the retention work-list indexes, `notifications_kind_check` re-added with `billing`/`workspace`, `resolve_stripe_customer`), `0024_audit_retention_index.sql` (`audit_log (created_at)`), **`0025_billing_backfill.sql`** (the fix wave, ruling R33: 0023's backfill re-run under `SET ROLE aesa_platform … RESET ROLE` — the one that actually inserts) |
 | New commands | `pnpm smoke:tenant` (root; §6) and `pnpm --filter @aesa/worker keys:rotate` (§4) |
 
-**Deploy migrations before code, as always.** Two notes on this set:
+**Deploy migrations before code, as always.** Three notes on this set:
 
-- **`0023` backfills a `billing_subscriptions` row for every existing workspace** (`plan = 'trial'`,
-  `status = 'trialing'`), and stamps `trial_ends_at = agent_enabled_at + 14 days` for any workspace
-  whose agent is already on. **Every existing workspace therefore lands on the TRIAL tier the moment
-  the migration runs — and the trial tier is much tighter than the catalog defaults every workspace
-  ran on through Phase 6.** Sources 100 → 10, crawl pages 200 → 20, sandbox runs/day 100 → 10,
-  mailbox connections 5 → 1, drafts/day 2000 → 50, Managed-AI USD/day 60 → 3, plus a TOTAL trial
-  budget of $10 and a flat allowance of 50 Managed conversations per period. This is intended (it is
-  what "the plan column becomes real" means), but any design-partner workspace with more than one
-  mailbox, more than ten sources or a busy queue will hit a cap the same day. Either subscribe those
-  workspaces (§2.5) before the migration, or set per-workspace `org_settings` overrides for the keys
-  that matter (`knowledge.max_sources`, `mailboxes.max_connections`, `autonomy.daily_draft_cap`,
-  `autonomy.daily_llm_usd_cap`) — `resolveSetting` reads org > plan > default, so an org row still
-  wins over the plan. A workspace already over a cap is not broken: the 11th source is refused, the
-  existing ten stay.
+- **`0023`'s trial-row backfill was a silent no-op, and `0025` is the one that lands.** Migrations
+  run as `aesa_owner`; every tenant table is FORCE RLS with no policy for that role, so 0023's
+  `INSERT … SELECT FROM workspaces` saw zero workspaces and inserted nothing — on the dev database,
+  7 workspaces and 1 billing row. `0025_billing_backfill.sql` re-runs it under
+  `SET ROLE aesa_platform … RESET ROLE` (ruling R33; `migrations.test.ts` now refuses any later
+  data write against a tenant table without that pair), with `ON CONFLICT DO UPDATE … COALESCE` so a
+  row `ensureBillingRow` minted meanwhile with a NULL clock gets its clock too. **The moment 0025
+  runs, every existing workspace has a `billing_subscriptions` row** (`plan = 'trial'`,
+  `status = 'trialing'`, `trial_ends_at = agent_enabled_at + 14 days` when the agent was ever on,
+  NULL — no expiry — when it never was). Two consequences, and they are immediate:
+  - **A workspace whose `agent_enabled_at + 14 d` is already in the past reads `trial_expired` the
+    instant 0025 lands** — Autopilot OFF (every auto-eligible draft lands in review as
+    `subscription_inactive`), not "tighter caps", and no `org_settings` override can lift it: the
+    derived billing STATE is not a setting. `billing.report-usage` pages "Your trial has ended"
+    that night.
+  - Every workspace lands on the TRIAL tier's caps — much tighter than the catalog defaults
+    everything ran on through Phase 6: sources 100 → 10, crawl pages 200 → 20, sandbox runs/day
+    100 → 10, mailbox connections 5 → 1, drafts/day 2000 → 50, Managed-AI USD/day 60 → 3, plus a
+    TOTAL trial budget of $10 (a genuine, unexpired trial only, summed from `agent_enabled_at` —
+    ruling R27) and a flat allowance of 50 Managed conversations per period. A workspace already
+    over a cap is not broken: the 11th source is refused, the existing ten stay.
+
+  So the order is **migrate → deploy → IMMEDIATELY act on every design-partner workspace**.
+  "Subscribe before the migration" is impossible (Checkout needs the table). Either subscribe them
+  through the app the same hour (§2.5 — `checkout.session.completed` lands `standard/active` and the
+  paid caps the same instant), or extend the trial by hand:
+
+      UPDATE billing_subscriptions SET trial_ends_at = now() + interval '14 days'
+       WHERE org_id IN ('<org>', …) AND status = 'trialing';
+
+  (as `aesa_platform` or a superuser — `aesa_app` under RLS with no `app.org_id` sees nothing).
+  `trialEndsAtFor` is the one formula for a FRESH clock (`setAgentEnabled`, 0025); an extension is an
+  operator's write and the trial budget still counts from `agent_enabled_at`. For a cap alone, a
+  per-workspace `org_settings` override (`knowledge.max_sources`, `mailboxes.max_connections`,
+  `autonomy.daily_draft_cap`, `autonomy.daily_llm_usd_cap`) still works — `resolveSetting` reads
+  org > plan > default — but it cannot un-expire a trial.
 - **`0023` drops and re-adds `notifications_kind_check`** (one constraint validation's
   `ACCESS EXCLUSIVE` on a small table, the Phase 5/6 shape) and creates `resolve_stripe_customer`,
   a SECURITY DEFINER function owned by `aesa_platform` and `GRANT EXECUTE`d to `aesa_app` alone —
-  the api's ONE cross-org read, mapping a Stripe customer id to an org. It returns **zero rows** for
-  an unknown customer, and the webhook treats that as `unknown_customer` + an alert.
+  the fifth fixed-signature resolver of its kind (after `resolve_mailbox_connection` and
+  `resolve_mailbox_subscription` in 0006, `resolve_oauth_flow` in 0009 and
+  `resolve_draft_action_token` in 0011; see CLAUDE.md), mapping a Stripe customer id to an org. It returns **zero rows** for an unknown customer, and the webhook
+  treats that as `unknown_customer` + an alert.
+- **The fix wave's `0025` is the LAST migration on this branch and carries no snapshot** (hand-written,
+  like 0021 and 0024). `pnpm db:check` is green against it; `pnpm --filter @aesa/db generate` emits
+  nothing.
 
 ---
 
@@ -113,6 +140,30 @@ rotated secret or someone probing), and **200** for every other outcome (`applie
 must ack. Deliveries are deduplicated on `event.id` through `webhook_events` (the envelope stores the
 type and timestamp only, never the object — it carries the customer's email and card brand) and
 ordered by `last_stripe_event_created` (checked on the read and repeated in the UPDATE's WHERE).
+
+What the route will NOT apply (the fix wave, rulings R30–R32 — each is `outcome: 'ignored'`, 200,
+and the row is untouched):
+
+- **A `customer.subscription.updated|deleted` for a subscription the row does not hold** is ignored
+  and alerts `stripe_foreign_subscription_event` (the twelfth alert kind). Only
+  `checkout.session.completed` may introduce a different subscription id — the platform creates every
+  subscription through Checkout. This is what makes the `stripe_double_subscription` remedy safe:
+  cancelling the orphan the alert names delivers a `deleted` for THAT id, which is now ignored
+  (and alerts, so you see it land) rather than displacing the live subscription. **Cancel the orphan
+  it names, never the survivor.**
+- **Any `invoice.*` on a `canceled` row** — the "cancel immediately + prorate" Portal flow delivers
+  `deleted` then `invoice.paid` in the same second, and a canceled Stripe subscription can never
+  become active again. Re-subscribing goes through Checkout.
+- **`incomplete_expired`** moves nothing; **`past_due`/`canceled` land only on a `standard`-plan
+  row.** A Checkout that completed unpaid (a card that failed at completion, an SCA never finished —
+  ruling R10's deferred state) leaves the row on the trial plan holding the subscription id, and
+  `startCheckout` reads that as a Checkout still pending (`checkout_pending`: "Stripe is still
+  confirming your payment") rather than starting a second one. When Stripe gives up on it
+  (`incomplete_expired`, or a `deleted`) the ids are forgotten and Checkout is open again; an
+  `invoice.payment_failed` on it pages nobody. **Until a reconciliation arm exists (a carry), keep
+  the Checkout's payment methods to cards** — a delayed-notification method (SEPA, ACH) is exactly
+  the state these guards were written for, and the only recovery for a row that drifts from Stripe
+  is the Dashboard plus a hand fix.
 
 Three operator notes on that route, from the review:
 
@@ -239,13 +290,16 @@ Do this once in **test mode** end to end, then once more in live mode with a rea
   regression cannot be tied to a deploy.
 - **Alert rules on the `kind` tag.** Every `alert(kind, ctx)` is a `captureMessage` at level
   `error` tagged `kind` and `org_id`; every uncaught error goes through `captureWithOrg` tagged
-  `org_id` (and `job` on the worker, `path` on the api). The **eleven** kinds in `ALERT_KINDS`
+  `org_id` (and `job` on the worker, `path` on the api). The **twelve** kinds in `ALERT_KINDS`
   (`apps/{api,worker}/src/observability.ts`) are: `admission_slot_timeout`,
   `deletion_billing_unconfigured`, `export_failed`, `keys_rotate_failed`,
   `knowledge_reembed_stranded`, `org_spend_capped`, `purge_failed`, `stripe_double_subscription`,
-  `stripe_report_failed`, `stripe_unknown_customer`, `stripe_webhook_rejected`. Make one rule per
-  kind (or one rule on `kind:*` with the kind and `org_id` in the notification message) and page on
-  all of them but `org_spend_capped`, which is a daily notice. The plan's twelfth kind,
+  `stripe_foreign_subscription_event` (the fix wave's, ruling R31 — routine after you cancel the
+  orphan a `stripe_double_subscription` named, otherwise a subscription this platform did not
+  create), `stripe_report_failed`, `stripe_unknown_customer`, `stripe_webhook_rejected`. Make one
+  rule per kind (or one rule on `kind:*` with the kind and `org_id` in the notification message) and
+  page on all of them but `org_spend_capped`, which is a daily notice (`scope: daily`) or, for a
+  trial that has spent its whole $10 (`scope: trial`), a once-per-workspace one. The plan's other kind,
   `platform_killswitch_on`, is wired nowhere — flipping `platform_state['killswitch.global']` is a
   manual operation and the operator doing it knows; a carry, not a gap.
 - **What Sentry may NOT receive, and what stops it.** `beforeSend` in each app's `observability.ts`
@@ -462,9 +516,16 @@ Phase 7 makes four promises true in code; the privacy policy has to state them i
   finally the Better Auth `organization` row (cascading members and invitations) — the ONE place the
   worker writes Better Auth's tables directly. One platform audit row records that the purge
   happened, and nothing else. `cancelDeletion` inside the window clears the stamps; the agent stays
-  off until switched on. A workspace with a live subscription on a replica that has no Stripe
-  configured is **refused** (`deletion_billing_unconfigured`) rather than purged while the card keeps
-  being charged.
+  off until switched on (and since the fix wave `setAgentEnabled(true)` is refused while the
+  deletion is pending — the switch comes back with `cancelDeletion`). The purge re-checks the
+  cancel a second time INSIDE its row transaction, under `FOR UPDATE` (fix wave B4): a
+  `cancelDeletion` that lands between the job's read and its row purge wins, the rows are kept, and
+  the job alerts `purge_failed` with `phase: cancelled_mid_purge` — **the objects are already gone
+  by then** (every upload and the export bundle), so that alert means telling the owner what was
+  lost. A workspace holding a subscription — a live one, or a deferred Checkout's that could still
+  settle — on a replica that has no Stripe configured is **refused** (`deletion_billing_unconfigured`)
+  rather than purged while the card keeps being charged; a `canceled` row is the one status the
+  cancel is skipped for.
 - **Export: what the bundle contains.** `workspace.requestExport` (owner) → `workspace.export`
   writes ONE NDJSON object per workspace to `orgs/<orgId>/exports/<exportId>.ndjson`: a manifest
   line, then one line per row across the workspace profile, settings, agents, categories and
@@ -593,7 +654,12 @@ file is secret except the path to the Play service-account JSON, which stays out
   one; learned answers are re-embedded in place. Both run on the `knowledge` role. A document whose
   re-embed enqueue fails is `knowledge_reembed_stranded` — the vectors are NULL and the sweep's own
   discovery cannot find it again (it looks for `embedding IS NOT NULL`), so the alert IS the
-  recovery path: re-enqueue `knowledge.embed-batch` for that document by hand.
+  recovery path: re-enqueue `knowledge.embed-batch` for that document by hand. Since the fix wave
+  the chunk arm checks the org's daily embed cap BEFORE nulling anything (a refill the cap refused
+  stranded the document the same way, silently). **Do not change `KNOWLEDGE_EMBED_MODEL` in
+  production until the rediscovery arm lands** (a Phase 8 carry: a `ready` source with
+  `embedded_count < chunk_count` and no live job is found by nothing today), and never run two
+  `knowledge` replicas on different models — they re-embed each other's work up to each cap, daily.
 - **The mailbox connection cap counts LIVE SYNC SLOTS** — `connected` and `pending_claim`, not
   `reauth_required` (ruling R7) — so an owner can always repair a broken mailbox on a trial capped at
   1. The residual: a workspace can end one over the cap by adding a mailbox while an old one is
@@ -629,7 +695,11 @@ the gated mailbox step. Open them signed in, at wide and phone widths and on a r
   reading *already remembered*.
 - **The `/share` route** (27) from the real iOS share sheet and the real Android intent chooser — a
   link, a paragraph, a PDF, and a file of an unsupported type (which must NOT report success — the
-  Task 10 fix).
+  Task 10 fix). **On iOS the share must land on `/share` directly, never on "Page not found"**: the
+  library reopens the app with `aesa://dataUrl=aesaShareKey`, which Expo Router routed to
+  `+not-found` until the fix wave's `src/app/+native-intent.ts` (`redirectSystemPath`, ruling R34)
+  sent it to `/`. Reasoned from both libraries' sources, provable only on the dev build — confirm
+  it there, cold start and warm.
 - **Push routing** for the `billing` and `workspace` kinds landing on the right settings screen from
   the notification shade.
 - **Dark mode** on all of the above.
