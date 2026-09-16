@@ -35,14 +35,16 @@ import {
   collectGroundedNumbers, decide, validateReplyBody,
   type GuardrailFinding, type GuardrailResult,
 } from '@aesa/core'
-import { agentCategoryPolicies, agentRuns, agents, drafts, mailboxConnections, platformState, withOrg, type Db } from '@aesa/db'
+import { agentCategoryPolicies, agentRuns, agents, drafts, mailboxConnections, platformState, readBillingState, withOrg, type Db } from '@aesa/db'
 import { computeCostMicros, findPricing, LlmError, type ChatMeta } from '@aesa/llm'
 import { defineJob, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
 import { loadSharedDraftContext, type SharedDraftContext } from '../drafting/context.ts'
 import { errorMessage } from '../err-message.ts'
 import { buildReplyPolicy, personaFor } from '../drafting/policy.ts'
 import { computeEvidence } from '../drafting/evidence.ts'
+import { noAdmission, type AdmissionPool } from '../drafting/admission.ts'
 import { appendRunEvent, finishRun } from '../drafting/runs.ts'
+import { alert } from '../observability.ts'
 import { cacheTtlFor, type ProviderResolver } from '../provider-resolver.ts'
 
 export const AgentSandboxPayload = z.object({ orgId: z.string(), runId: z.string() })
@@ -67,6 +69,10 @@ export interface AgentSandboxDeps {
   providers: ProviderResolver
   retriever: Retriever
   logger: pino.Logger
+  /** Phase 7: the deployment-wide ceiling on concurrent MANAGED model calls — the SAME instance
+   *  `ticket.draft` holds, so a "Try it" run competes for the same slots a real draft does.
+   *  Omitted is `noAdmission`; a refused slot never fails the run. */
+  admission?: AdmissionPool
   now?: () => Date
   /** Test seam: the watchdog budget for the whole run (default `INVARIANTS.DRAFT_WATCHDOG_SECONDS`). */
   watchdogMs?: number
@@ -139,6 +145,9 @@ interface Preload {
   input: z.infer<typeof RunInput>
   platformKillSwitch: boolean
   mailboxHealthy: boolean
+  /** Phase 7: `decide()`'s `subscriptionActive`. A "Try it" run on an expired trial has to show the
+   *  owner the SAME verdict a real draft would land — `review / subscription_inactive`. */
+  subscriptionActive: boolean
 }
 
 /**
@@ -146,7 +155,7 @@ interface Preload {
  * that writes nothing), its agent, the ticket-independent shared draft context, its connection's
  * health, and the platform kill lever. Returns null for "this job has nothing to do".
  */
-async function loadPreload(db: Db, orgId: string, runId: string): Promise<Preload | null> {
+async function loadPreload(db: Db, orgId: string, runId: string, now: Date): Promise<Preload | null> {
   return withOrg(db, orgId, async (tx) => {
     const [run] = await tx
       .select({ status: agentRuns.status, kind: agentRuns.kind, agentId: agentRuns.agentId, input: agentRuns.input })
@@ -173,6 +182,7 @@ async function loadPreload(db: Db, orgId: string, runId: string): Promise<Preloa
       input: RunInput.parse(run.input),
       platformKillSwitch: lever?.value === true,
       mailboxHealthy: connection?.status === 'connected',
+      subscriptionActive: (await readBillingState(tx, now)).active,
     }
   })
 }
@@ -298,7 +308,7 @@ async function runAgentSandboxUnsafe(
   const { orgId, runId } = payload
   const now = deps.now?.() ?? new Date()
 
-  const pre = await loadPreload(deps.db, orgId, runId)
+  const pre = await loadPreload(deps.db, orgId, runId, now)
   if (pre === null) return
   const { agent, shared, input } = pre
 
@@ -385,6 +395,13 @@ async function runAgentSandboxUnsafe(
   // pipeline would do on the first attempt, guardrail failure and all.
   const meta: ChatMeta = { orgId, agentId: agent.id, runId, role: 'draft', idempotencyKey: `sandbox:${runId}:1` }
   let call: DraftCallResult
+  // Phase 7's admission slot, around the model call alone — managed only (a BYOK call has its own
+  // per-credential limiter), and `null` PROCEEDS with an alert rather than failing the run.
+  const admission = deps.admission ?? noAdmission
+  const slot = config.mode === 'managed' ? await admission.acquire(watchdog) : null
+  if (config.mode === 'managed' && slot === null) {
+    alert(deps.logger, 'admission_slot_timeout', { orgId, runId })
+  }
   try {
     call = await runDraftCall(resolved.provider, promptInput, meta, watchdog)
   } catch (err) {
@@ -392,6 +409,8 @@ async function runAgentSandboxUnsafe(
     const code = aborted ? 'watchdog' : err instanceof LlmError ? `llm_${err.code}` : 'llm_unknown'
     await fail(code, errorToDetail(err), aborted ? 'aborted' : 'failed')
     return
+  } finally {
+    await slot?.release()
   }
   const pricing = findPricing(call.result.model)
   if (!pricing) {
@@ -466,7 +485,7 @@ async function runAgentSandboxUnsafe(
       workspaceKillSwitch: shared.workspaceKillSwitch,
       agentEnabled: shared.agentEnabled,
       agentActive: agent.status === 'active',
-      subscriptionActive: true,
+      subscriptionActive: pre.subscriptionActive,
       tripwire: false,
       outcome: decision.outcome,
       ownerFeedbackPending: false,
@@ -482,6 +501,9 @@ async function runAgentSandboxUnsafe(
       evidence,
       threshold,
       hasAttachments: false,
+      // Never exhausted here: a sandbox run sends nothing, so it consumes no conversation from the
+      // billing allowance and must not be refused by one either. (`subscriptionActive` above IS a
+      // fact, because an inactive subscription is something the owner needs to SEE on a Try it run.)
       allowanceExhausted: false,
       // A "Try it" run never sends, so it never consumes — let alone exhausts — the daily cap.
       autoSendCapReached: false,

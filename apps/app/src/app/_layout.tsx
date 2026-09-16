@@ -4,6 +4,7 @@ import { useEffect } from 'react'
 import { Providers } from '@/components/providers'
 import { useWindowDropGuard } from '@/lib/drop-guard'
 import { useBrandFonts } from '@/lib/fonts'
+import { ShareIntentProviderSafe } from '@/lib/share-intent'
 
 // Hold the native splash until the brand faces are registered (or have failed to): the first frame the
 // owner sees is already set in Fraunces and Plus Jakarta Sans instead of re-flowing from the system
@@ -20,9 +21,17 @@ export default function RootLayout() {
   useWindowDropGuard()
   useEffect(() => { if (ready) SplashScreen.hideAsync().catch(() => {}) }, [ready])
   if (!ready) return null
+  // `ShareIntentProviderSafe` (`@/lib/share-intent`, native vs `.web` split) wraps the WHOLE tree,
+  // outermost, so the intent is already resolved by the time `(app)/_layout.tsx`'s `Shell`
+  // (`useShareIntentRouting`) reads it. This layout never imports `expo-share-intent` itself, on
+  // EITHER platform — importing `ShareIntentProvider` directly here, even behind a `Platform.select`
+  // around its USE, still left the import (and so the whole package) in the one shared web bundle
+  // every route loads (task 10 fix round 1, finding 1).
   return (
-    <Providers>
-      <Stack screenOptions={{ headerShown: false }} />
-    </Providers>
+    <ShareIntentProviderSafe>
+      <Providers>
+        <Stack screenOptions={{ headerShown: false }} />
+      </Providers>
+    </ShareIntentProviderSafe>
   )
 }

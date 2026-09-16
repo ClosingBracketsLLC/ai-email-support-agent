@@ -8,17 +8,18 @@
  */
 import { randomInt } from 'node:crypto'
 import { TRPCError } from '@trpc/server'
-import { and, count, eq } from 'drizzle-orm'
+import { and, count, eq, inArray } from 'drizzle-orm'
 import {
-  AddAddressInput, AdminConsentInfoInput, ClaimConnectionInput, ConsentAddressInput, DisconnectInput,
+  AddAddressInput, AdminConsentInfoInput, BILLING_ERROR_MESSAGES, ClaimConnectionInput, ConsentAddressInput, DisconnectInput,
   MAX_AGENTS_PER_DOMAIN, RequestGmailAccessInput, ResendVerificationInput, StartConnectInput, emailDomain,
   type AgentStatus, type MailProvider,
 } from '@aesa/contracts'
+import { resolveSetting } from '@aesa/core'
+import { hashToken } from '@aesa/crypto'
 import {
   agentCategoryPolicies, agents, audit, categories, ensureDefaultCategories, getOrgBoxPublicKeyOrNull,
-  gmailAccessRequests, mailboxConnections, oauthFlows,
+  gmailAccessRequests, loadSettingSources, mailboxConnections, oauthFlows,
 } from '@aesa/db'
-import { hashToken } from '@aesa/crypto'
 import { JOB_NAMES } from '@aesa/queue'
 import { createFlow } from '../../connect/flows.ts'
 import { mailboxClaimedMail, verificationMail } from '../../mail/templates.ts'
@@ -57,6 +58,37 @@ export const mailboxesRouter = router({
     await ctx.deps.enqueue(JOB_NAMES.keysProvision, { orgId: ctx.orgId }, { entityId: 'keys', debounceSeconds: 30 })
 
     const { flowId, state } = await ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
+      // Phase 7: the plan's mailbox ceiling, checked BEFORE anything is written — an owner at the
+      // cap should be told so, not walked through a consent screen whose connection cannot land.
+      // It comes first for the same reason: "you are at your plan's limit" is a truer answer than
+      // "provisioning", which is what the box-key check below would say on a brand-new workspace.
+      //
+      // The counted set is `connected` + `pending_claim` — LIVE SYNC SLOTS, which is the resource
+      // this cap protects (controller ruling R7). `disabled` and `reauth_required` are both
+      // excluded: a reauth_required mailbox syncs nothing, and the reconnect that repairs it REUSES
+      // its row (`connect/routes.ts` updates the existing connection to `pending_claim` rather than
+      // inserting a second one), so counting it would refuse a repair that could never create a new
+      // connection. `startConnect` takes only `{ provider, platform }` and cannot tell a repair from
+      // a new mailbox, so the count is the only lever — and on Gmail's Testing-mode consent screen,
+      // where every external refresh token dies after 7 days, that lockout would be the NORMAL case
+      // at the trial plan's cap of 1: the owner's only inbox breaks weekly and the sole escape is a
+      // destructive-sounding Disconnect. `pending_claim` MUST stay counted — an in-flight claim
+      // becomes a connection, and excluding it would let someone open N flows at once.
+      //
+      // Accepted residual risk, stated so nobody "fixes" it back: a workspace can end ONE over its
+      // cap by connecting a new mailbox while an old one is broken and then repairing the old one.
+      // Bounded by one, self-limiting (they can add no more), and far cheaper than the lockout.
+      const sources = await loadSettingSources(tx, ['mailboxes.max_connections'])
+      const maxConnections = resolveSetting('mailboxes.max_connections', sources)
+      const [live] = await tx.select({ value: count() }).from(mailboxConnections)
+        .where(and(
+          eq(mailboxConnections.orgId, ctx.orgId),
+          inArray(mailboxConnections.status, ['connected', 'pending_claim']),
+        ))
+      if ((live?.value ?? 0) >= maxConnections) {
+        throw new TRPCError({ code: 'FORBIDDEN', message: BILLING_ERROR_MESSAGES.connection_limit })
+      }
+
       const boxPublicKey = await getOrgBoxPublicKeyOrNull(tx)
       if (!boxPublicKey) throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'provisioning' })
 

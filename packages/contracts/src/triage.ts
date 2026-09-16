@@ -11,6 +11,8 @@ export const NEEDS_OWNER_REASONS = [
   'agent_escalated', 'agent_failed', 'agent_run_cap', 'guardrail_failed', 'redraft_limit_reached',
   'redraft_unfulfilled', 'owner_handling', 'orphaned', 'draft_expired', 'send_failed', 'category_off', 'no_agent',
   'provider_unavailable',
+  /** Phase 7 (ruling R27): a genuine, unexpired trial has spent its total Managed-AI budget. */
+  'trial_budget',
 ] as const
 export type NeedsOwnerReason = (typeof NEEDS_OWNER_REASONS)[number]
 

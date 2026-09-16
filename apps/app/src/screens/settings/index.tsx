@@ -8,6 +8,7 @@ import { Screen } from '@/components/screen'
 import { Heading, Muted } from '@/components/typography'
 import { authClient } from '@/lib/auth-client'
 import { useTRPC } from '@/lib/trpc'
+import { BillingBanner } from '@/screens/inbox/billing-banner'
 
 export function SettingsIndexScreen() {
   const trpc = useTRPC()
@@ -44,6 +45,7 @@ export function SettingsIndexScreen() {
   return (
     <Screen testID="settings">
       <Heading>{ws.data?.businessName ?? 'Workspace'}</Heading>
+      <BillingBanner />
       <ListRow title="Workspace profile" subtitle="Website, tone, links the agent may share" onPress={() => router.push('/settings/workspace')} testID="settings-workspace" />
       <ListRow title="Team" subtitle="Invite teammates, change roles" onPress={() => router.push('/settings/team')} testID="settings-team" />
       <ListRow title="Notifications" subtitle="Push on this device" onPress={() => router.push('/settings/notifications')} testID="settings-notifications" />
@@ -53,7 +55,7 @@ export function SettingsIndexScreen() {
       <ListRow title="Autopilot" subtitle="Off / Review / Auto per category" onPress={() => router.push('/settings/autopilot')} testID="settings-autopilot" />
       <ListRow title="Learned answers" subtitle="What the agent learned from your approvals" onPress={() => router.push('/settings/memory')} testID="settings-memory" />
       <ListRow title="AI" subtitle="Managed AI or your own provider" onPress={() => router.push('/settings/ai')} testID="settings-ai" />
-      <ListRow title="Billing" subtitle="Plan, domains, usage" badge="Phase 7" />
+      <ListRow title="Billing" subtitle="Plan, domains, usage" onPress={() => router.push('/settings/billing')} testID="settings-billing" />
       {organizations && organizations.length > 1 ? (
         <>
           <Heading>Switch workspace</Heading>

@@ -186,7 +186,7 @@ describe('SECURITY DEFINER resolvers', () => {
   it('locks the resolvers down to aesa_app only — PUBLIC has no EXECUTE', async () => {
     for (const sig of [
       'resolve_mailbox_connection(text,text)', 'resolve_mailbox_subscription(text)', 'resolve_oauth_flow(uuid)',
-      'resolve_draft_action_token(text)',
+      'resolve_draft_action_token(text)', 'resolve_stripe_customer(text)',
     ]) {
       const priv = await admin.query<{ public_exec: boolean; app_exec: boolean }>(
         `SELECT has_function_privilege('public', $1, 'EXECUTE') AS public_exec,

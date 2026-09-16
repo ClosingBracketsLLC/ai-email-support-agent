@@ -64,6 +64,7 @@ const REASON_CHIP: Record<NeedsOwnerReason, string> = {
   category_off: 'Off',
   no_agent: 'No agent',
   provider_unavailable: 'AI provider unavailable',
+  trial_budget: 'Trial budget',
 }
 
 /** `needsOwnerReason` is a plain `text` column (checked by the API, not a drizzle `pgEnum`), so the
@@ -79,7 +80,7 @@ const REASON_TONE: Record<NeedsOwnerReason, ChipTone> = {
   agent_escalated: 'warning', agent_failed: 'danger', agent_run_cap: 'warning', guardrail_failed: 'danger',
   redraft_limit_reached: 'warning', redraft_unfulfilled: 'warning', owner_handling: 'neutral', orphaned: 'warning',
   draft_expired: 'warning', send_failed: 'danger', category_off: 'neutral', no_agent: 'neutral',
-  provider_unavailable: 'danger',
+  provider_unavailable: 'danger', trial_budget: 'warning',
 }
 function reasonTone(reason: string | null): ChipTone { return (reason && (REASON_TONE as Record<string, ChipTone>)[reason]) || 'neutral' }
 /** What one row lets a countdown chip read its clock from — test-only in practice (see `AutoSendChip`). */

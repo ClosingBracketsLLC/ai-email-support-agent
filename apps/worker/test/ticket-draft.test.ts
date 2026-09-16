@@ -12,13 +12,14 @@
  */
 import { randomBytes } from 'node:crypto'
 import { and, eq } from 'drizzle-orm'
+import type PgBoss from 'pg-boss'
 import pino from 'pino'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { emptyRetriever, type DraftDecision } from '@aesa/agent'
 import { DRAFT_EXPIRE_DAYS } from '@aesa/contracts'
 import {
-  agentCategoryPolicies, agentRunEvents, agentRuns, agents, auditLog, categories, createMeterSink,
-  drafts, ensureDefaultCategories, llmCalls, llmCredentials, mailboxConnections, messages,
+  agentCategoryPolicies, agentRunEvents, agentRuns, agents, auditLog, billingSubscriptions, categories,
+  createMeterSink, drafts, ensureDefaultCategories, llmCalls, llmCredentials, mailboxConnections, messages,
   notifications, orgSettings, outboundSends, platformState, resolvedAnswers, SEND_METERS, tickets,
   usageCounters, user, withOrg, withPlatform, workspaces,
 } from '@aesa/db'
@@ -30,6 +31,8 @@ import {
   createFakeProvider, LlmError, withMeta, withMetering,
   type Capabilities, type ChatRequest, type ChatResult, type LlmProvider,
 } from '@aesa/llm'
+import type { AdmissionPool } from '../src/drafting/admission.ts'
+import { runTicketBackstopSweep } from '../src/jobs/ticket-backstop-sweep.ts'
 import { runTicketDraft, STOP_LOSS_BYOK_OUTPUT_TOKENS, STOP_LOSS_MICROS, type TicketDraftDeps } from '../src/jobs/ticket-draft.ts'
 import { staticRefusal, staticResolver } from '../src/provider-resolver.ts'
 
@@ -232,6 +235,34 @@ async function seedRuns(n: number, over: Partial<typeof agentRuns.$inferInsert> 
     ))
 }
 
+/**
+ * An `AdmissionPool` that records what the job asked of it. `slots: 'none'` is the timeout case the
+ * whole module is built around — `acquire` resolving null, which must NOT cost the draft.
+ */
+function countingAdmission(slots: 'slot' | 'none' = 'slot'): { pool: AdmissionPool; calls: { acquired: number; released: number } } {
+  const calls = { acquired: 0, released: 0 }
+  return {
+    calls,
+    pool: {
+      acquire: async () => {
+        calls.acquired += 1
+        if (slots === 'none') return null
+        return { release: async () => { calls.released += 1 } }
+      },
+    },
+  }
+}
+
+/** A pino-shaped logger that keeps every structured line, for the `alert: true` assertions. */
+function spyLogger(): { logger: TicketDraftDeps['logger']; errors: Record<string, unknown>[] } {
+  const errors: Record<string, unknown>[] = []
+  const base = pino({ level: 'silent' })
+  const logger = Object.assign(Object.create(base) as typeof base, {
+    error: (obj: Record<string, unknown>) => void errors.push(obj),
+  }) as unknown as TicketDraftDeps['logger']
+  return { logger, errors }
+}
+
 /** A `DetailedRetriever` whose answers leg returns exactly one active answer (Phase 5's memory). */
 function answerRetriever(answer: { id: string; score: number; approvals: number }): DetailedRetriever {
   const answers = [{ id: answer.id, question: 'where is my order', answer: 'It ships tomorrow.', score: answer.score, approvals: answer.approvals }]
@@ -244,6 +275,14 @@ function answerRetriever(answer: { id: string; score: number; approvals: number 
 async function setPolicy(categoryId: string, values: { mode: 'off' | 'review' | 'auto'; autoSendMinConfidence?: number }): Promise<void> {
   await withOrg(app.db, fx.orgId, (tx) =>
     tx.insert(agentCategoryPolicies).values({ orgId: fx.orgId, agentId: fx.agentId, categoryId, ...values }))
+}
+
+/** Phase 7: the workspace's `billing_subscriptions` row. Without one `readBillingState` reads a
+ *  fresh TRIAL (active, allowance 50), which is what every other test in this file runs on. */
+async function seedBilling(over: Partial<typeof billingSubscriptions.$inferInsert> = {}): Promise<void> {
+  await withOrg(app.db, fx.orgId, (tx) =>
+    tx.insert(billingSubscriptions).values({ orgId: fx.orgId, plan: 'standard', status: 'active', domainQuantity: 2, ...over })
+      .onConflictDoUpdate({ target: billingSubscriptions.orgId, set: { plan: 'standard', status: 'active', domainQuantity: 2, ...over } }))
 }
 
 async function setOrgSetting(key: string, value: unknown): Promise<void> {
@@ -441,6 +480,101 @@ describe('runTicketDraft', () => {
     expect(capNotifications[0]!.title).toBe('Daily AI budget reached')
     expect(capNotifications[0]!.payload).toEqual({})
     expect(notified).toEqual([capNotifications[0]!.id])
+  })
+
+  // ---- Ruling R27: the trial's TOTAL budget lands through escalateTicket, keyed on the STATE ----
+
+  it('3c. a live trial at its $10 total budget: needs_owner/trial_budget, ONE ticket page, ONE org-level billing notice, ONE operator alert keyed on the org; a second ticket pages once more and alerts nobody; the backstop sweep re-selects neither', async () => {
+    // A genuine trial (no billing row → trialing, no clock), $10 spent over its life — $1 today
+    // (under the trial's $3 daily cap, which is checked first) and $9 on an earlier day.
+    await setUsageCounter('llm_cost_micros', 1_000_000)
+    await withOrg(app.db, fx.orgId, (tx) => tx.insert(usageCounters).values({ orgId: fx.orgId, day: '2026-08-15', meter: 'llm_cost_micros', value: 9_000_000 }))
+    const ticketId = await seedDraftableTicket()
+    const provider = createFakeProvider([{ parsed: REPLY }])
+    const { logger, errors } = spyLogger()
+    const { deps, notified, drafted } = makeDeps(provider, { logger })
+
+    await run(deps, ticketId)
+
+    const ticket = await getTicket(ticketId)
+    expect(ticket.status).toBe('needs_owner')
+    expect(ticket.needsOwnerReason).toBe('trial_budget')
+    expect(provider.calls).toHaveLength(0)
+    expect(await runsFor(ticketId)).toHaveLength(0)
+    const pages = await notificationsWithPrefix(`trial_budget:${ticketId}:`)
+    expect(pages).toHaveLength(1)
+    expect(pages[0]).toMatchObject({ kind: 'escalation', title: 'Trial AI budget reached', payload: { ticketId } })
+    const notices = await notificationsWithPrefix(`llm_cap:trial:${fx.orgId}`)
+    expect(notices).toHaveLength(1)
+    expect(notices[0]).toMatchObject({ kind: 'billing', dedupeKey: `llm_cap:trial:${fx.orgId}`, title: 'Trial AI budget reached' })
+    expect(notices[0]!.body).toContain('subscribe')
+    expect(notified.sort()).toEqual([pages[0]!.id, notices[0]!.id].sort())
+    const alerts = errors.filter((e) => e.alert === true && e.kind === 'org_spend_capped')
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0]).toMatchObject({ orgId: fx.orgId, scope: 'trial' })
+    // No day in the key: the old `llm_cap:trial:<org>:<day>` re-paged and re-alerted daily, forever.
+    expect(await notificationsWithPrefix(`llm_cap:trial:${fx.orgId}:`)).toEqual([])
+    const audited = await auditRowsFor(ticketId, 'ticket.escalated')
+    expect(audited).toHaveLength(1)
+    expect(audited[0]!.detail).toMatchObject({ reason: 'trial_budget', costMicros: 10_000_000 })
+
+    // A second ticket the same day: its own page, no second notice, no second alert.
+    const second = await seedDraftableTicket()
+    await run(deps, second)
+    expect((await getTicket(second)).needsOwnerReason).toBe('trial_budget')
+    expect(await notificationsWithPrefix(`trial_budget:${second}:`)).toHaveLength(1)
+    expect(await notificationsWithPrefix(`llm_cap:trial:${fx.orgId}`)).toHaveLength(1)
+    expect(errors.filter((e) => e.alert === true && e.kind === 'org_spend_capped')).toHaveLength(1)
+
+    // The refusal STAMPED the ticket out of `triaged`: a re-run is a no-op, and the backstop sweep's
+    // arm (a) — which used to re-enqueue an untouched `triaged` ticket every minute — selects
+    // nothing (the stub boss throws on any enqueue).
+    await run(deps, ticketId)
+    expect(await notificationsWithPrefix(`trial_budget:${ticketId}:`)).toHaveLength(1)
+    expect(drafted).toEqual([])
+    const noBoss = new Proxy({}, { get(_t, prop) { throw new Error(`the sweep enqueued something (boss.${String(prop)})`) } }) as unknown as PgBoss
+    expect(await runTicketBackstopSweep(noBoss, { db: app.db, logger: pino({ level: 'silent' }), now: () => new Date(NOW.getTime() + 20 * 60_000) }))
+      .toMatchObject({ draftsEnqueued: 0 })
+  })
+
+  it('3d. a CANCELED workspace with $500 of paid-era spend still drafts (review/subscription_inactive) — the trial budget is the live trial\'s alone', async () => {
+    await seedBilling({ plan: 'trial', status: 'canceled', domainQuantity: 0 })
+    await setUsageCounter('llm_cost_micros', 2_000_000)
+    await withOrg(app.db, fx.orgId, (tx) => tx.insert(usageCounters).values({ orgId: fx.orgId, day: '2026-08-01', meter: 'llm_cost_micros', value: 500_000_000 }))
+    const ticketId = await seedDraftableTicket()
+    const provider = createFakeProvider([{ parsed: REPLY }])
+    const { deps } = makeDeps(provider)
+
+    await run(deps, ticketId)
+
+    expect(provider.calls).toHaveLength(1)
+    const [draft] = await draftsFor(ticketId)
+    expect(draft).toMatchObject({ decision: 'review', decisionReason: 'subscription_inactive', body: CLEAN_BODY })
+    expect((await getTicket(ticketId)).status).toBe('awaiting_review')
+    expect(await notificationsWithPrefix('trial_budget:')).toEqual([])
+    expect(await notificationsWithPrefix('llm_cap:')).toEqual([])
+  })
+
+  it('3e. a live trial whose spend predates agent_enabled_at does not count it against the budget', async () => {
+    await withOrg(app.db, fx.orgId, (tx) => tx.update(workspaces).set({ agentEnabledAt: new Date('2026-09-05T08:00:00Z') }).where(eq(workspaces.orgId, fx.orgId)))
+    await setUsageCounter('llm_cost_micros', 1_000_000)                                      // $1 today, inside the trial
+    await withOrg(app.db, fx.orgId, (tx) => tx.insert(usageCounters).values({ orgId: fx.orgId, day: '2026-09-01', meter: 'llm_cost_micros', value: 9_500_000 }))   // $9.50 before it
+    const ticketId = await seedDraftableTicket()
+    const provider = createFakeProvider([{ parsed: REPLY }])
+    const { deps } = makeDeps(provider)
+
+    await run(deps, ticketId)
+
+    expect(provider.calls).toHaveLength(1)
+    expect((await draftsFor(ticketId))[0]).toMatchObject({ decision: 'review', body: CLEAN_BODY })
+    expect(await notificationsWithPrefix('trial_budget:')).toEqual([])
+
+    // Move the spend INSIDE the trial and the same workspace is capped.
+    await withOrg(app.db, fx.orgId, (tx) => tx.update(usageCounters).set({ day: '2026-09-06' }).where(eq(usageCounters.day, '2026-09-01')))
+    const next = await seedDraftableTicket()
+    await run(deps, next)
+    expect(provider.calls).toHaveLength(1)
+    expect((await getTicket(next)).needsOwnerReason).toBe('trial_budget')
   })
 
   it('4. a CAS-rejected duplicate audits draft.run_skipped and writes no run row', async () => {
@@ -1541,5 +1675,240 @@ describe('runTicketDraft', () => {
     const [draft] = await draftsFor(ticketId)
     expect(draft!.body).toBe(CLEAN_BODY)
     expect(draft!.confidenceBreakdown).toMatchObject({ provider: 'custom', modelId: 'qwen3:32b', mode: 'byok' })
+  })
+
+  // --- Phase 7: the two billing facts `decide()` now takes ---------------------------------------
+
+  describe('18. subscription_inactive: a workspace that cannot send still gets its draft', () => {
+    it('a past_due row lands the draft in review with decision_reason subscription_inactive', async () => {
+      await seedBilling({ status: 'past_due' })
+      const ticketId = await seedDraftableTicket()
+      const provider = createFakeProvider([{ parsed: REPLY }])
+      const { deps, sends } = makeDeps(provider)
+
+      await run(deps, ticketId)
+
+      const [draft] = await draftsFor(ticketId)
+      // The DRAFT still exists and still carries the body — "drafts continue, nothing sends
+      // automatically" (spec's trial/past-due policy).
+      expect(draft).toMatchObject({ status: 'pending', decision: 'review', decisionReason: 'subscription_inactive', body: CLEAN_BODY })
+      expect(draft!.confidenceBreakdown).toMatchObject({ blockers: { subscription: 'past_due' } })
+      expect((await getTicket(ticketId)).status).toBe('awaiting_review')
+      expect(await sendsFor(draft!.id)).toEqual([])
+      expect(sends).toEqual([])
+    })
+
+    it('an expired trial reads the same way — the clock alone decides, nothing is written back', async () => {
+      await seedBilling({ plan: 'trial', status: 'trialing', trialEndsAt: new Date(NOW.getTime() - 86_400_000) })
+      const ticketId = await seedDraftableTicket()
+      const provider = createFakeProvider([{ parsed: REPLY }])
+      const { deps } = makeDeps(provider)
+
+      await run(deps, ticketId)
+
+      const [draft] = await draftsFor(ticketId)
+      expect(draft).toMatchObject({ decision: 'review', decisionReason: 'subscription_inactive' })
+      expect(draft!.confidenceBreakdown).toMatchObject({ blockers: { subscription: 'trial_expired' } })
+      // `trial_expired` is DERIVED: the stored status is untouched.
+      const [row] = await withOrg(app.db, fx.orgId, (tx) => tx.select().from(billingSubscriptions))
+      expect(row!.status).toBe('trialing')
+    })
+
+    it('an inactive subscription beats every later blocker — an otherwise auto-eligible draft still reads subscription_inactive', async () => {
+      await seedBilling({ status: 'canceled' })
+      await setPolicy(fx.categoryId, { mode: 'auto', autoSendMinConfidence: 80 })
+      await seedHumanDecisions(10)
+      const answerId = crypto.randomUUID()
+      const ticketId = await seedDraftableTicket()
+      const provider = createFakeProvider([{ parsed: reply({ confidence: 0.9, usedAnswerIds: [answerId] }) }])
+      const { deps } = makeDeps(provider, { retriever: answerRetriever({ id: answerId, score: 0.95, approvals: 3 }) })
+
+      await run(deps, ticketId)
+
+      const [draft] = await draftsFor(ticketId)
+      expect(draft).toMatchObject({ decision: 'review', decisionReason: 'subscription_inactive', decisionSource: null })
+      expect(await sendsFor(draft!.id)).toEqual([])
+    })
+  })
+
+  describe('19. allowance_exhausted: the MANAGED conversation allowance', () => {
+    /** The Phase 5 auto fixture: Autopilot on at 80, cold start cleared, one strong used answer. */
+    async function seedAutoEligible(): Promise<{ ticketId: string; answerId: string }> {
+      await setPolicy(fx.categoryId, { mode: 'auto', autoSendMinConfidence: 80 })
+      await seedHumanDecisions(10)
+      return { ticketId: await seedDraftableTicket(), answerId: crypto.randomUUID() }
+    }
+
+    it('standard + blocked + 2 domains + 600 managed conversations this period → review, allowance_exhausted', async () => {
+      await seedBilling({ overageMode: 'blocked' })
+      await setUsageCounter(SEND_METERS.aiHandledManaged, 600)
+      const { ticketId, answerId } = await seedAutoEligible()
+      const provider = createFakeProvider([{ parsed: reply({ confidence: 0.9, usedAnswerIds: [answerId] }) }])
+      const { deps, sends } = makeDeps(provider, { retriever: answerRetriever({ id: answerId, score: 0.95, approvals: 3 }) })
+
+      await run(deps, ticketId)
+
+      const [draft] = await draftsFor(ticketId)
+      expect(draft).toMatchObject({ status: 'pending', decision: 'review', decisionReason: 'allowance_exhausted', decisionSource: null })
+      // 300 included per domain × 2 domains.
+      expect(draft!.confidenceBreakdown).toMatchObject({
+        blockers: { allowance: { used: 600, allowance: 600, mode: 'blocked', exhausted: true } },
+      })
+      expect(await sendsFor(draft!.id)).toEqual([])
+      expect((await getTicket(ticketId)).status).toBe('awaiting_review')
+      expect(sends).toEqual([])
+    })
+
+    it('the SAME usage under automatic overage sends — metered overage accrues instead of stopping', async () => {
+      await seedBilling({ overageMode: 'automatic' })
+      await setUsageCounter(SEND_METERS.aiHandledManaged, 600)
+      const { ticketId, answerId } = await seedAutoEligible()
+      const provider = createFakeProvider([{ parsed: reply({ confidence: 0.9, usedAnswerIds: [answerId] }) }])
+      const { deps } = makeDeps(provider, { retriever: answerRetriever({ id: answerId, score: 0.95, approvals: 3 }) })
+
+      await run(deps, ticketId)
+
+      const [draft] = await draftsFor(ticketId)
+      expect(draft).toMatchObject({ decision: 'send', decisionReason: 'ok', decisionSource: 'auto' })
+      expect(draft!.confidenceBreakdown).toMatchObject({
+        blockers: { allowance: { used: 600, allowance: 600, mode: 'automatic', exhausted: false } },
+      })
+      expect(await sendsFor(draft!.id)).toHaveLength(1)
+    })
+
+    it('a BYOK agent is NEVER exhausted — the same blocked row at 600 still sends', async () => {
+      await seedBilling({ overageMode: 'blocked' })
+      await setUsageCounter(SEND_METERS.aiHandledManaged, 600)
+      const credentialId = await seedCredential()
+      // A `limited` tier caps the model term at 0.6, so the bar is set where 0.6 clears it — the
+      // point under test is the allowance, not the quality cap.
+      await setPolicy(fx.categoryId, { mode: 'auto', autoSendMinConfidence: 50 })
+      await seedHumanDecisions(10)
+      const answerId = crypto.randomUUID()
+      const ticketId = await seedDraftableTicket()
+      const provider = createFakeProvider([{ parsed: reply({ confidence: 0.9, usedAnswerIds: [answerId] }) }])
+      const { deps } = makeDeps(provider, {
+        providers: staticResolver(provider, byokConfig(credentialId)),
+        retriever: answerRetriever({ id: answerId, score: 0.95, approvals: 3 }),
+      })
+
+      await run(deps, ticketId)
+
+      const [draft] = await draftsFor(ticketId)
+      expect(draft).toMatchObject({ decision: 'send', decisionReason: 'ok', decisionSource: 'auto' })
+      expect(draft!.confidenceBreakdown).toMatchObject({
+        blockers: { allowance: { used: 600, allowance: 600, mode: 'blocked', exhausted: false } },
+      })
+      expect(await sendsFor(draft!.id)).toHaveLength(1)
+    })
+
+    it("a trial hard-stops at its FLAT 50, whatever the overage mode", async () => {
+      await seedBilling({ plan: 'trial', status: 'trialing', overageMode: 'automatic', domainQuantity: 0 })
+      await setUsageCounter(SEND_METERS.aiHandledManaged, 50)
+      const { ticketId, answerId } = await seedAutoEligible()
+      const provider = createFakeProvider([{ parsed: reply({ confidence: 0.9, usedAnswerIds: [answerId] }) }])
+      const { deps } = makeDeps(provider, { retriever: answerRetriever({ id: answerId, score: 0.95, approvals: 3 }) })
+
+      await run(deps, ticketId)
+
+      const [draft] = await draftsFor(ticketId)
+      expect(draft).toMatchObject({ decision: 'review', decisionReason: 'allowance_exhausted' })
+      expect(draft!.confidenceBreakdown).toMatchObject({
+        blockers: { allowance: { used: 50, allowance: 50, mode: 'automatic', exhausted: true } },
+      })
+    })
+
+    it('only the MANAGED meter counts: 600 ai_handled_conversations with no managed half is not exhausted', async () => {
+      await seedBilling({ overageMode: 'blocked' })
+      await setUsageCounter(SEND_METERS.aiHandledConversations, 600)
+      const { ticketId, answerId } = await seedAutoEligible()
+      const provider = createFakeProvider([{ parsed: reply({ confidence: 0.9, usedAnswerIds: [answerId] }) }])
+      const { deps } = makeDeps(provider, { retriever: answerRetriever({ id: answerId, score: 0.95, approvals: 3 }) })
+
+      await run(deps, ticketId)
+
+      const [draft] = await draftsFor(ticketId)
+      expect(draft).toMatchObject({ decision: 'send', decisionReason: 'ok' })
+      expect(draft!.confidenceBreakdown).toMatchObject({ blockers: { allowance: { used: 0, exhausted: false } } })
+    })
+  })
+
+  // --- Phase 7: the admission pool's rule, pinned where it is USED --------------------------------
+
+  describe('20. a draft is never lost to admission control', () => {
+    it('a managed call that gets NO slot still lands its draft, and alerts admission_slot_timeout', async () => {
+      const ticketId = await seedDraftableTicket()
+      const provider = createFakeProvider([{ parsed: REPLY }])
+      const { logger, errors } = spyLogger()
+      // The pool's own failure mode, injected: `acquire` resolves null for the whole run.
+      const { deps } = makeDeps(provider, { logger, admission: { acquire: async () => null } })
+
+      await run(deps, ticketId)
+
+      // The rule the module exists for: the model was still called and the draft still landed.
+      expect(provider.calls).toHaveLength(1)
+      const [draft] = await draftsFor(ticketId)
+      expect(draft).toMatchObject({ status: 'pending', body: CLEAN_BODY })
+      expect((await getTicket(ticketId)).status).toBe('awaiting_review')
+      const [run1] = await runsFor(ticketId)
+      expect(run1!.status).toBe('succeeded')
+      // …and an operator hears about it (Task 11 replaces the placeholder with `alert()`).
+      const alert = errors.find((e) => e.alert === true && e.kind === 'admission_slot_timeout')
+      expect(alert).toBeDefined()
+      expect(alert!.orgId).toBe(fx.orgId)
+      expect(alert!.runId).toBe(run1!.id)
+    })
+
+    it('a successful managed call takes exactly one slot and RELEASES it', async () => {
+      const ticketId = await seedDraftableTicket()
+      const provider = createFakeProvider([{ parsed: REPLY }])
+      const admission = countingAdmission()
+      const { deps } = makeDeps(provider, { admission: admission.pool })
+
+      await run(deps, ticketId)
+
+      expect(admission.calls).toEqual({ acquired: 1, released: 1 })
+      expect((await draftsFor(ticketId))[0]).toMatchObject({ status: 'pending', body: CLEAN_BODY })
+    })
+
+    it('a BYOK call never enters the pool at all — its budget is the per-credential limiter', async () => {
+      const credentialId = await seedCredential()
+      const ticketId = await seedDraftableTicket()
+      const provider = createFakeProvider([{ parsed: REPLY }])
+      const admission = countingAdmission()
+      const { deps } = makeDeps(provider, {
+        providers: staticResolver(provider, byokConfig(credentialId)),
+        admission: admission.pool,
+      })
+
+      await run(deps, ticketId)
+
+      expect(provider.calls).toHaveLength(1)
+      expect(admission.calls).toEqual({ acquired: 0, released: 0 })
+    })
+
+    it('the guardrail redraft takes a SECOND slot and releases it too — one per model call', async () => {
+      const ticketId = await seedDraftableTicket()
+      // Attempt 1 hard-fails the guardrails (html), attempt 2 comes back clean.
+      const provider = createFakeProvider([{ parsed: reply({ body: HTML_BODY }) }, { parsed: REPLY }])
+      const admission = countingAdmission()
+      const { deps } = makeDeps(provider, { admission: admission.pool })
+
+      await run(deps, ticketId)
+
+      expect(provider.calls).toHaveLength(2)
+      expect(admission.calls).toEqual({ acquired: 2, released: 2 })
+    })
+
+    it('a slot is released even when the model call THROWS', async () => {
+      const ticketId = await seedDraftableTicket()
+      const provider = createFakeProvider([{ error: new LlmError('502 bad gateway', 'transient', true) }])
+      const admission = countingAdmission()
+      const { deps } = makeDeps(provider, { admission: admission.pool })
+
+      await expect(run(deps, ticketId)).rejects.toThrow()
+
+      expect(admission.calls).toEqual({ acquired: 1, released: 1 })
+    })
   })
 })

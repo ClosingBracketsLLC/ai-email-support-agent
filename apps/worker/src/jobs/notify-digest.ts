@@ -20,7 +20,7 @@ import { and, asc, eq, inArray, isNull, lt } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import { resolveSetting } from '@aesa/core'
-import { notificationDevices, notifications, orgSettings, tickets, withOrg, withPlatform, workspaces, type Db } from '@aesa/db'
+import { loadSettingSources, notificationDevices, notifications, tickets, withOrg, withPlatform, workspaces, type Db } from '@aesa/db'
 import type { MailTransport } from '@aesa/platform-mail'
 import { registerCron } from '@aesa/queue'
 import { runDigestEmailForOrg } from '../digest-email.ts'
@@ -61,10 +61,7 @@ interface DueDigest {
  * must run outside any tx. */
 async function loadDueDigest(db: Db, orgId: string, now: Date): Promise<DueDigest | null> {
   return withOrg(db, orgId, async (tx) => {
-    const settingRows = await tx.select({ value: orgSettings.value }).from(orgSettings).where(eq(orgSettings.key, 'notifications.digest_minutes'))
-    const digestMinutes = resolveSetting('notifications.digest_minutes', {
-      org: settingRows[0] ? { 'notifications.digest_minutes': settingRows[0].value } : {},
-    })
+    const digestMinutes = resolveSetting('notifications.digest_minutes', await loadSettingSources(tx, ['notifications.digest_minutes'], now))
     const cutoff = new Date(now.getTime() - digestMinutes * 60_000)
 
     const rows = await tx

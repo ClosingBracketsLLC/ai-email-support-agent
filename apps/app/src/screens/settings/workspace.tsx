@@ -8,6 +8,7 @@ import { SwitchRow } from '@/components/switch-row'
 import { Muted } from '@/components/typography'
 import { useTRPC } from '@/lib/trpc'
 import { ProfileForm } from '@/screens/onboarding/profile-form'
+import { DangerZone } from './danger-zone'
 
 export function WorkspaceSettingsScreen() {
   const trpc = useTRPC()
@@ -35,6 +36,10 @@ export function WorkspaceSettingsScreen() {
       {setAgentEnabled.isError ? <Banner tone="error" testID="agent-switch-error">Could not change the agent. Try again.</Banner> : null}
       {/* Stay on this screen: router.back() used to pop it before "Saved." could ever be seen (Phase 1 review, minor 9). */}
       <ProfileForm initial={ws.data} submitLabel="Save" onSaved={() => setSaved(true)} />
+      {/* Phase 7: kill switch, retention, export, delete — owner-only; DangerZone shows an admin the
+          same readonly note `ai.tsx` shows a plain member, since this screen's own gate above only
+          keeps a plain member out, not an admin. */}
+      <DangerZone />
     </Screen>
   )
 }

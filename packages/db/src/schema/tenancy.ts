@@ -35,6 +35,15 @@ export const workspaces = pgTable('workspaces', {
   /** Random 32 bytes minted lazily by `ensureCustomerHashSalt`; keys `resolved_answers.source_customer_hash`;
    * never returned by an API. */
   customerHashSalt: bytea('customer_hash_salt'),
+  /** Set when the owner requests the workspace be deleted (Phase 7); `deletionRequestedBy` is a loose
+   *  reference to `user.id` (no FK — the user may be long gone by the time the grace period ends). */
+  deletionRequestedAt: timestamp('deletion_requested_at', { withTimezone: true }),
+  deletionRequestedBy: uuid('deletion_requested_by'),
+  /** The owner's data-export request lifecycle: none | queued | ready | failed (CHECK, 0023). */
+  exportState: text('export_state').notNull().default('none'),
+  exportKey: text('export_key'),
+  exportReadyAt: timestamp('export_ready_at', { withTimezone: true }),
+  exportRequestedAt: timestamp('export_requested_at', { withTimezone: true }),
   createdAt: createdAt(),
   updatedAt: updatedAt(),
 }, (t) => [

@@ -16,10 +16,10 @@
 import { and, asc, count, eq, gte, inArray } from 'drizzle-orm'
 import { alias } from 'drizzle-orm/pg-core'
 import type pino from 'pino'
-import { resolveSetting, type SettingKey } from '@aesa/core'
+import { resolveSetting } from '@aesa/core'
 import { generateToken } from '@aesa/crypto'
 import {
-  categories, draftActionTokens, drafts, member, notifications, orgSettings, tickets, user, withOrg, workspaces, type Db,
+  categories, draftActionTokens, drafts, loadSettingSources, member, notifications, tickets, user, withOrg, workspaces, type Db,
 } from '@aesa/db'
 import { digestMail, DIGEST_MAX_ITEMS, type DigestDraftItem, type DigestEscalationItem, type MailTransport } from '@aesa/platform-mail'
 
@@ -67,7 +67,7 @@ interface DigestHead {
   hour: number
 }
 
-async function loadHead(db: Db, orgId: string): Promise<DigestHead | null> {
+async function loadHead(db: Db, orgId: string, now: Date): Promise<DigestHead | null> {
   return withOrg(db, orgId, async (tx) => {
     const [ws] = await tx
       .select({ businessName: workspaces.businessName, timezone: workspaces.timezone })
@@ -75,17 +75,12 @@ async function loadHead(db: Db, orgId: string): Promise<DigestHead | null> {
       .where(eq(workspaces.orgId, orgId))
     if (!ws) return null // No workspace: onboarding never finished, so there is nothing to summarize.
 
-    const rows = await tx
-      .select({ key: orgSettings.key, value: orgSettings.value })
-      .from(orgSettings)
-      .where(and(eq(orgSettings.orgId, orgId), inArray(orgSettings.key, [...DIGEST_SETTING_KEYS])))
-    const org: Partial<Record<SettingKey, unknown>> = {}
-    for (const row of rows) org[row.key as SettingKey] = row.value
+    const sources = await loadSettingSources(tx, DIGEST_SETTING_KEYS, now)
 
     return {
       ...ws,
-      enabled: resolveSetting('notifications.digest_email', { org }),
-      hour: resolveSetting('notifications.digest_email_hour', { org }),
+      enabled: resolveSetting('notifications.digest_email', sources),
+      hour: resolveSetting('notifications.digest_email_hour', sources),
     }
   })
 }
@@ -234,7 +229,7 @@ async function mintDraftItems(deps: DigestEmailDeps, orgId: string, userId: stri
  * happened (individual sends may still have failed; each is logged and left for tomorrow).
  */
 export async function runDigestEmailForOrg(deps: DigestEmailDeps, orgId: string, now: Date): Promise<'sent' | 'skipped'> {
-  const head = await loadHead(deps.db, orgId)
+  const head = await loadHead(deps.db, orgId, now)
   if (!head || !head.enabled) return 'skipped'
 
   const { hour, day } = localHourAndDay(now, head.timezone)

@@ -1,13 +1,18 @@
 # Project status
 
-Updated 2026-09-12. The spec (`docs/superpowers/specs/2026-09-07-ai-email-support-agent-design.md`)
+Updated 2026-09-16. The spec (`docs/superpowers/specs/2026-09-07-ai-email-support-agent-design.md`)
 defines Phase 0 (rails and tenancy) plus seven build phases, Phases 1–7; this file records where the
-build stands against them. As of 2026-09-12: Phases 0–5 and the brand are on `main` (Phase 4 via PR #5,
-merge commit `ef81169`; Phase 5 via PR #6, merge commit `99a852d`). **Phase 6 (provider choice / BYOK)
-is COMPLETE on branch `phase-6`** — gate green, whole-branch review done and its fix wave landed — and
-lands on `main` through a GitHub PR merged with a merge commit, on Robert's go-ahead. Only Phase 7
-(billing, caps, launch hardening) remains, starting at `superpowers:writing-plans` from the spec's
-*Build phases → Phase 7* paragraph.
+build stands against them. As of 2026-09-16: Phases 0–6 and the brand are on `main` (Phase 4 via PR
+#5, merge commit `ef81169`; Phase 5 via PR #6, merge commit `99a852d`; Phase 6 via PR #7, merge
+commit `c999904`). **Phase 7 (billing, caps, launch hardening) is COMPLETE on branch `phase-7`** —
+gate green, every task reviewed, the whole-branch review done (five reviewers; 3 Critical and 15
+Important, all fixed in one wave and confirmed by a scoped re-review; the record is
+`docs/superpowers/reviews/2026-09-16-phase-7-final-review.md`), the branch clean to merge at
+`6f40203` — and lands on `main` through a GitHub PR merged with a merge commit, on Robert's
+go-ahead. **All seven build phases are built.** What
+remains is the launch itself: the manual list in `docs/runbooks/2026-09-phase-7-external-setup.md`,
+the CASA evidence package in `docs/security/2026-09-casa-evidence.md`, and the items the spec leaves
+open under *Next: after Phase 7* below.
 
 ## Done
 
@@ -1213,7 +1218,7 @@ the record)</summary>
   `apps/api` 285, `apps/worker` 501 [including the four E2E files], `apps/app` 421 jest across 56
   suites — no database); `db:check` reports no drift; the
   Expo web export produces **24 static routes** (up from 22 — `(app)/settings/autopilot` and
-  `(app)/settings/memory` are the two new route files; **25 since Phase 6**, which is the current
+  `(app)/settings/memory` are the two new route files; **27 since Phase 7**, which is the current
   baseline — this line records the Phase 5 gate); the Playwright signup smoke passed at the
   close-out commit and is untouched by the fix wave (still ending at the gated mailbox step, per
   Phase 2's Task 20 ruling — it runs against the SHARED dev database, so
@@ -1502,11 +1507,11 @@ the record)</summary>
     has no NaN guard; `autopilot.tsx` writes `AUTONOMY_THRESHOLD_PRESETS.balanced` where
     `DEFAULT_AUTO_SEND_THRESHOLD` would say why.
 
-### Phase 6 — provider choice (BYOK) (complete on branch `phase-6`; PR pending Robert)
+### Phase 6 — provider choice (BYOK) (complete; merged into `main` via PR #7 on 2026-09-12, merge commit `c999904`)
 
-- PR #7 (https://github.com/ClosingBracketsLLC/ai-email-support-agent/pull/7) is open against
-  `main`, CI green. Two CI-only commits sit above the reviewed head `25aad56` and are not part of the
-  record below: `021d66e` (Docker Hub's `minio/minio:latest` became unpullable on 2026-09-12 — `main`'s
+- PR #7 (https://github.com/ClosingBracketsLLC/ai-email-support-agent/pull/7) was merged into
+  `main` with merge commit `c999904` on 2026-09-12. Two CI-only commits sat above the reviewed head
+  `25aad56` and are not part of the record below: `021d66e` (Docker Hub's `minio/minio:latest` became unpullable on 2026-09-12 — `main`'s
   own last CI run failed the same way — so `compose.yaml` and `ci.yml` pull the pinned
   `quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z`) and `92b1a77` (a 20 s jest `testTimeout` for
   `apps/app`: a suite's FIRST test pays jest-expo's cold start on a loaded runner and hit the 5 s
@@ -1559,7 +1564,8 @@ the record)</summary>
   `@aesa/mail` 242, `@aesa/knowledge` 162, `@aesa/test-kit` 43 [39 run + 4 conditional skips],
   `apps/api` 301, `apps/worker` 586 [including the five E2E files], `apps/app` 458 jest across 58
   suites — no database); `db:check` reports no drift; the Expo web export produces **25 static
-  routes** (up from 24 — `(app)/settings/ai` is the one new route file); the Playwright signup smoke
+  routes** (up from 24 — `(app)/settings/ai` is the one new route file; **27 since Phase 7**, which
+  is the current baseline — this line records the Phase 6 gate); the Playwright signup smoke
   passes (still ending at the gated mailbox step, per Phase 2's Task 20 ruling — it runs against the
   SHARED dev database, so `DATABASE_URL=… pnpm --filter @aesa/db migrate` has to be run once after
   this phase's 0018–0020 land or it fails). The pre-existing `e2e-phase3.test.ts` case-10 timing
@@ -1809,7 +1815,7 @@ the record)</summary>
   - **NOT closed: the `src/drafts/learning.ts` split.** Phase 5's review named it "Phase 6 cleanup";
     Phase 6 did not do it. `apps/api/src/drafts/service.ts` is still one file, and
     `apps/worker/src/jobs/ticket-draft.ts` joined it at ~1,021 lines. Both are carried below.
-- **Carries still open**, grouped:
+- **Carries still open** (a record of the Phase 6 moment — the Phase 7 record's list below is the live one), grouped:
   - **From Phase 4, unchanged:** the stuck-source sweep (a `queued` crawl with no job, a `processing`
     source with unembedded chunks, an abandoned `queued` upload) → **Phase 7**; the source cap's
     read-then-insert race (the crawl half is closed by 0018; the cap itself is still cap ± 1); a crawl
@@ -1914,89 +1920,639 @@ the record)</summary>
     on a dead credential may also change its MODEL on that key, bumping the generation and demoting
     while the key is still rejected — the resolver refuses it at run time regardless.
 
-## Next: Phase 7 — billing, caps, launch hardening
+### Phase 7 — billing, caps, launch hardening (complete on branch `phase-7`; PR pending Robert)
 
-**Where to start.** Phase 6 is complete on branch `phase-6` and lands on `main` through a GitHub PR
+- Review: `docs/superpowers/reviews/2026-09-16-phase-7-final-review.md` — the whole-branch review
+  record (five area reviewers: db+core+contracts / api / worker / app / the cross-cutting seams).
+  Its structure, the spec's Verify list with the proving tests, the twenty-five rulings for the
+  seams reviewer and the ledger's thirty-five deferred minors rolled up for triage were written at
+  this close-out; the review then ran (five reports: 3 Critical, 15 Important, ~13 folded minors,
+  ~12 carries — every seam the phase was designed around held), and **the fix wave landed all of it
+  as two commits on top of `f12dcd9`** (rulings R26–R36 below; the fix-wave paragraph after the gate
+  numbers says what changed). The scoped re-review verdicted every A/B/C item ADDRESSED with tests,
+  the D carries recorded and not implemented, both implementer interpretations right, and ONE
+  residual — `+native-intent.ts`'s pass-through half — which ruling R36 closed directly in
+  `6f40203`; five minors are parked with their reasons in the record. **The branch is clean to merge
+  at `6f40203`, 37 commits over `main`.**
+- Plan: `docs/superpowers/plans/2026-09-12-phase-7-billing-caps-launch-hardening.md` (13 tasks,
+  executed with subagent-driven development; its "Rulings during execution" appendix carries the
+  rationale for every ruling below). Commits **`7cfc87b..`** (33 at the reviewed head `77f5a5e`,
+  the close-out's docs commit `f12dcd9`, the fix wave's two `58afd7a`+`ddf69ac`, ruling R36's
+  `6f40203`, and this record's final docs commit — 37 before it) on `phase-7`, branched from `main` at `c999904` (the PR #7
+  merge commit) — the plan commit, twelve implementation tasks with their three pre-review
+  correctness fixes and nine review-driven fix rounds, and the Task 13 close-out. The per-task list,
+  newest last:
+  `7cfc87b` plan ·
+  `03e176c`+`53950f3` T1 the folded structure carries (`src/drafts/learning.ts` split out of the
+  drafts service as a pure move; `escalateProviderUnavailable`/`killCredential` into
+  `drafting/outcomes.ts`) and `sweeps.daily`'s arms (g) `agent_runs` 90 d and (h) `platform.access`
+  30 d, with migration 0021 ·
+  `2c57848` T2 contracts+core (the billing and lifecycle vocabulary, `BILLING_PRICING`, `PLANS` from
+  one source, the pure billing maths, two invariants) ·
+  `f7a1005`+`9a8f835`+`cfc5a2d` T3 `billing_subscriptions` and the lifecycle/purge columns
+  (migrations 0022–0023), `readBillingState`, `loadSettingSources`, the managed conversations meter,
+  `rewrapOrgDek`, `purgeWorkspace` pinned to the table list, then ruling R6's flat trial allowance ·
+  `20402b0`+`5d9f844`+`80830f1`+`82c3a00` T4 `ownerProcedure`, the billing service and router, the
+  raw-body Stripe webhook, the billing row at creation and the trial stamp,
+  `mailboxes.max_connections` enforced, every api `resolveSetting` on `loadSettingSources`; then R7
+  (live sync slots), the three Important fixes (items by price, the foreign-invoice guard, the
+  double-subscription alert) and R10 (fulfil on `payment_status`) ·
+  `702f84c`+`2c8872d`+`d5bfbda` T5 settings from org + plan at every worker site, the two
+  `decide()` facts, the `subscription_inactive` send lever, the managed meter, the trial budget, the
+  admission slot pool, the `billing.report-usage` cron; then R11 and the record-failure alert ·
+  `030f1c7`+`637d084`+`cc3d559`+`4bfb9dc` T6 `retention.sweep`, `workspace.export`,
+  `workspace.purge` + `purge-sweep`, `keys.rotate` and its script; then migration 0024 (R13), the
+  export-key mismatch (R14), and the fix round (per-org retention transactions R15, the foreign
+  object key, the rotate/purge alerts) ·
+  `ccaab11`+`88b69c9` T7 `knowledge.stuck-sweep`, `knowledge.reembed-sweep`, `memory.capture`'s
+  `messageId` source; then the double-fire fix, the attempt bound and `failSourceTx` ·
+  `0acf041`+`06ee94d`+`211601d`+`b89a104`+`4e85a33` T8 the workspace lifecycle (kill switch,
+  retention, delete with grace, export) and `memory.rememberReply`; then R18–R20, R21–R22 and R23 ·
+  `fb0e114` T9 Settings → Billing (**route 26**), the billing banner, the danger zone, Remember
+  this reply, push routing ·
+  `e5869a0`+`bdca416` T10 the native share sheet (**route 27**) and the web-bundle split ·
+  `4ae2af3`+`6b17cfa`+`eb9315b` T11 Sentry with org attribution, the job observer, eleven named
+  alerts (twelve since the fix wave), `scripts/smoke-tenant.ts`; then the TWO Critical PII leaks
+  closed at the event level, and R25's one redaction home ·
+  `20b4bb3`+`77f5a5e` T12 the Phase 7 E2E (11 scenarios) and its two inert-assertion fixes ·
+  `f12dcd9` the Task 13 close-out (this record, the runbook, the CASA evidence package, CLAUDE.md,
+  the env examples, the EAS submit profiles, the plan's execution rulings, the review record's
+  structure) · `58afd7a`+`ddf69ac` the whole-branch FIX WAVE (code + tests, then docs — the
+  paragraph after the gate numbers) · `6f40203` ruling R36 (the re-review's one residual) · the final
+  docs commit (the review record's findings, this baseline, the plan's rulings 26–36). The per-task
+  execution ledger was an ephemeral SDD artifact; everything load-bearing from it is distilled
+  below, and the git history is the durable account.
+  Gate at the head `6f40203` (the whole-branch review's fixes and ruling R36 on top of `f12dcd9`;
+  the baseline at `77f5a5e` + docs was 2,998 tests, so the wave added 37 — core +4, db +4, api +7,
+  worker +10, app +12 — minio up, the dev `S3_*` exported so the storage suite runs):
+  typecheck and lint clean across all **15** packages/apps; `pnpm test` green with **3,035 tests**
+  plus 4 conditional skips (`@aesa/contracts` 42, `@aesa/crypto` 52, `@aesa/platform-mail` 19,
+  `brand` 110, `@aesa/core` 300, `@aesa/llm` 158, `@aesa/agent` 71, `@aesa/db` 119, `@aesa/queue`
+  29, `@aesa/mail` 242, `@aesa/knowledge` 165, `@aesa/test-kit` 43 [39 run + 4 conditional skips],
+  `apps/api` 398, `apps/worker` 749 [including the six E2E files], `apps/app` 542 jest across 66
+  suites — no database); `db:check` reports no drift (the fix wave's hand-written 0025 committed
+  first, `generate` emitting nothing); the Expo web export produces **27 static routes** (up from
+  25 — `(app)/settings/billing` and `share` are the two new route files; the fix wave's
+  `+native-intent.ts` is excluded from the route table by Expo Router itself); the Playwright
+  signup smoke passes (still ending at the gated mailbox step, per Phase 2's Task 20 ruling — it
+  runs against the SHARED dev database, so `DATABASE_URL=… pnpm --filter @aesa/db migrate` has to
+  be run once after this phase's 0021–0025 land or it fails). The known `e2e-phase3.test.ts`
+  case-10 timing flake is handled per ruling R4 (a gate that fails ONLY there is re-run solo for
+  that file); it did not fire in the close-out's, the fix wave's or R36's runs. The 27 routes, the
+  Playwright pass and the E2E's 11/11 stand from the wave's own gate at `58afd7a`; the R36 commit
+  touched two `apps/app` files and the app suite ran 542/542 at `6f40203`.
+- **The whole-branch fix wave** (after the final review's five reports; ruling R35 sequenced it as
+  ONE implementer over the whole brief, two commits — code + tests, then docs — and one scoped
+  re-review). What landed, by ruling: **R33** migration `0025_billing_backfill.sql` re-runs 0023's
+  trial-row backfill under `SET ROLE aesa_platform … RESET ROLE` (0023 ran as `aesa_owner`, which
+  FORCE RLS filters to nothing — verified on the dev database, 7 workspaces and 1 billing row —
+  so every pre-existing workspace sat on a trial that never expired), with `ON CONFLICT DO UPDATE
+  … COALESCE` for a row `ensureBillingRow` minted with a NULL clock, plus a guard test making any
+  tenant-table data write in a migration require that pair (0023 is the one recorded exception);
+  **R31** a `customer.subscription.updated|deleted` for a subscription the row does not hold is
+  `ignored` and alerts `stripe_foreign_subscription_event` (the TWELFTH alert kind) — only
+  `checkout.session.completed` may introduce a different id, the same asymmetry the invoice guard
+  has, so cancelling the orphan a `stripe_double_subscription` alert names no longer displaces the
+  live subscription; **R26** `send.execute` dedupes a billed conversation on the BILLING PERIOD —
+  `tickets.ai_handled_month` is the period start's date, `handledPeriodStamp`/`handledPeriodStamps`/
+  `isHandledInPeriod` in `@aesa/core` with the legacy `'YYYY-MM'` honoured for a period starting
+  on the 1st, no migration — and the E2E's scenario 3 re-anchors org A's period to the 15th and
+  proves a follow-up sent in the next calendar month inside it is the same conversation; **R32**
+  any `invoice.*` on a `canceled` row is ignored (the `deleted` → `invoice.paid` same-second
+  ordering a Portal "cancel immediately + prorate" gives no longer resurrects a paid workspace);
+  **R30** `incomplete_expired` maps to nothing, `past_due`/`canceled` land only on a
+  `standard`-plan row, a subscription Stripe says is gone is forgotten from a trialing row so a
+  fresh Checkout can start, and `startCheckout` reads a subscription id on a trialing row as
+  `checkout_pending` (a new `BILLING_ERROR_MESSAGES` key); **R27** the trial's total budget applies
+  only while the derived STATE is `trialing`, summed from `workspaces.agent_enabled_at` (now on
+  `readBillingState`'s view as `agentEnabledAt`; `SettingSources` exposes the whole `billing` view
+  and `ticket.draft`'s duplicated read is gone), and its refusal lands `needs_owner/trial_budget`
+  (the nineteenth reason, at every sibling site) through `escalateTicket` with one org-level
+  billing notice (`llm_cap:trial:<org>`) gating a once-per-org operator alert — a cancelled
+  workspace with $500 of paid-era spend drafts again, and a capped trial no longer re-enqueues
+  every minute; **R28** `billing.report-usage` drops its 500-org window; **R29** the domain
+  quantity floor is 1 in the nightly sync too; **R34** `apps/app/src/app/+native-intent.ts`
+  (`redirectSystemPath`) sends the iOS share relaunch's `dataUrl=` url to `/`. Beside the rulings:
+  the reembed sweep's chunk arm checks the embed cap before nulling (B3); `workspace.purge`
+  re-checks the cancel under `FOR UPDATE` inside phase 3 and alerts `purge_failed /
+  cancelled_mid_purge` — the objects are already gone (B4); `billing_subscriptions`' two
+  price-table defaults are `BILLING_PRICING` (B7); the app gates Remember this reply on the role
+  (B9), renders `trial_expired`/`canceled` as lapsed with the usage tile and Subscribe rather than a
+  priced plan and keys the overage radio on `plan === 'standard'` (B10), thanks only an `active`
+  state on `?checkout=success` (B11), and the inbox `BillingBanner` hides its action when
+  `configured` is false, renders the api's refusal through the `BILLING_ERROR_MESSAGES` whitelist and
+  never rejects unhandled (B12); and the folded minors — `requestDeletion` cancels ANY subscription
+  the row holds on every status but `canceled` (a deferred one could still settle), `setAgentEnabled`
+  refuses ON while a deletion is pending, `setAgentEnabled`'s clock is `trialEndsAtFor(agent_enabled_at)`
+  in TypeScript (the "one formula" is now true), the Stripe client's 15 s timeout and explicit 2
+  retries, `sweeps.daily` arm (g) in `RETENTION_BATCH` slices, `redactHeaders` dropping a non-string
+  value, `error-surface.test.ts`'s undici widening removed, `share.tsx` coercing a null
+  `fileName`/`mimeType`, `danger-zone`'s export poll owner-only, and four stale comments. RED was
+  captured for A1–A3, B1, B2, B4–B6, B8–B12 against the pre-wave code. The fix wave changed no
+  environment variable and added one migration. **Then the scoped re-review's one residual, closed
+  by ruling R36 in `6f40203`:** the wave's `+native-intent.ts` returned `null` for every url without
+  `dataUrl=`, reading Expo Router's contract as "null = no redirect" — it is the opposite (both call
+  sites do `if (href) listener(href)`, and `getLinkingConfig.js` uses the return AS the initial url),
+  so every non-share native url was DROPPED rather than routed; latent today (no associated domains,
+  push taps use `router.push`, the connect flow polls) but the first universal link added later
+  would have been swallowed at launch. `redirectSystemPath` now returns the path unchanged for every
+  non-share url and `null` only for a non-string; the test's three "left alone" assertions flipped
+  from `toBeNull` to the path itself.
+- What exists now:
+  - `packages/contracts` — `billing.ts`: `PLAN_IDS`/`PlanId` (the ONE home, ruling R2),
+    `BILLING_STATUSES`, `BILLING_STATES` (`trialing`, `trial_expired`, `active`, `past_due`,
+    `canceled`), `OVERAGE_MODES`, `BILLING_PRICING` (4999 ¢/domain, 300 included per domain, 12 ¢
+    overage, 14 trial days, a flat 50 trial conversations, a $10 trial budget), `BillingView`,
+    `SetOverageModeInput`, `BILLING_ERROR_MESSAGES`; `workspace.ts` gains `SetKillSwitchInput`,
+    `SetRetentionDaysInput` (30–730), `RequestDeletionInput`, `WORKSPACE_DELETE_GRACE_DAYS` (30),
+    `EXPORT_STATES`, `exportObjectKey` (ruling R14 — the ONE function the api mints an export key
+    with and the worker validates against) and `WORKSPACE_ERROR_MESSAGES` (incl. `not_pending`,
+    ruling R18); `memory.ts` gains `RememberReplyInput`; `notify.ts` gains the `billing` and
+    `workspace` kinds; `knowledge.ts` gains the `abandoned` and `stuck` failure reasons.
+  - `packages/core` — `billing.ts` (the pure maths: `billingStateOf`, `isBillingActive`,
+    `allowanceOf` — flat on a trial, ruling R6 — `periodOf`, `overageOf`, `isAllowanceExhausted`,
+    `trialEndsAtFor`); `plans.ts` now references `BILLING_PRICING` and carries the trial's
+    `llmUsdBudget`; `invariants.ts` gains the trial-budget rules; and **`redact.ts`** (ruling R25):
+    `redactUrl`, `redactText`, `SCRUB_KEYS`/`scrubKeys`, `SENSITIVE_HEADER_NAMES`/`redactHeaders`,
+    `redactQueryParams`, `redactBreadcrumbMessage` — the ONE implementation both apps' logging and
+    Sentry boundaries scrub with (the api's `src/redact.ts` is a re-export). `packages/db` now
+    depends on `@aesa/core` (for `planSettingDefaults`); no cycle.
+  - `packages/db` — `billing_subscriptions` (one row per workspace from creation; migrations
+    0022–0023 with the trial-row backfill), the lifecycle/export columns on `workspaces`,
+    `drafts.body_purged_at`, `knowledge_sources.sweep_attempts`, `resolved_answers.source_message_id`
+    (partial unique — "Remember this reply" is idempotent), the retention indexes (0021 `agent_runs
+    (started_at)`, 0023's work-list and age indexes, 0024 `audit_log (created_at)` — ruling R13),
+    `resolve_stripe_customer` (SECURITY DEFINER — the fifth fixed-signature resolver of its kind,
+    after `resolve_mailbox_connection`/`resolve_mailbox_subscription` (0006), `resolve_oauth_flow`
+    (0009) and `resolve_draft_action_token` (0011), each its route's one cross-org read), and the
+    fix wave's 0025 (the backfill that actually lands, ruling R33); `billing.ts` —
+    **`readBillingState` (the ONE reader of a workspace's billing state)**, `ensureBillingRow`,
+    `countManagedConversations`, `countActiveDomains`; `settings.ts` — `loadSettingSources` /
+    `SettingSources` (org + plan, the ONLY way a plan becomes a `resolveSetting` source);
+    `metering.ts` — `SEND_METERS.aiHandledManaged` (`ai_handled_conversations_managed`) and
+    `sumMeter`; `keys.ts` — `rewrapOrgDek` (guarded on the exact bytes read; throws when the ring
+    lacks the row's version); `purge.ts` — `PURGE_ORDER` (31 tenant tables in FK order),
+    `purgeWorkspace`, `purgeAuthRows`; `test/helpers/tables.ts` — `EXPECTED_TABLES` (42) and
+    `RLS_EXEMPT` shared by the migrations, RLS and purge tests so the three lists cannot drift.
+  - `packages/queue` — the three new queues in `JOB_NAMES`/`QUEUE_OPTIONS` (`workspace.export`
+    `short`, `workspace.purge` `short`, `keys.rotate` `standard`) and `observe.ts` —
+    `setJobObserver`/`notifyJobFailure`, the seam `registerJob` reports a scrubbed job failure
+    through (no Sentry dependency in this package).
+  - `packages/knowledge` — the `ObjectStore` port gains `put` and `presignGet` (S3 and memory
+    adapters; `presignGet` is a local SigV4 computation, pinned network-free by a test).
+  - `apps/api` — `ownerProcedure` (`role === 'owner'`); `src/billing/{stripe,service,webhook}.ts`
+    (`@aesa/api/billing`): `getBilling`, `startCheckout`, `openPortal`, `setOverageMode`, and
+    `applyStripeEvent` + `registerStripeWebhook` (the raw-body route, signature over the bytes,
+    dedupe through `webhook_events`, the `last_stripe_event_created` watermark, items read by price,
+    the foreign-invoice guard, `payment_status` fulfilment — ruling R10 — and the
+    `stripe_double_subscription` alert — ruling R8); the `billing` router; `workspace.create`
+    inserts the billing row and `setAgentEnabled` stamps `trial_ends_at`; `mailboxes.startConnect`
+    refuses beyond the plan's live sync slots (ruling R7); `src/workspace/lifecycle.ts`
+    (`@aesa/api/workspace`): `setKillSwitch`, `setRetentionDays`, `requestDeletion` (the Stripe
+    cancel first, outside the transaction; refused `deletion_billing_unconfigured` when a live
+    subscription meets a replica with no Stripe), `cancelDeletion` (`needsResubscribe`, ruling R23),
+    `requestExport` (`export_in_progress`, ruling R16), `exportStatus` (the URL for the owner only,
+    ruling R21); `memory.rememberReply`; `src/observability.ts` (`initObservability`, `beforeSend`,
+    `alert`, `captureWithOrg`, `ALERT_KINDS`) wired into Fastify's error handler and tRPC's
+    `onError`; `apps/api/src/org-settings.ts` DELETED (no `{ org }`-only `resolveSetting` anywhere).
+  - `apps/worker` — `billing/{stripe,report-usage}.ts` (`StripeUsagePort`; the `billing.report-usage`
+    cron, 00:20 UTC, `cron` role — collect → act → record, overage deltas as meter events with an
+    idempotent identifier, the daily quantity sync, the trial and allowance pages — ruling R11);
+    `drafting/admission.ts` (the managed slot pool: `MANAGED_DRAFT_SLOTS`, session-level advisory
+    locks, a 60 s wait then proceed with `admission_slot_timeout`); `drafting/caps.ts` reads the
+    plan and — for a genuine, unexpired trial, from its own clock (ruling R27) — the trial's total
+    budget; every job on `loadSettingSources`; `ticket.draft` passes `readBillingState(...).active`
+    and `isAllowanceExhausted(...)` into `decide()` while `agent.sandbox` passes `.active` and a
+    literal `allowanceExhausted: false`, deliberately (a probe is never a billed conversation);
+    `send.execute`'s eighth lever `subscription_inactive` and the managed meter, deduped per
+    billing period since ruling R26;
+    `jobs/retention-sweep.ts` (03:45 UTC, `cron` — one short transaction per workspace, every
+    workspace, ruling R15), `jobs/workspace-export.ts` and `jobs/workspace-purge.ts` (+ the 04:15
+    `workspace.purge-sweep`; both jobs on the `knowledge` role, which owns the store),
+    `jobs/keys-rotate.ts` (`sync` role) and `scripts/keys-rotate.ts` (`pnpm --filter @aesa/worker
+    keys:rotate`), `jobs/knowledge-stuck-sweep.ts` (every 5 min) and
+    `jobs/knowledge-reembed-sweep.ts` (every 10 min) on the `knowledge` role, `memory.capture`'s
+    `messageId` payload variant with audited skips (ruling R20), `src/observability.ts` (the same
+    shape as the api's; the job observer wired at boot), and `config.ts`'s `STRIPE_SECRET_KEY` /
+    `STRIPE_METER_EVENT_NAME` / `MANAGED_DRAFT_SLOTS` / `SENTRY_DSN` / `SENTRY_ENVIRONMENT`.
+  - `apps/app` — **Settings → Billing** (route 26: plan, domains, allowance and usage — "N of M
+    conversations this month", not the period's dates — Subscribe / Manage billing through Stripe
+    in a popup, the overage-mode toggle for the owner, a lapsed workspace reading as lapsed since
+    the fix wave),
+    the **BillingBanner** across the inbox, the **danger zone** on Settings → Workspace (owner only,
+    ruling R24: the kill switch, retention days, export with its download, delete with the typed
+    confirmation and the two billing sentences, cancel deletion), **Remember this reply** on an
+    outbound message, push routing for the `billing` and `workspace` kinds, and the native
+    **share sheet** (`expo-share-intent`; route 27 `/share`: a link crawls, text pastes, a file
+    uploads; `lib/share-intent{,.web}.tsx` keep it out of the web bundle).
+  - `scripts/smoke-tenant.ts` (`pnpm smoke:tenant`) — the post-deploy walk of a throwaway
+    workspace's authenticated surface, never printing its cookie.
+  - Three new runtime dependencies, pinned exactly: `stripe@22.6.2` (api, worker),
+    `@sentry/node@10.74.0` (api, worker), `expo-share-intent@8.0.1` (app).
+- Deviations from the spec's Phase 7 list, as recorded in the plan (the spec wins on everything
+  else), and how each fared in execution:
+  1. **The `plan` column lives on `billing_subscriptions`**, one row per workspace from creation,
+     backfilled by 0023; `readBillingState` treats a missing row as the trial defaults. *Held.*
+  2. **The trial is card-less and local** — `trial_ends_at = agent_enabled_at + 14 days`, stamped on
+     the first enable and backfilled. *Held* (`trialEndsAtFor` is the one formula — TRUE since the
+     fix wave, when `setAgentEnabled` started computing the clock with it from the row's own
+     `agent_enabled_at` instead of a second SQL `now()`; before that the export had no caller, and
+     the backfill itself was a no-op until 0025 — ruling R33).
+  3. **Overage is a Billing Meter event carrying the DELTA**, identifier
+     `${orgId}:${periodStartIso}:${overageTotal}`, the allowance computed locally. *Held*; the worked
+     example (600; 601 → 1; 650 → 49; 650 → 0) is walked in `packages/core`'s table test, the cron's
+     suite and E2E scenario 3.
+  4. **Two prices, one subscription; the domain quantity synced daily.** *Held.*
+  5. **Trial numbers: 50 conversations, flat; a $10 total budget.** *Held; mechanism amended by
+     ruling R6* — the trial allowance is a constant in `BILLING_PRICING`, never a stored column, so a
+     missing row and a real row read identically.
+  6. **Inactive = `trial_expired` / `past_due` / `canceled`** → `review/subscription_inactive` and
+     the send lever; a human approval still sends. *Held*; ruling R12 keeps `decide()`'s order.
+  7. **`allowanceExhausted`** = managed ∧ used ≥ allowance ∧ (trial ∨ blocked). *Held*; ruling R11
+     made the allowance page follow the same predicate.
+  8. **Downgrade = cancellation through the Portal** → `canceled` + `plan = 'trial'`; the status
+     map. *Held*; ruling R10 refined the Checkout side (fulfil on `payment_status`; `invoice.paid`
+     for the row's own subscription re-establishes `standard`).
+  9. **Delete is soft, then a sweep**; the Stripe cancel first; the Better Auth rows by direct SQL
+     from the worker. *Held*; rulings R19 (day-scoped page), R22 (the copy stops promising a
+     reversal — the cancel is immediate) and R23 (two signals, two names) shaped the api half, and
+     the unbriefed `deletion_billing_unconfigured` refusal was endorsed.
+  10. **Export is an NDJSON bundle** in the store, 200 MB cap, a 7-day presigned GET. *Held*; rulings
+      R14/R16 (the key-mismatch branch and the api contract that makes it correct) and R21 (owner-only
+      URL); `presignGet` added to the port.
+  11. **`keys.rotate` re-wraps the DEK only.** *Held.*
+  12. **Retention**: per-workspace body purges plus three platform windows; `sweeps.daily`'s two
+      arms. *Held; amended by ruling R15* — one short transaction per org and no per-run window
+      (`RETENTION_ORGS_PER_RUN`, in the brief's interface, no longer exists); ruling R13 added the
+      audit index the plan omitted.
+  13. **Admission slots: prevention with a reactive floor.** *Held*; `deps.admission` is optional
+      with a `noAdmission` default (production wiring is `agent-role.ts` alone).
+  14. **Observability**: Sentry in both apps, org attribution as a tag, named alerts, the log drain
+      as configuration. *Held with two changes*: `ALERT_KINDS` is **twelve** (the plan's nine, minus
+      `platform_killswitch_on` which is wired nowhere, plus R8's `stripe_double_subscription`, R17's
+      `knowledge_reembed_stranded`, Task 8's `deletion_billing_unconfigured` and the fix wave's
+      `stripe_foreign_subscription_event`, R31), and the PII
+      boundary is **`beforeSend`, event-level** rather than the call sites — the review found two
+      Critical leaks on Sentry's own capture paths and the boundary was rebuilt (ruling R25).
+  15. **Share-sheet intake is ONE route.** *Held*; the web bundle needed a split
+      (`share-intent.web.tsx`) the plan did not foresee, and a shared file of an unsupported type
+      was reporting success — both fixed in Task 10's round.
+  16. **"Remember this reply" is the backfill.** *Held*; ruling R20 audits every skip.
+  17. **`member_prefs` is not built.** *Held* — a product decision, carried.
+  18. **Stripe lives in both apps**, all-or-none, required in production (the api always; the
+      worker on `cron`). *Held.*
+  19. **`mailboxes.max_connections` gets its first caller.** *Held; the counted set amended by
+      ruling R7* (live sync slots, not "non-disabled").
+  20. **Carries folded in.** *All delivered*: the `learning.ts` split, the outcomes move, the two
+      retention arms, the slot pool, the stuck and re-embed sweeps, the `kill_switch` toggle. The
+      "carried again" list stands (below).
+- Execution-time rulings recorded during the build, in order (one line each; the plan's appendix
+  carries each one's rationale and cost-if-wrong):
+  1. Task 6 IMPORTS `auditPerOrgArm` from `sweeps-daily.ts` instead of copying it.
+  2. `PlanId` lives ONCE in `@aesa/contracts`; `core/plans.ts` re-exports it.
+  3. `includedConversationsPerDomain` keeps its name on both tiers; `allowanceOf` documents the flat
+     trial reading.
+  4. The baseline is accepted modulo the known `e2e-phase3` case-10 flake; a gate failing ONLY there
+     is re-run solo before it counts as red.
+  5. `knowledge_sources.failure_reason` has no CHECK constraint; `abandoned`/`stuck` need no DDL.
+  6. **AMENDS deviation 5's mechanism** — the trial allowance is a FLAT CONSTANT
+     (`BILLING_PRICING.trialIncludedConversations`), never `row.includedConversationsPerDomain`;
+     `defaultRow` sets that field to 300 so a missing row and a real row are identical.
+  7. The mailbox connection cap counts LIVE SYNC SLOTS (`connected`, `pending_claim`), never
+     `reauth_required` — an owner can always repair their only mailbox.
+  8. A double completed Checkout ACCEPTS the newer subscription and ALERTS with both ids.
+  9. One Minor folded into Task 4's fix round (a Checkout must not seed `active` for an
+     `incomplete` subscription) — same lines, same bug class.
+  10. Fulfil on the session's own `payment_status`; `invoice.paid` for the row's own subscription
+      establishes `plan = 'standard'` again — the conservative direction for a deferred payment.
+  11. The `allowance_reached` page follows `isAllowanceExhausted`: a trial pages under `automatic`
+      too; a standard + automatic workspace never does (it bills overage).
+  12. **`decide()` is NOT reordered.** `subscription_inactive` before the guardrail branch is the
+      spec's order; containment is identical, only the reason's precision differs. A spec question
+      for Robert is recorded (Next, below).
+  13. `audit_log_created_idx (created_at)` in migration 0024 — the plan's omission over the largest
+      of the three age-swept tables.
+  14. A mismatched `export_key` lands `failed` + alert, not a silent `skipped`; `exportObjectKey`
+      lives in `@aesa/contracts`.
+  15. `retention.sweep` takes ONE SHORT `withPlatform` transaction PER ORG and visits every
+      workspace — a `LIMIT` with no rotation was a workspace whose retention promise was never kept.
+  16. The R14 shape stands; its contract — `requestExport` refuses while `queued` — is enforced by
+      Task 8 (`export_in_progress`).
+  17. The re-embed sweep's stranded document is an `error` + `knowledge_reembed_stranded` alert; no
+      recovery arm (a design question, carried).
+  18. `not_pending`'s message moves into `WORKSPACE_ERROR_MESSAGES`.
+  19. The deletion notification is DAY-scoped, not lifetime — scheduling a workspace's destruction
+      must always reach a human.
+  20. A human tap must not vanish silently: `memory.capture` audits its `messageId`-path skips with
+      a reason; the api's `{ ok: true }` (queued) contract stays.
+  21. `exportStatus` stays `orgProcedure` for STATE; the download URL is minted for the OWNER only —
+      the bundle carries the complete audit log.
+  22. The deletion copy stops promising a reversal it cannot deliver: the Stripe cancel is
+      immediate, and `cancelDeletion` says the plan is dead.
+  23. Two billing signals, two names: `requestDeletion.subscriptionCancelled` ("this call cancelled
+      it") and `cancelDeletion.needsResubscribe` (`!isBillingActive && stripeSubscriptionId !== null`).
+  24. **OVERRULES Task 9's Important finding** — the danger zone stays OWNER-only in the UI; R21 is
+      an api-layer ruling and stays load-bearing as built.
+  25. ONE home for the redaction helpers, `packages/core/src/redact.ts`; both `observability.ts`
+      files import them and the api's `redact.ts` is a re-export — for a security boundary,
+      "hand-diffed once" is not parity.
+  26. **(fix wave)** A billed conversation is deduped on the BILLING PERIOD, never the calendar
+      month: `ai_handled_month` carries the period start's date, with a shim that reads a stored
+      `'YYYY-MM'` as that month's 1st so nothing already stamped is counted twice on upgrade.
+  27. **(fix wave)** The trial's total Managed-AI budget applies only while the derived STATE is
+      `trialing`, summed from `agent_enabled_at`; its refusal is `needs_owner/trial_budget` through
+      `escalateTicket` (one page per ticket) with a once-per-org operator alert.
+  28. **(fix wave)** `billing.report-usage` has no per-run org window (R15's reasoning; here the
+      promise is money).
+  29. **(fix wave)** The domain-quantity floor is 1 everywhere — Checkout, `allowanceOf` AND the
+      nightly sync.
+  30. **(fix wave)** Deviation 8 wins over Task 4's status map: `incomplete_expired` moves nothing;
+      `past_due`/`canceled` land only on a `standard` row; a subscription id on a `trialing` row is
+      a Checkout still pending.
+  31. **(fix wave)** Only `checkout.session.completed` may introduce a subscription id different from
+      the row's; a `customer.subscription.*` for a foreign id is ignored and alerts
+      `stripe_foreign_subscription_event`.
+  32. **(fix wave)** Any `invoice.*` on a `canceled` row is ignored — a canceled Stripe subscription
+      can never become active again.
+  33. **(fix wave)** Migration 0025 re-runs the backfill under `SET ROLE aesa_platform … RESET ROLE`
+      with `DO UPDATE … COALESCE`, and a guard test makes any later tenant-table data write in a
+      migration require the pair.
+  34. **(fix wave)** `apps/app/src/app/+native-intent.ts` redirects a system path containing
+      `dataUrl=` to `/`, so the iOS share relaunch never lands on Page not found.
+  35. **(sequencing)** One implementer lands the whole fix-wave brief as two commits, then one
+      scoped re-review; residuals are adjudicated, not re-waved.
+  36. **(after the re-review)** B13's residual is fixed DIRECTLY by the orchestrator (one expression
+      + three assertion flips, verified against expo-router's source) rather than parked or
+      re-waved: `redirectSystemPath` now returns the path unchanged for every non-share url, null
+      only for a non-string. Cost if wrong: none reachable — passing the url through is exactly what
+      the router does when no `+native-intent` file exists, so the change is the no-op equivalent
+      for every url but the share relaunch.
+  A recorded deviation beside the rulings, not numbered: `billing.setOverageMode` is
+  `ownerProcedure`, where the plan's Roles paragraph implied `managerProcedure` — owner is the
+  better call for a money mode; every billing mutation is the owner's.
+- The E2E: `apps/worker/test/e2e-phase7.test.ts`, **11 scenarios** on one throwaway database with
+  the REAL api services (billing, lifecycle, memory), the REAL webhook decision (`applyStripeEvent`
+  fed real event bodies), the REAL jobs and crons, a fake Stripe implementing both ports, a fake
+  clock, and orgs A and B whose row counts are snapshotted before and compared after every
+  destructive scenario — the trial clock (enable → `trial_ends_at`; 15 days on →
+  `review/subscription_inactive`, "Your trial has ended" once); Checkout → caps rise the same day;
+  conversation 601 of 600 (four real sends on the managed meter; exactly one unit at 601, the
+  watermark, nothing on a re-run); blocked vs automatic at 601 (`review/allowance_exhausted` and the
+  page, including R11's trial-under-automatic arm; then `send`); `invoice.payment_failed` →
+  `past_due` (the queued auto send HOLDS, an owner approval still goes out, a foreign invoice is
+  ignored); `customer.subscription.deleted` → `canceled` + trial caps the same instant, a BYOK agent
+  still drafting and never counting; retention at 30 vs 180 days; delete with grace (the Stripe
+  cancel, the kill switch, the purge of every `PURGE_ORDER` table, the workspace, the organization and
+  the bucket object — the one object keyed under another tenant skipped, alerted and left); rotate
+  (v1 → v2, a replica without v2 refused, the BYOK key and the mailbox credential still opening);
+  Remember this reply (an ACTIVE answer with `source_message_id`, retrieved on the answers leg, a
+  second tap `already_remembered`); and the two knowledge sweeps (requeue ×3 then `stuck`; a flipped
+  embedding model re-embedded without a `knowledge_version` bump).
+- **Carries CLOSED by this phase:**
+  - **The `plan` column and the `{ plan }` argument at every `resolveSetting` site** (Phase 4 seams
+    D1, carried since): `loadSettingSources` is the ONLY way a plan becomes a source, every one of
+    the 25 call sites (at head) goes through it, both `loadOrgSettings` twins and `apps/api/src/org-settings.ts`
+    are gone, and a grep for `resolveSetting(` with `{ org:` outside tests finds nothing.
+  - **`agent_runs` retention** (Phase 6's urgent carry): `sweeps.daily` arm (g), 90 days, with
+    migration 0021's `(started_at)` index.
+  - **`platform.access` audit retention** (carried since Phase 1): arm (h), 30 days, with 0024's
+    index.
+  - **The stuck-source sweep** (carried since Phase 4): `knowledge.stuck-sweep` — a `processing`
+    source past its lease is requeued (and its job re-enqueued) up to three times, then failed
+    `stuck`; an upload `queued` 24 hours with no object is failed `abandoned`.
+  - **The `KNOWLEDGE_EMBED_MODEL` re-embed job** (carried since Phase 5): `knowledge.reembed-sweep`
+    — chunks and learned answers under another model are re-embedded onto the configured one, so
+    that value can finally change on a live workspace.
+  - **The `pg_try_advisory_lock` slot pool** (carried since Phase 3): `drafting/admission.ts`.
+  - **The `workspaces.kill_switch` Settings toggle** (carried since Phase 3): the danger zone's
+    switch, owner only; its reads are unchanged.
+  - **`mailboxes.max_connections`'s first caller** (the api map's gap): `startConnect`.
+  - **The `src/drafts/learning.ts` split** (named for the fourth time) and the
+    **`escalateProviderUnavailable`/`killCredential` move into `drafting/outcomes.ts`** — both pure
+    moves in Task 1. `service.ts` is still ~1,075 lines and `ticket-draft.ts` ~1,092, so the size
+    carry stands even though the named seams are done.
+  - **Workspace delete cascading the learning and provider tables** (Phase 5/6): `PURGE_ORDER` is
+    every tenant table, pinned by a test, so `resolved_answers`, `llm_credentials`,
+    `llm_credential_secrets` and `agent_model_config` cannot be missed.
+  - **The `keys.rotate` runbook** (Phase 6's "new tenant"): the job, the script and the four-step
+    procedure in the Phase 7 runbook §4.
+  - **Two Critical PII leaks to an external service, found and closed within the phase** (Task 11's
+    review): Sentry's own capture paths (Fastify's error handler, the uncaught-exception
+    integrations) sent the RAW error — a `DrizzleQueryError`'s SQL and bound values, which for
+    `drafts` is `final_body` — and every captured api event carried `request.headers.cookie` (a live
+    session credential) and, on the review routes, the `?t=` one-click token. The boundary is now
+    `beforeSend`, event-level, exercised by a fake transport in both apps' `observability.test.ts`.
+  - **A live latent bug in the purge** (Task 6's fix round): the pre-fix object delete would have
+    removed ANOTHER tenant's object had a foreign key ever been written into those columns; it now
+    refuses any key outside `orgs/<orgId>/` and alerts.
+- **Carries still open**, grouped:
+  - **From Phase 4, unchanged:** the source cap's read-then-insert race (the crawl half is closed by
+    0018; the cap itself is still cap ± 1); a crawl does not resume, so a re-entry re-walks from the
+    start URL.
+  - **Long-standing, unchanged:** the api's three in-memory rate limiters (per-replica since Phase
+    1 — and now the one thing between Stripe's delivery burst and a 429, runbook §2.3); the Better
+    Auth 1.7.3 ↔ `drizzle-orm` peer bump; `packages/db/test/keys.test.ts`'s order-dependence; the
+    `apps/app` accessibility minors including the draft panel's "Blocked: …" lines rendering as
+    plain `Text`; **the three-pane review layout, J/K navigation, multi-select and the
+    stubbed-provider Playwright walk** (spec items, still not built — Next, below);
+    `notify.digest`'s email pass scanning every workspace on each 5-minute tick; the org-cap arm of
+    the backstop busy loop; emoji presentation flattening; `blocks.ts` still telling the model bidi
+    controls are "rejected"; a re-approve inside the undo window landing up to ~2 minutes late;
+    `sweeps.daily` holding write locks across every expiring draft for the whole pass; the
+    hand-authored cache-hit fixture; `sendFailureLabel`'s untested coupling to worker-owned
+    literals; `context_too_long`'s "halve retrieval, retry once" (Phase 3 → 5 → 6 → 7, still not
+    done); and Phase 3's list of smaller review minors, unchanged.
+  - **Structure:** `apps/api/src/drafts/service.ts` at ~1,075 lines and
+    `apps/worker/src/jobs/ticket-draft.ts` at ~1,092 even after the two pure moves;
+    `ticket-triage.ts` still carries its own private `escalateProviderUnavailable`/`killCredential`
+    copies where `outcomes.ts` now has the real ones; `relativeTime` in six app files and
+    `lookup()` in two; `ticket.draft` still re-implements `caps.ts`'s private `meterValue`;
+    `outcomes.ts`'s type-only reversed import of `TicketDraftDeps`.
+  - **From Phase 5 and Phase 6, untouched by Phase 7:** every item in the Phase 6 record's "Carries
+    still open" except the ones closed above (`agent_runs` retention, the re-embed job, the stuck
+    sweep, `platform.access` retention, the slot pool, the kill-switch toggle) — Phase 5's
+    untouched list (the reinforce UPDATE not re-guarded on `status = 'active'`, `sweeps.daily` arm
+    (f) without an `org_id` predicate, `category_stats_daily`'s PK, the daily auto-send cap reading
+    the DELIVERED meter, the coverage gaps, the app-polish list, and the rest), Phase 6's own
+    deferred minors (the queue/contracts/core, crypto/llm, db, worker, api and app lists, including
+    `llm-reprobe-sweep.ts`'s unbounded select, `agents.list`'s N+1, Together/OpenRouter's missing
+    pricing rows and the UNVERIFIED DeepSeek rows), and the Phase 6 fix wave's residuals.
+  - **Phase 7's own deferred minors** (the thirty-five ledger lines, one line per area; the review
+    record rolls them up in full for the whole-branch review's triage). *db/core/contracts:*
+    `billing.test.ts` never pins `trialEndsAt === now`; `periodOf`'s fallback has no December →
+    January case; the worked example's day-2/3 tests hardcode 600; `purge.test.ts` seeds tickets
+    without `agentId`/`categoryId`, so two restricting FKs are ordered by inspection only;
+    `rewrapOrgDek`'s throw on a missing ring version is documented on the job, not the function;
+    `countManagedConversations` truncates period bounds to UTC days (a boundary day lands in the
+    later period — deliberate, undocumented); `auditPerOrgArm`'s `action` widened to `string`; and
+    three ledger lines that are records rather than work — Task 2 touching two files outside its
+    brief (`source-list.tsx`'s labels, a contracts test's exact array; disclosed),
+    `resolve_stripe_customer` returning ZERO rows for an unknown customer (carried into Task 4 and
+    handled there), and a task report saying 30 `PURGE_ORDER` tables where the code lists 31.
+    *api:* `serviceDeps` duplicated over `ServerDeps` and the tRPC context, and `webhook.ts`
+    inlining the clock; a dead `AUDIT_ACTIONS[…] ?? 'billing.event'` fallback and a redundant
+    `?? null`; `startCheckout` auditing after the Stripe session exists (a failing third transaction
+    is a 500 with a live session); `recordWebhookEvent` preceding application (a throw mid-apply
+    loses the event to the dedupe — recovered by the following `invoice.paid`); no test that the
+    rate limiter covers `/webhooks/stripe` (the final review PROBED it: the limiter reaches the
+    nested route); ~~`invoicePromotesPlan` not excluding an already-`canceled` row~~ — CLOSED by
+    the fix wave (ruling R32, any invoice on a canceled row is ignored); no reconciliation sweep
+    for a workspace whose deferred Checkout never gets its follow-up event; an already-cancelled
+    subscription inside the webhook window making deletion impossible (`billing_cancel_failed`);
+    a retry from `ready` orphaning the
+    previous export bundle while its link stays valid; the deletion audit detail recording neither
+    side effect; the writes-nothing proofs asserting different tables per case; `setRetentionDays`
+    untested at its bounds; `unwrapRemember`'s router-local sentences; `cancelDeletion` re-deriving
+    `!isBillingActive`; `stripe_webhook_rejected` losing its stack frames to the alert helper.
+    *worker:* ~~the stale "run rows are never pruned" comment in `sweeps-daily.ts`~~ (fixed in
+    the wave); the BYOK→managed fallback call bypassing the admission pool; ~~the trial spend page
+    re-paging daily on a budget that never resets~~ (CLOSED — ruling R27); ~~`billing_subscriptions`
+    read twice per transaction~~ at `ticket.draft` (CLOSED — `SettingSources.billing`; the
+    `knowledge` sites that call `loadSettingSources` for one cap still read the row once each, which
+    is the design); the managed meter resolving the model config at SEND time (a draft that sat in
+    review across a mode switch counts under the wrong mode — plan-mandated); `trialNotices`
+    counting the allowance page, `billing-report-usage.test.ts:469`'s title promising a failing org
+    the body lacks, and a waiting `acquire` holding a pooled client for the whole 60 s, spent from
+    the 240 s watchdog; `countingAdmission('none')` dead code and a redundant reset; `Buffer.concat`
+    doubling peak memory at the 200 MB export ceiling, an aborted export reading as "could not be
+    finished", no export case proving a second org's rows absent, ~~`new URL(file://…)` in
+    `scripts/keys-rotate.ts`~~ (fixed in the wave), `workspace.purge-sweep`'s unbounded select; `retention.sweep`'s pass
+    scaling with the org count (the accepted consequence of R15) and a missing paragraph break in
+    `workspace-export.ts`; the reembed sweep's answers arm starving other orgs at one org's embed
+    cap (`fairSelectSql` exists), its counters incremented inside vs outside the savepoint, the
+    vector UPDATEs without the redundant `org_id` predicate, memory idempotency never proven through
+    the partial unique index, `boss` unused in the sweep; `localVariablesIntegration` under
+    `--inspect`; E2E scenario 9 length-checking the DEK, an unguarded `afterAll`, the harness helpers
+    copied across four E2E files, a local `Breakdown` re-declaration, the plan's "301" label where
+    the test says 601. *app:* ~~a lapsed workspace (`trial_expired`/`canceled`) reading "trial ·
+    0 domains · $0.00 / month" beside Subscribe~~ (CLOSED by the fix wave, B10 — it reads
+    "Cancelled"/"Trial ended" with the usage tile and Subscribe);
+    `rememberErrorText` rendering `error.message` verbatim; `DangerZone`'s extra `workspace.get`
+    refetch; `formatDate`/`daysUntil` in three screens; no ESLint rule against a direct
+    `expo-share-intent` import outside the split, and both provider tests using a passthrough mock.
+  - **Carries recorded by the fix wave** (the review's findings that were adjudicated NOT to land in
+    the wave — none is a regression; each is a bounded gap with the workaround named):
+    - **The rediscovery arm for stranded NULL vectors** (B3's second half): a `ready` source with
+      `embedded_count < chunk_count` and no live `knowledge.embed-batch` is found by nothing today —
+      the reembed sweep now refuses to null under the embed cap, and the
+      `knowledge_reembed_stranded` alert covers a failed enqueue, but a refill that failed for any
+      other reason stays NULL. **Do not change `KNOWLEDGE_EMBED_MODEL` in production until it lands**
+      (runbook §10); two `knowledge` replicas on different models ping-pong re-embeds up to each cap
+      daily.
+    - **A Stripe reconciliation arm** (`subscriptions.retrieve` per row) in `billing.report-usage`
+      for lost follow-up events, and an idempotent `cancelSubscription` at the port (an
+      already-cancelled subscription is success, not `billing_cancel_failed`). Until then: cards only
+      at Checkout (runbook §2.3), and the Dashboard is the truth for a drifted row.
+    - **`cancel_at_period_end` semantics on `requestDeletion`** — the cancel is immediate, so the
+      money does not follow the 30-day grace (ruling R22's harshness; a later improvement).
+    - **The mailbox cap enforced at `startConnect` only** — N consent tabs opened before any
+      completes pass N times (cap ± N, the source cap's shape).
+    - **The two `billing/stripe.ts` `scrub()`/`guard()` copies belong in `core/redact.ts`** (the
+      same class as R25).
+    - **Notification retention at 90 days deletes the one LIFETIME dedupe key** (`billing:trial_ended`
+      — and now `llm_cap:trial:<org>`): a workspace still expired a quarter later is nudged again.
+    - **Retention scope vs the privacy policy**: `triage_questions`, `customer_name`/`customer_email`,
+      `reject_reason` and guidance text survive the body purge — the policy must say "message
+      bodies", not "everything about the customer", until they are covered.
+    - **`memory.capture` excludes an inbound with `sent_at NULL`**.
+    - **The E2E never runs `workspace.export` end to end** (the job has its own unit suite).
+    - **R12, for Robert:** `subscription_inactive` (and `category_off`, `dmarc_fail`) are masked by
+      the spec's own `decide()` order — the kill-switch branches mask the same three today; amend the
+      spec or accept (the seams reviewer upheld the ruling and recommends amending the spec).
+    - **R24's cost:** a manager on a paused workspace sees nothing — a read-only "Paused by the
+      owner" inbox line would close it.
+    - The deferred-fulfilment (R10) state still offers Subscribe (now refused as `checkout_pending`
+      with a sentence, which is the honest half); `cancelDeletion`'s copy omits that the kill switch
+      and the agent stay off; the R22 harshness; the `knowledge_chunks_embedding_model_idx` that
+      cannot serve `<>`; the deferred-Checkout audit action name (`billing.subscription_activated`
+      with no `paymentStatus`); and the pending-count `next-path` collision between a push and a
+      share.
+  - **Two api-surface carries from the E2E** (Task 12): `setAgentEnabled` is router-only (a
+    `@aesa/api/workspace` service for it would let the E2E stop replaying its COALESCE statements);
+    `applyStripeEvent` is not re-exported by the api's `./billing` entry point.
+  - **A process note for the final review:** Task 5's implementer reported that four of its six
+    suites were test-after with mutation evidence substituted for the missing RED; the review should
+    weigh whether they pin behaviour.
+
+## Next: after Phase 7
+
+**Where to start.** Phase 7 is complete on branch `phase-7` and lands on `main` through a GitHub PR
 merged with a merge commit, on Robert's go-ahead (the standing flow from his 2026-09-09 instruction);
-until that merge, `main` carries Phases 0–5 and the brand. Once it lands, check out `main`, pull, and
-branch `phase-7` off it. Start with `superpowers:writing-plans` against the spec's *Build phases →
-Phase 7* (and the seams listed under **The hand-off** below). Run the local setup from `CLAUDE.md` —
-including `pnpm db:up && pnpm s3:init` and the `S3_*` exports, so the minio-gated storage suite
-actually runs; a dev Postgres created before Phase 6 needs
-`DATABASE_URL=postgres://aesa:aesa@localhost:5434/aesa_dev pnpm --filter @aesa/db migrate` once for
-migrations **0018–0020** before `pnpm e2e` — and confirm the baseline before writing the plan:
+until that merge, `main` carries Phases 0–6 and the brand. **All seven build phases in the spec are
+now built.** What comes next is not a phase in the spec but the launch itself, and the manual work
+that only Robert can do — `docs/runbooks/2026-09-phase-7-external-setup.md` is that list (Stripe,
+Sentry and the log drain, the KEK rotation, the chaos walk, the two-week design-partner run with its
+daily checks, the privacy-policy numbers, the store submissions, `MANAGED_DRAFT_SLOTS`). The
+evidence package for the Gmail CASA assessment is `docs/security/2026-09-casa-evidence.md`.
 
-- **2,599 tests** plus 4 conditional test-kit skips with `S3_*` exported (`@aesa/contracts` 36,
-  `@aesa/crypto` 52, `@aesa/platform-mail` 19, `brand` 110, `@aesa/core` 247, `@aesa/llm` 158,
-  `@aesa/agent` 71, `@aesa/db` 95, `@aesa/queue` 23, `@aesa/mail` 242, `@aesa/knowledge` 162,
-  `@aesa/test-kit` 43, `apps/api` 301, `apps/worker` 586, `apps/app` 458 jest across 58 suites);
-- **25 web routes** from `pnpm --filter @aesa/app export:web`;
+Run the local setup from `CLAUDE.md` — including `pnpm db:up && pnpm s3:init` and the `S3_*`
+exports, so the minio-gated storage suite actually runs; a dev Postgres created before Phase 7 needs
+`DATABASE_URL=postgres://aesa:aesa@localhost:5434/aesa_dev pnpm --filter @aesa/db migrate` once for
+migrations **0021–0025** before `pnpm e2e` — and confirm the baseline (final, at the head
+`6f40203` after the whole-branch review, its fix wave and ruling R36):
+
+- **3,035 tests** plus 4 conditional test-kit skips with `S3_*` exported (`@aesa/contracts` 42,
+  `@aesa/crypto` 52, `@aesa/platform-mail` 19, `brand` 110, `@aesa/core` 300, `@aesa/llm` 158,
+  `@aesa/agent` 71, `@aesa/db` 119, `@aesa/queue` 29, `@aesa/mail` 242, `@aesa/knowledge` 165,
+  `@aesa/test-kit` 43, `apps/api` 398, `apps/worker` 749, `apps/app` 542 jest across 66 suites);
+- **27 web routes** from `pnpm --filter @aesa/app export:web`;
 - `db:check` clean;
 - the Playwright signup smoke green (still ending at the gated mailbox step).
 
-A dev Postgres volume created before Phase 4 still needs `pnpm db:down && pnpm db:up` once to pick up
-pgvector, and in production the `vector` extension must be installed by a superuser before Phase 4's
-migrations run (`docs/runbooks/2026-09-phase-4-external-setup.md`). Two lessons carried forward from
-Phase 5 and re-earned in Phase 6: walk any recipe that recomputes a table against one worked example,
-and give the close-out task the whole-branch review record explicitly. Phase 6 adds a third — **when
-a plan narrows a behaviour the spec states twice, the spec wins**: deviation 4's "the probe overrides
-downward only" survived nine tasks before the E2E made it visible, and reversing it late cost a fix
-round (ruling 16).
+Lessons carried forward, now four: walk any recipe that recomputes a table against one worked
+example (Phase 5); give the close-out task the whole-branch review record explicitly (Phase 6 — and
+Phase 7 moved the review itself OUT of the close-out task, so the record's findings are written by
+the reviewer's controller, not the implementer who wrote the docs); when a plan narrows a behaviour
+the spec states twice, the spec wins (Phase 6); and Phase 7's own — **a test fixture that cannot
+express the production state is a test that cannot fail**: the stuck sweep's double-fire was
+structurally invisible because every `processing` fixture had `created_at = now()`, and the
+admission "never lose a draft" rule was untested at its call sites until the review asked for the
+call-site tests. A second Phase 7 lesson sits beside it: **require bundle or wire evidence, not a
+claim** — the share-intent split's second leak was found only by grepping the rebuilt web bundle,
+and the two Sentry Criticals only by reading the installed SDK's source rather than its types.
 
-**The hand-off.** Phase 7 is billing, caps and launch hardening: `billing_subscriptions` + Stripe
-Checkout/Portal/webhooks + `billing.report-usage` (domain quantity, automatic overage, blocked mode);
-the trial policy (14 days from `agent_enabled_at`, no card; at trial end or `past_due` decisions
-become `review` with a banner — drafts continue, nothing sends automatically); per-org caps from
-`usage_counters` everywhere including the daily LLM USD cap and trial budgets; the retention sweep;
-workspace export/delete with a 30-day grace; the `keys.rotate` runbook; Sentry + a log drain + alerts
-with org attribution; the CASA evidence package finalized; store submissions (EAS Build);
-`scripts/smoke-tenant.ts`; native share-sheet intake and "Remember this reply" (the backfill of past
-conversations arrives here, not at connect). Load testing is deferred until the first paying
-customers. The seams already in place and waiting for it:
+**What the spec leaves open**, in the order it would be worth doing:
 
-- **The `plan` column and the `{ plan }` argument at every `resolveSetting` site.** `PLANS` and
-  `planSettingDefaults` exist in `@aesa/core` and have had no caller since Phase 4: every org sits on
-  the catalog defaults (100 sources, 200 crawl pages, 5,000,000 daily embed tokens, 50 guidance
-  suggestions a day) and `PLANS.trial` is inert. Billing is the phase that makes them real, and
-  `list.caps` already reports what the api actually enforces rather than a tier.
-- **`billing_subscriptions` is the missing table**; `usage_counters` is already the meter store every
-  cap reads, and `SEND_METERS` / `LLM_METERS` / `SANDBOX_METERS` / `KNOWLEDGE_METERS` /
-  `GUIDANCE_METERS` already carry the quantities an invoice would price.
-- **The daily USD cap now reads only MANAGED spend.** Phase 6 split BYOK cost into
-  `llm_cost_micros_byok` precisely so a tenant's own key can never trip the platform's allowance —
-  which means the cap Phase 7 turns into a billing control is already the right number, and the
-  screens that answer "what is this costing me" already sum both. A per-plan managed budget is a
-  `resolveSetting` away.
-- **`agent_runs` retention is now due.** Phase 6 made `ticket.triage` write its own run row, so the
-  table gains **one row per inbound email** and nothing sweeps it. `sweeps.daily` already owns
-  run-event and action-token retention; triage rows are the next arm, beside the
-  `platform.access` audit retention that has been carried since Phase 1.
-- **The stuck-source sweep** (carried since Phase 4) has exactly three customers waiting: a `queued`
-  crawl with no job, a `processing` source whose embed retries are exhausted, and an abandoned
-  `queued` upload. `refreshCrawl` accepts `queued` so the owner has a manual path out in the meantime.
-- **The `keys.rotate` runbook has a new tenant.** Phase 6's provider cache is deliberately
-  **freshness-keyed** (`${credentialId}:${lastProbedAt}`, 15-minute ceiling) so that any replica's
-  probe retires every replica's cached provider — the property a rotate surface needs and the reason
-  it was fixed before one existed. The rotate story now covers the KEK ring, `mailbox_credentials`
-  AND `llm_credential_secrets`, and the ring must be identical on every `sync`, `send` and `agent`
-  replica.
-- **Workspace delete must cascade the learning and provider tables.** `resolved_answers` was named in
-  Phase 5; Phase 6 adds `llm_credentials`, `llm_credential_secrets` and `agent_model_config`.
-  Delete-by-customer is still the interim erasure route for a single customer's answers.
+- **The bridge for on-prem models.** A BYOK endpoint must be a public https hostname in v1
+  (Phase 6 deviation 11); a customer's local Ollama/vLLM/LM Studio needs the outbound bridge the
+  spec parks — a tunnel the platform operates, or an agent the customer runs — and the seam is the
+  `transport` column on `llm_credentials` (`direct` only, CHECK). Every model call must stay inside
+  the SSRF guard when it lands.
+- **Gemini** as a first-class provider (the spec names it; v1 offers it only through an
+  OpenAI-compatible proxy or OpenRouter). It is one adapter or one preset plus pricing rows, on the
+  Phase 6 shape.
+- **PgBouncer** in front of Postgres once replica counts grow — with the caveat every transaction
+  here sets its role and `app.org_id` through libpq startup options and `SET LOCAL`, so it has to be
+  session pooling or a re-check of every `withOrg` under transaction pooling; the admission pool's
+  session-level advisory locks would need their own direct connection.
+- **Load tests** — deferred until the first paying customers (spec). The numbers to size against
+  are `MANAGED_DRAFT_SLOTS`, the per-org caps and the 300/min api limiter.
+- **The stubbed-provider Playwright walk** — the smoke still ends at the gated mailbox step; a
+  MockMailbox-backed api would let it run connect → inbound → draft → approve → sent in a browser.
+- **The three-pane review layout, J/K navigation and multi-select** (spec, carried since Phase 3).
+- **`member_prefs`** (deviation 17) — per-member notification preferences; `org_settings` covers the
+  one knob so far.
+- **A spec question from ruling R12:** should `subscription_inactive` move after the
+  tripwire/guardrail branches of `decide()` so a lapsed workspace still gets the precise reason on a
+  guardrail failure? Containment is identical either way.
+- **A reconciliation sweep against Stripe** (the webhook is the only writer of billing state), the
+  `platform_killswitch_on` alert (wired nowhere), and `context_too_long`'s retrieval halving — the
+  three oldest operational gaps still open.
 
-**Carries still open.** The Phase 6 record above groups all of them — Phase 4's remainder, the
-long-standing list, the structure carries (the `src/drafts/learning.ts` split, now named for a third
-time, and `ticket-draft.ts` at ~1,021 lines), Phase 5's untouched list, Phase 6's own deferred minors
-and the fix wave's residuals. Four items are explicitly addressed to **Phase 7** and are the ones
-most worth folding into its first task: **`agent_runs` retention** (new, and growing per inbound),
-the **stuck-source sweep**, **`platform.access` audit retention**, and the
-**`KNOWLEDGE_EMBED_MODEL` re-embed job** without which that value can never be changed on a live
-workspace. Robert's manual list for Phase 6 is
-`docs/runbooks/2026-09-phase-6-external-setup.md`.
+**Carries still open.** The Phase 7 record above groups all of them — Phase 4's remainder, the
+long-standing list, the structure carries, Phase 5's and Phase 6's untouched lists, Phase 7's own
+deferred minors (less the ones the fix wave closed, struck through in place), the fix wave's own
+recorded carries (the rediscovery arm for stranded vectors first among them — **do not change
+`KNOWLEDGE_EMBED_MODEL` in production until it lands**), and its two api-surface carries — and
+the review record rolls the Phase 7 ones up for the whole-branch triage. The lapsed-workspace
+presentation on the Billing screen that was flagged for Robert's eyes is closed (fix wave, B10);
+what still wants his eyes is R12 (the spec's own `decide()` order masks `subscription_inactive`)
+and the iOS share relaunch on the dev build (runbook §11).
 
-## Later phases (see the spec for scope and verification)
+## Later phases
 
-- Phase 7 — billing, caps, launch hardening, and the last phase in the spec. Owes the `plan` column and the `{ plan }` argument at every `resolveSetting` site: until then every org sits on the catalog defaults (100 sources, 200 crawl pages, 5,000,000 daily embed tokens, 50 guidance suggestions a day) and `PLANS.trial` is inert (Phase 4 final review, seams D1). It also owes `agent_runs` retention, which Phase 6 made urgent by writing one triage run row per inbound email. See **Next: Phase 7** above for the full hand-off.
+None in the spec. Phase 7 was the last build phase; what remains is the launch (the Phase 7 runbook)
+and the list above.
 
 ## Open items for Robert
 
@@ -2076,6 +2632,34 @@ Ollama/vLLM needs a **public https hostname** in v1. Like every screen before th
 signed in, at wide and phone widths and on a real phone, and check the key paste, the two-minute probe
 wait and its copy, Remove's armed confirm *and* its Cancel, the `provider_health` push deep-linking to
 `/settings/ai` from the notification shade, and dark mode on both.
+
+The Phase 7 external-setup runbook (`docs/runbooks/2026-09-phase-7-external-setup.md`) is the
+launch list, and the first since Phase 4 with **vendors to provision**: Stripe (one product, the
+licensed $49.99 price and the metered $0.12 price on a Billing Meter named `ai_conversation_overage`,
+the Customer Portal with quantity edits DISABLED, the webhook at `<APP_BASE_URL>/webhooks/stripe`
+on five event types, four api env values and two worker ones), Sentry (the DSN in both apps,
+`SENTRY_RELEASE` from the deploy SHA, alert rules on the twelve `kind` tags) and a log drain with
+`org_id` indexed. **Nine environment variable names** in all; `STRIPE_*` is required in production
+on the api and on a `cron` worker. Three things in it are irreversible and have a procedure: the
+**KEK rotation** (add `AESA_KEK_V2` everywhere → `ACTIVE=2` everywhere →
+`pnpm --filter @aesa/worker keys:rotate` → confirm zero on v1 → remove v1; skipping a step is
+`provider_unavailable` or a mailbox that cannot refresh), the **retention sweep** (180 days default,
+owner-set 30–730, bodies nulled nightly) and the **workspace purge** (a 30-day grace after a typed
+confirmation, the Stripe cancel first). The **migration lands every existing workspace on the trial
+tier** — sources 10, connections 1, 50 drafts and $3 a day — so subscribe or override the design
+partners before it runs. Then the walks no gate can stand in for: the Stripe live walk (subscribe,
+force `past_due`, cancel through the Portal, read the meter after `billing.report-usage`), the
+**chaos walk** (kill a `send` worker between Graph's `createReply` and `send`, and after Gmail's
+`messages.send` → exactly one email; stop Postgres for two minutes with mail arriving → no duplicate
+ticket), the **two-week design-partner run** with its daily checks (`pnpm smoke:tenant`, Sentry, the
+`platform.access` trail, the zero-cross-org-rows query the runbook gives) and the Microsoft-first
+launch order, the **privacy-policy numbers** (retention, the grace, what the export contains, the
+delete-by-customer route), **`MANAGED_DRAFT_SLOTS`** sized between the `agent` replica count and the
+Anthropic tier's concurrency ceiling, and the **store submissions** (`eas.json`'s submit profiles
+with their placeholders, the nutrition labels — mail content yes, contacts none — and the share
+extension's review notes). Two screens and one extension have never rendered outside jest:
+Settings → Billing (route 26, including the lapsed-workspace presentation flagged for Robert's eye),
+the Workspace danger zone, and the `/share` route (27) from a real share sheet.
 
 Open the Knowledge screen in a browser once, signed in, and once on a phone. No gate renders it: the
 Playwright smoke still ends at the gated mailbox step, and jest-expo exercises the components but

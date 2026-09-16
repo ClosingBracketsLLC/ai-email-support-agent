@@ -30,7 +30,7 @@ import { KNOWLEDGE_DEFAULT_CRAWL_PAGES, type KnowledgeSourceStatus } from '@aesa
 import { resolveSetting } from '@aesa/core'
 import {
   audit, bumpKnowledgeVersion, bumpMeter, knowledgeChunks, knowledgeDocuments, knowledgeSources,
-  KNOWLEDGE_METERS, withOrg, type OrgTx,
+  KNOWLEDGE_METERS, loadSettingSources, withOrg, type OrgTx,
 } from '@aesa/db'
 import {
   CrawlError, crawlSite, createPinnedCrawlFetch, ParseError, prepareDocument,
@@ -40,7 +40,7 @@ import { defineJob, enqueue, JOB_NAMES, registerJob, type RegisteredJobDefinitio
 import { utcDayString } from '../date-utils.ts'
 import { errorMessage } from '../err-message.ts'
 import {
-  failSource, guardedSourceWrite, guardedSourceWriteReturning, loadOrgSettings,
+  failSource, guardedSourceWrite, guardedSourceWriteReturning,
 } from '../knowledge/sources.ts'
 import type { KnowledgeDeps } from '../knowledge-deps.ts'
 
@@ -110,7 +110,7 @@ function crawlConfigOf(raw: unknown): Record<string, unknown> {
  * tx1: the advisory-locked claim. `queued` always; `processing` only once the lease has expired
  * (the crashed-mid-crawl case). Returns null when someone else holds the source.
  */
-async function claim(deps: KnowledgeDeps, orgId: string, sourceId: string): Promise<ClaimedCrawl | null> {
+async function claim(deps: KnowledgeDeps, orgId: string, sourceId: string, now: Date): Promise<ClaimedCrawl | null> {
   return withOrg(deps.db, orgId, async (tx) => {
     await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`knowledge-crawl:${orgId}`}))`)
 
@@ -133,7 +133,7 @@ async function claim(deps: KnowledgeDeps, orgId: string, sourceId: string): Prom
 
     const config = crawlConfigOf(row.crawlConfig)
     const requested = typeof config.maxPages === 'number' && config.maxPages > 0 ? config.maxPages : KNOWLEDGE_DEFAULT_CRAWL_PAGES
-    const cap = resolveSetting('knowledge.max_crawl_pages', { org: await loadOrgSettings(tx, ['knowledge.max_crawl_pages']) })
+    const cap = resolveSetting('knowledge.max_crawl_pages', await loadSettingSources(tx, ['knowledge.max_crawl_pages'], now))
     return { url: row.url, maxPages: Math.min(requested, cap), token }
   })
 }
@@ -191,7 +191,7 @@ export async function runKnowledgeCrawl(deps: KnowledgeDeps, payload: KnowledgeC
   // `completed_at` with the time it actually finished.
   const nowAt = (): Date => deps.now?.() ?? new Date()
 
-  const claimed = await claim(deps, orgId, sourceId)
+  const claimed = await claim(deps, orgId, sourceId, nowAt())
   if (!claimed) return
 
   /** One short transaction per batch, then the enqueues — never an enqueue inside the transaction. */

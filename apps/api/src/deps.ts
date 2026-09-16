@@ -8,6 +8,7 @@ import type { ObjectStore } from '@aesa/knowledge/storage'
 import { enqueue as enqueueJob, type JobDefinition } from '@aesa/queue'
 import type { MailboxProvider } from '@aesa/mail'
 import type { Auth } from './auth.ts'
+import type { StripePort } from './billing/stripe.ts'
 import type { ApiConfig } from './config.ts'
 import type { MailTransport } from './mail/transport.ts'
 
@@ -49,6 +50,13 @@ export interface ApiFacade {
    */
   resolveDraftActionToken(tokenHash: string): Promise<{ tokenId: string; orgId: string; draftId: string; userId: string; expiresAt: Date; consumedAt: Date | null } | null>
   /**
+   * Phase 7's Stripe webhook is session-less AND org-less: the only identifier Stripe sends is its
+   * own customer id, so the org is found through 0023's `resolve_stripe_customer(text)`
+   * (SECURITY DEFINER, `aesa_app` EXECUTE) — the same shape as the three resolvers above. The
+   * function returns ZERO ROWS for a customer this platform has never stored, hence the null.
+   */
+  resolveStripeCustomer(customerId: string): Promise<{ orgId: string } | null>
+  /**
    * `webhook_events` (RLS-exempt platform table, migration 0005/0006): INSERT ... ON CONFLICT
    * (provider, external_id) DO NOTHING. Returns false when the row already existed — a duplicate
    * delivery the caller should ack without redoing any enqueue.
@@ -85,6 +93,11 @@ export function createApiFacade(handle: { db: Db; pool: pg.Pool }): ApiFacade {
       )
       const row = res.rows[0]
       return row ? { tokenId: row.token_id, orgId: row.org_id, draftId: row.draft_id, userId: row.user_id, expiresAt: row.expires_at, consumedAt: row.consumed_at } : null
+    },
+    async resolveStripeCustomer(customerId) {
+      const res = await handle.pool.query<{ org_id: string }>('SELECT * FROM resolve_stripe_customer($1)', [customerId])
+      const row = res.rows[0]
+      return row ? { orgId: row.org_id } : null
     },
     async recordWebhookEvent(provider, externalId, envelope) {
       const inserted = await handle.db.insert(webhookEvents)
@@ -148,6 +161,10 @@ export interface ServerDeps {
   /** The knowledge router's presigned uploads and object deletes: S3 (minio locally) when
    * `config.s3` is set, an in-memory store otherwise (src/index.ts). */
   store: ObjectStore
+  /** Phase 7: the Stripe port when `config.stripe` is set, null otherwise — `/meta`'s `billing`
+   * flag, the `billing` router's `not_configured` refusals and the webhook's own 404 all read it.
+   * A type-only import, so the SDK never enters the module graph of anything but `src/index.ts`. */
+  stripe: StripePort | null
   /** Test seam: overrides the real Gmail/Graph adapters per provider (connect/routes.ts); production
    * code leaves this unset and resolves the real adapter every time. */
   mailProviders?: Partial<Record<MailProvider, MailboxProvider>>

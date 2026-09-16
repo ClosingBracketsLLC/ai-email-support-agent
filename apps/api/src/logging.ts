@@ -1,20 +1,14 @@
 import { DrizzleQueryError } from 'drizzle-orm/errors'
 import pino from 'pino'
-import { redactUrl } from './redact.ts'
+import { redactText, redactUrl } from '@aesa/core'
 
-const URL_IN_TEXT = /https?:\/\/[^\s"'<>)\]]+/g
+/** Ruling R25 (Task 11 fix round 2): the implementation lives in `@aesa/core` (shared with the
+ *  worker's `observability.ts`) — re-exported so every existing import of `redactText` from this
+ *  file (`logging.test.ts` included) keeps working unchanged. */
+export { redactText }
+
 /** Short machine codes are safe to log: Postgres SQLSTATEs, Fastify FST_*, Node ECONN*. Never a message. */
 const SAFE_CODE = /^[A-Z0-9_]{1,40}$/
-
-/**
- * Masks any URL found inside free-form text (Better Auth log messages, error messages) with redactUrl(), then
- * collapses anything after a `Failed query:` marker — Better Auth's onError path (`api/index.mjs`) can log a
- * drizzle error's plain `.message` string (`Failed query: <sql>\nparams: <bound values>`) directly, not only
- * as an Error object the `err` serializer would otherwise catch.
- */
-export function redactText(s: string): string {
-  return s.replace(URL_IN_TEXT, (url) => redactUrl(url)).replace(/Failed query:[\s\S]*$/, 'Failed query: [redacted]')
-}
 
 interface SerializedError { [key: string]: unknown; type: string; message: string; stack: string; code?: string }
 

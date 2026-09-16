@@ -76,12 +76,14 @@ describe('/meta', () => {
     expect((await off.inject({ method: 'GET', url: '/meta' })).json()).toEqual({
       providers: { google: false, microsoft: false },
       mail: { gmail: false, microsoft: false },
+      billing: false,
     })
     await off.close()
     const on = buildServer(stubDeps({ GOOGLE_CLIENT_ID: 'g', GOOGLE_CLIENT_SECRET: 's' }))
     expect((await on.inject({ method: 'GET', url: '/meta' })).json()).toEqual({
       providers: { google: true, microsoft: false },
       mail: { gmail: false, microsoft: false },
+      billing: false,
     })
     await on.close()
   })
@@ -91,6 +93,9 @@ describe('/meta', () => {
     expect((await on.inject({ method: 'GET', url: '/meta' })).json()).toEqual({
       providers: { google: false, microsoft: false },
       mail: { gmail: true, microsoft: true },
+      // Phase 7: stubDeps() has no Stripe port, so a deploy with no STRIPE_* says so here — the app
+      // hides Subscribe rather than offering a button that can only answer `not_configured`.
+      billing: false,
     })
     await on.close()
   })

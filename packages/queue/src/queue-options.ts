@@ -42,6 +42,16 @@ export const QUEUE_OPTIONS: Record<JobName, JobQueueOptions> = {
   [JOB_NAMES.memoryCapture]: { policy: 'short', expireInSeconds: 120, retryLimit: 3, retryDelay: 30, retryBackoff: true },
   [JOB_NAMES.guidanceSuggest]: { policy: 'short', expireInSeconds: 120, retryLimit: 1 },
   [JOB_NAMES.llmProbe]: { policy: 'short', expireInSeconds: 120, retryLimit: 2, retryBackoff: true },
+  // Phase 7's three. `workspace.export` streams a whole tenant's rows into one NDJSON object, so it
+  // gets the crawl's 30-minute ceiling and ONE retry — a second attempt re-reads the same rows and
+  // re-PUTs the same key, and a third would only be burning the bucket. `workspace.purge` is
+  // destructive and idempotent (a purged org has no `workspaces` row, so the re-run returns
+  // `skipped`), so two backed-off retries are safe and worth having. `keys.rotate` is one small
+  // guarded re-wrap: standard policy (its producer is a hand-run script, never a burst) and three
+  // retries, matching `keys.provision` beside it.
+  [JOB_NAMES.workspaceExport]: { policy: 'short', expireInSeconds: 1800, retryLimit: 1 },
+  [JOB_NAMES.workspacePurge]: { policy: 'short', expireInSeconds: 600, retryLimit: 2, retryBackoff: true },
+  [JOB_NAMES.keysRotate]: { expireInSeconds: 60, retryLimit: 3, retryBackoff: true },
 }
 
 /** The `PgBoss.Queue` shape both pre-create lists hand to `createQueueRetrying`. */

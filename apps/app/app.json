@@ -18,7 +18,16 @@
       "expo-router",
       "expo-secure-store",
       ["expo-splash-screen", { "backgroundColor": "#0B1220", "image": "./assets/splash-icon.png", "imageWidth": 108 }],
-      ["expo-notifications", { "icon": "./assets/notification-icon.png", "color": "#2563EB" }]
+      ["expo-notifications", { "icon": "./assets/notification-icon.png", "color": "#2563EB" }],
+      ["expo-share-intent", {
+        "iosActivationRules": {
+          "NSExtensionActivationSupportsWebURLWithMaxCount": 1,
+          "NSExtensionActivationSupportsWebPageWithMaxCount": 1,
+          "NSExtensionActivationSupportsText": true,
+          "NSExtensionActivationSupportsFileWithMaxCount": 1
+        },
+        "androidIntentFilters": ["text/*", "application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "text/markdown", "text/plain"]
+      }]
     ],
     "experiments": { "typedRoutes": true }
   }

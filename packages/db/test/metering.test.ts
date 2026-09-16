@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto'
 import type { MeterRecord } from '@aesa/llm'
 import { and, eq } from 'drizzle-orm'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { createMeterSink, LLM_METERS, llmCalls, usageCounters, withOrg, workspaces } from '../src/index.ts'
+import { bumpMeter, createMeterSink, LLM_METERS, llmCalls, sumMeter, usageCounters, withOrg, workspaces } from '../src/index.ts'
 import { createDb } from '../src/raw.ts'
 import { createTestDatabase, createTestOrganization } from './helpers/test-db.ts'
 
@@ -167,5 +167,49 @@ describe('createMeterSink', () => {
 
     expect((await meterRow(LLM_METERS.costMicrosByok))?.value).toBe(byokCostBefore + 777)
     expect((await meterRow(LLM_METERS.costMicros))?.value ?? 0).toBe(managedCostBefore)
+  })
+})
+
+describe('sumMeter', () => {
+  let t: Awaited<ReturnType<typeof createTestDatabase>>
+  let app: ReturnType<typeof createDb>
+  let orgId: string
+
+  beforeAll(async () => {
+    t = await createTestDatabase()
+    app = createDb(t.url)
+    orgId = await createTestOrganization(app)
+    await withOrg(app.db, orgId, (tx) => tx.insert(workspaces).values({ orgId, businessName: 'A', timezone: 'UTC' }))
+  })
+  afterAll(async () => { await app.pool.end(); await t.drop() })
+
+  it('sums a meter over day-string bounds with an exclusive end', async () => {
+    const meter = 'sum_meter_test'
+    await withOrg(app.db, orgId, async (tx) => {
+      await bumpMeter(tx, orgId, '2026-09-01', meter, 3)
+      await bumpMeter(tx, orgId, '2026-09-30', meter, 4)
+      await bumpMeter(tx, orgId, '2026-10-01', meter, 100)   // outside: end is exclusive
+      await bumpMeter(tx, orgId, '2026-08-31', meter, 100)   // outside: before start
+    })
+
+    const total = await withOrg(app.db, orgId, (tx) => sumMeter(tx, meter, '2026-09-01', '2026-10-01'))
+    expect(total).toBe(7)
+  })
+
+  it('with no toDayExclusive, sums everything from fromDay onward', async () => {
+    const meter = 'sum_meter_open_ended'
+    await withOrg(app.db, orgId, async (tx) => {
+      await bumpMeter(tx, orgId, '2026-09-01', meter, 1)
+      await bumpMeter(tx, orgId, '2026-12-31', meter, 2)
+      await bumpMeter(tx, orgId, '2026-08-31', meter, 100)   // outside: before start
+    })
+
+    const total = await withOrg(app.db, orgId, (tx) => sumMeter(tx, meter, '2026-09-01'))
+    expect(total).toBe(3)
+  })
+
+  it('returns 0 when nothing matches', async () => {
+    const total = await withOrg(app.db, orgId, (tx) => sumMeter(tx, 'no_such_meter', '2026-01-01', '2027-01-01'))
+    expect(total).toBe(0)
   })
 })

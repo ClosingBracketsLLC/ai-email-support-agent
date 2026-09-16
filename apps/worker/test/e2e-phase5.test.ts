@@ -322,6 +322,10 @@ describe('Phase 5 close-out E2E (real pg-boss autonomy + learning jobs, the real
       knowledgeEmbedModel: 'voyage-4',
       knowledgeRerank: false,
       s3: null,
+      stripe: null,
+      managedDraftSlots: 0,
+      sentryDsn: null,
+      sentryEnvironment: 'test',
       platformSender: 'no-reply@aesa.test',
     }
   }

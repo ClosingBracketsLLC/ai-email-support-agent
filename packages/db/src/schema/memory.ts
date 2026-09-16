@@ -30,6 +30,10 @@ export const resolvedAnswers = pgTable('resolved_answers', {
   sourceTicketId: uuid('source_ticket_id').references(() => tickets.id, { onDelete: 'set null' }),
   sourceDraftId: uuid('source_draft_id').references(() => drafts.id, { onDelete: 'set null' }),
   sourceCustomerHash: text('source_customer_hash'),             // sha256(salt ‖ 'customer:' ‖ email) — delete-by-customer's key
+  /** Loose (no FK): idempotency key for "Remember this reply" (deviation 16) — the partial unique
+   *  index on (org_id, source_message_id) in 0023 is what makes a second remember of the same
+   *  message a no-op rather than a duplicate answer. */
+  sourceMessageId: uuid('source_message_id'),
   supersedesId: uuid('supersedes_id').references((): AnyPgColumn => resolvedAnswers.id, { onDelete: 'set null' }),
   reviewReason: text('review_reason'),                          // contracts REVIEW_REASONS
   retiredReason: text('retired_reason'),                        // contracts RETIRED_REASONS

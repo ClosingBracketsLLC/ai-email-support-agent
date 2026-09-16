@@ -102,7 +102,7 @@ describe('knowledge.ingest', () => {
     const key = uploadKey(orgId, sourceId, 'faq.txt')
     await withOrg(app.db, orgId, (tx) => tx.update(knowledgeSources).set({ storageKey: key }).where(eq(knowledgeSources.id, sourceId)))
     const { deps, store, embedded } = makeDeps()
-    store.put(key, Buffer.from(FAQ, 'utf8'), 'text/plain')
+    await store.put(key, Buffer.from(FAQ, 'utf8'), 'text/plain')
 
     await run(deps, sourceId)
 
@@ -157,7 +157,7 @@ describe('knowledge.ingest', () => {
     const key = uploadKey(orgId, sourceId, 'huge.pdf')
     await withOrg(app.db, orgId, (tx) => tx.update(knowledgeSources).set({ storageKey: key }).where(eq(knowledgeSources.id, sourceId)))
     const { deps, store, embedded } = makeDeps()
-    store.put(key, Buffer.alloc(8), 'application/pdf')
+    await store.put(key, Buffer.alloc(8), 'application/pdf')
     // The HEAD is what the cap is read from — the object's real size is never downloaded.
     deps.store = { ...store, head: async () => ({ contentLength: 21 * 1024 * 1024, contentType: 'application/pdf' }), delete: store.delete }
 
@@ -182,7 +182,7 @@ describe('knowledge.ingest', () => {
     const key = uploadKey(orgId, sourceId, 'faq.md')
     await withOrg(app.db, orgId, (tx) => tx.update(knowledgeSources).set({ storageKey: key }).where(eq(knowledgeSources.id, sourceId)))
     const { deps, store } = makeDeps()
-    store.put(key, Buffer.from('# hi', 'utf8'), 'application/zip')
+    await store.put(key, Buffer.from('# hi', 'utf8'), 'application/zip')
 
     await run(deps, sourceId)
 
@@ -204,7 +204,7 @@ describe('knowledge.ingest', () => {
         throw new ParseError('parse_timeout', 'parser exceeded 60000 ms')
       },
     })
-    store.put(key, Buffer.from('%PDF', 'utf8'), 'application/pdf')
+    await store.put(key, Buffer.from('%PDF', 'utf8'), 'application/pdf')
 
     await expect(run(deps, sourceId)).resolves.toBeUndefined()
 
@@ -239,7 +239,7 @@ describe('knowledge.ingest', () => {
     const key = uploadKey(orgId, sourceId, 'policies.pdf')
     await withOrg(app.db, orgId, (tx) => tx.update(knowledgeSources).set({ storageKey: key }).where(eq(knowledgeSources.id, sourceId)))
     const { deps, store } = makeDeps({ parseInChild: async () => { throw new Error('ECONNRESET') } })
-    store.put(key, Buffer.from('%PDF', 'utf8'), 'application/pdf')
+    await store.put(key, Buffer.from('%PDF', 'utf8'), 'application/pdf')
 
     await expect(run(deps, sourceId)).rejects.toThrow('ECONNRESET')
 
@@ -366,7 +366,7 @@ describe('knowledge.ingest', () => {
     await withOrg(app.db, orgId, (tx) => tx.update(knowledgeSources).set({ storageKey: key }).where(eq(knowledgeSources.id, sourceId)))
     let childCalls = 0
     const { deps, store } = makeDeps({ parseInChild: async () => { childCalls++; return { blocks: [] as Block[], truncated: false } } })
-    store.put(key, Buffer.from(`## Shipping\n\n${FAQ}`, 'utf8'), 'text/markdown')
+    await store.put(key, Buffer.from(`## Shipping\n\n${FAQ}`, 'utf8'), 'text/markdown')
 
     await run(deps, sourceId)
 

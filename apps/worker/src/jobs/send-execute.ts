@@ -48,17 +48,18 @@
  * killed connection). The claim (step 1) and the pre-send flip (step 8) are each ONE statement set in
  * ONE transaction. The api never runs any of this: sending is worker-only.
  */
-import { and, asc, eq, gt, inArray, lte, ne, or, sql } from 'drizzle-orm'
+import { and, asc, eq, gt, inArray, isNull, lte, ne, notInArray, or, sql } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import { z } from 'zod'
 import {
-  appendSignature, clearRedraftCycle, INVARIANTS, ticketTransitions, validateReplyBody,
+  appendSignature, clearRedraftCycle, handledPeriodStamps, INVARIANTS, isHandledInPeriod, ticketTransitions, validateReplyBody,
 } from '@aesa/core'
 import type { KekRing } from '@aesa/crypto'
 import {
   agentCategoryPolicies, agents, audit, bumpMeter, drafts, escalateTicket, mailboxConnections,
-  messages, notifications, outboundSends, platformState, SEND_METERS, tickets, withOrg, workspaces,
+  messages, notifications, outboundSends, platformState, readBillingState, resolveModelConfig,
+  SEND_METERS, tickets, withOrg, workspaces,
   type Db, type OrgTx,
 } from '@aesa/db'
 import {
@@ -125,6 +126,7 @@ const LEVER_WORDS = {
   agent_inactive: 'this agent is not active',
   connection_unavailable: 'this mailbox is not connected',
   category_off: "the agent is switched off for this ticket's category",
+  subscription_inactive: 'the workspace has no active subscription',
   category_not_auto: 'this category is no longer on Autopilot',
 } as const
 type KillLever = keyof typeof LEVER_WORDS
@@ -234,6 +236,11 @@ interface ClaimedSend {
   }
   platformKillSwitch: boolean
   categoryMode: 'off' | 'review' | 'auto'
+  /** Phase 7: whether the workspace's subscription is live (`trialing` or `active`) — it holds AUTO
+   *  sends only, see `firstKillLever` — and the start of the BILLING PERIOD the conversation meters
+   *  count over (ruling R26): `completeSend` stamps the ticket with it, so a thread is billed once
+   *  per Stripe period, not once per calendar month. */
+  billing: { active: boolean; periodStart: Date }
 }
 
 /**
@@ -336,9 +343,15 @@ async function claimSend(deps: SendExecuteDeps, orgId: string, sendId: string, n
       if (policy) categoryMode = policy.mode as 'off' | 'review' | 'auto'
     }
 
+    // Phase 7, read LAST and read-only: `workspaces` and `billing_subscriptions` sit in the fourth
+    // position of the global lock order (CLAUDE.md), behind outbound_sends → drafts → tickets, and
+    // this claim has already taken all three above.
+    const billing = await readBillingState(tx, now)
+
     return {
       claimToken, send, draft, ticket, agent: resolvedAgent ?? null, connection, workspace,
       platformKillSwitch: lever?.value === true, categoryMode,
+      billing: { active: billing.active, periodStart: billing.period.start },
     }
   })
 }
@@ -356,6 +369,12 @@ function firstKillLever(c: ClaimedSend): KillLever | null {
   if (c.agent === null || c.agent.status !== 'active') return 'agent_inactive'
   if (c.connection.status !== 'connected') return 'connection_unavailable'
   if (c.categoryMode === 'off') return 'category_off'
+  // Phase 7's eighth lever, and it holds AUTO sends ONLY (plan deviation 6). The spec's wording is
+  // "nothing sends automatically" — an owner who read a reply and tapped Approve while the card was
+  // past due must still have it delivered, or a billing hiccup silently swallows their decision.
+  // Like `category_not_auto` below it reads the DRAFT's `decision_source`, so a Hold + re-approve
+  // (which rewrites that column to `app`) sends.
+  if (!c.billing.active && c.draft.decisionSource === 'auto') return 'subscription_inactive'
   // The auto-send's own lever (Phase 5, final fix wave): the agent decided this reply because the
   // category was on Autopilot, and it is not any more — the owner switched it to Review or Off, or a
   // demotion did it for them, inside the hold window. Nobody read this draft, so the authority it
@@ -638,6 +657,12 @@ interface CompleteSendInput {
   bodyText: string
   threadSnapshotAt: Date
   aiHandledMonth: string | null
+  /** The start of the billing period the claim read (`readBillingState(...).period.start`) — the
+   *  ONE key the conversation dedupe is stamped and compared on (ruling R26). */
+  billingPeriodStart: Date
+  /** The SEND row's own agent (nullable: deleting an agent nulls it). Phase 7 resolves its draft
+   *  model from this to decide whether the reply counts against the MANAGED allowance. */
+  agentId: string | null
   /** `drafts.decision_source` — `auto` meters `auto_sends`, anything else `review_sends`. */
   decisionSource: string | null
   /** Present only on the fresh-send path; a recovery has no threading context to record. */
@@ -649,7 +674,14 @@ interface CompleteSendInput {
  * landing point: a re-entry that finds its own marker runs exactly this and nothing else.
  */
 async function completeSend(l: Landing, input: CompleteSendInput): Promise<void> {
-  const month = l.now.toISOString().slice(0, 7)
+  // The dedupe key is the BILLING PERIOD's start, never the wall clock's month (ruling R26): the
+  // allowance and the overage are counted over `periodOf` (a Stripe anniversary period on a paid
+  // plan), and a stamp keyed on the calendar month billed a thread replied on Jan 31 and Feb 1
+  // inside a Jan 15–Feb 15 period as two conversations. `handledPeriodStamps` also honours the
+  // legacy `'YYYY-MM'` a ticket may still carry from before the wave, so nothing is counted twice
+  // on upgrade. On a trial the period IS the calendar month and the stamp is its 1st — unchanged.
+  const periodStamps = handledPeriodStamps(input.billingPeriodStart)
+  const periodStamp = periodStamps[0]!
   for (const from of SENDING_TICKET_STATUSES) {
     ticketTransitions.assert(from, 'waiting_on_customer')
     ticketTransitions.assert(from, 'triaged')
@@ -755,15 +787,24 @@ async function completeSend(l: Landing, input: CompleteSendInput): Promise<void>
     // (`auto_sends`). `decision_source` is the draft's own column, so a Hold + re-approve inside the
     // window correctly bills the re-approved reply as a review send.
     await bumpMeter(tx, l.orgId, l.day, input.decisionSource === 'auto' ? SEND_METERS.autoSends : SEND_METERS.reviewSends, 1)
-    // At most once per ticket per calendar month — the stamp IS the dedupe, so a second send in the
-    // same month matches nothing and the meter stays put.
-    if (input.aiHandledMonth !== month) {
+    // At most once per ticket per BILLING PERIOD — the stamp IS the dedupe, so a second send in the
+    // same period matches nothing and the meter stays put. The guard repeats the comparison in SQL
+    // (over every equivalent stored form) so a concurrent completion cannot stamp twice.
+    if (!isHandledInPeriod(input.aiHandledMonth, input.billingPeriodStart)) {
       const stamped = await tx
         .update(tickets)
-        .set({ aiHandledMonth: month })
-        .where(and(eq(tickets.id, l.ticketId), or(sql`${tickets.aiHandledMonth} IS NULL`, sql`${tickets.aiHandledMonth} <> ${month}`)))
+        .set({ aiHandledMonth: periodStamp })
+        .where(and(eq(tickets.id, l.ticketId), or(isNull(tickets.aiHandledMonth), notInArray(tickets.aiHandledMonth, periodStamps))))
         .returning({ id: tickets.id })
-      if (stamped.length > 0) await bumpMeter(tx, l.orgId, l.day, SEND_METERS.aiHandledConversations, 1)
+      if (stamped.length > 0) {
+        await bumpMeter(tx, l.orgId, l.day, SEND_METERS.aiHandledConversations, 1)
+        // Phase 7: the BILLING meter, and it counts MANAGED replies alone — a workspace on its own
+        // key pays the subscription and nothing per conversation (spec), so a BYOK reply must never
+        // consume an included conversation or become billable overage. Same stamp, same guard, same
+        // transaction: there is exactly ONE idempotency gate for both meters.
+        const cfg = await resolveModelConfig(tx, input.agentId, 'draft')
+        if (cfg.mode === 'managed') await bumpMeter(tx, l.orgId, l.day, SEND_METERS.aiHandledManaged, 1)
+      }
     }
 
     await audit(tx, {
@@ -989,7 +1030,8 @@ async function afterClaim(deps: SendExecuteDeps, ctx: SendExecuteContext, claime
       await completeSend(l, {
         recovered: true, providerMessageId: recoveredId, providerThreadId: ticket.providerThreadId, rfcMessageId,
         fromAddress, subject, bodyText, threadSnapshotAt: draft.threadSnapshotAt, aiHandledMonth: ticket.aiHandledMonth,
-        decisionSource: draft.decisionSource,
+        billingPeriodStart: claimed.billing.periodStart,
+        agentId: send.agentId, decisionSource: draft.decisionSource,
       })
       return
     }
@@ -1151,6 +1193,8 @@ async function afterClaim(deps: SendExecuteDeps, ctx: SendExecuteContext, claime
       bodyText,
       threadSnapshotAt: draft.threadSnapshotAt,
       aiHandledMonth: ticket.aiHandledMonth,
+      billingPeriodStart: claimed.billing.periodStart,
+      agentId: send.agentId,
       decisionSource: draft.decisionSource,
       threading: { to: [ticket.customerEmail], inReplyTo, refs: references },
     })

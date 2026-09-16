@@ -113,13 +113,13 @@ describe('knowledge router', () => {
   it('list returns caps resolved the SAME way the mutations clamp with (org override wins over the plan default), and canManage false for a plain member', async () => {
     const org = await seedOrg()
     const defaults = await org.c.knowledge.list.query()
-    // 100 / 200 are the settings-catalog defaults (packages/core/src/settings-catalog.ts), and they
-    // are what EVERY org gets today: `resolveSetting` is called with `{ org }` only at every
-    // knowledge site, so the org's own `org_settings` row is the sole override layer.
-    // `planSettingDefaults` (packages/core/src/plans.ts) exists but has no caller — plan-tier
-    // resolution arrives with Phase 7's billing, which owns the org's `plan` column and the
-    // `{ plan }` argument. Until then this is a pin on the defaults, NOT on a trial tier.
-    expect(defaults.caps).toEqual({ maxSources: 100, maxCrawlPages: 200 })
+    // 10 / 20 are the TRIAL plan's own caps (`PLANS.trial` in packages/core/src/plans.ts), not the
+    // settings-catalog defaults (100 / 200) this used to pin. Phase 7 turned the plan layer on:
+    // every knowledge site now resolves through `loadSettingSources` (`@aesa/db`), which reads the
+    // org's `org_settings` rows AND `planSettingDefaults(plan)` for whatever plan
+    // `billing_subscriptions` says the workspace is on — a fresh workspace is `trial`. The catalog
+    // default is now only the floor under a key no plan mentions.
+    expect(defaults.caps).toEqual({ maxSources: 10, maxCrawlPages: 20 })
     expect(defaults.canManage).toBe(true)
 
     await setCap(org.orgId, 'knowledge.max_sources', 5)
@@ -176,8 +176,10 @@ describe('knowledge router', () => {
     const presignCalls: { key: string; opts: { contentType: string; expiresSeconds: number } }[] = []
     const spyStore: ObjectStore = {
       presignPut: async (key, opts) => { presignCalls.push({ key, opts }); return inner.presignPut(key, opts) },
+      put: (key, bytes, contentType) => inner.put(key, bytes, contentType),
       head: (key) => inner.head(key),
       get: (key) => inner.get(key),
+      presignGet: (key, opts) => inner.presignGet(key, opts),
       delete: (key) => inner.delete(key),
     }
     const t2 = await createTestApi({}, { store: spyStore })
@@ -369,7 +371,7 @@ describe('knowledge router', () => {
     const org = await seedOrg()
     const upload = await org.c.knowledge.startUpload.mutate({ fileName: 'file.txt', mime: 'text/plain', byteSize: 5 })
     const [before] = await t.api.withOrg(org.orgId, (tx) => tx.select().from(knowledgeSources).where(eq(knowledgeSources.id, upload.sourceId)))
-    ;(t.store as TestObjectStore).put(before!.storageKey!, new Uint8Array([1, 2, 3]), 'text/plain')
+    await (t.store as TestObjectStore).put(before!.storageKey!, new Uint8Array([1, 2, 3]), 'text/plain')
     expect(await t.store.head(before!.storageKey!)).not.toBeNull()
 
     const beforeVersion = (await org.c.knowledge.list.query()).knowledgeVersion

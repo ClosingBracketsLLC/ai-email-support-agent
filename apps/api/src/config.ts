@@ -3,6 +3,9 @@ import { Secret } from '@aesa/crypto'
 import { parseS3Env, type S3Config } from '@aesa/knowledge/storage'
 import { parseMailConfig, type MailConfig } from '@aesa/platform-mail'
 import { z } from 'zod'
+// Type-only: `StripeConfig` is just four fields, and importing it for VALUE would drag the Stripe
+// SDK into the module graph of everything that loads config (error-surface.test.ts walks it).
+import type { StripeConfig } from './billing/stripe.ts'
 
 const isHttpUrl = (v: string) => { try { return ['http:', 'https:'].includes(new URL(v).protocol) } catch { return false } }
 const csv = (v: string | undefined) => (v ?? '').split(',').map((s) => s.trim()).filter(Boolean)
@@ -66,6 +69,19 @@ const EnvSchema = z.object({
   S3_ACCESS_KEY_ID: z.string().optional(),
   S3_SECRET_ACCESS_KEY: z.string().optional(),
   S3_FORCE_PATH_STYLE: z.string().optional(),
+  /** Phase 7 billing. All four or none (`stripeGroup`), and REQUIRED IN PRODUCTION: an api with no
+   * Stripe keys can neither start a Checkout nor verify a webhook, and would look healthy while
+   * every subscription silently failed. Unset outside production is normal — `deps.stripe` is null,
+   * `/meta` reports `billing: false`, the billing procedures soft-refuse `not_configured` and
+   * POST /webhooks/stripe 404s. */
+  STRIPE_SECRET_KEY: z.string().optional(),
+  STRIPE_WEBHOOK_SECRET: z.string().optional(),
+  STRIPE_PRICE_DOMAIN: z.string().optional(),
+  STRIPE_PRICE_OVERAGE: z.string().optional(),
+  /** Task 11's error reporting. Parsed here (one schema owns the api's environment) and read there;
+   * absent everywhere it is not configured, which is the normal state of a dev box. */
+  SENTRY_DSN: z.string().optional(),
+  SENTRY_ENVIRONMENT: z.string().optional(),
 })
 
 export interface OAuthClient { clientId: string; clientSecret: Secret }
@@ -107,6 +123,12 @@ export interface ApiConfig {
   flowKey: Buffer
   /** The six `S3_*` as one config, or null when object storage is not configured at all. */
   s3: ApiS3Config | null
+  /** The four `STRIPE_*` as one config, or null when billing is not configured at all. */
+  stripe: StripeConfig | null
+  /** Task 11: the Sentry DSN, or null. Wrapped like every other credential in this file. */
+  sentryDsn: Secret | null
+  /** Task 11: the environment tag Sentry stamps on an event; defaults to NODE_ENV. */
+  sentryEnvironment: string
 }
 
 /** `parseS3Env`'s shape with the secret wrapped — the same rule every other credential in this file
@@ -126,6 +148,21 @@ function gmailPubsubPair(audience: string | undefined, serviceAccount: string | 
   if (!audience && !serviceAccount) return null
   if (!audience || !serviceAccount) throw new Error('GMAIL_PUBSUB_AUDIENCE and GMAIL_PUBSUB_SA_EMAIL must be set together')
   return { audience, serviceAccount }
+}
+
+/** All four or none — the `oauthPair` shape widened to a four-name group. A deploy that sets the
+ *  secret key but forgets the webhook secret would accept Checkout sessions it could never hear back
+ *  about, which is worse than refusing to boot. */
+function stripeGroup(
+  secretKey: string | undefined, webhookSecret: string | undefined,
+  priceDomain: string | undefined, priceOverage: string | undefined,
+): StripeConfig | null {
+  const present = [secretKey, webhookSecret, priceDomain, priceOverage].filter((v) => v !== undefined && v !== '')
+  if (present.length === 0) return null
+  if (present.length < 4) {
+    throw new Error('STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_DOMAIN and STRIPE_PRICE_OVERAGE must be set together')
+  }
+  return { secretKey: new Secret(secretKey!), webhookSecret: new Secret(webhookSecret!), priceDomain: priceDomain!, priceOverage: priceOverage! }
 }
 
 function deriveFlowKey(betterAuthSecret: string): Buffer {
@@ -178,6 +215,11 @@ export function loadConfig(env: NodeJS.ProcessEnv): ApiConfig {
     throw new Error('S3_* (endpoint, region, bucket, access key id, secret access key, force path style) are required in production (the presigned upload flow has nowhere to point)')
   }
 
+  const stripe = stripeGroup(d.STRIPE_SECRET_KEY, d.STRIPE_WEBHOOK_SECRET, d.STRIPE_PRICE_DOMAIN, d.STRIPE_PRICE_OVERAGE)
+  if (production && !stripe) {
+    throw new Error('STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_DOMAIN and STRIPE_PRICE_OVERAGE are required in production (billing)')
+  }
+
   return {
     env: d.NODE_ENV, databaseUrl: d.DATABASE_URL, port: d.PORT, host: d.HOST, logLevel: d.LOG_LEVEL,
     appBaseUrl, appWebOrigin, webOrigins, trustedOrigins, trustProxy,
@@ -191,5 +233,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): ApiConfig {
     gmailPubsubServiceAccount: gmailPubsub?.serviceAccount ?? null,
     flowKey: deriveFlowKey(d.BETTER_AUTH_SECRET),
     s3,
+    stripe,
+    sentryDsn: d.SENTRY_DSN ? new Secret(d.SENTRY_DSN) : null,
+    sentryEnvironment: d.SENTRY_ENVIRONMENT ?? d.NODE_ENV,
   }
 }

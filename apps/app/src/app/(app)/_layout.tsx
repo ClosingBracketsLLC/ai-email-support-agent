@@ -5,6 +5,7 @@ import { Loading } from '@/components/loading'
 import { ResponsiveShell } from '@/components/responsive-shell'
 import { clearNextPath, peekNextPath } from '@/lib/next-path'
 import { usePushRouting } from '@/lib/push-routing'
+import { useShareIntentRouting } from '@/lib/share-routing'
 import { usePushRegistration } from '@/lib/use-push-registration'
 import { hrefFor } from '@/lib/session-gate'
 import { useGate } from '@/lib/use-gate'
@@ -25,6 +26,7 @@ export default function AppLayout() {
 function Shell() {
   usePushRegistration()
   usePushRouting()
+  useShareIntentRouting()
   const next = peekNextPath()
   useEffect(() => { if (next) clearNextPath() }, [next])
   if (next) return <Redirect href={next as Href} />

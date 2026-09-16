@@ -13,12 +13,16 @@
     "db:check": "bash scripts/check-migration-drift.sh",
     "s3:init": "tsx scripts/s3-init.ts",
     "e2e": "pnpm --filter @aesa/app e2e",
-    "brand:build": "pnpm --filter @aesa/brand build"
+    "brand:build": "pnpm --filter @aesa/brand build",
+    "smoke:tenant": "tsx scripts/smoke-tenant.ts"
   },
   "devDependencies": {
+    "@aesa/api": "workspace:*",
     "@aws-sdk/client-s3": "^3.1130.0",
     "@eslint/js": "^9.30.0",
+    "@trpc/client": "11.18.0",
     "eslint": "^9.30.0",
+    "superjson": "^2.2.0",
     "tsx": "^4.20.0",
     "typescript": "^5.9.2",
     "typescript-eslint": "^8.35.0"

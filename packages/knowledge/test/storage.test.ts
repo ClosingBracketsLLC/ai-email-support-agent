@@ -17,11 +17,17 @@ describe('uploadKey / parseS3Env', () => {
 describe('createMemoryStore', () => {
   it('round-trips put/head/get/delete and presigns a memory: URL', async () => {
     const store = createMemoryStore()
-    store.put('k', new Uint8Array([1, 2, 3]), 'text/plain')
+    await store.put('k', new Uint8Array([1, 2, 3]), 'text/plain')
     expect(await store.head('k')).toEqual({ contentLength: 3, contentType: 'text/plain' })
     expect([...(await store.get('k'))]).toEqual([1, 2, 3])
     expect((await store.presignPut('k2', { contentType: 'text/plain', expiresSeconds: 600 })).url).toMatch(/^memory:\/\/k2/)
     await store.delete('k'); expect(await store.head('k')).toBeNull()
+  })
+
+  it('presignGet returns a memory: URL for the key (Phase 7: the export download link)', async () => {
+    const store = createMemoryStore()
+    await store.put('orgs/o1/exports/e1.ndjson', new Uint8Array([7]), 'application/x-ndjson')
+    expect(await store.presignGet('orgs/o1/exports/e1.ndjson', { expiresSeconds: 600 })).toBe('memory://orgs/o1/exports/e1.ndjson')
   })
 })
 
@@ -36,6 +42,20 @@ describe.skipIf(!s3)('createS3Store against minio', () => {
     expect(res.ok).toBe(true)
     expect(await store.head(key)).toEqual({ contentLength: 5, contentType: 'text/plain' })
     expect(new TextDecoder().decode(await store.get(key))).toBe('hello')
+    await store.delete(key); expect(await store.head(key)).toBeNull()
+  })
+
+  it('put writes the bytes server-side and presignGet hands back a URL that GETs them (Phase 7: workspace.export)', async () => {
+    const store = createS3Store({ ...s3!, secretAccessKey: new Secret(s3!.secretAccessKey) })
+    const key = `orgs/org-test/exports/${Date.now()}.ndjson`
+    await store.put(key, new TextEncoder().encode('{"kind":"manifest"}\n'), 'application/x-ndjson')
+    expect(await store.head(key)).toEqual({ contentLength: 20, contentType: 'application/x-ndjson' })
+
+    const url = await store.presignGet(key, { expiresSeconds: 60 })
+    const res = await fetch(url)
+    expect(res.ok).toBe(true)
+    expect(await res.text()).toBe('{"kind":"manifest"}\n')
+
     await store.delete(key); expect(await store.head(key)).toBeNull()
   })
 
@@ -55,5 +75,24 @@ describe.skipIf(!s3)('createS3Store against minio', () => {
     expect(res.ok).toBe(true)
 
     await store.delete(key)
+  })
+})
+
+/** `presignGet` is a local SigV4 computation, never a request: `getSignedUrl` installs a middleware
+ *  that short-circuits the stack before the HTTP handler, and `createS3Store` passes STATIC
+ *  credentials, so no credential provider reaches IMDS/STS either. Task 8 calls it inside an api
+ *  request, so prove it offline: an endpoint nothing is listening on still resolves, promptly. */
+describe('createS3Store.presignGet performs no network I/O', () => {
+  it('signs against an unreachable endpoint without throwing', async () => {
+    const store = createS3Store({
+      endpoint: 'http://127.0.0.1:1', region: 'us-east-1', bucket: 'nowhere',
+      accessKeyId: 'a', secretAccessKey: new Secret('b'), forcePathStyle: true,
+    })
+    const started = Date.now()
+    const url = await store.presignGet('orgs/o/exports/e.ndjson', { expiresSeconds: 3600 })
+    expect(url).toContain('http://127.0.0.1:1/nowhere/orgs/o/exports/e.ndjson')
+    expect(url).toContain('X-Amz-Signature=')
+    expect(url).toContain('X-Amz-Expires=3600')
+    expect(Date.now() - started).toBeLessThan(2_000)
   })
 })

@@ -14,10 +14,9 @@ import {
 import { COLD_START_DECISIONS, resolveSetting } from '@aesa/core'
 import {
   agentCategoryPolicies, agentRuns, agents, audit, bumpMeter, categories, countHumanDecisions, drafts, mailboxConnections,
-  categoryStatsDaily, resolveModelConfig, SANDBOX_METERS, usageCounters,
+  categoryStatsDaily, loadSettingSources, resolveModelConfig, SANDBOX_METERS, usageCounters,
 } from '@aesa/db'
 import { JOB_NAMES } from '@aesa/queue'
-import { loadOrgSettings } from '../../org-settings.ts'
 import { managerProcedure, orgProcedure, router } from '../init.ts'
 
 const utcDayString = (d: Date): string => d.toISOString().slice(0, 10)
@@ -295,8 +294,8 @@ export const agentsRouter = router({
         throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'agent is not active' })
       }
 
-      const settings = await loadOrgSettings(tx, ['sandbox.daily_cap'])
-      const cap = resolveSetting('sandbox.daily_cap', { org: settings })
+      const settings = await loadSettingSources(tx, ['sandbox.daily_cap'])
+      const cap = resolveSetting('sandbox.daily_cap', settings)
 
       const [counter] = await tx.select({ value: usageCounters.value }).from(usageCounters)
         .where(and(eq(usageCounters.orgId, ctx.orgId), eq(usageCounters.day, day), eq(usageCounters.meter, SANDBOX_METERS.runs)))

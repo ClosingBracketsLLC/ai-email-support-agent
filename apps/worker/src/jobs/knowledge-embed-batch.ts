@@ -36,14 +36,14 @@ import type { KnowledgeFailureReason } from '@aesa/contracts'
 import { resolveSetting } from '@aesa/core'
 import {
   audit, bumpMeter, knowledgeChunks, knowledgeDocuments, knowledgeSources, KNOWLEDGE_METERS,
-  usageCounters, withOrg,
+  loadSettingSources, usageCounters, withOrg,
 } from '@aesa/db'
 import { batchTexts, EmbedError, vectorLiteral } from '@aesa/knowledge'
 import { defineJob, enqueue, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
 import { utcDayString } from '../date-utils.ts'
 import { errorMessage } from '../err-message.ts'
 import {
-  failSource, FAILURE_DETAIL_MAX, guardedSourceWrite, guardedSourceWriteReturning, loadOrgSettings,
+  failSource, FAILURE_DETAIL_MAX, guardedSourceWrite, guardedSourceWriteReturning,
 } from '../knowledge/sources.ts'
 import type { KnowledgeDeps } from '../knowledge-deps.ts'
 
@@ -121,7 +121,7 @@ async function recordFailure(
 }
 
 /** One read transaction: the document's source, its unembedded chunks, and today's token spend. */
-async function loadPending(deps: KnowledgeDeps, orgId: string, documentId: string, day: string): Promise<Pending | null> {
+async function loadPending(deps: KnowledgeDeps, orgId: string, documentId: string, day: string, now: Date): Promise<Pending | null> {
   return withOrg(deps.db, orgId, async (tx) => {
     const [doc] = await tx
       .select({ sourceId: knowledgeDocuments.sourceId })
@@ -146,7 +146,7 @@ async function loadPending(deps: KnowledgeDeps, orgId: string, documentId: strin
       .select({ value: usageCounters.value })
       .from(usageCounters)
       .where(and(eq(usageCounters.day, day), eq(usageCounters.meter, KNOWLEDGE_METERS.embedTokens)))
-    const cap = resolveSetting('knowledge.daily_embed_tokens_cap', { org: await loadOrgSettings(tx, ['knowledge.daily_embed_tokens_cap']) })
+    const cap = resolveSetting('knowledge.daily_embed_tokens_cap', await loadSettingSources(tx, ['knowledge.daily_embed_tokens_cap'], now))
 
     return {
       sourceId: doc.sourceId, sourceKind: source.kind, sourceStatus: source.status,
@@ -197,7 +197,7 @@ export async function runKnowledgeEmbedBatch(
   const now = deps.now?.() ?? new Date()
   const day = utcDayString(now)
 
-  const pending = await loadPending(deps, orgId, documentId, day)
+  const pending = await loadPending(deps, orgId, documentId, day, now)
   if (!pending) return
 
   /** The owner sees a failed source rather than a silently half-embedded one; re-running it after

@@ -20,8 +20,8 @@
  * or rollback of the caller's transaction, never leaked.
  */
 import { and, count, eq, gt, gte, sql } from 'drizzle-orm'
-import { INVARIANTS, resolveSetting, type SettingKey } from '@aesa/core'
-import { agentRuns, LLM_METERS, usageCounters, type OrgTx } from '@aesa/db'
+import { INVARIANTS, PLANS, resolveSetting } from '@aesa/core'
+import { agentRuns, LLM_METERS, sumMeter, usageCounters, type BillingStateView, type OrgTx, type SettingSources } from '@aesa/db'
 import { utcDayString } from '../date-utils.ts'
 
 /** The `usage_counters` meter the org-wide daily draft cap is measured against. */
@@ -29,19 +29,50 @@ export const DRAFT_METER = 'draft_runs'
 /** How many draft runs one org may have in flight at once. A fairness bound, not a cap: refused runs come back. */
 export const PER_ORG_DRAFT_CONCURRENCY = 2
 
+/** WHICH budget an `org_spend_capped` refusal spent: the org's DAILY USD cap, or — on a trial
+ *  workspace only — the plan's TOTAL Managed-AI budget over the whole trial. The owner-facing page
+ *  differs ("starts again after midnight UTC" vs "subscribe to keep drafting"), so the caller needs
+ *  to know which one it met. */
+export type SpendCapScope = 'daily' | 'trial'
+
 export type GateOutcome =
   | { outcome: 'proceed'; runId: string }
   | { outcome: 'ticket_capped'; runsToday: number }
   | { outcome: 'org_busy' }
   | { outcome: 'org_draft_capped' }
-  | { outcome: 'org_spend_capped'; costMicrosToday: number }
+  | { outcome: 'org_spend_capped'; scope: SpendCapScope; costMicros: number }
+
+/** `sumMeter`'s inclusive lower bound when the trial has no clock of its own yet (the agent was
+ *  never switched on — a sandbox probe can still spend): "since this workspace began". A literal
+ *  rather than the org's creation date: `usage_counters` rows only exist from the first metered
+ *  call onward, so any earlier day is the same sum. */
+const TRIAL_BUDGET_EPOCH_DAY = '1970-01-01'
+
+/**
+ * Ruling R27: the trial's total Managed-AI budget applies ONLY to a genuine, unexpired trial — the
+ * derived billing STATE, never the plan. A cancelled workspace is back on `plan = 'trial'` (plan
+ * deviation 8) and an expired trial keeps its `trialing` row, but both are already review-only
+ * through `subscription_inactive` and bounded by the daily cap; summing a paying workspace's
+ * whole history against $10 the day it cancelled stopped its drafting outright, against the
+ * spec's "drafts continue".
+ */
+export const trialBudgetApplies = (billing: Pick<BillingStateView, 'state'>): boolean => billing.state === 'trialing'
+
+/** The day the trial budget is summed FROM (ruling R27): the trial's own clock —
+ *  `workspaces.agent_enabled_at` — so spend that predates the trial (the sandbox, an earlier
+ *  enable on a workspace 0025 later re-clocked) is not the trial's; the epoch only when null. */
+export function trialBudgetFromDay(billing: Pick<BillingStateView, 'agentEnabledAt'>): string {
+  return billing.agentEnabledAt ? utcDayString(billing.agentEnabledAt) : TRIAL_BUDGET_EPOCH_DAY
+}
 
 /** Start of `d`'s UTC day — the boundary every daily count here is measured from. */
 export function utcMidnight(d: Date): Date {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()))
 }
 
-const usdCapToMicros = (usd: number): number => Math.round(usd * 1_000_000)
+/** A USD cap as `usage_counters.llm_cost_micros` counts it. Exported because `ticket.draft`'s
+ *  pre-claim check compares the same two numbers and used to carry its own copy of this line. */
+export const usdCapToMicros = (usd: number): number => Math.round(usd * 1_000_000)
 
 async function meterValue(tx: OrgTx, day: string, meter: string): Promise<number> {
   const [row] = await tx
@@ -68,7 +99,11 @@ export interface GateParams {
   provider: string
   model: string
   input: Record<string, unknown>
-  settings: Partial<Record<SettingKey, unknown>>
+  /** The org's own `org_settings` rows AND its PLAN's defaults (`loadSettingSources`, `@aesa/db`) —
+   *  a trial workspace's caps are the trial tier's unless an owner overrode them. Its `billing`
+   *  view (the derived state and the trial clock) is what decides whether branch 4b's total trial
+   *  budget applies at all, and from which day it is summed. */
+  settings: SettingSources
   now: Date
 }
 
@@ -81,8 +116,14 @@ export interface GateParams {
  *   1. per-ticket daily runs  ≥ AGENT_MAX_RUNS_PER_TICKET_PER_DAY → ticket_capped
  *   2. live running draft runs ≥ PER_ORG_DRAFT_CONCURRENCY        → org_busy
  *   3. usage_counters draft_runs      ≥ autonomy.daily_draft_cap  → org_draft_capped
- *   4. usage_counters llm_cost_micros ≥ autonomy.daily_llm_usd_cap × 1e6 → org_spend_capped
+ *   4. usage_counters llm_cost_micros ≥ autonomy.daily_llm_usd_cap × 1e6 → org_spend_capped/daily
+ *  4b. a genuine trial only (`trialBudgetApplies`): the SAME meter summed from the trial's own
+ *      clock (`trialBudgetFromDay`) ≥ PLANS.trial.llmUsdBudget × 1e6 → org_spend_capped/trial
  *   5. otherwise: insert the `agent_runs` row (status `running`) and bump `draft_runs`.
+ *
+ * Step 4 and step 4b both read `LLM_METERS.costMicros` and never `costMicrosByok`: the daily cap and
+ * the trial budget are the PLATFORM's money (CLAUDE.md Metering), and a tenant's own BYOK spend must
+ * never trip either of them.
  *
  * Step 2 only counts runs younger than `DRAFT_JOB_EXPIRE_SECONDS`: a `running` row older than the
  * job's own expiry belongs to a process that is already gone (the backstop sweep's `markStuckRuns`
@@ -107,11 +148,21 @@ export async function gateAndRecordRun(tx: OrgTx, p: GateParams): Promise<GateOu
   if ((runningRow?.value ?? 0) >= PER_ORG_DRAFT_CONCURRENCY) return { outcome: 'org_busy' }
 
   const draftsToday = await meterValue(tx, day, DRAFT_METER)
-  if (draftsToday >= resolveSetting('autonomy.daily_draft_cap', { org: p.settings })) return { outcome: 'org_draft_capped' }
+  if (draftsToday >= resolveSetting('autonomy.daily_draft_cap', p.settings)) return { outcome: 'org_draft_capped' }
 
   const costMicrosToday = await meterValue(tx, day, LLM_METERS.costMicros)
-  if (costMicrosToday >= usdCapToMicros(resolveSetting('autonomy.daily_llm_usd_cap', { org: p.settings }))) {
-    return { outcome: 'org_spend_capped', costMicrosToday }
+  if (costMicrosToday >= usdCapToMicros(resolveSetting('autonomy.daily_llm_usd_cap', p.settings))) {
+    return { outcome: 'org_spend_capped', scope: 'daily', costMicros: costMicrosToday }
+  }
+
+  // 4b, Phase 7: the trial's TOTAL Managed-AI budget (spec §Budgets) — a second, cumulative ceiling
+  // that only a genuine, unexpired trial has (ruling R27). Evaluated AFTER the daily cap so a
+  // workspace that is over both reports the one that resets on its own, and skipped entirely on a
+  // paid plan (`llmUsdBudget: null`), an expired trial and a cancelled workspace.
+  if (trialBudgetApplies(p.settings.billing)) {
+    const budget = PLANS.trial.llmUsdBudget
+    const total = await sumMeter(tx, LLM_METERS.costMicros, trialBudgetFromDay(p.settings.billing))
+    if (total >= usdCapToMicros(budget)) return { outcome: 'org_spend_capped', scope: 'trial', costMicros: total }
   }
 
   // The run row IS the spend row, and it goes in under the same lock as the counts that authorized
@@ -140,12 +191,26 @@ export async function gateAndRecordRun(tx: OrgTx, p: GateParams): Promise<GateOu
  */
 export async function readCapsUnlocked(
   tx: OrgTx,
-  p: { orgId: string; ticketId: string; settings: Partial<Record<SettingKey, unknown>>; now: Date },
-): Promise<{ ticketRunsToday: number; orgCostMicrosToday: number; orgDraftsToday: number }> {
+  p: { orgId: string; ticketId: string; settings: SettingSources; now: Date },
+): Promise<UnlockedCaps> {
   const day = utcDayString(p.now)
   return {
     ticketRunsToday: await draftRunsForTicketToday(tx, p.ticketId, utcMidnight(p.now)),
     orgCostMicrosToday: await meterValue(tx, day, LLM_METERS.costMicros),
     orgDraftsToday: await meterValue(tx, day, DRAFT_METER),
+    // Read for EVERY state, not only a live trial: this is the unlocked mirror of branch 4b, and a
+    // caller comparing it against a budget its own billing state says does not apply is the
+    // caller's business. One indexed aggregate over one org's counters — the same table the two
+    // reads above touch — from the same day the locked gate sums from.
+    orgTrialCostMicros: await sumMeter(tx, LLM_METERS.costMicros, trialBudgetFromDay(p.settings.billing)),
   }
+}
+
+/** What the pre-claim read hands `ticket.draft`'s own cap checks — one field per locked-gate branch. */
+export interface UnlockedCaps {
+  ticketRunsToday: number
+  orgCostMicrosToday: number
+  orgDraftsToday: number
+  /** `llm_cost_micros` summed from the trial's own clock (`trialBudgetFromDay`) — branch 4b's input. */
+  orgTrialCostMicros: number
 }

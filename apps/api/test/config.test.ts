@@ -7,6 +7,10 @@ const S3_ENV = {
   S3_ENDPOINT: 'http://localhost:9000', S3_REGION: 'us-east-1', S3_BUCKET: 'aesa-dev',
   S3_ACCESS_KEY_ID: 'aesa', S3_SECRET_ACCESS_KEY: 'aesaaesa', S3_FORCE_PATH_STYLE: 'true',
 }
+const STRIPE_ENV = {
+  STRIPE_SECRET_KEY: 'sk_test_NEVERPRINT', STRIPE_WEBHOOK_SECRET: 'whsec_NEVERPRINT',
+  STRIPE_PRICE_DOMAIN: 'price_domain', STRIPE_PRICE_OVERAGE: 'price_overage',
+}
 
 describe('api config', () => {
   it('parses defaults: devsink mail outside production, aesa:// and exp:// trusted', () => {
@@ -38,7 +42,7 @@ describe('api config', () => {
     expect(() => loadConfig({ ...BASE, NODE_ENV: 'production', RESEND_API_KEY: 're_x' })).toThrow(/MAIL_FROM/)
     expect(() => loadConfig({ ...BASE, NODE_ENV: 'production', EMAIL_TRANSPORT: 'devsink' })).toThrow(/devsink/)
     const c = loadConfig({
-      ...BASE, ...S3_ENV, NODE_ENV: 'production', RESEND_API_KEY: 're_x', MAIL_FROM: 'aesa <no-reply@mail.example.com>',
+      ...BASE, ...S3_ENV, ...STRIPE_ENV, NODE_ENV: 'production', RESEND_API_KEY: 're_x', MAIL_FROM: 'aesa <no-reply@mail.example.com>',
       AUTH_TRUSTED_ORIGINS: 'https://app.example.com, https://staging.example.com', TRUST_PROXY: 'true',
     })
     expect(c.mail.transport).toBe('resend')
@@ -63,10 +67,46 @@ describe('api config', () => {
     it('is required in production; boots once every S3_* is set', () => {
       expect(() => loadConfig({ ...BASE, NODE_ENV: 'production', RESEND_API_KEY: 're_x', MAIL_FROM: 'a <a@example.com>', TRUST_PROXY: 'true' }))
         .toThrow(/S3_\*.*required in production/)
-      const c = loadConfig({ ...BASE, ...S3_ENV, NODE_ENV: 'production', RESEND_API_KEY: 're_x', MAIL_FROM: 'a <a@example.com>', TRUST_PROXY: 'true' })
+      const c = loadConfig({ ...BASE, ...S3_ENV, ...STRIPE_ENV, NODE_ENV: 'production', RESEND_API_KEY: 're_x', MAIL_FROM: 'a <a@example.com>', TRUST_PROXY: 'true' })
       expect(c.s3?.bucket).toBe('aesa-dev')
     })
   })
+  describe('billing (Phase 7)', () => {
+    it('is null when no STRIPE_* is set — a dev box has no billing at all', () => {
+      expect(loadConfig(BASE).stripe).toBeNull()
+    })
+    it('parses the four STRIPE_* into one config with both secrets wrapped, and never prints either', () => {
+      const c = loadConfig({ ...BASE, ...STRIPE_ENV })
+      expect(c.stripe).toMatchObject({ priceDomain: 'price_domain', priceOverage: 'price_overage' })
+      expect(c.stripe?.secretKey).toBeInstanceOf(Secret)
+      expect(c.stripe?.secretKey.expose()).toBe('sk_test_NEVERPRINT')
+      expect(c.stripe?.webhookSecret.expose()).toBe('whsec_NEVERPRINT')
+      const printed = JSON.stringify(c) + String(c.stripe?.secretKey) + String(c.stripe?.webhookSecret)
+      expect(printed).not.toContain('sk_test_NEVERPRINT')
+      expect(printed).not.toContain('whsec_NEVERPRINT')
+    })
+    it('the four names are all-or-none', () => {
+      expect(() => loadConfig({ ...BASE, STRIPE_SECRET_KEY: 'sk_test_x' }))
+        .toThrow(/STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_DOMAIN and STRIPE_PRICE_OVERAGE must be set together/)
+      expect(() => loadConfig({ ...BASE, ...STRIPE_ENV, STRIPE_PRICE_OVERAGE: undefined })).toThrow(/must be set together/)
+    })
+    it('is required in production — an api that cannot verify a webhook must not boot', () => {
+      expect(() => loadConfig({ ...BASE, ...S3_ENV, NODE_ENV: 'production', RESEND_API_KEY: 're_x', MAIL_FROM: 'a <a@example.com>', TRUST_PROXY: 'true' }))
+        .toThrow(/required in production \(billing\)/)
+    })
+  })
+
+  it('parses SENTRY_DSN (wrapped, never printed) and defaults SENTRY_ENVIRONMENT to NODE_ENV', () => {
+    const off = loadConfig(BASE)
+    expect(off.sentryDsn).toBeNull()
+    expect(off.sentryEnvironment).toBe('development')
+    const on = loadConfig({ ...BASE, SENTRY_DSN: 'https://abc@o1.ingest.example.com/1', SENTRY_ENVIRONMENT: 'staging' })
+    expect(on.sentryDsn).toBeInstanceOf(Secret)
+    expect(on.sentryDsn?.expose()).toBe('https://abc@o1.ingest.example.com/1')
+    expect(on.sentryEnvironment).toBe('staging')
+    expect(JSON.stringify(on)).not.toContain('o1.ingest.example.com')
+  })
+
   it('strips trailing slashes from the origins before trusting them', () => {
     const c = loadConfig({ DATABASE_URL: 'postgres://x', APP_BASE_URL: 'http://localhost:3001/', APP_WEB_ORIGIN: 'http://localhost:8081/', BETTER_AUTH_SECRET: 's'.repeat(32), AUTH_TRUSTED_ORIGINS: 'https://app.example.com/' })
     expect(c.appBaseUrl).toBe('http://localhost:3001')

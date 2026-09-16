@@ -4,7 +4,7 @@ import { eq } from 'drizzle-orm'
 import superjson from 'superjson'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { loadKekRing, type KekRing } from '@aesa/crypto'
-import { categories, mailboxConnections, oauthFlows, openSealedForOrg, provisionOrgKeys } from '@aesa/db'
+import { categories, mailboxConnections, oauthFlows, openSealedForOrg, orgSettings, provisionOrgKeys } from '@aesa/db'
 import type { MailboxProvider, TokenSet } from '@aesa/mail'
 import { JOB_NAMES } from '@aesa/queue'
 import type { EnqueueFn } from '../src/deps.ts'
@@ -78,6 +78,11 @@ describe('mailbox connect flow', () => {
     a = client(base, cookieA)
     const { orgId: created } = await a.workspace.create.mutate({ businessName: 'Acme', timezone: 'UTC' })
     orgId = created
+    // Phase 7 caps a TRIAL workspace at one mailbox connection (`PLANS.trial.maxConnections`, read
+    // through `loadSettingSources`), and this suite connects the same org several times over — it is
+    // about the OAuth dance, not the plan ceiling, which `mailboxes-router.test.ts` owns. One org
+    // override lifts it out of the way.
+    await t.api.withOrg(orgId, (tx) => tx.insert(orgSettings).values({ orgId, key: 'mailboxes.max_connections', value: 20 }))
   })
   afterAll(async () => { await t.close() })
 
@@ -452,6 +457,11 @@ describe('mailbox connect flow: storeCredentials enqueue_failed recovery', () =>
           orgId: orgId2, provider: 'gmail', providerAccountId: 'acct-enqfail-reconnect-old', emailAddress: 'support@enqfail-reconnect.test',
           status: 'reauth_required', connectedByUserId: signed.user.id,
         }).returning())
+
+      // No connection-cap override here, deliberately: this org is on the trial plan, whose cap is
+      // 1, and the existing connection above is `reauth_required` — which ruling R7 does NOT count
+      // (it syncs nothing, and the reconnect below reuses its very row). So this case doubles as
+      // the end-to-end proof of R7: the repair of a workspace's only, broken mailbox is startable.
 
       providerOverrides.gmail = fakeGmailProvider(fixedExchange({
         tokens: { refreshToken: 'rt-enqfail-2', accessToken: 'at-enqfail-2', accessTokenExpiresAt: null },

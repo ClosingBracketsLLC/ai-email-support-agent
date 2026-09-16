@@ -3,6 +3,7 @@ import { DrizzleQueryError } from 'drizzle-orm/errors'
 import { ZodError, type z } from 'zod'
 import { JOB_SIGNAL_MARGIN_SECONDS } from '@aesa/core'
 import type { JobName } from './names.ts'
+import { notifyJobFailure } from './observe.ts'
 import { createQueueRetrying } from './pg-boss.ts'
 import { QUEUE_OPTIONS } from './queue-options.ts'
 
@@ -113,7 +114,16 @@ export async function registerJob<T extends { orgId: string }>(boss: PgBoss, def
       try {
         await def.handler({ data, signal: controller.signal, job: job as PgBoss.JobWithMetadata<T> })
       } catch (err) {
-        throw scrubJobError(err)
+        // Task 11: the observer (Sentry, in the worker) gets the SAME scrubbed value pg-boss is
+        // about to persist into `pgboss.job.output` — never the raw error. `scrubJobError` only
+        // transforms a `DrizzleQueryError` (its SQL and bound parameters); every other error passes
+        // through unchanged, so this costs nothing for the common case and closes the one real leak:
+        // a raw DrizzleQueryError's message reaching an EXTERNAL service (Sentry) with a query's
+        // bound parameters still in it. Never throws itself (see notifyJobFailure's own doc
+        // comment), so it can never replace the error pg-boss is about to record.
+        const scrubbed = scrubJobError(err)
+        notifyJobFailure(scrubbed, { name: def.name, jobId: job.id, orgId: data.orgId })
+        throw scrubbed
       } finally {
         clearTimeout(timer)
       }

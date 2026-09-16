@@ -1,12 +1,16 @@
+import * as Sentry from '@sentry/node'
 import { assertInvariants, loadDotEnv } from '@aesa/core'
 import { loadModelPricing } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createMailLimiter } from '@aesa/mail'
 import { createMailTransport } from '@aesa/platform-mail'
-import { createQueueRetrying, JOB_NAMES, queueOptionsFor, startBoss } from '@aesa/queue'
+import { createQueueRetrying, JOB_NAMES, queueOptionsFor, setJobObserver, startBoss } from '@aesa/queue'
 import { maybeRegisterAgentRole } from './agent-role.ts'
+import { registerBillingReportUsage } from './billing/report-usage.ts'
+import { createStripeUsagePort } from './billing/stripe.ts'
 import { loadConfig } from './config.ts'
 import { registerKeysProvision } from './jobs/keys-provision.ts'
+import { registerKeysRotate } from './jobs/keys-rotate.ts'
 import { enqueueKnowledgeEmbedBatch } from './jobs/knowledge-embed-batch.ts'
 import { enqueueLlmProbe } from './jobs/llm-probe.ts'
 import { registerLlmReprobeSweep } from './jobs/llm-reprobe-sweep.ts'
@@ -19,26 +23,39 @@ import { registerNotifyDigest } from './jobs/notify-digest.ts'
 import { enqueueNotifyDispatch, registerNotifyDispatch } from './jobs/notify-dispatch.ts'
 import { registerPlatformHeartbeat } from './jobs/platform-heartbeat.ts'
 import { enqueueSendExecute } from './jobs/send-execute.ts'
+import { registerRetentionSweep } from './jobs/retention-sweep.ts'
 import { registerStatsRollup } from './jobs/stats-rollup.ts'
 import { registerSweepsDaily } from './jobs/sweeps-daily.ts'
 import { registerTicketBackstopSweep } from './jobs/ticket-backstop-sweep.ts'
 import { enqueueTicketDraft } from './jobs/ticket-draft.ts'
+import { registerWorkspacePurgeSweep } from './jobs/workspace-purge.ts'
 import { maybeRegisterKnowledgeRole } from './knowledge-role.ts'
 import { createWorkerLogger } from './logging.ts'
+import { captureWithOrg, initObservability } from './observability.ts'
 import { createExpoPush } from './push.ts'
 import { maybeRegisterSendRole } from './send-role.ts'
 
 loadDotEnv(import.meta.url)
 const config = loadConfig(process.env)
 assertInvariants()
+// Task 11, FIRST thing after config/invariants: every job failure from here on (the observer wired
+// below) and every alert() call anywhere in this process can reach Sentry from the moment the
+// queue starts working jobs. `SENTRY_RELEASE` is deliberately not part of `WorkerConfig` — the
+// runbook sets it from the deploy's git SHA as a plain env var, read here at the composition root.
+const sentryEnabled = initObservability({
+  sentry: config.sentryDsn ? { dsn: config.sentryDsn, environment: config.sentryEnvironment } : null,
+  release: process.env.SENTRY_RELEASE,
+})
 const logger = createWorkerLogger(config.logLevel)
+if (!sentryEnabled) logger.warn('SENTRY_DSN missing; error reporting is off (alerts still log via pino)')
+setJobObserver({ onFailure: (err, ctx) => captureWithOrg(err, { orgId: ctx.orgId, job: ctx.name }) })
 const { db, pool } = createDb(config.databaseUrl, { role: 'app' })
 // The platform price table, read ONCE at boot and handed to every metered provider. An empty table
 // (nothing seeded, or a database that predates 0020) is passed as `undefined` so `withMetering`
 // stays on its code-seeded `PRICING_SEED` rather than costing every call at zero.
 const pricing = await loadModelPricing(db)
 const boss = await startBoss(config.databaseUrl)
-logger.info({ roles: [...config.roles], kekActive: config.kekRing?.active ?? null }, 'worker up')
+logger.info({ roles: [...config.roles], kekActive: config.kekRing?.active ?? null, sentry: sentryEnabled }, 'worker up')
 
 // pg-boss 10's insertJob SQL INNER JOINs the new job row against the queue table and returns zero
 // rows (no error, `boss.send` resolves `null`) when the named queue does not exist yet. notify.dispatch
@@ -49,7 +66,7 @@ logger.info({ roles: [...config.roles], kekActive: config.kekRing?.active ?? nul
 // `ticket.triage` regardless; the same gap hits mailbox.sync on a `sync`-role replica missing the KEK
 // ring or MAIL_FROM, which mailbox.poll-sweep's (a) enqueues into unconditionally too, agent.sandbox
 // (whose producer is the API's sandbox-start mutation, on a process that runs no worker roles at all),
-// and send.execute (whose producer is the API's approve mutation, same story). Create all twelve
+// and send.execute (whose producer is the API's approve mutation, same story). Create all fifteen
 // unconditionally at boot, before any role-gated registration, so a send never silently no-ops on a
 // role-partitioned or under-configured replica.
 // Every option below comes from `QUEUE_OPTIONS` (`packages/queue/src/queue-options.ts`) via
@@ -78,6 +95,13 @@ await createQueueRetrying(boss, JOB_NAMES.guidanceSuggest, queueOptionsFor(JOB_N
 // Phase 6: the api's `llm.addCredential`/`probeCredential` and the worker's own `llm.reprobe-sweep`
 // both send it.
 await createQueueRetrying(boss, JOB_NAMES.llmProbe, queueOptionsFor(JOB_NAMES.llmProbe))
+// Phase 7's three: the api's `workspace.requestExport` sends workspace.export, this process's own
+// `workspace.purge-sweep` cron sends workspace.purge, and `pnpm --filter @aesa/worker keys:rotate`
+// (a third process entirely) sends keys.rotate — none of which may depend on which roles happen to
+// be active on the replica that booted first.
+await createQueueRetrying(boss, JOB_NAMES.workspaceExport, queueOptionsFor(JOB_NAMES.workspaceExport))
+await createQueueRetrying(boss, JOB_NAMES.workspacePurge, queueOptionsFor(JOB_NAMES.workspacePurge))
+await createQueueRetrying(boss, JOB_NAMES.keysRotate, queueOptionsFor(JOB_NAMES.keysRotate))
 
 // notify.dispatch's producers span every role (ticket.triage's escalations under `agent`,
 // mailbox.sync/renew-watch's reauth notices and mailbox.poll-sweep's stuck-pending retry under
@@ -96,15 +120,28 @@ if (config.roles.has('cron')) {
   await registerTicketBackstopSweep(boss, { db, logger })
   await registerSweepsDaily(boss, { db, logger })
   await registerStatsRollup(boss, { db, logger })
+  // Phase 7: the nightly retention pass (customer bodies past each workspace's own retention_days,
+  // plus three append-only tables), and the sweep that hands a workspace whose 30-day deletion grace
+  // period has elapsed to `workspace.purge`.
+  await registerRetentionSweep(boss, { db, logger })
+  await registerWorkspacePurgeSweep(boss, { db, logger })
   // Phase 6: every six hours, re-ask each live BYOK credential whether it still works — a key can be
   // revoked or rotated at any time, and without this the workspace finds out from a failed draft.
   await registerLlmReprobeSweep(boss, {
     db, logger, enqueueProbe: (orgId, credentialId, opts) => enqueueLlmProbe(boss, orgId, credentialId, opts),
   })
+  // Phase 7: the nightly billing pass. `stripe: null` (no STRIPE_SECRET_KEY) still runs the local
+  // half — the trial and allowance pages — and counts every Stripe call it could not make;
+  // `loadConfig` refuses a PRODUCTION `cron` replica without the key.
+  await registerBillingReportUsage(boss, {
+    db, logger,
+    stripe: config.stripe ? createStripeUsagePort(config.stripe) : null,
+    enqueueNotify: (orgId, notificationId) => enqueueNotifyDispatch(boss, orgId, notificationId),
+  })
 }
 
 await maybeRegisterAgentRole({
-  boss, db, logger, config,
+  boss, db, pool, logger, config,
   enqueueNotify: (orgId, notificationId) => enqueueNotifyDispatch(boss, orgId, notificationId),
   enqueueDraft: (orgId, ticketId, opts) => enqueueTicketDraft(boss, orgId, ticketId, opts),
   // The auto landing's send. `enqueueSendExecute` resolves the pg-boss job id (or null when the
@@ -116,6 +153,9 @@ await maybeRegisterAgentRole({
 await maybeRegisterKnowledgeRole({
   boss, db, logger, config,
   enqueueEmbedBatch: (orgId, documentId) => enqueueKnowledgeEmbedBatch(boss, orgId, documentId),
+  // Phase 7: the `knowledge` role also owns `workspace.export` and `workspace.purge` — the two jobs
+  // that need the object store but have nothing to do with knowledge. The export pages the owner.
+  enqueueNotify: (orgId, notificationId) => enqueueNotifyDispatch(boss, orgId, notificationId),
 })
 
 // ONE limiter for the whole process, created ABOVE the role branches and shared by `mailbox.sync`
@@ -143,6 +183,9 @@ if (config.roles.has('sync')) {
     )
   } else {
     await registerKeysProvision(boss, { db, ring: config.kekRing })
+    // Phase 7: the KEK re-wrap. It belongs beside keys.provision for the same reason — both hold the
+    // ring, and `sync` is the role that has it.
+    await registerKeysRotate(boss, { db, ring: config.kekRing, logger })
     await registerStoreCredentials(boss, { db })
     await registerRevokeMailbox(boss, { db, ring: config.kekRing, config, logger })
     await registerMailboxRenewWatch(boss, { db, ring: config.kekRing, config, logger })
@@ -161,5 +204,14 @@ if (config.roles.has('sync')) {
 }
 
 for (const sig of ['SIGTERM', 'SIGINT'] as const) {
-  process.on(sig, async () => { await boss.stop({ graceful: true, wait: true }); await pool.end(); process.exit(0) })
+  process.on(sig, async () => {
+    await boss.stop({ graceful: true, wait: true })
+    await pool.end()
+    // Important 3: the transport buffers and sends asynchronously — without this, an event raised
+    // during the shutdown window itself (the job failure that triggered the deploy, an alert()
+    // fired seconds earlier) is dropped rather than delivered. A no-op when Sentry was never
+    // initialised (Sentry.flush resolves `false` immediately with no client).
+    await Sentry.flush(2000)
+    process.exit(0)
+  })
 }

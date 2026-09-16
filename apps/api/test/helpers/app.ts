@@ -33,7 +33,7 @@ const noopEnqueue: EnqueueFn = async () => null
  * what the `req` serializer's redactUrl() actually emitted (review-pages.test.ts). */
 export async function createTestApi(
   overrides: Partial<NodeJS.ProcessEnv> = {},
-  depsOverrides: Partial<Pick<ServerDeps, 'enqueue' | 'mailProviders' | 'verifyGoogleJwt' | 'store'>> = {},
+  depsOverrides: Partial<Pick<ServerDeps, 'enqueue' | 'mailProviders' | 'verifyGoogleJwt' | 'store' | 'stripe'>> = {},
   opts: { logLevel?: string } = {},
 ) {
   const t = await createTestDatabase()
@@ -46,12 +46,16 @@ export async function createTestApi(
   const auth = createAuth({ db: handle.db, config, mail, logger, audit: (orgId, entry) => api.withOrg(orgId, (tx) => audit(tx, entry)) })
   const enqueue = depsOverrides.enqueue ?? noopEnqueue
   const store = depsOverrides.store ?? createMemoryStore()
+  // `stripe` is opt-in per suite: a `createTestApi()` with no override is an api with STRIPE_*
+  // unconfigured, which is exactly what a dev box looks like (and what `/meta` reports as
+  // `billing: false`).
+  const stripe = depsOverrides.stripe ?? null
   const app = buildServer({
-    config, auth, api, mail, logger, enqueue, store,
+    config, auth, api, mail, logger, enqueue, store, stripe,
     mailProviders: depsOverrides.mailProviders,
     verifyGoogleJwt: depsOverrides.verifyGoogleJwt,
   })
-  return { app, config, mail, api, handle, lines, store, close: async () => { await app.close(); await handle.pool.end(); await t.drop() } }
+  return { app, config, mail, api, handle, lines, store, stripe, close: async () => { await app.close(); await handle.pool.end(); await t.drop() } }
 }
 
 /** Deps for suites that never touch the database (error handler, redaction, /meta). Silent by default. */
@@ -64,11 +68,12 @@ export function stubDeps(env: Partial<NodeJS.ProcessEnv> = {}, opts: { level?: s
     resolveMailboxConnection: async () => null,
     resolveMailboxSubscription: async () => null,
     resolveDraftActionToken: async () => null,
+    resolveStripeCustomer: async () => null,
     recordWebhookEvent: async () => { throw new Error('no database in stubDeps') },
     health: async () => ({ db: 'error', migrations: { count: 0, latest: null } }),
   }
   const logger = createAppLogger({ level: opts.level ?? 'silent', stream: opts.stream })
-  return { config, auth, api, mail: createDevSink(), logger, enqueue: noopEnqueue, store: createMemoryStore() }
+  return { config, auth, api, mail: createDevSink(), logger, enqueue: noopEnqueue, store: createMemoryStore(), stripe: null }
 }
 
 /** Email OTP sign-in through the real routes. Returns the session cookie (name=value) and the user. */

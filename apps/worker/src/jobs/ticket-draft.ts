@@ -27,33 +27,34 @@ import {
 } from '@aesa/agent'
 import { DEFAULT_AUTO_SEND_THRESHOLD, MANAGED_MODELS, type LlmEffort } from '@aesa/contracts'
 import {
-  COLD_START_DECISIONS, collectGroundedNumbers, decide, INVARIANTS, QUALITY_CAPS,
-  resolveSetting, THREAD_MAX_MESSAGES_FOR_AUTO, validateReplyBody, type GuardrailResult, type SettingKey,
+  COLD_START_DECISIONS, collectGroundedNumbers, decide, INVARIANTS, isAllowanceExhausted, PLANS, QUALITY_CAPS,
+  resolveSetting, THREAD_MAX_MESSAGES_FOR_AUTO, validateReplyBody, type GuardrailResult,
 } from '@aesa/core'
 import {
-  agentCategoryPolicies, agentRuns, agents, audit, drafts, escalateTicket, mailboxConnections,
-  messages, notifications, orgSettings, platformState, SEND_METERS, tickets, usageCounters, withOrg,
-  type Db, type OrgTx,
+  agentCategoryPolicies, agentRuns, agents, audit, countManagedConversations, drafts, escalateTicket,
+  loadSettingSources, mailboxConnections, messages, notifications, platformState,
+  SEND_METERS, tickets, usageCounters, withOrg,
+  type BillingStateView, type Db, type OrgTx, type SettingSources,
 } from '@aesa/db'
 import { computeCostMicros, findPricing, LlmError, type ChatMeta } from '@aesa/llm'
 // type-only: the base `Retriever` is what this job depends on; this is the shape of the richer one.
 import type { DetailedRetriever } from '@aesa/knowledge'
 import { defineJob, enqueue, JOB_NAMES, registerJob, type RegisteredJobDefinition } from '@aesa/queue'
 import { utcDayString } from '../date-utils.ts'
-import { gateAndRecordRun, readCapsUnlocked } from '../drafting/caps.ts'
+import { noAdmission, type AdmissionPool } from '../drafting/admission.ts'
+import { gateAndRecordRun, readCapsUnlocked, trialBudgetApplies, usdCapToMicros, type SpendCapScope, type UnlockedCaps } from '../drafting/caps.ts'
 import { claimTicket, recordFailure, unwindClaimStamp, type ClaimedTicket } from '../drafting/claim.ts'
 import { loadSharedDraftContext } from '../drafting/context.ts'
 import {
-  applyDraftOutcome, applyEscalateOutcome, applyNoReplyOutcome, DRAFT_ACTOR, LostRaceError, recordLostRace,
+  applyDraftOutcome, applyEscalateOutcome, applyNoReplyOutcome, DRAFT_ACTOR, escalateProviderUnavailable,
+  killCredential, LostRaceError, recordLostRace,
   type DraftLanding, type OutcomeContext,
 } from '../drafting/outcomes.ts'
 import { buildReplyPolicy, personaFor } from '../drafting/policy.ts'
 import { computeEvidence } from '../drafting/evidence.ts'
+import { alert } from '../observability.ts'
 import { appendRunEvent, finishRun } from '../drafting/runs.ts'
-import { notifyProviderHealth } from '../provider-health-notify.ts'
-import {
-  cacheTtlFor, FALLBACK_CODES, markCredentialDead, type ProviderResolver, type ResolvedProvider,
-} from '../provider-resolver.ts'
+import { cacheTtlFor, FALLBACK_CODES, type ProviderResolver } from '../provider-resolver.ts'
 
 /**
  * Spec §Budgets: $0.40 of managed spend per run. Past it the automatic redraft after a guardrail
@@ -85,9 +86,23 @@ const AGENT_CACHE_WINDOW_MS = 60 * 60_000
 /** How long an `org_busy` refusal waits before the job re-enqueues itself. */
 const ORG_BUSY_RETRY_MS = 30_000
 
-/** The once-per-org-per-day page when the whole workspace has spent its daily model budget. */
-const LLM_CAP_TITLE = 'Daily AI budget reached'
-const LLM_CAP_BODY = "Today's AI budget for this workspace is used up. Drafting starts again after midnight UTC."
+/** The once-per-org-per-day page when the whole workspace has spent its DAILY model budget, which
+ *  resets on its own at UTC midnight. The trial's TOTAL budget is the other scope, and it lands
+ *  differently (ruling R27, `escalateTrialBudget` below): per ticket through `escalateTicket`, with
+ *  `escalationCopy('trial_budget')` as the page, plus ONE billing notice per org, ever. */
+const LLM_DAILY_CAP_COPY = {
+  title: 'Daily AI budget reached',
+  body: "Today's AI budget for this workspace is used up. Drafting starts again after midnight UTC.",
+} as const
+
+/** The org-level "subscribe" notice a trial gets ONCE when its total budget is spent — and the
+ *  durable once-per-org gate behind the operator alert (ruling R27: the alert keys on the ORG,
+ *  never the day). `kind: 'billing'`, like the report-usage pass's `billing:trial_ended` and
+ *  `billing:allowance` notices, which say the same kind of thing. */
+const TRIAL_BUDGET_NOTICE = {
+  title: 'Trial AI budget reached',
+  body: 'The AI budget for this trial is used up. Replies wait for you until you subscribe — subscribe to keep the agent drafting.',
+} as const
 
 /**
  * One audit-facing sentence per `escalate` reason the model can return. `escalateTicket`'s
@@ -154,6 +169,10 @@ export interface TicketDraftDeps {
   /** The auto landing's queued send, due when the agent's hold window elapses; index.ts wires
    *  `enqueueSendExecute`. Best-effort — the backstop sweep's due-send arm (d) is the net. */
   enqueueSend: (orgId: string, sendId: string, opts: { startAfter: Date }) => Promise<void>
+  /** Phase 7: the deployment-wide ceiling on concurrent MANAGED model calls (plan deviation 13).
+   *  Omitted is `noAdmission` — no admission control, which is also what `MANAGED_DRAFT_SLOTS=0`
+   *  buys; `agent-role.ts` always passes a real one. A refused slot NEVER fails a draft. */
+  admission?: AdmissionPool
   now?: () => Date
   /** Test seam: the watchdog budget for the WHOLE run (default `INVARIANTS.DRAFT_WATCHDOG_SECONDS`). */
   watchdogMs?: number
@@ -192,14 +211,15 @@ type AgentRow = { [K in keyof typeof AGENT_COLUMNS]: (typeof agents.$inferSelect
 
 interface PreClaim {
   agent: AgentRow | null
-  settings: Partial<Record<SettingKey, unknown>>
-  caps: { ticketRunsToday: number; orgCostMicrosToday: number; orgDraftsToday: number }
-}
-
-function buildOrgSettings(rows: { key: string; value: unknown }[]): Partial<Record<SettingKey, unknown>> {
-  const out: Partial<Record<SettingKey, unknown>> = {}
-  for (const row of rows) out[row.key as SettingKey] = row.value
-  return out
+  /** The org's `org_settings` rows AND its plan's defaults, loaded ONCE for the whole run — every
+   *  `resolveSetting` below reads this object, and so does the locked gate. */
+  sources: SettingSources
+  /** Phase 7: the workspace's plan, state and allowance — `decide()`'s `subscriptionActive`. */
+  billing: BillingStateView
+  /** MANAGED-model conversations this billing period (`ai_handled_conversations_managed`). A BYOK
+   *  reply never counts here, so it can never exhaust the allowance. */
+  managedUsed: number
+  caps: UnlockedCaps
 }
 
 /**
@@ -230,16 +250,22 @@ async function loadPreClaim(db: Db, orgId: string, ticketId: string, now: Date):
           .orderBy(asc(agents.priority), asc(agents.createdAt))
           .limit(1)
 
-    const settingsRows = await tx
-      .select({ key: orgSettings.key, value: orgSettings.value })
-      .from(orgSettings)
-      .where(inArray(orgSettings.key, [
-        'autonomy.daily_draft_cap', 'autonomy.daily_llm_usd_cap',
-        'autonomy.daily_auto_send_cap', 'notifications.push_auto_sends',
-      ]))
-    const settings = buildOrgSettings(settingsRows)
+    const sources = await loadSettingSources(tx, [
+      'autonomy.daily_draft_cap', 'autonomy.daily_llm_usd_cap',
+      'autonomy.daily_auto_send_cap', 'notifications.push_auto_sends',
+    ], now)
 
-    return { agent: agent ?? null, settings, caps: await readCapsUnlocked(tx, { orgId, ticketId, settings, now }) }
+    // Phase 7: the two billing facts `decide()` now takes as facts rather than literals. Read here,
+    // in the pre-claim transaction, so the model call is never what discovers them. The billing
+    // view is the ONE `loadSettingSources` already read (ruling R27) — never a second read of the
+    // row, which could disagree with the caps resolved from the first.
+    const billing = sources.billing
+    const managedUsed = await countManagedConversations(tx, billing.period)
+
+    return {
+      agent: agent ?? null, sources, billing, managedUsed,
+      caps: await readCapsUnlocked(tx, { orgId, ticketId, settings: sources, now }),
+    }
   })
 }
 
@@ -260,66 +286,86 @@ async function escalateRunCapped(deps: TicketDraftDeps, orgId: string, ticketId:
 }
 
 /**
- * Phase 6: the agent's configured provider cannot be produced at all — a dead credential, no KEK
- * ring, a secret row the probe has not written yet, or a managed config on a replica with no
- * platform key. Same discipline as `no_agent`: this happens BEFORE the claim, so there is no stamp,
- * no run row and no spend; the owner gets one page per ticket per UTC day (reason-scoped, because a
- * key that stopped working is materially different from whatever else escalated this ticket today).
- */
-async function escalateProviderUnavailable(
-  deps: TicketDraftDeps, orgId: string, ticketId: string, day: string, now: Date, refusal: string,
-): Promise<void> {
-  deps.logger.warn({ orgId, ticketId, refusal }, 'ticket.draft: no model provider for this agent; escalating provider_unavailable')
-  const notificationId = await withOrg(deps.db, orgId, async (tx) => {
-    const { notificationId } = await escalateTicket(tx, {
-      orgId, ticketId, fromStatus: 'triaged', reason: 'provider_unavailable', day, now,
-      dedupeKey: `provider_unavailable:${ticketId}:${day}`, actor: DRAFT_ACTOR, auditAction: 'ticket.escalated',
-      detail: { refusal },
-    })
-    return notificationId
-  })
-  if (notificationId) await deps.enqueueNotify(orgId, notificationId)
-}
-
-/**
- * Phase 6: the provider rejected the tenant's own key mid-run. `markCredentialDead` is guarded on
- * `health_status <> 'dead'`, so a probe (or another draft) that got there first simply wins and this
- * writes nothing at all — including the page, which belongs to whoever actually flipped the row.
- * Its own short transaction: `notifyProviderHealth` opens another, and neither may span the model call.
- */
-async function killCredential(
-  deps: TicketDraftDeps, orgId: string, config: ResolvedProvider['config'], error: string, now: Date,
-): Promise<void> {
-  const credentialId = config.credentialId
-  if (!credentialId || !config.credential) return
-  const flipped = await withOrg(deps.db, orgId, (tx) => markCredentialDead(tx, orgId, credentialId, error, DRAFT_ACTOR))
-  if (!flipped) return
-  await notifyProviderHealth(
-    { db: deps.db, enqueueNotify: deps.enqueueNotify }, orgId, credentialId, config.credential.label, config.provider, now,
-  )
-}
-
-/**
- * The org-wide daily budget. The ticket is left completely untouched — no stamp, no status change —
+ * The org-wide DAILY budget. The ticket is left completely untouched — no stamp, no status change —
  * so it is selectable again after UTC midnight; the owner gets ONE page per org per day, keyed on
  * the day, with an empty payload (there is no one ticket to deep-link to).
  */
 async function notifyOrgCapped(deps: TicketDraftDeps, orgId: string, day: string): Promise<void> {
+  const dedupeKey = `llm_cap:${orgId}:${day}`
   const notificationId = await withOrg(deps.db, orgId, async (tx) => {
     const [row] = await tx
       .insert(notifications)
-      .values({ orgId, kind: 'escalation', title: LLM_CAP_TITLE, body: LLM_CAP_BODY, dedupeKey: `llm_cap:${orgId}:${day}`, payload: {} })
+      .values({ orgId, kind: 'escalation', title: LLM_DAILY_CAP_COPY.title, body: LLM_DAILY_CAP_COPY.body, dedupeKey, payload: {} })
       .onConflictDoNothing({ target: notifications.dedupeKey })
       .returning({ id: notifications.id })
     return row?.id
   })
-  if (notificationId) await deps.enqueueNotify(orgId, notificationId)
+  if (!notificationId) return
+  // An operator has to see a workspace that has stopped drafting, and a `notifications` row only
+  // reaches its owner. It rides the SAME dedupe the page does (once per org per day): a capped
+  // workspace hits this path on every queued ticket, and an alert per refusal would bury the one
+  // that mattered.
+  alert(deps.logger, 'org_spend_capped', { orgId, scope: 'daily' })
+  await deps.enqueueNotify(orgId, notificationId)
 }
 
-function orgCapReached(settings: Partial<Record<SettingKey, unknown>>, caps: PreClaim['caps']): boolean {
-  const draftCap = resolveSetting('autonomy.daily_draft_cap', { org: settings })
-  const usdCap = resolveSetting('autonomy.daily_llm_usd_cap', { org: settings })
-  return caps.orgDraftsToday >= draftCap || caps.orgCostMicrosToday >= Math.round(usdCap * 1_000_000)
+/**
+ * The trial's TOTAL budget (ruling R27), which only a subscription clears — so unlike the daily cap
+ * the ticket is NOT left `triaged` to be retried: it lands `needs_owner/trial_budget` through
+ * `escalateTicket`, which stamps it out of the backstop sweep's selection (a refusal that left it
+ * untouched re-enqueued it every minute — ~1,440 no-op jobs a day per stranded ticket) and pages
+ * the owner once per ticket, like every other reason. The operator alert keys on the ORG, once:
+ * its durable gate is the org-level billing notice (`llm_cap:trial:<org>`), inserted in the same
+ * transaction — a capped trial hits this path on every new ticket, and an alert per ticket (or per
+ * day, as before) would bury the one that mattered.
+ */
+async function escalateTrialBudget(
+  deps: TicketDraftDeps, orgId: string, ticketId: string, day: string, now: Date, costMicros: number,
+): Promise<void> {
+  const landed = await withOrg(deps.db, orgId, async (tx) => {
+    const { escalated, notificationId } = await escalateTicket(tx, {
+      orgId, ticketId, fromStatus: 'triaged', reason: 'trial_budget', day, now,
+      dedupeKey: `trial_budget:${ticketId}:${day}`, actor: DRAFT_ACTOR, auditAction: 'ticket.escalated',
+      detail: { costMicros },
+    })
+    if (!escalated) return null
+    const [notice] = await tx
+      .insert(notifications)
+      .values({ orgId, kind: 'billing', title: TRIAL_BUDGET_NOTICE.title, body: TRIAL_BUDGET_NOTICE.body, dedupeKey: `llm_cap:trial:${orgId}`, payload: {} })
+      .onConflictDoNothing({ target: notifications.dedupeKey })
+      .returning({ id: notifications.id })
+    return { notificationId, noticeId: notice?.id }
+  })
+  if (!landed) return
+  if (landed.noticeId) {
+    alert(deps.logger, 'org_spend_capped', { orgId, scope: 'trial', ticketId })
+    await deps.enqueueNotify(orgId, landed.noticeId)
+  }
+  if (landed.notificationId) await deps.enqueueNotify(orgId, landed.notificationId)
+}
+
+/** Which landing an org-cap refusal takes (both call sites below): the daily cap leaves the ticket
+ *  untouched, the trial budget escalates it. */
+async function landOrgCapped(
+  deps: TicketDraftDeps, orgId: string, ticketId: string, day: string, now: Date, scope: SpendCapScope, costMicros: number,
+): Promise<void> {
+  if (scope === 'trial') await escalateTrialBudget(deps, orgId, ticketId, day, now, costMicros)
+  else await notifyOrgCapped(deps, orgId, day)
+}
+
+/**
+ * The unlocked mirror of the locked gate's branches 3, 4 and 4b, in the SAME order — a workspace
+ * over both its daily cap and its trial budget must report `daily`, the one that clears by itself.
+ * `null` means nothing is capped. The draft cap has no scope of its own: it lands on the same
+ * `daily` page (it is a per-day ceiling), which is what Phase 3 did too. Branch 4b keys on the
+ * derived billing STATE (`trialBudgetApplies`), never the plan — ruling R27.
+ */
+function orgCapReached(sources: SettingSources, caps: UnlockedCaps): SpendCapScope | null {
+  const draftCap = resolveSetting('autonomy.daily_draft_cap', sources)
+  const usdCap = resolveSetting('autonomy.daily_llm_usd_cap', sources)
+  if (caps.orgDraftsToday >= draftCap || caps.orgCostMicrosToday >= usdCapToMicros(usdCap)) return 'daily'
+  if (trialBudgetApplies(sources.billing) && caps.orgTrialCostMicros >= usdCapToMicros(PLANS.trial.llmUsdBudget)) return 'trial'
+  return null
 }
 
 // -- Rule 6: the run context --
@@ -517,8 +563,9 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
     await escalateRunCapped(deps, orgId, ticketId, day, now, pre.caps.ticketRunsToday)
     return
   }
-  if (orgCapReached(pre.settings, pre.caps)) {
-    await notifyOrgCapped(deps, orgId, day)
+  const preCapScope = orgCapReached(pre.sources, pre.caps)
+  if (preCapScope !== null) {
+    await landOrgCapped(deps, orgId, ticketId, day, now, preCapScope, pre.caps.orgTrialCostMicros)
     return
   }
 
@@ -547,7 +594,7 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
       orgId, ticketId, agentId: agent.id, kind: 'draft',
       provider: config.provider, model: config.model,
       input: { redraft: isRedraft, feedbackChars: (ticket.ownerRedraftFeedback ?? '').length },
-      settings: pre.settings, now,
+      settings: pre.sources, now,
     }))
   if (gate.outcome !== 'proceed') {
     if (gate.outcome === 'ticket_capped') {
@@ -556,13 +603,15 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
       await escalateRunCapped(deps, orgId, ticketId, day, now, gate.runsToday)
       return
     }
-    // Every other refusal leaves the ticket exactly as if the claim had never run.
+    // Every other refusal leaves the ticket exactly as if the claim had never run — except the
+    // trial budget, which escalates it (the stamp is moot there too: the ticket leaves `triaged`).
     await withOrg(deps.db, orgId, (tx) => unwindClaimStamp(tx, ticketId, claim.stampedLastAgentRunAt, claim.priorLastAgentRunAt))
     if (gate.outcome === 'org_busy') {
       await deps.enqueueDraft(orgId, ticketId, { startAfter: new Date(now.getTime() + ORG_BUSY_RETRY_MS) })
       return
     }
-    await notifyOrgCapped(deps, orgId, day)
+    if (gate.outcome === 'org_spend_capped') await landOrgCapped(deps, orgId, ticketId, day, now, gate.scope, gate.costMicros)
+    else await notifyOrgCapped(deps, orgId, day)
     return
   }
   const runId = gate.runId
@@ -684,6 +733,15 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
     // still succeed on the tenant's own provider, and the breakdown's provenance has to describe the
     // attempt whose body was actually stored.
     let fellBack = false
+    // Phase 7's admission slot, around the MODEL CALL alone — never around the trace writes below,
+    // which take a second pool client of their own. A managed call waits for a slot; a BYOK call
+    // bypasses the pool entirely (its budget is the per-credential limiter). `null` means no slot
+    // freed in time, and the run PROCEEDS: an alert, never a lost draft (drafting/admission.ts).
+    const admission = deps.admission ?? noAdmission
+    const slot = config.mode === 'managed' ? await admission.acquire(watchdog) : null
+    if (config.mode === 'managed' && slot === null) {
+      alert(deps.logger, 'admission_slot_timeout', { orgId, runId, attempt })
+    }
     try {
       call = await runDraftCall(resolved.provider, promptInput(guardrailRetry, effort), meta, watchdog)
     } catch (err) {
@@ -714,6 +772,8 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
         )
         fellBack = true
       } else throw err
+    } finally {
+      await slot?.release()
     }
     const pricing = findPricing(call.result.model)
     // A model with no seeded pricing row costs 0 here, which silently disables BOTH the stop-loss
@@ -839,13 +899,25 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
   const threshold =
     replyDecision && ctx.categoryMode === 'auto' ? (ctx.autoSendMinConfidence ?? DEFAULT_AUTO_SEND_THRESHOLD) / 100 : null
 
+  // --- Phase 7's two billing FACTS (plan deviations 6 and 7), computed once and used by both
+  // `decide()` and the breakdown below. `allowanceExhausted` reads the RESOLVED model's mode: a
+  // BYOK agent is never exhausted (it is the owner's own spend), and under `automatic` overage a
+  // standard workspace simply accrues metered units instead of stopping.
+  const allowanceExhausted = isAllowanceExhausted({
+    mode: config.mode,
+    plan: pre.billing.plan,
+    overageMode: pre.billing.overageMode,
+    used: pre.managedUsed,
+    allowance: pre.billing.allowance,
+  })
+
   // --- Rule 14: the autonomy decision, then the landing.
   const verdict = decide({
     platformKillSwitch: false, // rule 1 already returned if the lever were on
     workspaceKillSwitch: ctx.workspaceKillSwitch,
     agentEnabled: ctx.agentEnabled,
     agentActive: agent.status === 'active',
-    subscriptionActive: true,
+    subscriptionActive: pre.billing.active,
     tripwire: false, // a tripwired ticket is never `triaged`, so a draft run can never see one
     outcome: decision.outcome,
     ownerFeedbackPending,
@@ -860,8 +932,8 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
     evidence,
     threshold,
     hasAttachments: ticket.hasAttachments,
-    allowanceExhausted: false,
-    autoSendCapReached: ctx.autoSendsToday >= resolveSetting('autonomy.daily_auto_send_cap', { org: pre.settings }),
+    allowanceExhausted,
+    autoSendCapReached: ctx.autoSendsToday >= resolveSetting('autonomy.daily_auto_send_cap', pre.sources),
     mailboxHealthy: ctx.mailboxHealthy,
   })
   await withOrg(deps.db, orgId, (tx) =>
@@ -911,7 +983,7 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
           decisionReason: verdict.reason,
           delayMin: agent.autoSendDelayMin,
           sendAfter: new Date((deps.now?.() ?? new Date()).getTime() + agent.autoSendDelayMin * 60_000),
-          pushAutoSends: resolveSetting('notifications.push_auto_sends', { org: pre.settings }),
+          pushAutoSends: resolveSetting('notifications.push_auto_sends', pre.sources),
         }
       : verdict.action === 'escalate'
         ? {
@@ -942,7 +1014,14 @@ export async function runTicketDraft(deps: TicketDraftDeps, payload: TicketDraft
           memoryConflict: memoryConflictIds.length > 0,
           unresolvedQuestions: decision.unresolvedQuestions.length > 0,
           threadTooLong: ctx.threadLength > THREAD_MAX_MESSAGES_FOR_AUTO,
-          autoSendCap: ctx.autoSendsToday >= resolveSetting('autonomy.daily_auto_send_cap', { org: pre.settings }),
+          autoSendCap: ctx.autoSendsToday >= resolveSetting('autonomy.daily_auto_send_cap', pre.sources),
+          // Phase 7. The allowance is recorded with the numbers it was judged on, not just a
+          // boolean: "why did this not auto-send?" is answerable from the draft alone.
+          allowance: {
+            used: pre.managedUsed, allowance: pre.billing.allowance,
+            mode: pre.billing.overageMode, exhausted: allowanceExhausted,
+          },
+          subscription: pre.billing.state,
         },
         // The CAPPED model term — what the evidence score was actually built from (Phase 6). The
         // model's own uncapped number is `modelRaw` beside it, and `drafts.confidence` above.

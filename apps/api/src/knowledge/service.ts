@@ -25,14 +25,13 @@ import {
 } from '@aesa/contracts'
 import { resolveSetting } from '@aesa/core'
 import {
-  audit, bumpKnowledgeVersion, knowledgeChunks, knowledgeDocuments, knowledgeSources, workspaces,
+  audit, bumpKnowledgeVersion, knowledgeChunks, knowledgeDocuments, knowledgeSources, loadSettingSources, workspaces,
   type AuditActor, type OrgTx,
 } from '@aesa/db'
 import { uploadKey, type ObjectStore } from '@aesa/knowledge/storage'
 import { normalizeUrl } from '@aesa/knowledge/url'
 import { JOB_NAMES } from '@aesa/queue'
 import type { ApiFacade, EnqueueFn } from '../deps.ts'
-import { loadOrgSettings } from '../org-settings.ts'
 import { isUniqueViolation } from '../pg-error.ts'
 import { computeGaps, type GapsView } from './gaps.ts'
 
@@ -155,9 +154,9 @@ export async function listSources(deps: KnowledgeServiceDeps, orgId: string, can
       flagged: sql<number>`count(*) FILTER (WHERE ${knowledgeChunks.injectionFlagged})`,
     }).from(knowledgeChunks).where(eq(knowledgeChunks.orgId, orgId))
 
-    const settings = await loadOrgSettings(tx, ['knowledge.max_sources', 'knowledge.max_crawl_pages'])
-    const maxSources = resolveSetting('knowledge.max_sources', { org: settings })
-    const maxCrawlPages = resolveSetting('knowledge.max_crawl_pages', { org: settings })
+    const settings = await loadSettingSources(tx, ['knowledge.max_sources', 'knowledge.max_crawl_pages'])
+    const maxSources = resolveSetting('knowledge.max_sources', settings)
+    const maxCrawlPages = resolveSetting('knowledge.max_crawl_pages', settings)
 
     return {
       knowledgeVersion: workspace?.knowledgeVersion ?? 0,
@@ -177,12 +176,11 @@ export async function listSources(deps: KnowledgeServiceDeps, orgId: string, can
  * "Non-failed sources" (controller ruling): `status <> 'failed'` — a failed source doesn't hold a
  * slot, so an owner can always retry after cleaning up.
  *
- * What the cap resolves to TODAY: `resolveSetting` is called with `{ org }` only, so it is the org's
- * own `org_settings` override if it has one and the settings-catalog default otherwise
- * (`knowledge.max_sources` 100, `knowledge.max_crawl_pages` 200). `@aesa/core`'s `planSettingDefaults`
- * exists but has no caller — plan-tier resolution arrives with Phase 7's billing, which owns both the
- * org's `plan` column and the `{ plan }` argument at every `resolveSetting` site. Nothing here claims
- * a plan layer that is not live.
+ * What the cap resolves to: `loadSettingSources` (`@aesa/db`) reads the org's `org_settings` rows AND
+ * the plan defaults for whatever plan `billing_subscriptions` says the workspace is on, so
+ * `resolveSetting` layers org override → plan default → catalog default (`knowledge.max_sources` 100,
+ * `knowledge.max_crawl_pages` 200). Phase 7 turned that plan layer on; before it, only the org's own
+ * rows and the catalog default were consulted.
  *
  * Read-then-insert, with no lock: two concurrent calls that both read `cap − 1` both pass, so the
  * org can land one row over its cap. Deliberately unlike `agents.ts`'s sandbox cap (an
@@ -192,8 +190,8 @@ export async function listSources(deps: KnowledgeServiceDeps, orgId: string, can
  * a lock on every upload/paste/crawl start.
  */
 async function checkSourceCap(tx: OrgTx, orgId: string): Promise<{ ok: true } | SoftFailure> {
-  const settings = await loadOrgSettings(tx, ['knowledge.max_sources'])
-  const cap = resolveSetting('knowledge.max_sources', { org: settings })
+  const settings = await loadSettingSources(tx, ['knowledge.max_sources'])
+  const cap = resolveSetting('knowledge.max_sources', settings)
   const [row] = await tx.select({ value: count() })
     .from(knowledgeSources)
     .where(and(eq(knowledgeSources.orgId, orgId), ne(knowledgeSources.status, 'failed')))
@@ -376,8 +374,8 @@ export async function startCrawl(
   if (url === null) return { ok: false, code: 'bad_request', message: 'Crawls need an https:// address' }
 
   const outcome = await deps.api.withOrg(orgId, async (tx) => {
-    const settings = await loadOrgSettings(tx, ['knowledge.max_sources', 'knowledge.max_crawl_pages'])
-    const pageCap = resolveSetting('knowledge.max_crawl_pages', { org: settings })
+    const settings = await loadSettingSources(tx, ['knowledge.max_sources', 'knowledge.max_crawl_pages'])
+    const pageCap = resolveSetting('knowledge.max_crawl_pages', settings)
 
     const [existing] = await tx.select({ id: knowledgeSources.id, status: knowledgeSources.status })
       .from(knowledgeSources)
@@ -458,8 +456,8 @@ export async function refreshCrawl(
       return { ok: false as const, code: 'bad_request' as const, message: 'source is processing, not ready, failed or queued' }
     }
 
-    const settings = await loadOrgSettings(tx, ['knowledge.max_crawl_pages'])
-    const pageCap = resolveSetting('knowledge.max_crawl_pages', { org: settings })
+    const settings = await loadSettingSources(tx, ['knowledge.max_crawl_pages'])
+    const pageCap = resolveSetting('knowledge.max_crawl_pages', settings)
     // The row's OWN stored budget, only reclamped — `refreshCrawl` takes no `maxPages` input, so
     // there is no caller value to prefer (see `requeueCrawlSource`'s doc comment).
     const maxPages = Math.min(existingMaxPagesOf(source.crawlConfig), pageCap)

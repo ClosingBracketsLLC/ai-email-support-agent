@@ -25,11 +25,16 @@ interface MockTicket {
   agentAddress: string | null; categoryLabel: string | null; redraftCount: number
 }
 
+interface MockMessage {
+  id: string; direction: string; bodyText: string | null; dmarcPass: boolean | null; attachments: unknown
+}
+
 let mockDraft: MockDraft | null = null
 /** When set, every query after the first returns THIS view — the reject→redraft handover (and the
  * window in between, where the live draft is gone and the ticket is back on `triaged`). */
 let mockLater: { draft: MockDraft | null; ticket?: MockTicket } | null = null
 let mockTicket: MockTicket = {} as MockTicket
+let mockMessages: MockMessage[] = []
 let mockTicketQueries = 0
 let mockTicketOpts: { refetchInterval?: unknown } = {}
 let mockUndoUntil = new Date()
@@ -42,6 +47,7 @@ const mockRejectCalls: unknown[] = []
 const mockResumeCalls: unknown[] = []
 const mockResolveCalls: unknown[] = []
 const mockFlagCalls: unknown[] = []
+const mockRememberCalls: unknown[] = []
 
 let mockApproveImpl: (input: unknown) => Promise<unknown> = () => Promise.resolve({})
 let mockHoldImpl: (input: unknown) => Promise<unknown> = () => Promise.resolve({ held: true })
@@ -49,6 +55,9 @@ let mockRejectImpl: (input: unknown) => Promise<unknown> = () => Promise.resolve
 let mockMarkViewedImpl: (input: unknown) => Promise<unknown> = () => Promise.resolve({ viewed: true })
 let mockResumeImpl: (input: unknown) => Promise<unknown> = () => Promise.resolve({ resumed: true })
 let mockResolveImpl: (input: unknown) => Promise<unknown> = () => Promise.resolve({ resolved: true })
+let mockRememberImpl: (input: unknown) => Promise<unknown> = () => Promise.resolve({ ok: true })
+/** The signed-in member's role — `workspace.get`'s, which gates "Remember this reply" (B9). */
+let mockRole = 'owner'
 
 jest.mock('expo-router', () => ({
   useLocalSearchParams: () => ({ id: mockTicketId }),
@@ -68,7 +77,7 @@ jest.mock('@/lib/trpc', () => ({
               const later = mockTicketQueries > 1 ? mockLater : null
               return Promise.resolve({
                 ticket: later?.ticket ?? mockTicket,
-                messages: [],
+                messages: mockMessages,
                 draft: later ? later.draft : mockDraft,
               })
             },
@@ -87,6 +96,12 @@ jest.mock('@/lib/trpc', () => ({
       reject: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => { mockRejectCalls.push(v); return mockRejectImpl(v) }, ...o }) },
       resume: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => { mockResumeCalls.push(v); return mockResumeImpl(v) }, ...o }) },
       flagAutoSent: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => { mockFlagCalls.push(v); return Promise.resolve({ ok: true }) }, ...o }) },
+    },
+    memory: {
+      rememberReply: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => { mockRememberCalls.push(v); return mockRememberImpl(v) }, ...o }) },
+    },
+    workspace: {
+      get: { queryOptions: () => ({ queryKey: ['workspace', 'get'], queryFn: () => Promise.resolve({ businessName: 'Acme', role: mockRole }) }) },
     },
   }),
 }))
@@ -129,17 +144,20 @@ beforeEach(() => {
   }
   mockDraft = pendingDraft({ viewedAt: new Date('2026-01-01T00:00:00Z') })
   mockLater = null
+  mockMessages = []
   mockTicketQueries = 0
   mockTicketOpts = {}
   mockUndoUntil = new Date(Date.now() + 15_000)
+  mockRole = 'owner'
   mockBack.mockReset()
-  for (const calls of [mockMarkViewedCalls, mockApproveCalls, mockHoldCalls, mockRejectCalls, mockResumeCalls, mockResolveCalls, mockFlagCalls]) calls.length = 0
+  for (const calls of [mockMarkViewedCalls, mockApproveCalls, mockHoldCalls, mockRejectCalls, mockResumeCalls, mockResolveCalls, mockFlagCalls, mockRememberCalls]) calls.length = 0
   mockApproveImpl = () => Promise.resolve({ sendId: 'send-1', sendAfter: mockUndoUntil, undoUntil: mockUndoUntil })
   mockHoldImpl = () => Promise.resolve({ held: true })
   mockRejectImpl = () => Promise.resolve({ resolution: 'redraft', guidanceAdded: false })
   mockMarkViewedImpl = () => Promise.resolve({ viewed: true })
   mockResumeImpl = () => Promise.resolve({ resumed: true })
   mockResolveImpl = () => Promise.resolve({ resolved: true })
+  mockRememberImpl = () => Promise.resolve({ ok: true })
 })
 afterEach(async () => { for (const teardown of teardowns.splice(0)) await teardown() })
 
@@ -474,4 +492,78 @@ test('"Should not have sent" flags the auto-sent reply', async () => {
 
   expect(mockFlagCalls).toEqual([{ draftId: mockDraftId }])
   await waitFor(() => expect(screen.getByText('Flagged — the agent will not reuse what it learned here.')).toBeTruthy())
+})
+
+// --- Phase 7: "Remember this reply" — the one-tap backfill from an already-sent message.
+
+const mockOutboundId = '44444444-4444-4444-8444-444444444444'
+const mockInboundId = '55555555-5555-4555-8555-555555555555'
+
+function messages(): MockMessage[] {
+  return [
+    { id: mockInboundId, direction: 'inbound', bodyText: 'Where is my order?', dmarcPass: true, attachments: [] },
+    { id: mockOutboundId, direction: 'outbound', bodyText: 'Your order ships tomorrow.', dmarcPass: null, attachments: [] },
+  ]
+}
+
+test('an outbound bubble offers "Remember this reply"; an inbound one shows no button', async () => {
+  mockMessages = messages()
+  await setup()
+
+  await waitFor(() => expect(screen.getByTestId(`remember-${mockOutboundId}`)).toBeTruthy())
+  expect(screen.queryByTestId(`remember-${mockInboundId}`)).toBeNull()
+})
+
+test('a MEMBER is never offered "Remember this reply" — memory.rememberReply is manager-only, and a FORBIDDEN rendered verbatim is not a button (fix wave B9)', async () => {
+  mockRole = 'member'
+  mockMessages = messages()
+  await setup()
+
+  await waitFor(() => expect(screen.getByTestId('ticket-messages')).toBeTruthy())
+  await waitFor(() => expect(screen.getAllByText('Your order ships tomorrow.').length).toBeGreaterThan(0))
+  // Give the workspace query every chance to land before asserting the button stayed away.
+  await new Promise((r) => setTimeout(r, 20))
+  expect(screen.queryByTestId(`remember-${mockOutboundId}`)).toBeNull()
+  expect(screen.queryByTestId(`remember-${mockInboundId}`)).toBeNull()
+})
+
+/** A promise this test resolves by hand, to keep the mutation pending across a repeated press —
+ * mirrors `create-workspace.test.tsx`'s own `deferred`. */
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((res) => { resolve = res })
+  return { promise, resolve }
+}
+
+test('pressing "Remember this reply" twice while it is still in flight calls the mutation only once, then reports success in the shared note', async () => {
+  mockMessages = messages()
+  const gate = deferred<{ ok: true }>()
+  mockRememberImpl = () => gate.promise
+  await setup()
+  await waitFor(() => expect(screen.getByTestId(`remember-${mockOutboundId}`)).toBeTruthy())
+
+  await fireEvent.press(screen.getByTestId(`remember-${mockOutboundId}`))
+  // TanStack Query's mutation observer notifies React asynchronously — wait for the pending state to
+  // actually land (a real second press while the first request is still in flight) before firing the
+  // next one, which the `isPending` guard must then swallow.
+  await waitFor(() => {
+    const button = screen.getByTestId(`remember-${mockOutboundId}`)
+    expect(button.props.accessibilityState?.disabled ?? button.props.disabled).toBe(true)
+  })
+  await fireEvent.press(screen.getByTestId(`remember-${mockOutboundId}`))
+  expect(mockRememberCalls).toEqual([{ messageId: mockOutboundId }])
+
+  gate.resolve({ ok: true })
+  await waitFor(() => expect(screen.getByText('Saved — the agent can reuse this answer.')).toBeTruthy())
+})
+
+test('a reply that was already remembered says so in the owner\'s own words, in error tone', async () => {
+  mockMessages = messages()
+  mockRememberImpl = () => Promise.reject(Object.assign(new Error('this reply is already remembered'), { data: { code: 'PRECONDITION_FAILED' } }))
+  await setup()
+  await waitFor(() => expect(screen.getByTestId(`remember-${mockOutboundId}`)).toBeTruthy())
+
+  await fireEvent.press(screen.getByTestId(`remember-${mockOutboundId}`))
+
+  await waitFor(() => expect(screen.getByText('this reply is already remembered')).toBeTruthy())
 })

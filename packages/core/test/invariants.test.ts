@@ -21,4 +21,16 @@ describe('invariants', () => {
       'SEND_RELEASE_RETRY_SECONDS (60) must be < SEND_RETRY_DELAY_SECONDS (30) — pg-boss retries a failed send.execute at retryDelay seconds at the earliest, and a row whose send_after is later is not claimable then',
     ])
   })
+  // Phase 7 task 2: a trial budget above what the daily cap can ever let through in 14 days is unreachable.
+  it('catches a trial LLM budget the daily cap could never let through', () => {
+    expect(checkInvariants({ ...INVARIANTS, TRIAL_LLM_USD_BUDGET: 43 })).toEqual([
+      'TRIAL_LLM_USD_BUDGET (43) must be <= TRIAL_DAILY_LLM_USD_CAP (3) * TRIAL_DAYS (14)',
+    ])
+  })
+  // Phase 7 task 2: the runbook promises a week of regret room before a workspace is purged.
+  it('catches a workspace delete grace period under a week', () => {
+    expect(checkInvariants({ ...INVARIANTS, WORKSPACE_DELETE_GRACE_DAYS: 6 })).toEqual([
+      'WORKSPACE_DELETE_GRACE_DAYS (6) must be >= 7',
+    ])
+  })
 })

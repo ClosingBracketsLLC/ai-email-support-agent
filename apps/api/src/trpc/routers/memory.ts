@@ -5,13 +5,13 @@
  * workspace management (`managerProcedure`).
  */
 import { TRPCError } from '@trpc/server'
-import { AnswerIdInput, DeleteByCustomerInput, MemoryListInput } from '@aesa/contracts'
+import { AnswerIdInput, DeleteByCustomerInput, MemoryListInput, RememberReplyInput } from '@aesa/contracts'
 import type { AuditActor } from '@aesa/db'
 import type pino from 'pino'
 import type { ApiFacade, EnqueueFn } from '../../deps.ts'
 import {
-  confirmCandidate, deleteByCustomer, keepAnswer, list, rejectCandidate, retireAnswer, summary,
-  type MemoryActor, type MemoryResult, type MemoryServiceDeps,
+  confirmCandidate, deleteByCustomer, keepAnswer, list, rejectCandidate, rememberReply, retireAnswer, summary,
+  type MemoryActor, type MemoryResult, type MemoryServiceDeps, type RememberReplyResult,
 } from '../../memory/service.ts'
 import { managerProcedure, orgProcedure, router } from '../init.ts'
 
@@ -55,4 +55,24 @@ export const memoryRouter = router({
    * number of answers that matched it comes out. */
   deleteByCustomer: managerProcedure.input(DeleteByCustomerInput).mutation(({ ctx, input }) =>
     deleteByCustomer(serviceDeps(ctx), ctx.orgId, input.email, appActor(ctx))),
+
+  /** Phase 7's "Remember this reply": one already-sent outbound message becomes a learned answer,
+   * through the SAME `memory.capture` job everything else goes through. `{ ok: true }` means the job
+   * is queued — the job re-validates and may still skip (a reply with no question before it). */
+  rememberReply: managerProcedure.input(RememberReplyInput).mutation(async ({ ctx, input }) =>
+    unwrapRemember(await rememberReply(serviceDeps(ctx), ctx.orgId, input.messageId, appActor(ctx)))),
 })
+
+/** Exhaustive with NO `default`, so a new soft code in the service is a compile error rather than a
+ * silent 500. `not_found` covers "another workspace's message" too — telling those apart would leak
+ * whether an id exists elsewhere. The other three are states of the message that a different action
+ * (or none) resolves, never the caller's input being malformed: PRECONDITION_FAILED. */
+function unwrapRemember(res: RememberReplyResult): { ok: true } {
+  if (res.ok) return { ok: true }
+  switch (res.code) {
+    case 'not_found': throw new TRPCError({ code: 'NOT_FOUND', message: 'message not found' })
+    case 'not_outbound': throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'only a reply this workspace sent can be remembered' })
+    case 'already_remembered': throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'this reply is already remembered' })
+    case 'empty': throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'this reply has no text left to remember' })
+  }
+}

@@ -4,7 +4,8 @@ import { eq } from 'drizzle-orm'
 import superjson from 'superjson'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { OPERATING_GUIDANCE_MAX } from '@aesa/contracts'
-import { auditLog, categories, guidanceSuggestions, workspaces } from '@aesa/db'
+import { trialEndsAtFor } from '@aesa/core'
+import { auditLog, billingSubscriptions, categories, guidanceSuggestions, workspaces } from '@aesa/db'
 import type { AppRouter } from '../src/trpc/router.ts'
 import {
   WEB, createTestApi, insertAgent, insertConnectedMailbox, insertTicket, listen, seedPendingDraft, signInWithOtp,
@@ -41,11 +42,26 @@ describe('workspace router', () => {
     const ws = await a.workspace.get.query()
     expect(ws).toMatchObject({ orgId, businessName: 'Acme & Sons', timezone: 'Europe/Berlin', tone: 'friendly', onboardingStep: 'profile', role: 'owner', allowedUrlHosts: [] })
     expect(Object.keys(ws)).not.toContain('boxPublicKey')
+    // Phase 7 widened the view with the lifecycle the owner now controls — and nothing else: the box
+    // key and the customer-hash salt stay server-side (`workspace-lifecycle.test.ts` drives the
+    // procedures that move these).
+    expect(ws).toMatchObject({
+      killSwitch: false, retentionDays: 180, deletionRequestedAt: null, purgeAfter: null,
+      exportState: 'none', exportReadyAt: null,
+    })
+    expect(Object.keys(ws)).not.toContain('customerHashSalt')
+    expect(Object.keys(ws)).not.toContain('exportKey')
     const rows = await t.api.withOrg(orgId, (tx) => tx.select().from(auditLog).where(eq(auditLog.action, 'workspace.create')))
     expect(rows).toHaveLength(1)
     expect(rows[0]).toMatchObject({ actor: `user:${userA.id}`, entityType: 'workspace', entityId: orgId })
     const { rows: org } = await t.handle.pool.query<{ slug: string }>('SELECT slug FROM organization WHERE id = $1', [orgId])
     expect(org[0]!.slug).toMatch(/^acme-sons-[a-z0-9]{4}$/)
+
+    // Phase 7: the billing row exists from birth, on the trial plan with NO clock yet — the trial
+    // starts when the agent is switched on, not when the workspace is made.
+    const billing = await t.api.withOrg(orgId, (tx) => tx.select().from(billingSubscriptions).where(eq(billingSubscriptions.orgId, orgId)))
+    expect(billing).toHaveLength(1)
+    expect(billing[0]).toMatchObject({ plan: 'trial', status: 'trialing', trialEndsAt: null, overageMode: 'automatic', domainQuantity: 0 })
   })
 
   it('updateProfile derives the allowed hosts and moves profile → mailbox exactly once', async () => {
@@ -129,6 +145,35 @@ describe('workspace router', () => {
     const disabledRows = await t.api.withOrg(orgId, (tx) => tx.select().from(auditLog).where(eq(auditLog.action, 'workspace.agent_disabled')))
     expect(disabledRows).toHaveLength(1)
     expect(disabledRows[0]).toMatchObject({ actor: `user:${owner.user.id}`, entityType: 'workspace', entityId: orgId })
+  })
+
+  it('setAgentEnabled(true) stamps the 14-day trial clock once — a later off/on flip never restarts it', async () => {
+    const owner = await signInWithOtp(t.app, t.mail, 'trialclock@example.com', 'Trial')
+    const c = client(base, owner.cookie)
+    const { orgId } = await c.workspace.create.mutate({ businessName: 'Trial Co', timezone: 'UTC' })
+    const billingRow = async () => (await t.api.withOrg(orgId, (tx) =>
+      tx.select().from(billingSubscriptions).where(eq(billingSubscriptions.orgId, orgId))))[0]!
+
+    expect((await billingRow()).trialEndsAt).toBeNull()
+
+    const res = await c.workspace.setAgentEnabled.mutate({ enabled: true })
+    const stampedTrial = (await billingRow()).trialEndsAt!
+    expect(stampedTrial).toBeInstanceOf(Date)
+    // `trialEndsAtFor` (@aesa/core) is agentEnabledAt + BILLING_PRICING.trialDays; both are stamped
+    // from the SAME transaction's now(), so they agree to the millisecond.
+    expect(stampedTrial.getTime()).toBe(trialEndsAtFor(res.agentEnabledAt!).getTime())
+
+    await c.workspace.setAgentEnabled.mutate({ enabled: false })
+    await c.workspace.setAgentEnabled.mutate({ enabled: true })
+    expect((await billingRow()).trialEndsAt!.getTime()).toBe(stampedTrial.getTime())
+
+    // Disabling alone never stamps one on a workspace that was never enabled.
+    const fresh = await signInWithOtp(t.app, t.mail, 'trialclock2@example.com', 'Trial2')
+    const c2 = client(base, fresh.cookie)
+    const { orgId: orgId2 } = await c2.workspace.create.mutate({ businessName: 'Trial Co 2', timezone: 'UTC' })
+    await c2.workspace.setAgentEnabled.mutate({ enabled: false })
+    const [row2] = await t.api.withOrg(orgId2, (tx) => tx.select().from(billingSubscriptions).where(eq(billingSubscriptions.orgId, orgId2)))
+    expect(row2!.trialEndsAt).toBeNull()
   })
 
   it('setAgentEnabled: a member (not manager) is FORBIDDEN', async () => {

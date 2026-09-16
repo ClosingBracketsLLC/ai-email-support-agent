@@ -1,3 +1,6 @@
+import { WORKSPACE_DELETE_GRACE_DAYS } from '@aesa/contracts'
+import { PLANS } from './plans.ts'
+
 /**
  * The margin between a job's pg-boss expiry and the AbortSignal deadline defineJob() gives its handler.
  * @aesa/queue imports this one: two copies would let the boot invariant pass while the real deadline drifts.
@@ -21,6 +24,17 @@ export const INVARIANTS = {
   DRAFT_JOB_EXPIRE_SECONDS: 600,
   DRAFT_WATCHDOG_SECONDS: 240,
   JOB_SIGNAL_MARGIN_SECONDS,
+  /** Total Managed-AI spend a trial may cost the platform, USD (`PLANS.trial.llmUsdBudget`, itself
+   *  `BILLING_PRICING.trialLlmUsdBudget`) — must fit under what the daily cap can let through across
+   *  the whole trial, or the budget number is theatre. */
+  TRIAL_LLM_USD_BUDGET: PLANS.trial.llmUsdBudget,
+  /** `autonomy.daily_llm_usd_cap`'s trial-plan default (`PLANS.trial.dailyLlmUsdCap`). */
+  TRIAL_DAILY_LLM_USD_CAP: PLANS.trial.dailyLlmUsdCap,
+  /** `PLANS.trial.trialDays`, itself `BILLING_PRICING.trialDays`. */
+  TRIAL_DAYS: PLANS.trial.trialDays,
+  /** Days a deleted workspace's data is retained before `workspace.purge` runs it for real
+   *  (`@aesa/contracts`'s `WORKSPACE_DELETE_GRACE_DAYS`) — the runbook promises a week of regret room. */
+  WORKSPACE_DELETE_GRACE_DAYS,
 } as const
 
 export function checkInvariants(v: Record<keyof typeof INVARIANTS, number>): string[] {
@@ -35,6 +49,10 @@ export function checkInvariants(v: Record<keyof typeof INVARIANTS, number>): str
       + 'pg-boss retries a failed send.execute at retryDelay seconds at the earliest, and a row whose send_after is later is not claimable then')
   if (v.DRAFT_WATCHDOG_SECONDS + v.JOB_SIGNAL_MARGIN_SECONDS >= v.DRAFT_JOB_EXPIRE_SECONDS)
     violations.push(`DRAFT_WATCHDOG_SECONDS + JOB_SIGNAL_MARGIN_SECONDS must be < DRAFT_JOB_EXPIRE_SECONDS`)
+  if (v.TRIAL_LLM_USD_BUDGET > v.TRIAL_DAILY_LLM_USD_CAP * v.TRIAL_DAYS)
+    violations.push(`TRIAL_LLM_USD_BUDGET (${v.TRIAL_LLM_USD_BUDGET}) must be <= TRIAL_DAILY_LLM_USD_CAP (${v.TRIAL_DAILY_LLM_USD_CAP}) * TRIAL_DAYS (${v.TRIAL_DAYS})`)
+  if (v.WORKSPACE_DELETE_GRACE_DAYS < 7)
+    violations.push(`WORKSPACE_DELETE_GRACE_DAYS (${v.WORKSPACE_DELETE_GRACE_DAYS}) must be >= 7`)
   return violations
 }
 

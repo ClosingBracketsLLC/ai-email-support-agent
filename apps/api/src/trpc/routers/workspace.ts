@@ -1,15 +1,25 @@
 import { TRPCError } from '@trpc/server'
 import { APIError } from 'better-auth/api'
 import { and, asc, count, desc, eq, inArray, sql } from 'drizzle-orm'
+import type pino from 'pino'
 import {
-  CreateWorkspaceInput, OPERATING_GUIDANCE_MAX, SetAgentEnabledInput, SuggestionIdInput, UpdateGuidanceInput,
+  CreateWorkspaceInput, OPERATING_GUIDANCE_MAX, RequestDeletionInput, SetAgentEnabledInput,
+  SetKillSwitchInput, SetRetentionDaysInput, SuggestionIdInput, UpdateGuidanceInput, WORKSPACE_ERROR_MESSAGES,
   deriveAllowedHosts, isOnboardingStep, nextOnboardingStep, slugify,
-  UpdateProfileInput, type OnboardingStep, type Tone,
+  UpdateProfileInput, type ExportState, type OnboardingStep, type Tone,
 } from '@aesa/contracts'
-import { agents, audit, categories, drafts, guidanceSuggestions, tickets, workspaces } from '@aesa/db'
+import { trialEndsAtFor } from '@aesa/core'
+import { agents, audit, billingSubscriptions, categories, drafts, ensureBillingRow, guidanceSuggestions, tickets, workspaces, type AuditActor } from '@aesa/db'
+import type { ObjectStore } from '@aesa/knowledge/storage'
 import type { Auth } from '../../auth.ts'
+import type { StripePort } from '../../billing/stripe.ts'
+import type { ApiFacade, EnqueueFn } from '../../deps.ts'
+import {
+  cancelDeletion, exportStatus, purgeAfterFor, requestDeletion, requestExport, setKillSwitch, setRetentionDays,
+  type LifecycleActor, type LifecycleDeps,
+} from '../../workspace/lifecycle.ts'
 import { mapAuthError } from '../auth-errors.ts'
-import { authedProcedure, managerProcedure, orgProcedure, router } from '../init.ts'
+import { authedProcedure, managerProcedure, orgProcedure, ownerProcedure, router } from '../init.ts'
 
 /** The "live" draft statuses — the same set `drafts_live_per_ticket_uidx` (migration 0011) enforces
  * one-per-ticket over. `goLiveStatus`'s `firstDraft` is the newest of these, org-wide. */
@@ -28,17 +38,53 @@ export interface WorkspaceView {
   orgId: string; businessName: string; websiteUrl: string | null; description: string | null; tone: Tone
   timezone: string; locale: string; contactPhone: string | null; contactUrls: string[]; allowedUrlHosts: string[]
   operatingGuidance: string; agentEnabled: boolean; agentEnabledAt: Date | null; onboardingStep: OnboardingStep; createdAt: Date
+  /** Phase 7's lifecycle, all of it the OWNER's to see (Settings → Workspace renders every field;
+   * `workspace.get` itself stays `orgProcedure`, because a teammate needs to know the agent is
+   * stopped or the workspace is on its way out). `purgeAfter` is derived, never stored. */
+  killSwitch: boolean; retentionDays: number
+  deletionRequestedAt: Date | null; purgeAfter: Date | null
+  exportState: ExportState; exportReadyAt: Date | null
 }
 
-/** The client-facing shape. Never the box key, never the kill switch internals. */
+/** The client-facing shape. Never the box key, never the customer-hash salt — and never
+ * `export_key` either, which is an object-store path the owner reaches only through a presigned URL
+ * (`workspace.exportStatus`). The KILL SWITCH is on the view since Phase 7: it is the owner's own
+ * control, and a workspace that has stopped sending has to be able to say so. */
 export function toWorkspaceView(w: WorkspaceRow): WorkspaceView {
   return {
     orgId: w.orgId, businessName: w.businessName, websiteUrl: w.websiteUrl, description: w.description, tone: w.tone as Tone,
     timezone: w.timezone, locale: w.locale, contactPhone: w.contactPhone, contactUrls: w.contactUrls, allowedUrlHosts: w.allowedUrlHosts,
     operatingGuidance: w.operatingGuidance, agentEnabled: w.agentEnabled, agentEnabledAt: w.agentEnabledAt,
     onboardingStep: isOnboardingStep(w.onboardingStep) ? w.onboardingStep : 'profile', createdAt: w.createdAt,
+    killSwitch: w.killSwitch, retentionDays: w.retentionDays,
+    deletionRequestedAt: w.deletionRequestedAt,
+    purgeAfter: w.deletionRequestedAt ? purgeAfterFor(w.deletionRequestedAt) : null,
+    exportState: w.exportState as ExportState, exportReadyAt: w.exportReadyAt,
   }
 }
+
+/** The slice of the tRPC context `src/workspace/lifecycle.ts` needs — structural, so the real
+ * context just satisfies it (the same shape `routers/billing.ts` and `routers/memory.ts` use). */
+interface LifecycleContext {
+  deps: { api: ApiFacade; enqueue: EnqueueFn; logger: pino.Logger; stripe: StripePort | null; store: ObjectStore }
+  user: { id: string }
+  actor: AuditActor
+  ip: string
+  userAgent: string | null
+}
+
+const lifecycleDeps = (ctx: LifecycleContext): LifecycleDeps => ({
+  api: ctx.deps.api, enqueue: ctx.deps.enqueue, logger: ctx.deps.logger, stripe: ctx.deps.stripe, store: ctx.deps.store,
+})
+const lifecycleActor = (ctx: LifecycleContext): LifecycleActor =>
+  ({ userId: ctx.user.id, actor: ctx.actor, ip: ctx.ip, userAgent: ctx.userAgent })
+
+/** `confirm_mismatch` is the caller's own input being wrong — BAD_REQUEST. `deletion_pending`,
+ * `not_pending` and `export_in_progress` are states of the workspace that a different action clears
+ * (cancel the deletion; request one first; wait for the export) — PRECONDITION_FAILED.
+ * `billing_cancel_failed` is Stripe being unreachable or refusing, which is a BAD_GATEWAY and the
+ * one code the screen may offer a plain "try again" for. */
+const precondition = (message: string): TRPCError => new TRPCError({ code: 'PRECONDITION_FAILED', message })
 
 /** Better Auth owns the organization row; the slug is unique, so retry with a fresh suffix on collision. */
 async function createOrganizationWithFreshSlug(auth: Auth, headers: Headers, name: string): Promise<{ id: string }> {
@@ -82,6 +128,12 @@ export const workspaceRouter = router({
     }
     await ctx.deps.api.withOrg(org.id, async (tx) => {
       await tx.insert(workspaces).values({ orgId: org.id, businessName: input.businessName, timezone: input.timezone })
+      // Phase 7: every workspace owns a `billing_subscriptions` row from birth — on the trial plan,
+      // with no trial CLOCK yet (`trial_ends_at` is stamped by `setAgentEnabled`, below). A missing
+      // row already reads as a fresh trial through `readBillingState`, so this is not what makes
+      // billing work; it is what makes the row that Stripe's webhook and the overage sweep UPDATE
+      // exist before either of them needs it.
+      await ensureBillingRow(tx)
       await audit(tx, { actor: ctx.actor, action: 'workspace.create', entityType: 'workspace', entityId: org.id, detail: { businessName: input.businessName }, ip: ctx.ip, userAgent: ctx.userAgent })
     })
     return { orgId: org.id }
@@ -147,15 +199,44 @@ export const workspaceRouter = router({
    * timestamp survives every later on/off flip.
    */
   setAgentEnabled: managerProcedure.input(SetAgentEnabledInput).mutation(async ({ ctx, input }) => {
+    const now = new Date()
     const updated = await ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
-      const [current] = await tx.select({ onboardingStep: workspaces.onboardingStep }).from(workspaces).where(eq(workspaces.orgId, ctx.orgId))
+      const [current] = await tx
+        .select({ onboardingStep: workspaces.onboardingStep, deletionRequestedAt: workspaces.deletionRequestedAt })
+        .from(workspaces).where(eq(workspaces.orgId, ctx.orgId))
       if (!current) throw new TRPCError({ code: 'NOT_FOUND', message: 'workspace not created yet' })
+      // A workspace on its way out stays off (fix wave): `requestDeletion` switched the agent off
+      // for the whole grace period, and an admin turning managed drafting back on meanwhile would
+      // spend against a workspace that is about to be erased. `cancelDeletion` lifts this.
+      if (input.enabled && current.deletionRequestedAt !== null) {
+        throw new TRPCError({ code: 'PRECONDITION_FAILED', message: WORKSPACE_ERROR_MESSAGES.deletion_pending })
+      }
       const onboardingStep = input.enabled && current.onboardingStep === 'go_live' ? 'done' : current.onboardingStep
 
       const patch: Record<string, unknown> = { agentEnabled: input.enabled, onboardingStep }
-      if (input.enabled) patch.agentEnabledAt = sql`COALESCE(${workspaces.agentEnabledAt}, now())`
+      if (input.enabled) patch.agentEnabledAt = sql`COALESCE(${workspaces.agentEnabledAt}, ${now}::timestamptz)`
 
       const [row] = await tx.update(workspaces).set(patch).where(eq(workspaces.orgId, ctx.orgId)).returning()
+
+      // Phase 7: enabling the agent is what starts the trial CLOCK — the same COALESCE idiom as
+      // `agentEnabledAt` above and for the same reason: the workspace's first-ever enable is the
+      // trial's start, and every later off/on flip leaves it alone (a trial cannot be restarted by
+      // toggling the switch). `ensureBillingRow` first, so a workspace created before Phase 7 has a
+      // row for the UPDATE to hit. `trialEndsAt` stays NULL until then, which `billingStateOf`
+      // reads as "trialing, no expiry yet" — a workspace that never went live never runs out.
+      //
+      // The clock is `trialEndsAtFor(agent_enabled_at)` — the ONE formula (`@aesa/core`), computed
+      // from the stamp the row now carries rather than from a second `now()`: migration 0025's
+      // backfill and this write therefore agree to the millisecond, and a workspace whose first
+      // enable predates the row (a NULL clock beside an old `agent_enabled_at`) gets the clock that
+      // enable earned, never a fresh fourteen days.
+      if (input.enabled) {
+        await ensureBillingRow(tx)
+        await tx.update(billingSubscriptions)
+          .set({ trialEndsAt: sql`COALESCE(${billingSubscriptions.trialEndsAt}, ${trialEndsAtFor(row!.agentEnabledAt ?? now)}::timestamptz)` })
+          .where(eq(billingSubscriptions.orgId, ctx.orgId))
+      }
+
       await audit(tx, {
         actor: ctx.actor, action: input.enabled ? 'workspace.agent_enabled' : 'workspace.agent_disabled',
         entityType: 'workspace', entityId: ctx.orgId, detail: { onboardingStep }, ip: ctx.ip, userAgent: ctx.userAgent,
@@ -284,4 +365,64 @@ export const workspaceRouter = router({
       }
     }),
   ),
+
+  // -----------------------------------------------------------------------------------------
+  // Phase 7's lifecycle — thin wrappers over `src/workspace/lifecycle.ts`. Every MUTATION here is
+  // `ownerProcedure`: an ADMIN manages the workspace (mailboxes, guidance, the agent switch), but
+  // only the OWNER stops it dead, changes how long it keeps customer mail, exports it, or deletes
+  // it. `exportStatus` alone is `orgProcedure` — whether the export finished is not a privileged
+  // fact, and the bundle itself is behind a presigned URL that only that query ever mints.
+  // -----------------------------------------------------------------------------------------
+
+  /** "Stop sending, now" — the switch `send.execute`, `drafts.approve` and the review pages already
+   * obey. Nothing downstream changes; this is only the owner's hand on it. */
+  setKillSwitch: ownerProcedure.input(SetKillSwitchInput).mutation(({ ctx, input }) =>
+    setKillSwitch(lifecycleDeps(ctx), ctx.orgId, input.on, lifecycleActor(ctx))),
+
+  /** How long this workspace keeps message bodies; `retention.sweep` purges past it nightly. */
+  setRetentionDays: ownerProcedure.input(SetRetentionDaysInput).mutation(({ ctx, input }) =>
+    setRetentionDays(lifecycleDeps(ctx), ctx.orgId, input.retentionDays, lifecycleActor(ctx))),
+
+  /** The one irreversible thing the app can start. `confirm` must be the business name EXACTLY, a
+   * live Stripe subscription is cancelled BEFORE anything is written, and a failure there refuses
+   * the deletion outright rather than scheduling a purge on a card that keeps being charged. */
+  requestDeletion: ownerProcedure.input(RequestDeletionInput).mutation(async ({ ctx, input }) => {
+    const res = await requestDeletion(lifecycleDeps(ctx), ctx.orgId, input.confirm, lifecycleActor(ctx))
+    if (res.ok) return { purgeAfter: res.purgeAfter, subscriptionCancelled: res.subscriptionCancelled }
+    switch (res.code) {
+      case 'confirm_mismatch': throw new TRPCError({ code: 'BAD_REQUEST', message: WORKSPACE_ERROR_MESSAGES.confirm_mismatch })
+      case 'deletion_pending': throw precondition(WORKSPACE_ERROR_MESSAGES.deletion_pending)
+      case 'billing_cancel_failed': throw new TRPCError({ code: 'BAD_GATEWAY', message: WORKSPACE_ERROR_MESSAGES.billing_cancel_failed })
+    }
+  }),
+
+  /** "Actually, keep it." Clears the stamps alone — the kill switch stays on, the agent stays off,
+   * and a subscription Stripe ended when the deletion was requested stays ended. `needsResubscribe`
+   * is what lets the screen point the owner at Billing; it is a STATE ("no active plan, one on
+   * file"), deliberately not `requestDeletion`'s causal `subscriptionCancelled` (ruling R23). */
+  cancelDeletion: ownerProcedure.mutation(async ({ ctx }) => {
+    const res = await cancelDeletion(lifecycleDeps(ctx), ctx.orgId, lifecycleActor(ctx))
+    if (res.ok) return { ok: true as const, needsResubscribe: res.needsResubscribe }
+    switch (res.code) {
+      case 'not_pending': throw precondition(WORKSPACE_ERROR_MESSAGES.not_pending)
+    }
+  }),
+
+  /** Queues `workspace.export`. Refuses while one is still `queued` (ruling R16) — see the service's
+   * own comment: moving `export_key` under a job in flight makes that job fail the owner's newest
+   * request. */
+  requestExport: ownerProcedure.mutation(async ({ ctx }) => {
+    const res = await requestExport(lifecycleDeps(ctx), ctx.orgId, lifecycleActor(ctx))
+    if (res.ok) return { exportId: res.exportId }
+    switch (res.code) {
+      case 'export_in_progress': throw precondition(WORKSPACE_ERROR_MESSAGES.export_in_progress)
+    }
+  }),
+
+  /** The export screen's poll target — and the only way the bundle's bytes are ever reachable: a
+   * presigned GET, valid for seven days, issued only once the worker has landed `ready`.
+   * `orgProcedure` because knowing whether the export FINISHED is not a privileged fact — but the
+   * bundle carries the complete audit log and the Stripe ids, so the service mints the URL for the
+   * OWNER alone and hands every other member `url: null`. */
+  exportStatus: orgProcedure.query(({ ctx }) => exportStatus(lifecycleDeps(ctx), ctx.orgId, ctx.member.role)),
 })

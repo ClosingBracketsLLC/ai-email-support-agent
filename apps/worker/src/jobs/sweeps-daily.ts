@@ -25,31 +25,54 @@
  * (f)'s "does any cited chunk no longer exist" predicate has no drizzle query-builder shape (it
  * needs `unnest`), so it is raw SQL, same discipline `apps/api/src/knowledge/gaps.ts` uses for its
  * own hand-written query: every identifier is a literal table/column name, every value a bound
- * parameter. All three write their audit trail through `auditMemoryArm`, which groups the returned
+ * parameter. All three write their audit trail through `auditPerOrgArm`, which groups the returned
  * rows by `orgId` so a platform-wide sweep still leaves ONE audit row per ORG per arm, never one
- * giant cross-tenant row.
+ * giant cross-tenant row. That helper is EXPORTED (it is no longer memory-specific): Phase 7's
+ * `retention.sweep` is a second platform-wide pass with the same per-org audit shape, and it imports
+ * this one rather than carrying a copy that could drift from it.
+ *
+ * (g)/(h) — Phase 7's two age-based deletes — are plain guarded bulk `DELETE`s, unscoped by `orgId`
+ * like the arms above them. (g) needs `agent_runs_started_idx` (migration 0021): the platform-wide
+ * age scan does not lead with `org_id`, so the tenant-first indexes `agent_runs` already carries
+ * (`agent_runs_org_ticket_idx`, `agent_runs_org_status_idx`) do not serve it. (h) targets exactly the
+ * `platform.access` rows `withPlatform` stamps on every call — including this very sweep's own — and
+ * leaves every tenant `audit_log` row alone regardless of age. That trail is `retention.sweep`'s
+ * (730 days, `org_id IS NOT NULL`), and the two arms are deliberately disjoint on that column so
+ * neither cron can delete a row the other is responsible for.
  */
-import { and, eq, inArray, lt, sql } from 'drizzle-orm'
+import { and, eq, getTableName, inArray, isNull, lt, sql } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import { MEMORY_CANDIDATE_MAX_AGE_DAYS } from '@aesa/core'
 import {
-  agentRunEvents, auditLog, draftActionTokens, drafts, escalateTicket, resolvedAnswers, withOrgIdentity, withPlatform,
-  type Db, type EscalateTicketParams, type OrgTx, type PlatformTx,
+  agentRunEvents, agentRuns, auditLog, draftActionTokens, drafts, escalateTicket, resolvedAnswers, withOrgIdentity, withPlatform,
+  type AuditActor, type Db, type EscalateTicketParams, type OrgTx, type PlatformTx,
 } from '@aesa/db'
 import { registerCron } from '@aesa/queue'
 import { utcDayString } from '../date-utils.ts'
 import { errorMessage } from '../err-message.ts'
 import { enqueueNotifyDispatch } from './notify-dispatch.ts'
+import { deleteAged } from './retention-sweep.ts'
 
-/** How long `agent_run_events` traces are kept; `agent_runs` rows themselves are never pruned. */
+/** How long `agent_run_events` traces are kept on a SURVIVING run; a run older than
+ *  `AGENT_RUN_RETENTION_DAYS` is deleted outright and takes its events with it (FK cascade). */
 export const RUN_EVENT_RETENTION_DAYS = 30
 
 /** How long a `draft_action_tokens` row is kept PAST its own `expires_at` (not from creation) —
  *  a consumed or unconsumed token is harmless once expired; this just caps table growth. */
 export const ACTION_TOKEN_RETENTION_DAYS = 7
 
-const SWEEP_ACTOR = 'system:cron:sweeps.daily' as const
+/** How long an `agent_runs` row is kept, finished or not (arm g). Phase 6 made `ticket.triage`
+ *  write one run row per inbound email; a run this old is bookkeeping nobody reads — Activity and
+ *  `stats.rollup` read `drafts`, and `llm_calls` carries the money — and a `running` row this old is
+ *  an abandoned crash, not a run in flight. */
+export const AGENT_RUN_RETENTION_DAYS = 90
+
+/** How long a platform-wide `platform.access` `audit_log` row (every `withPlatform()` call writes
+ *  one) is kept (arm h): provenance for 30 days, then noise beside the 2-year tenant trail. */
+export const PLATFORM_ACCESS_AUDIT_RETENTION_DAYS = 30
+
+const SWEEP_ACTOR: AuditActor = 'system:cron:sweeps.daily'
 
 export interface SweepsDailyDeps {
   db: Db
@@ -66,20 +89,42 @@ interface ExpiredDraftRow {
   ticketId: string
 }
 
-/** One audit row per DISTINCT `orgId` among `rows`, each carrying that org's own count — never one
- *  row per updated answer, and never one cross-tenant row for the whole arm. A no-op when `rows` is
- *  empty (an arm that touched nothing writes nothing). */
-async function auditMemoryArm(
-  tx: PlatformTx, arm: string, action: 'memory.retired' | 'memory.needs_review', rows: { orgId: string }[],
+/**
+ * One audit row per DISTINCT org, each carrying that org's own count — never one row per touched
+ * row, and never one cross-tenant row for the whole arm. A no-op when there is nothing to report (an
+ * arm that touched nothing writes nothing).
+ *
+ * Exported and actor-parameterized for Phase 7's `retention.sweep`, which is the same shape: a
+ * platform-wide pass whose per-org effects each want ONE audit row. `actor` is the caller's because
+ * the two passes are different jobs, and an audit trail that named the wrong one would be worse than
+ * no trail at all.
+ *
+ * `counts` takes EITHER form, because the two callers genuinely have different things in hand and
+ * neither should have to fake the other's: this file's arms hold the rows they updated (a
+ * `RETURNING { orgId }`, which is why the array form carries only that field), while a bulk
+ * `UPDATE … WHERE org_id = $1` arm already knows its count and has no rows to show — making it
+ * materialise one object per purged row just to have them counted back down was the allocation the
+ * map form removes. There is still exactly ONE implementation of the grouping rule.
+ */
+export async function auditPerOrgArm(
+  tx: PlatformTx, actor: AuditActor, arm: string, action: string,
+  counts: { orgId: string }[] | ReadonlyMap<string, number>,
 ): Promise<void> {
-  if (rows.length === 0) return
+  const byOrg = Array.isArray(counts) ? tallyByOrg(counts) : counts
+  // A zero count writes NO row: "an arm that touched nothing writes nothing" has to keep holding for
+  // the map form, where a caller naturally hands over `{ org → 0 }` rather than an empty collection.
+  // The array form can never produce a zero (a row counts one), so this changes nothing for it.
+  const values = [...byOrg.entries()]
+    .filter(([, cnt]) => cnt > 0)
+    .map(([orgId, cnt]) => ({ orgId, actor, action, entityType: 'workspace', entityId: orgId, detail: { arm, count: cnt } }))
+  if (values.length === 0) return
+  await tx.insert(auditLog).values(values)
+}
+
+function tallyByOrg(rows: { orgId: string }[]): Map<string, number> {
   const counts = new Map<string, number>()
   for (const r of rows) counts.set(r.orgId, (counts.get(r.orgId) ?? 0) + 1)
-  await tx.insert(auditLog).values(
-    [...counts.entries()].map(([orgId, cnt]) => ({
-      orgId, actor: SWEEP_ACTOR, action, entityType: 'workspace', entityId: orgId, detail: { arm, count: cnt },
-    })),
-  )
+  return counts
 }
 
 export async function runSweepsDaily(
@@ -88,6 +133,7 @@ export async function runSweepsDaily(
 ): Promise<{
   expiredDrafts: number; eventsDeleted: number; tokensDeleted: number
   answersExpired: number; candidatesRetired: number; answersSourceChanged: number
+  runsDeleted: number; platformAuditDeleted: number
 }> {
   const now = deps.now?.() ?? new Date()
   const day = utcDayString(now)
@@ -99,6 +145,8 @@ export async function runSweepsDaily(
   let answersExpired = 0
   let candidatesRetired = 0
   let answersSourceChanged = 0
+  let runsDeleted = 0
+  let platformAuditDeleted = 0
 
   await withPlatform(deps.db, 'cron:sweeps.daily', async (tx) => {
     // (a) draft expiry — two guarded bulk UPDATEs (see file header for why not one pre-SELECT).
@@ -142,7 +190,8 @@ export async function runSweepsDaily(
       }
     }
 
-    // (b) agent_run_events retention — the run rows themselves are never pruned.
+    // (b) agent_run_events retention — the run rows themselves outlive their events: arm (g) prunes
+    //     them at AGENT_RUN_RETENTION_DAYS, well past this cutoff.
     const eventCutoff = new Date(now.getTime() - RUN_EVENT_RETENTION_DAYS * 24 * 60 * 60_000)
     const deletedEvents = await tx.delete(agentRunEvents).where(lt(agentRunEvents.createdAt, eventCutoff)).returning({ id: agentRunEvents.id })
     eventsDeleted = deletedEvents.length
@@ -151,6 +200,24 @@ export async function runSweepsDaily(
     const tokenCutoff = new Date(now.getTime() - ACTION_TOKEN_RETENTION_DAYS * 24 * 60 * 60_000)
     const deletedTokens = await tx.delete(draftActionTokens).where(lt(draftActionTokens.expiresAt, tokenCutoff)).returning({ id: draftActionTokens.id })
     tokensDeleted = deletedTokens.length
+
+    // (g) agent_runs retention — Phase 6 made ticket.triage write one run row per inbound email; a run
+    //     older than AGENT_RUN_RETENTION_DAYS is bookkeeping nobody reads (Activity and the rollup read
+    //     drafts; llm_calls carries the money). A `running` row that old is an abandoned crash, not a run.
+    //     In RETENTION_BATCH slices (`retention.sweep`'s `deleteAged`, fix wave): a Phase 6 backlog
+    //     of triage runs is one row per inbound email ever received, and one DELETE over all of it
+    //     could exceed the 30 s statement timeout — which, inside this one transaction, rolled back
+    //     EVERY arm every night.
+    const runCutoff = new Date(now.getTime() - AGENT_RUN_RETENTION_DAYS * 24 * 60 * 60_000)
+    runsDeleted = await deleteAged(tx, getTableName(agentRuns), runCutoff, undefined, 'started_at')
+
+    // (h) platform.access rows — every withPlatform() call writes one; they are provenance for 30 days,
+    //     then noise beside the 2-year tenant trail (which retention.sweep owns from Phase 7).
+    const platformCutoff = new Date(now.getTime() - PLATFORM_ACCESS_AUDIT_RETENTION_DAYS * 24 * 60 * 60_000)
+    const deletedPlatformAudit = await tx.delete(auditLog)
+      .where(and(isNull(auditLog.orgId), eq(auditLog.action, 'platform.access'), lt(auditLog.createdAt, platformCutoff)))
+      .returning({ id: auditLog.id })
+    platformAuditDeleted = deletedPlatformAudit.length
 
     // (d) resolved_answers expiry — a fixed 365-day clock from capture/approval time (never rolled
     // by reuse); `active` and `needs_review` both retire outright once past it, `candidate` is (e)'s
@@ -190,9 +257,9 @@ export async function runSweepsDaily(
     const sourceChangedRows = sourceChangedRawRows.map((r) => ({ id: r.id, orgId: r.org_id }))
     answersSourceChanged = sourceChangedRows.length
 
-    await auditMemoryArm(tx, 'expired', 'memory.retired', answersExpiredRows)
-    await auditMemoryArm(tx, 'unsampled', 'memory.retired', candidatesRetiredRows)
-    await auditMemoryArm(tx, 'source_changed', 'memory.needs_review', sourceChangedRows)
+    await auditPerOrgArm(tx, SWEEP_ACTOR, 'expired', 'memory.retired', answersExpiredRows)
+    await auditPerOrgArm(tx, SWEEP_ACTOR, 'unsampled', 'memory.retired', candidatesRetiredRows)
+    await auditPerOrgArm(tx, SWEEP_ACTOR, 'source_changed', 'memory.needs_review', sourceChangedRows)
   })
 
   for (const item of pendingNotify) {
@@ -203,7 +270,7 @@ export async function runSweepsDaily(
     }
   }
 
-  return { expiredDrafts, eventsDeleted, tokensDeleted, answersExpired, candidatesRetired, answersSourceChanged }
+  return { expiredDrafts, eventsDeleted, tokensDeleted, answersExpired, candidatesRetired, answersSourceChanged, runsDeleted, platformAuditDeleted }
 }
 
 export async function registerSweepsDaily(boss: PgBoss, deps: SweepsDailyDeps): Promise<void> {

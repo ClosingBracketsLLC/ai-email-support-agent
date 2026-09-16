@@ -47,6 +47,7 @@ function buildFailingDeps(opts: { sessionThrows?: boolean } = {}): { deps: Serve
     resolveMailboxConnection: base.api.resolveMailboxConnection,
     resolveMailboxSubscription: base.api.resolveMailboxSubscription,
     resolveDraftActionToken: base.api.resolveDraftActionToken,
+    resolveStripeCustomer: base.api.resolveStripeCustomer,
     recordWebhookEvent: base.api.recordWebhookEvent,
     health: base.api.health,
   }
@@ -178,6 +179,11 @@ describe('the api module graph', () => {
     `
     const stdout = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', probe], {
       cwd: API_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'],
+      // Task 11: @sentry/node + @opentelemetry/* add a deep module graph, and this probe's `seen`
+      // array records every specifier resolved while loading it — comfortably past Node's default
+      // 1 MB stdout maxBuffer (spawnSync's failure mode for that is ENOBUFS, not a buffer-size
+      // error, which is what actually surfaced here). 64 MB is generous headroom, not a tuned number.
+      maxBuffer: 64 * 1024 * 1024,
     })
     const result = JSON.parse(stdout.trim().split('\n').at(-1)!) as { approve: string; seen: string[] }
 
@@ -204,17 +210,31 @@ describe('the api module graph', () => {
    * the shared flag path — so it inherits the same constraint and is walked as its own entry point:
    * the memory surface must stay as free of the Anthropic SDK as the draft one.
    *
+   * Phase 7 adds `./src/billing/service.ts` (`@aesa/api/billing`). It also pins something narrower:
+   * the billing SERVICE must reach `./billing/stripe.ts` for TYPES only, so the Stripe SDK never
+   * enters this graph at all — the case below the table asserts that, and that the SDK's own graph
+   * (which `src/index.ts` alone loads) reaches Node's http, not undici.
+   *
    * `undici` gets a narrower check than the other four: `@aesa/crypto`'s root barrel (`index.ts`)
    * ALSO re-exports the SSRF-pinned fetch (`ssrf/pinned-fetch.ts`), which is undici's OTHER source
    * here — a real, pre-existing, sanctioned dependency (`mailboxes.ts`'s `hashToken` import pulls
    * the same barrel; the connect flow's own outbound OAuth calls are what that guard is for), and
    * one this task has no charter to touch. So the assertion is "undici enters only through
    * `@aesa/crypto`, never through `@aesa/knowledge`" rather than "undici never appears at all".
+   *
+   * `@sentry/node` (loaded by `./src/observability.ts`) is NOT a second source, and the wave that
+   * added it briefly widened this filter as if it were: the probe shows undici resolving exactly
+   * once, from `packages/crypto` — `@opentelemetry/instrumentation-undici` patches through
+   * `diagnostics_channel` and never imports the package. The widening was removed in the Phase 7
+   * fix wave: an allowance nothing exercises is an open door, and the narrow filter passes as is.
    */
   it.each([
     ['./src/config.ts', 'loadConfig'],
     ['./src/trpc/router.ts', 'appRouter'],
     ['./src/memory/service.ts', 'summary'],
+    ['./src/billing/service.ts', 'getBilling'],
+    ['./src/workspace/lifecycle.ts', 'requestDeletion'],
+    ['./src/observability.ts', 'initObservability'],
   ])('importing %s never pulls in @anthropic-ai/sdk, @aesa/llm, pdfjs-dist or mammoth, and only reaches undici through @aesa/crypto', (modulePath, exportName) => {
     const probe = `
       import { registerHooks } from 'node:module'
@@ -225,6 +245,11 @@ describe('the api module graph', () => {
     `
     const stdout = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', probe], {
       cwd: API_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'],
+      // Task 11: @sentry/node + @opentelemetry/* add a deep module graph, and this probe's `seen`
+      // array records every specifier resolved while loading it — comfortably past Node's default
+      // 1 MB stdout maxBuffer (spawnSync's failure mode for that is ENOBUFS, not a buffer-size
+      // error, which is what actually surfaced here). 64 MB is generous headroom, not a tuned number.
+      maxBuffer: 64 * 1024 * 1024,
     })
     const result = JSON.parse(stdout.trim().split('\n').at(-1)!) as { hasExport: boolean; seen: { specifier: string; parent: string | null }[] }
 
@@ -237,5 +262,50 @@ describe('the api module graph', () => {
     expect(undiciFromOutsideCrypto).toEqual([])
 
     expect(result.seen.filter((s) => s.specifier === '@aesa/knowledge')).toEqual([])   // the pure sub-paths only
+  })
+
+  /**
+   * Phase 7. Two separate promises about the Stripe SDK:
+   *  - it is not in the api's REQUEST graph at all. `config.ts`, `deps.ts`, `service.ts`,
+   *    `webhook.ts` and `routers/billing.ts` all take `StripeConfig` / `StripePort` / `StripeEvent`
+   *    as TYPES (erased at runtime); only `src/index.ts` — the composition root, which no test and
+   *    no router imports — ever calls `createStripePort`. The router table above already walks
+   *    `./src/trpc/router.ts` and `./src/billing/service.ts`; this asserts the absence explicitly so
+   *    a future `import Stripe from 'stripe'` in a service fails HERE with an obvious message.
+   *  - when the SDK IS loaded (this case loads `./src/billing/stripe.ts` on purpose), its transport
+   *    is Node's own `http`/`https` (`stripe/esm/net/NodeHttpClient.js`), so it brings no `undici` —
+   *    the same constraint `@aesa/knowledge` is held to two cases above, where `@aesa/crypto`'s
+   *    SSRF-pinned fetch is the ONE sanctioned source.
+   */
+  it('the stripe SDK is loaded by src/index.ts alone, and its own graph reaches node:http, never undici', () => {
+    const probe = `
+      import { registerHooks } from 'node:module'
+      const seen = []
+      registerHooks({ resolve(specifier, context, next) { seen.push({ specifier, parent: context.parentURL ?? null }); return next(specifier, context) } })
+      const router = await import('./src/trpc/router.ts')
+      const beforePort = seen.map((s) => s.specifier)
+      const port = await import('./src/billing/stripe.ts')
+      console.log(JSON.stringify({ hasRouter: 'appRouter' in router, hasPort: typeof port.createStripePort, beforePort, seen }))
+    `
+    const stdout = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', probe], {
+      cwd: API_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'],
+      // Task 11: @sentry/node + @opentelemetry/* add a deep module graph, and this probe's `seen`
+      // array records every specifier resolved while loading it — comfortably past Node's default
+      // 1 MB stdout maxBuffer (spawnSync's failure mode for that is ENOBUFS, not a buffer-size
+      // error, which is what actually surfaced here). 64 MB is generous headroom, not a tuned number.
+      maxBuffer: 64 * 1024 * 1024,
+    })
+    const result = JSON.parse(stdout.trim().split('\n').at(-1)!) as {
+      hasRouter: boolean; hasPort: string; beforePort: string[]; seen: { specifier: string; parent: string | null }[]
+    }
+
+    expect(result.hasRouter).toBe(true)
+    expect(result.hasPort).toBe('function')
+    // The whole tRPC surface — billing router, billing service, webhook — pulls no `stripe`.
+    expect(result.beforePort.filter((sp) => sp === 'stripe' || sp.startsWith('stripe/'))).toEqual([])
+    // Loading the port itself does, and that graph carries no undici from outside @aesa/crypto.
+    expect(result.seen.filter((s) => s.specifier === 'stripe').length).toBeGreaterThan(0)
+    const undiciFromOutsideCrypto = result.seen.filter((s) => s.specifier === 'undici' && !(s.parent ?? '').includes('/packages/crypto/'))
+    expect(undiciFromOutsideCrypto).toEqual([])
   })
 })

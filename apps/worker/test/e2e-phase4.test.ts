@@ -303,6 +303,10 @@ describe('Phase 4 close-out E2E (real pg-boss knowledge jobs + the real api know
       knowledgeEmbedModel: 'voyage-4',
       knowledgeRerank: false,
       s3: null,
+      stripe: null,
+      managedDraftSlots: 0,
+      sentryDsn: null,
+      sentryEnvironment: 'test',
       platformSender: 'no-reply@aesa.test',
     }
   }
@@ -541,7 +545,10 @@ describe('Phase 4 close-out E2E (real pg-boss knowledge jobs + the real api know
     const listed = await listSources(service, orgA.orgId, true)
     expect(listed.knowledgeVersion).toBe(1)
     expect(listed.counts).toEqual({ sources: 1, readyChunks: 1, flaggedChunks: 0 })
-    expect(listed.caps).toEqual({ maxSources: 100, maxCrawlPages: 200 })
+    // 10 / 20 are the TRIAL plan's caps (`PLANS.trial`), which is what a fresh workspace is on since
+    // Phase 7 put `loadSettingSources` (org rows + the plan's defaults) behind every api
+    // `resolveSetting` — not the 100 / 200 settings-catalog defaults this pinned before.
+    expect(listed.caps).toEqual({ maxSources: 10, maxCrawlPages: 20 })
     expect(listed.canManage).toBe(true)
     expect(listed.sources[0]).toMatchObject({ id: pasteSourceId, kind: 'paste', status: 'ready', title: 'Returns FAQ', chunkCount: 1 })
   }, 120_000)
@@ -704,7 +711,7 @@ describe('Phase 4 close-out E2E (real pg-boss knowledge jobs + the real api know
     expect((started as { ok: true; url: string }).url).toBe(`memory://${key}`)
 
     // The browser's presigned PUT, as a direct write into the same store the job reads from.
-    store.put(key, Buffer.from(RETURNS_FAQ, 'utf8'), 'text/plain')
+    await store.put(key, Buffer.from(RETURNS_FAQ, 'utf8'), 'text/plain')
     expect(await completeUpload(service, orgC.orgId, actorFor(orgC), { sourceId })).toEqual({ ok: true })
 
     const ready = await waitForSource(orgC, sourceId, 'ready')
@@ -746,7 +753,7 @@ describe('Phase 4 close-out E2E (real pg-boss knowledge jobs + the real api know
     expect(started.ok).toBe(true)
     const sourceId = (started as { ok: true; sourceId: string }).sourceId
     const key = uploadKey(org.orgId, sourceId, fileName)
-    store.put(key, Buffer.alloc(KNOWLEDGE_MAX_UPLOAD_BYTES + 1), 'application/pdf')
+    await store.put(key, Buffer.alloc(KNOWLEDGE_MAX_UPLOAD_BYTES + 1), 'application/pdf')
     expect(await completeUpload(service, org.orgId, actorFor(org), { sourceId })).toEqual({ ok: true })
 
     const failed = await waitForSource(org, sourceId, 'failed')

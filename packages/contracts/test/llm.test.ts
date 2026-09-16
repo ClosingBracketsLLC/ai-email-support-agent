@@ -60,6 +60,7 @@ describe('llm contracts', () => {
 
   it('the three vocabularies gained their Phase 6 words', () => {
     expect(NEEDS_OWNER_REASONS).toContain('provider_unavailable')
+    expect(NEEDS_OWNER_REASONS).toContain('trial_budget')     // Phase 7 fix wave, ruling R27
     expect(NOTIFICATION_KINDS).toContain('provider_health')
     expect(DEMOTION_REASONS).toContain('model_changed')
   })

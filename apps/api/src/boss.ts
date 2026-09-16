@@ -39,13 +39,20 @@ export async function createSendOnlyBoss(connectionString: string): Promise<PgBo
   await createQueueRetrying(boss, JOB_NAMES.knowledgeCrawl, queueOptionsFor(JOB_NAMES.knowledgeCrawl))
   await createQueueRetrying(boss, JOB_NAMES.knowledgeEmbedBatch, queueOptionsFor(JOB_NAMES.knowledgeEmbedBatch))
   // Phase 5: `approveDraft` sends guidance.suggest after an edited approval — the api IS that
-  // producer. It never sends memory.capture (the worker's send.execute does, from its onSent seam),
-  // but the four-places rule is literal: every queue is pre-created on both processes regardless.
+  // producer. memory.capture was the worker's alone (send.execute's onSent seam) until Phase 7's
+  // `rememberReply` made the api a producer of its messageId variant too; either way the four-places
+  // rule is literal: every queue is pre-created on both processes regardless.
   await createQueueRetrying(boss, JOB_NAMES.guidanceSuggest, queueOptionsFor(JOB_NAMES.guidanceSuggest))
   await createQueueRetrying(boss, JOB_NAMES.memoryCapture, queueOptionsFor(JOB_NAMES.memoryCapture))
   // Phase 6: the api's `llm.addCredential`/`probeCredential` send it on every key added or
   // re-probed by hand, and the worker's own `llm.reprobe-sweep` cron sends it every six hours.
   await createQueueRetrying(boss, JOB_NAMES.llmProbe, queueOptionsFor(JOB_NAMES.llmProbe))
+  // Phase 7: the api's `workspace.requestExport` sends `workspace.export`; `workspace.purge` and
+  // `keys.rotate` have no api producer at all (the worker's own cron and the `keys:rotate` script),
+  // but the four-places rule is literal — every queue is pre-created on BOTH processes regardless.
+  await createQueueRetrying(boss, JOB_NAMES.workspaceExport, queueOptionsFor(JOB_NAMES.workspaceExport))
+  await createQueueRetrying(boss, JOB_NAMES.workspacePurge, queueOptionsFor(JOB_NAMES.workspacePurge))
+  await createQueueRetrying(boss, JOB_NAMES.keysRotate, queueOptionsFor(JOB_NAMES.keysRotate))
 
   return boss
 }

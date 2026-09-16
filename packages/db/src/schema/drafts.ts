@@ -46,6 +46,8 @@ export const drafts = pgTable('drafts', {
   flaggedBy: uuid('flagged_by').references(() => user.id, { onDelete: 'set null' }),
   /** `memory.capture`'s idempotency stamp. */
   memoryCapturedAt: timestamp('memory_captured_at', { withTimezone: true }),
+  /** The retention sweep's work-list stamp (deviation 12), the same shape `messages.body_purged_at` uses. */
+  bodyPurgedAt: timestamp('body_purged_at', { withTimezone: true }),
   expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
   createdAt: createdAt(), updatedAt: updatedAt(),
 }, (t) => [
