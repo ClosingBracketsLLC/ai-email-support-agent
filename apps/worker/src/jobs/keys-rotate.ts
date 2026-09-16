@@ -63,8 +63,7 @@ export async function runKeysRotate(deps: KeysRotateDeps, payload: KeysRotatePay
       return result
     })
   } catch (err) {
-    // Task 11 replaces this with `alert('keys_rotate_failed', { orgId })`. This is the one job whose
-    // failure means a tenant's data is one KEK away from unreadable — most likely because this
+    // This is the one job whose failure means a tenant's data is one KEK away from unreadable — most likely because this
     // replica's ring cannot unwrap the version the row carries, the exact "same ring on every
     // replica" failure the header warns about — so it must never be just a pg-boss retry record that
     // nobody reads until three backed-off attempts have gone by. Rethrown unchanged: the retry is

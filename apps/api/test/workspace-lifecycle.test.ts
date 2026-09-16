@@ -268,6 +268,38 @@ describe('workspace lifecycle', () => {
     expect(await free.c.workspace.cancelDeletion.mutate()).toEqual({ ok: true, needsResubscribe: false })
   })
 
+  it('setAgentEnabled(true) is refused while a deletion is pending (PRECONDITION_FAILED, deletion_pending); off is still allowed; cancelDeletion lifts it', async () => {
+    const org = await setupOrg()
+    await org.c.workspace.setAgentEnabled.mutate({ enabled: true })
+    await org.c.workspace.requestDeletion.mutate({ confirm: 'Acme' })
+    expect(await readWorkspace(org.orgId)).toMatchObject({ agentEnabled: false, killSwitch: true })
+
+    await expect(org.c.workspace.setAgentEnabled.mutate({ enabled: true })).rejects.toMatchObject({
+      message: WORKSPACE_ERROR_MESSAGES.deletion_pending, data: { code: 'PRECONDITION_FAILED' },
+    })
+    expect(await readWorkspace(org.orgId)).toMatchObject({ agentEnabled: false })
+    // Off is always allowed — nothing here should ever stop an owner switching the agent OFF.
+    await org.c.workspace.setAgentEnabled.mutate({ enabled: false })
+
+    await org.c.workspace.cancelDeletion.mutate()
+    const back = await org.c.workspace.setAgentEnabled.mutate({ enabled: true })
+    expect(back.agentEnabled).toBe(true)
+  })
+
+  it('a DEFERRED subscription on a trialing row (ruling R10) is cancelled too — it could still settle and bill a purged workspace', async () => {
+    const org = await setupOrg()
+    // What an unpaid `checkout.session.completed` leaves behind: the ids recorded, the plan still trial.
+    await t.api.withOrg(org.orgId, (tx) => tx.update(billingSubscriptions)
+      .set({ stripeCustomerId: `cus_deferred_${org.seq}`, stripeSubscriptionId: 'sub_deferred_del' })
+      .where(eq(billingSubscriptions.orgId, org.orgId)))
+
+    const requested = await org.c.workspace.requestDeletion.mutate({ confirm: 'Acme' })
+    expect(requested.subscriptionCancelled).toBe(true)
+    const cancels = callsTo(fake, 'cancelSubscription')
+    expect(cancels).toHaveLength(1)
+    expect(cancels[0]!.params).toEqual({ subscriptionId: 'sub_deferred_del' })
+  })
+
   it('a workspace cancelled through the Stripe Portal weeks ago: this deletion cancelled nothing, and yet the plan still needs re-subscribing (ruling R23)', async () => {
     const org = await setupOrg()
     // What `customer.subscription.deleted` leaves behind: status `canceled`, the subscription id

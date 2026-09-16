@@ -85,8 +85,12 @@ async function guard<T>(what: string, fn: () => Promise<T>): Promise<T> {
 
 export function createStripePort(config: StripeConfig): StripePort {
   // `typescript: true` only tags the user-agent; `apiVersion` is deliberately omitted so the SDK's
-  // own pinned version (see the header) is used rather than the account default.
-  const stripe = new Stripe(config.secretKey.expose(), { typescript: true })
+  // own pinned version (see the header) is used rather than the account default. `timeout` is the
+  // SDK's per-request clock (its default is 80 s — inside a tRPC request and a Fastify handler,
+  // long enough for the owner to have given up and tapped again); `maxNetworkRetries` is made
+  // explicit rather than inherited (the SDK's default is 2 — retries are safe here because every
+  // create carries the SDK's own idempotency key and `constructEvent` never leaves the process).
+  const stripe = new Stripe(config.secretKey.expose(), { typescript: true, timeout: 15_000, maxNetworkRetries: 2 })
 
   return {
     createCustomer: (p) => guard('createCustomer', async () => {

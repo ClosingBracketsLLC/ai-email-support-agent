@@ -57,7 +57,7 @@ import { scrubJobError } from '@aesa/queue'
 /**
  * The alert kinds actually raised, surveyed against every `alert(...)` call site left behind by
  * Tasks 4–8 (eleven, not the brief's nine — three were added by controller rulings after the brief
- * was written). `platform_killswitch_on` is deliberately NOT one of them: it is wired nowhere.
+ * was written) plus the fix wave's `stripe_foreign_subscription_event` (ruling R31): twelve. `platform_killswitch_on` is deliberately NOT one of them: it is wired nowhere.
  * `platform_state['killswitch.global']` is set BY HAND by an operator, so an alert telling them
  * what they just did would be pure noise, and "sends are paused" is already visible in the worker's
  * backstop sweep's own log line every minute it skips arm (a) — see the task report for the full
@@ -72,6 +72,7 @@ export const ALERT_KINDS = [
   'org_spend_capped',
   'purge_failed',
   'stripe_double_subscription',
+  'stripe_foreign_subscription_event',
   'stripe_report_failed',
   'stripe_unknown_customer',
   'stripe_webhook_rejected',

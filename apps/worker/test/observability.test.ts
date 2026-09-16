@@ -12,7 +12,7 @@ function loggedLines(): { logger: ReturnType<typeof createWorkerLogger>; lines: 
 }
 
 describe('ALERT_KINDS', () => {
-  it('is exactly the eleven kinds actually raised across the api and the worker — not the brief\'s nine', () => {
+  it('is exactly the twelve kinds actually raised across the api and the worker — the eleven Tasks 4–8 left plus the fix wave\'s foreign-subscription alert (R31)', () => {
     expect([...ALERT_KINDS].sort()).toEqual([
       'admission_slot_timeout',
       'deletion_billing_unconfigured',
@@ -22,6 +22,7 @@ describe('ALERT_KINDS', () => {
       'org_spend_capped',
       'purge_failed',
       'stripe_double_subscription',
+      'stripe_foreign_subscription_event',
       'stripe_report_failed',
       'stripe_unknown_customer',
       'stripe_webhook_rejected',

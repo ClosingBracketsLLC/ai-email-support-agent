@@ -10,7 +10,7 @@
  */
 import { and, eq, inArray } from 'drizzle-orm'
 import { planSettingDefaults, type PlanId, type SettingKey } from '@aesa/core'
-import { readBillingState } from './billing.ts'
+import { readBillingState, type BillingStateView } from './billing.ts'
 import { orgSettings } from './schema/index.ts'
 import type { OrgTx } from './tenant.ts'
 
@@ -18,6 +18,10 @@ export interface SettingSources {
   org: Partial<Record<SettingKey, unknown>>
   plan: Partial<Record<SettingKey, number | boolean>>
   planId: PlanId
+  /** The whole `readBillingState` view the plan defaults were resolved from (ruling R27): a caller
+   *  that needs the derived STATE (`trialing` vs `trial_expired`/`canceled` — the trial budget
+   *  applies to the first alone) or the trial clock reads it here instead of reading the row again. */
+  billing: BillingStateView
 }
 
 /** org_settings for `keys` + `planSettingDefaults(readBillingState(tx, now).plan)`. One query each. */
@@ -31,6 +35,6 @@ export async function loadSettingSources(tx: OrgTx, keys: readonly SettingKey[],
   const org: Partial<Record<SettingKey, unknown>> = {}
   for (const row of rows) org[row.key as SettingKey] = row.value
 
-  const { plan: planId } = await readBillingState(tx, now)
-  return { org, plan: planSettingDefaults(planId), planId }
+  const billing = await readBillingState(tx, now)
+  return { org, plan: planSettingDefaults(billing.plan), planId: billing.plan, billing }
 }

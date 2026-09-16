@@ -56,6 +56,8 @@ let mockMarkViewedImpl: (input: unknown) => Promise<unknown> = () => Promise.res
 let mockResumeImpl: (input: unknown) => Promise<unknown> = () => Promise.resolve({ resumed: true })
 let mockResolveImpl: (input: unknown) => Promise<unknown> = () => Promise.resolve({ resolved: true })
 let mockRememberImpl: (input: unknown) => Promise<unknown> = () => Promise.resolve({ ok: true })
+/** The signed-in member's role — `workspace.get`'s, which gates "Remember this reply" (B9). */
+let mockRole = 'owner'
 
 jest.mock('expo-router', () => ({
   useLocalSearchParams: () => ({ id: mockTicketId }),
@@ -97,6 +99,9 @@ jest.mock('@/lib/trpc', () => ({
     },
     memory: {
       rememberReply: { mutationOptions: (o: object) => ({ mutationFn: (v: unknown) => { mockRememberCalls.push(v); return mockRememberImpl(v) }, ...o }) },
+    },
+    workspace: {
+      get: { queryOptions: () => ({ queryKey: ['workspace', 'get'], queryFn: () => Promise.resolve({ businessName: 'Acme', role: mockRole }) }) },
     },
   }),
 }))
@@ -143,6 +148,7 @@ beforeEach(() => {
   mockTicketQueries = 0
   mockTicketOpts = {}
   mockUndoUntil = new Date(Date.now() + 15_000)
+  mockRole = 'owner'
   mockBack.mockReset()
   for (const calls of [mockMarkViewedCalls, mockApproveCalls, mockHoldCalls, mockRejectCalls, mockResumeCalls, mockResolveCalls, mockFlagCalls, mockRememberCalls]) calls.length = 0
   mockApproveImpl = () => Promise.resolve({ sendId: 'send-1', sendAfter: mockUndoUntil, undoUntil: mockUndoUntil })
@@ -505,6 +511,19 @@ test('an outbound bubble offers "Remember this reply"; an inbound one shows no b
   await setup()
 
   await waitFor(() => expect(screen.getByTestId(`remember-${mockOutboundId}`)).toBeTruthy())
+  expect(screen.queryByTestId(`remember-${mockInboundId}`)).toBeNull()
+})
+
+test('a MEMBER is never offered "Remember this reply" — memory.rememberReply is manager-only, and a FORBIDDEN rendered verbatim is not a button (fix wave B9)', async () => {
+  mockRole = 'member'
+  mockMessages = messages()
+  await setup()
+
+  await waitFor(() => expect(screen.getByTestId('ticket-messages')).toBeTruthy())
+  await waitFor(() => expect(screen.getAllByText('Your order ships tomorrow.').length).toBeGreaterThan(0))
+  // Give the workspace query every chance to land before asserting the button stayed away.
+  await new Promise((r) => setTimeout(r, 20))
+  expect(screen.queryByTestId(`remember-${mockOutboundId}`)).toBeNull()
   expect(screen.queryByTestId(`remember-${mockInboundId}`)).toBeNull()
 })
 

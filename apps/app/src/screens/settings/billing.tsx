@@ -93,13 +93,16 @@ export function BillingSettingsScreen() {
   const b = billing.data
   const days = b.trialEndsAt ? daysUntil(b.trialEndsAt) : null
 
+  // `openExternal` rethrows a refused `start()` (after closing its popup) so the mutation's own
+  // `onError` — which already set `error` — is the whole story; the handler must swallow it, or a
+  // void `onPress` turns every soft refusal into an unhandled rejection as well (fix wave B12).
   async function subscribe() {
     setError(null); setBlocked(null)
-    await openExternal(() => startCheckout.mutateAsync(), { onBlocked: setBlocked })
+    try { await openExternal(() => startCheckout.mutateAsync(), { onBlocked: setBlocked }) } catch { /* surfaced by onError */ }
   }
   async function manage() {
     setError(null); setBlocked(null)
-    await openExternal(() => openPortal.mutateAsync(), { onBlocked: setBlocked })
+    try { await openExternal(() => openPortal.mutateAsync(), { onBlocked: setBlocked }) } catch { /* surfaced by onError */ }
   }
 
   const canSubscribe = b.state === 'trialing' || b.state === 'trial_expired' || b.state === 'canceled'
@@ -112,7 +115,7 @@ export function BillingSettingsScreen() {
 
       {params.checkout === 'success' ? (
         <Banner tone="success" testID="billing-checkout-banner">
-          {b.state === 'trialing' ? 'Stripe is confirming your payment…' : 'Thanks — your subscription is active.'}
+          {b.state === 'active' ? 'Thanks — your subscription is active.' : 'Stripe is confirming your payment…'}
         </Banner>
       ) : null}
       {error ? <Banner tone="error" testID="billing-error">{error}</Banner> : null}
@@ -120,18 +123,30 @@ export function BillingSettingsScreen() {
       {b.state === 'past_due' ? <Banner tone="error" testID="billing-past-due">{PAST_DUE_TEXT}</Banner> : null}
 
       <Card testID="billing-summary">
-        {b.state === 'trialing' ? (
-          <>
-            <Chip tone="primary" testID="billing-chip">Trial</Chip>
-            {days !== null ? <Muted testID="billing-trial-ends">{`ends in ${plural(days, 'day')}`}</Muted> : null}
-          </>
-        ) : (
+        {b.plan === 'standard' ? (
+          // The paid plan alone shows a price: a `canceled` row keeps its last domain count, and
+          // "Trial · 2 domains · $99.98 / month" was what it used to read (fix wave B10).
           <>
             <Text style={[typeScale.bodyStrong, { color: c.text }]}>{`${PLAN_LABEL[b.plan]} · ${plural(b.domainQuantity, 'domain')}`}</Text>
             <Muted>{`${formatCents(b.perDomainCents * b.domainQuantity)} / month`}</Muted>
             {b.activeDomains !== b.domainQuantity ? (
               <Muted testID="billing-active-domains">{`${plural(b.activeDomains, 'domain')} connected`}</Muted>
             ) : null}
+          </>
+        ) : b.state === 'trialing' ? (
+          <>
+            <Chip tone="primary" testID="billing-chip">Trial</Chip>
+            {days !== null ? <Muted testID="billing-trial-ends">{`ends in ${plural(days, 'day')}`}</Muted> : null}
+          </>
+        ) : b.state === 'canceled' ? (
+          <>
+            <Chip tone="neutral" testID="billing-chip">Cancelled</Chip>
+            <Muted testID="billing-lapsed">Your subscription was cancelled — replies wait for your review until you subscribe again.</Muted>
+          </>
+        ) : (
+          <>
+            <Chip tone="warning" testID="billing-chip">Trial ended</Chip>
+            <Muted testID="billing-lapsed">Your trial has ended — replies wait for your review until you subscribe.</Muted>
           </>
         )}
         <StatTile testID="billing-usage" label="Usage" value={usageLine(b.used, b.allowance, b.overageUnits, b.overageUnitCents)} />
@@ -146,7 +161,7 @@ export function BillingSettingsScreen() {
         </>
       ) : null}
 
-      {owner && b.configured && b.state !== 'trialing' ? (
+      {owner && b.configured && b.plan === 'standard' ? (
         <View style={styles.block}>
           <Muted>How an overage beyond the plan is handled</Muted>
           <View style={styles.overageRow} accessibilityRole="radiogroup" testID="overage-mode">

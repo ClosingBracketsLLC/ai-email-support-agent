@@ -1,5 +1,6 @@
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
+import { BILLING_ERROR_MESSAGES } from '@aesa/contracts'
 import { Banner } from '@/components/banner'
 import { Button } from '@/components/button'
 import { openExternal } from '@/lib/open-external'
@@ -19,6 +20,15 @@ export const BILLING_BANNER_COPY = {
   trialExpired: 'Your trial has ended — replies wait for your review until you subscribe.',
   pastDue: 'Payment failed — Autopilot is paused until the card is updated.',
   deletion: (date: string): string => `This workspace will be deleted on ${date}. Turn this off in Settings → Workspace.`,
+}
+
+const BILLING_ERROR_VALUES = new Set<string>(Object.values(BILLING_ERROR_MESSAGES))
+/** The api's soft refusals already ARE the exact `BILLING_ERROR_MESSAGES` sentence — a whitelist,
+ * not a translation (the same per-file copy `billing.tsx` keeps): anything unrecognized never
+ * reaches the owner as raw text. */
+function billingErrorCopy(error: unknown): string {
+  const message = (error as { message?: unknown } | null | undefined)?.message
+  return typeof message === 'string' && BILLING_ERROR_VALUES.has(message) ? message : 'Could not complete that. Try again.'
 }
 
 /** Same rounding `billing.tsx` uses for its own trial countdown — each screen keeps its own copy
@@ -46,21 +56,25 @@ export function BillingBanner() {
   const trpc = useTRPC()
   const ws = useQuery(trpc.workspace.get.queryOptions())
   const billing = useQuery(trpc.billing.get.queryOptions())
+  // One slot for everything that stopped the action: a blocked popup, or the api's own refusal
+  // (`not_configured`, `already_subscribed`, `checkout_pending`, `stripe_unavailable`, …). Before the
+  // fix wave (B12) neither mutation had an `onError`, and the awaited `openExternal` inside a void
+  // `onPress` rejected unhandled — the popup flashed and closed, and nothing was said.
   const [blocked, setBlocked] = useState<string | null>(null)
 
-  const startCheckout = useMutation(trpc.billing.startCheckout.mutationOptions())
-  const openPortal = useMutation(trpc.billing.openPortal.mutationOptions())
+  const startCheckout = useMutation(trpc.billing.startCheckout.mutationOptions({ onError: (err: unknown) => setBlocked(billingErrorCopy(err)) }))
+  const openPortal = useMutation(trpc.billing.openPortal.mutationOptions({ onError: (err: unknown) => setBlocked(billingErrorCopy(err)) }))
 
   if (!ws.data || !billing.data) return null
   const owner = ws.data.role === 'owner'
 
   async function subscribe() {
     setBlocked(null)
-    await openExternal(() => startCheckout.mutateAsync(), { onBlocked: setBlocked })
+    try { await openExternal(() => startCheckout.mutateAsync(), { onBlocked: setBlocked }) } catch { /* surfaced by onError */ }
   }
   async function manage() {
     setBlocked(null)
-    await openExternal(() => openPortal.mutateAsync(), { onBlocked: setBlocked })
+    try { await openExternal(() => openPortal.mutateAsync(), { onBlocked: setBlocked }) } catch { /* surfaced by onError */ }
   }
 
   const spec = bannerSpec(ws.data, billing.data, {
@@ -69,11 +83,15 @@ export function BillingBanner() {
   })
   if (!spec) return null
 
+  // No Stripe on this server: the sentence still stands, the button that could only fail does not
+  // (Settings → Billing says why to the owner; the inbox is not the place).
+  const action = billing.data.configured ? spec.action : undefined
+
   return (
     <>
       <Banner tone={spec.tone} testID="billing-banner">{spec.text}</Banner>
-      {owner && spec.action ? (
-        <Button label={spec.action.label} onPress={spec.action.onPress} loading={spec.action.pending} testID={spec.action.testID} />
+      {owner && action ? (
+        <Button label={action.label} onPress={action.onPress} loading={action.pending} testID={action.testID} />
       ) : null}
       {blocked ? <Banner tone="error" testID="billing-banner-blocked">{blocked}</Banner> : null}
     </>

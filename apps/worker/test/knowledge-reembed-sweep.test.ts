@@ -205,6 +205,37 @@ describe('knowledge.reembed-sweep', () => {
     expect(untouched.embeddingModel).toBe('hash-v2')
   })
 
+  // Fix wave B3: arm 1 used to null a capped org's vectors and enqueue a refill the cap then
+  // refused — a `ready` source's document kept NULL vectors nothing rediscovers.
+  it('at the embed-tokens cap, the CHUNK arm nulls nothing and enqueues nothing for that org — its stale documents wait for tomorrow — while another org under its cap is still swept', async () => {
+    await setOrgSetting(orgId, 'knowledge.daily_embed_tokens_cap', 1000)
+    await setEmbedTokens(orgId, 1000)
+    const cappedDoc = await seedDocumentWithChunks(orgId, 2, 'hash-v1')
+    const otherOrg = await createTestOrganization(app, 'Under cap')
+    await withOrg(app.db, otherOrg, (tx) => tx.insert(workspaces).values({ orgId: otherOrg, businessName: 'Under cap', timezone: 'UTC' }))
+    const freeDoc = await seedDocumentWithChunks(otherOrg, 2, 'hash-v1')
+
+    const enqueued: { orgId: string; documentId: string }[] = []
+    const result = await runKnowledgeReembedSweep(fakeBoss, makeDeps({
+      enqueueEmbedBatch: async (o, d) => { enqueued.push({ orgId: o, documentId: d }); return 'job-1' },
+    }))
+
+    expect(result).toMatchObject({ documentsQueued: 1, skippedCap: 1 })
+    for (const c of await chunksFor(orgId, cappedDoc.documentId)) {
+      expect(c.embedding).not.toBeNull()
+      expect(c.embeddingModel).toBe('hash-v1')
+    }
+    expect((await getDocument(orgId, cappedDoc.documentId)).embeddedCount).toBe(2)
+    expect(enqueued).toEqual([{ orgId: otherOrg, documentId: freeDoc.documentId }])
+    for (const c of await chunksFor(otherOrg, freeDoc.documentId)) expect(c.embedding).toBeNull()
+
+    // Tomorrow (the cap is per UTC day) the capped org's document is picked up as usual.
+    const tomorrow = new Date(NOW.getTime() + 86_400_000)
+    const next = await runKnowledgeReembedSweep(fakeBoss, makeDeps({ now: () => tomorrow, enqueueEmbedBatch: async (o, d) => { enqueued.push({ orgId: o, documentId: d }); return 'job-2' } }))
+    expect(next).toMatchObject({ documentsQueued: 1, skippedCap: 0 })
+    expect(enqueued.at(-1)).toEqual({ orgId, documentId: cappedDoc.documentId })
+  })
+
   it('at the embed-tokens cap, the answers arm is skipped and nothing is written', async () => {
     await setOrgSetting(orgId, 'knowledge.daily_embed_tokens_cap', 1000)
     await setEmbedTokens(orgId, 1000)

@@ -89,6 +89,15 @@ describe('redactHeaders', () => {
   it('is a no-op on undefined', () => {
     expect(() => redactHeaders(undefined)).not.toThrow()
   })
+
+  // Phase 7 fix wave: the declared type is `Record<string, string>`, but the value comes off a
+  // Sentry event nobody validated. A scrubber never throws — and never passes a non-string through
+  // unredacted either: it is dropped.
+  it('drops a non-string header value instead of throwing or passing it through', () => {
+    const headers = { referer: ['https://x/a/d?t=TOK', 'b'], 'content-length': 12, nul: null, ok: 'fine' } as unknown as Record<string, string>
+    expect(() => redactHeaders(headers)).not.toThrow()
+    expect(headers).toEqual({ ok: 'fine' })
+  })
 })
 
 describe('redactQueryParams', () => {

@@ -46,6 +46,9 @@ export function DangerZone() {
   const ws = useQuery(trpc.workspace.get.queryOptions())
   const exportStatus = useQuery({
     ...trpc.workspace.exportStatus.queryOptions(),
+    // Owner-only, like everything else here: a member or admin never sees the export row, so
+    // polling it every 3 s on their behalf was pure load (fix wave).
+    enabled: ws.data?.role === 'owner',
     refetchInterval: (query) => (query.state.data?.state === 'queued' ? EXPORT_POLL_MS : false),
   })
 
@@ -109,7 +112,7 @@ export function DangerZone() {
     if (!exportStatus.data?.url) return
     const url = exportStatus.data.url
     setBlocked(null)
-    await openExternal(() => Promise.resolve({ url }), { onBlocked: setBlocked })
+    try { await openExternal(() => Promise.resolve({ url }), { onBlocked: setBlocked }) } catch { setBlocked('Could not open the download. Try again.') }
   }
 
   const exportState = exportStatus.data?.state ?? 'none'

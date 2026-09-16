@@ -1,5 +1,7 @@
 import { randomBytes } from 'node:crypto'
+import { eq } from 'drizzle-orm'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { BILLING_PRICING } from '@aesa/contracts'
 import {
   agents, billingSubscriptions, mailboxConnections, SEND_METERS, usageCounters, withOrg, workspaces,
 } from '../src/index.ts'
@@ -57,6 +59,21 @@ describe('billing', () => {
     expect(view.missingRow).toBe(false)
     expect(view.plan).toBe('trial')
     expect(view.allowance).toBe(50)
+  })
+
+  // Phase 7 fix wave (B7): the column defaults ARE `BILLING_PRICING` — a bare row (what
+  // `ensureBillingRow` mints, every column at its default) flipped to the paid plan prices one
+  // domain at exactly the catalog's per-domain allowance and overage rate. Nothing else pins the two
+  // defaults; drizzle-kit inlines them, so a catalog change becomes a migration `db:check` demands.
+  it('a bare ensureBillingRow row flipped to standard with one domain reads BILLING_PRICING.includedPerDomain and .overageUnitCents', async () => {
+    const bare = await mkOrg('Bare standard')
+    await withOrg(app.db, bare, (tx) => ensureBillingRow(tx))
+    await withOrg(app.db, bare, (tx) => tx.update(billingSubscriptions)
+      .set({ plan: 'standard', status: 'active', domainQuantity: 1 }).where(eq(billingSubscriptions.orgId, bare)))
+    const view = await withOrg(app.db, bare, (tx) => readBillingState(tx, new Date('2026-09-15T12:00:00Z')))
+    expect(view.allowance).toBe(BILLING_PRICING.includedPerDomain)
+    expect(view.includedConversationsPerDomain).toBe(BILLING_PRICING.includedPerDomain)
+    expect(view.overageUnitCents).toBe(BILLING_PRICING.overageUnitCents)
   })
 
   it('a trial row whose included_conversations_per_domain has been hand-set to 999 still reads allowance 50', async () => {

@@ -246,3 +246,61 @@ test('checkout=success while Stripe has not confirmed yet (still trialing) says 
   await waitFor(() => expect(screen.getByTestId('billing-checkout-banner')).toBeTruthy())
   expect(screen.getByText('Stripe is confirming your payment…')).toBeTruthy()
 })
+
+// ---- fix wave B11: the thanks is for an ACTIVE subscription, nothing else ----
+
+test('checkout=success from an EXPIRED trial (or a cancelled workspace) says Stripe is confirming — never "your subscription is active" above a Subscribe button', async () => {
+  mockCheckoutParam = 'success'
+  mockBilling = billing({ state: 'trial_expired', trialEndsAt: new Date(Date.now() - 86_400_000) })
+  await setup()
+
+  await waitFor(() => expect(screen.getByTestId('billing-checkout-banner')).toBeTruthy())
+  expect(screen.getByText('Stripe is confirming your payment…')).toBeTruthy()
+  expect(screen.queryByText('Thanks — your subscription is active.')).toBeNull()
+  expect(screen.getByTestId('billing-subscribe')).toBeTruthy()
+
+  for (const teardown of teardowns.splice(0)) await teardown()
+  mockBilling = billing({ state: 'canceled', trialEndsAt: null, domainQuantity: 2 })
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('billing-checkout-banner')).toBeTruthy())
+  expect(screen.getByText('Stripe is confirming your payment…')).toBeTruthy()
+})
+
+// ---- fix wave B10: a lapsed workspace reads as lapsed, never as a paid plan ----
+
+test('a CANCELLED workspace reads "cancelled" with the usage tile and Subscribe — not "Trial · 2 domains · $99.98 / month" and no overage radio', async () => {
+  mockBilling = billing({ plan: 'trial', state: 'canceled', trialEndsAt: null, domainQuantity: 2, allowance: 50, used: 301, overageUnits: 251, activeDomains: 2 })
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('billing-summary')).toBeTruthy())
+
+  expect(screen.getByText('Cancelled')).toBeTruthy()
+  expect(screen.getByText('Your subscription was cancelled — replies wait for your review until you subscribe again.')).toBeTruthy()
+  expect(screen.queryByText(/\/ month/)).toBeNull()
+  expect(screen.queryByText(/2 domains/)).toBeNull()
+  expect(screen.getByTestId('billing-usage')).toBeTruthy()
+  expect(screen.getByTestId('billing-subscribe')).toBeTruthy()
+  expect(screen.queryByTestId('billing-manage')).toBeNull()
+  expect(screen.queryByTestId('overage-mode')).toBeNull()
+})
+
+test('an EXPIRED trial reads "trial ended" with the usage tile and Subscribe, and no overage radio', async () => {
+  mockBilling = billing({ state: 'trial_expired', trialEndsAt: new Date(Date.now() - 86_400_000), used: 50 })
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('billing-summary')).toBeTruthy())
+
+  expect(screen.getByText('Trial ended')).toBeTruthy()
+  expect(screen.getByText('Your trial has ended — replies wait for your review until you subscribe.')).toBeTruthy()
+  expect(screen.queryByText(/ends in/)).toBeNull()
+  expect(screen.getByText('50 of 50 conversations this month')).toBeTruthy()
+  expect(screen.getByTestId('billing-subscribe')).toBeTruthy()
+  expect(screen.queryByTestId('overage-mode')).toBeNull()
+})
+
+test('a paid plan keeps its price line and the overage radio (B10 keys them on the plan, not the state)', async () => {
+  mockBilling = billing({ plan: 'standard', state: 'past_due', trialEndsAt: null, domainQuantity: 2, allowance: 600, used: 10, activeDomains: 2 })
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('billing-summary')).toBeTruthy())
+  expect(screen.getByText('Standard · 2 domains')).toBeTruthy()
+  expect(screen.getByText('$99.98 / month')).toBeTruthy()
+  expect(screen.getByTestId('overage-mode')).toBeTruthy()
+})

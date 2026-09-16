@@ -222,14 +222,11 @@ describe('the api module graph', () => {
    * one this task has no charter to touch. So the assertion is "undici enters only through
    * `@aesa/crypto`, never through `@aesa/knowledge`" rather than "undici never appears at all".
    *
-   * Task 11 adds a SECOND sanctioned source: `@sentry/node` (loaded by `./src/observability.ts`,
-   * which `./src/workspace/lifecycle.ts`'s `alert(...)` calls import directly, and which
-   * `trpc/router.ts` never reaches on its own) statically pulls in `@sentry/opentelemetry` and
-   * `@opentelemetry/instrumentation-undici` — Sentry instruments the Node global fetch/http stack
-   * for its own error and breadcrumb capture, and it NEVER fetches a customer- or tenant-supplied
-   * URL (unlike the crawler `@aesa/knowledge` guards against), so a parent module under
-   * `node_modules/@sentry/` or `node_modules/@opentelemetry/` is allowed the same way
-   * `@aesa/crypto`'s pinned fetch is.
+   * `@sentry/node` (loaded by `./src/observability.ts`) is NOT a second source, and the wave that
+   * added it briefly widened this filter as if it were: the probe shows undici resolving exactly
+   * once, from `packages/crypto` — `@opentelemetry/instrumentation-undici` patches through
+   * `diagnostics_channel` and never imports the package. The widening was removed in the Phase 7
+   * fix wave: an allowance nothing exercises is an open door, and the narrow filter passes as is.
    */
   it.each([
     ['./src/config.ts', 'loadConfig'],
@@ -238,7 +235,7 @@ describe('the api module graph', () => {
     ['./src/billing/service.ts', 'getBilling'],
     ['./src/workspace/lifecycle.ts', 'requestDeletion'],
     ['./src/observability.ts', 'initObservability'],
-  ])('importing %s never pulls in @anthropic-ai/sdk, @aesa/llm, pdfjs-dist or mammoth, and only reaches undici through @aesa/crypto or @sentry/@opentelemetry', (modulePath, exportName) => {
+  ])('importing %s never pulls in @anthropic-ai/sdk, @aesa/llm, pdfjs-dist or mammoth, and only reaches undici through @aesa/crypto', (modulePath, exportName) => {
     const probe = `
       import { registerHooks } from 'node:module'
       const seen = []
@@ -261,11 +258,7 @@ describe('the api module graph', () => {
     const hardForbidden = ['@anthropic-ai/', '@aesa/llm', 'pdfjs-dist', 'mammoth']
     expect(result.seen.filter((s) => hardForbidden.some((f) => s.specifier.includes(f)))).toEqual([])
 
-    const undiciFromOutsideCrypto = result.seen.filter((s) => {
-      if (s.specifier !== 'undici') return false
-      const parent = s.parent ?? ''
-      return !parent.includes('/packages/crypto/') && !parent.includes('/node_modules/@sentry/') && !parent.includes('/node_modules/@opentelemetry/')
-    })
+    const undiciFromOutsideCrypto = result.seen.filter((s) => s.specifier === 'undici' && !(s.parent ?? '').includes('/packages/crypto/'))
     expect(undiciFromOutsideCrypto).toEqual([])
 
     expect(result.seen.filter((s) => s.specifier === '@aesa/knowledge')).toEqual([])   // the pure sub-paths only

@@ -48,12 +48,12 @@
  * killed connection). The claim (step 1) and the pre-send flip (step 8) are each ONE statement set in
  * ONE transaction. The api never runs any of this: sending is worker-only.
  */
-import { and, asc, eq, gt, inArray, lte, ne, or, sql } from 'drizzle-orm'
+import { and, asc, eq, gt, inArray, isNull, lte, ne, notInArray, or, sql } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import { z } from 'zod'
 import {
-  appendSignature, clearRedraftCycle, INVARIANTS, ticketTransitions, validateReplyBody,
+  appendSignature, clearRedraftCycle, handledPeriodStamps, INVARIANTS, isHandledInPeriod, ticketTransitions, validateReplyBody,
 } from '@aesa/core'
 import type { KekRing } from '@aesa/crypto'
 import {
@@ -236,9 +236,11 @@ interface ClaimedSend {
   }
   platformKillSwitch: boolean
   categoryMode: 'off' | 'review' | 'auto'
-  /** Phase 7: whether the workspace's subscription is live (`trialing` or `active`). It holds AUTO
-   *  sends only — see `firstKillLever`. */
-  billing: { active: boolean }
+  /** Phase 7: whether the workspace's subscription is live (`trialing` or `active`) — it holds AUTO
+   *  sends only, see `firstKillLever` — and the start of the BILLING PERIOD the conversation meters
+   *  count over (ruling R26): `completeSend` stamps the ticket with it, so a thread is billed once
+   *  per Stripe period, not once per calendar month. */
+  billing: { active: boolean; periodStart: Date }
 }
 
 /**
@@ -348,7 +350,8 @@ async function claimSend(deps: SendExecuteDeps, orgId: string, sendId: string, n
 
     return {
       claimToken, send, draft, ticket, agent: resolvedAgent ?? null, connection, workspace,
-      platformKillSwitch: lever?.value === true, categoryMode, billing: { active: billing.active },
+      platformKillSwitch: lever?.value === true, categoryMode,
+      billing: { active: billing.active, periodStart: billing.period.start },
     }
   })
 }
@@ -654,6 +657,9 @@ interface CompleteSendInput {
   bodyText: string
   threadSnapshotAt: Date
   aiHandledMonth: string | null
+  /** The start of the billing period the claim read (`readBillingState(...).period.start`) — the
+   *  ONE key the conversation dedupe is stamped and compared on (ruling R26). */
+  billingPeriodStart: Date
   /** The SEND row's own agent (nullable: deleting an agent nulls it). Phase 7 resolves its draft
    *  model from this to decide whether the reply counts against the MANAGED allowance. */
   agentId: string | null
@@ -668,7 +674,14 @@ interface CompleteSendInput {
  * landing point: a re-entry that finds its own marker runs exactly this and nothing else.
  */
 async function completeSend(l: Landing, input: CompleteSendInput): Promise<void> {
-  const month = l.now.toISOString().slice(0, 7)
+  // The dedupe key is the BILLING PERIOD's start, never the wall clock's month (ruling R26): the
+  // allowance and the overage are counted over `periodOf` (a Stripe anniversary period on a paid
+  // plan), and a stamp keyed on the calendar month billed a thread replied on Jan 31 and Feb 1
+  // inside a Jan 15–Feb 15 period as two conversations. `handledPeriodStamps` also honours the
+  // legacy `'YYYY-MM'` a ticket may still carry from before the wave, so nothing is counted twice
+  // on upgrade. On a trial the period IS the calendar month and the stamp is its 1st — unchanged.
+  const periodStamps = handledPeriodStamps(input.billingPeriodStart)
+  const periodStamp = periodStamps[0]!
   for (const from of SENDING_TICKET_STATUSES) {
     ticketTransitions.assert(from, 'waiting_on_customer')
     ticketTransitions.assert(from, 'triaged')
@@ -774,13 +787,14 @@ async function completeSend(l: Landing, input: CompleteSendInput): Promise<void>
     // (`auto_sends`). `decision_source` is the draft's own column, so a Hold + re-approve inside the
     // window correctly bills the re-approved reply as a review send.
     await bumpMeter(tx, l.orgId, l.day, input.decisionSource === 'auto' ? SEND_METERS.autoSends : SEND_METERS.reviewSends, 1)
-    // At most once per ticket per calendar month — the stamp IS the dedupe, so a second send in the
-    // same month matches nothing and the meter stays put.
-    if (input.aiHandledMonth !== month) {
+    // At most once per ticket per BILLING PERIOD — the stamp IS the dedupe, so a second send in the
+    // same period matches nothing and the meter stays put. The guard repeats the comparison in SQL
+    // (over every equivalent stored form) so a concurrent completion cannot stamp twice.
+    if (!isHandledInPeriod(input.aiHandledMonth, input.billingPeriodStart)) {
       const stamped = await tx
         .update(tickets)
-        .set({ aiHandledMonth: month })
-        .where(and(eq(tickets.id, l.ticketId), or(sql`${tickets.aiHandledMonth} IS NULL`, sql`${tickets.aiHandledMonth} <> ${month}`)))
+        .set({ aiHandledMonth: periodStamp })
+        .where(and(eq(tickets.id, l.ticketId), or(isNull(tickets.aiHandledMonth), notInArray(tickets.aiHandledMonth, periodStamps))))
         .returning({ id: tickets.id })
       if (stamped.length > 0) {
         await bumpMeter(tx, l.orgId, l.day, SEND_METERS.aiHandledConversations, 1)
@@ -1016,6 +1030,7 @@ async function afterClaim(deps: SendExecuteDeps, ctx: SendExecuteContext, claime
       await completeSend(l, {
         recovered: true, providerMessageId: recoveredId, providerThreadId: ticket.providerThreadId, rfcMessageId,
         fromAddress, subject, bodyText, threadSnapshotAt: draft.threadSnapshotAt, aiHandledMonth: ticket.aiHandledMonth,
+        billingPeriodStart: claimed.billing.periodStart,
         agentId: send.agentId, decisionSource: draft.decisionSource,
       })
       return
@@ -1178,6 +1193,7 @@ async function afterClaim(deps: SendExecuteDeps, ctx: SendExecuteContext, claime
       bodyText,
       threadSnapshotAt: draft.threadSnapshotAt,
       aiHandledMonth: ticket.aiHandledMonth,
+      billingPeriodStart: claimed.billing.periodStart,
       agentId: send.agentId,
       decisionSource: draft.decisionSource,
       threading: { to: [ticket.customerEmail], inReplyTo, refs: references },

@@ -11,8 +11,13 @@
  *    selection predicate is `embedding IS NULL` (the partial index `knowledge_chunks_unembedded_idx`)
  *    — never `embedding_model <> $current` — so this arm's whole job is to NULL a document's stale
  *    vectors (a guarded write, re-checked at write time) and re-enqueue `knowledge.embed-batch`,
- *    which then refills them under whatever model the org runs today. **`knowledge_version` is
- *    deliberately NEVER bumped here**: that counter tracks the set of RETRIEVABLE chunks, and a
+ *    which then refills them under whatever model the org runs today. It checks the org's daily
+ *    embed cap BEFORE nulling anything (fix wave B3): a refill the cap refuses would leave the
+ *    document's vectors NULL with nothing left to rediscover them. Which is also why the arm is
+ *    the wrong place to change `KNOWLEDGE_EMBED_MODEL` casually — the rediscovery arm for a `ready`
+ *    source with `embedded_count < chunk_count` and no live job is a Phase 8 carry (STATUS.md).
+ *    **`knowledge_version` is deliberately NEVER bumped here**: that counter tracks the set of
+ *    RETRIEVABLE chunks, and a
  *    chunk stays retrievable through the LEXICAL leg the whole time this arm runs — nulling a
  *    vector only degrades how well the VECTOR leg scores it until the re-embed lands, it never
  *    removes the chunk from what a draft can cite (CLAUDE.md Knowledge bounds).
@@ -85,7 +90,7 @@ async function reembedDocument(deps: KnowledgeDeps, orgId: string, documentId: s
   })
 }
 
-/** Arm 2's read: does ORG's cap already cover today's spend? (`memory-capture.ts:66-68`'s shape.) */
+/** Both arms' read: does ORG's cap already cover today's spend? (`memory-capture.ts:66-68`'s shape.) */
 async function atEmbedCap(deps: KnowledgeDeps, orgId: string, day: string, now: Date): Promise<boolean> {
   return withOrg(deps.db, orgId, async (tx) => {
     const [counter] = await tx.select({ value: usageCounters.value }).from(usageCounters)
@@ -114,9 +119,29 @@ export async function runKnowledgeReembedSweep(
       .limit(REEMBED_DOCS_PER_RUN))
 
   let documentsQueued = 0
+  /** Orgs at their embed cap this run, each counted ONCE across both arms. */
+  let skippedCap = 0
+  const cappedOrgs = new Map<string, boolean>()
+  const orgAtCap = async (orgId: string): Promise<boolean> => {
+    let capped = cappedOrgs.get(orgId)
+    if (capped === undefined) {
+      capped = await atEmbedCap(deps, orgId, day, now)
+      cappedOrgs.set(orgId, capped)
+      if (capped) skippedCap += 1
+    }
+    return capped
+  }
+
   const toEnqueue: StaleDoc[] = []
+  // An org at its embed cap is skipped for EVERY document this pass (arm 2's rule, applied here
+  // too — fix wave B3). Nulling a document's vectors and enqueueing a refill that
+  // `knowledge.embed-batch` then refuses at the cap strands them: a `ready` source's document keeps
+  // NULL vectors that no path rediscovers (the refill lands `failSource`, guarded on `processing`),
+  // and a `crawl` source is flipped to `failed/cap_reached`. Checked BEFORE anything is nulled, so
+  // a capped org's documents are simply revisited tomorrow.
   for (const { orgId, documentId } of staleDocs) {
     try {
+      if (await orgAtCap(orgId)) continue
       if (await reembedDocument(deps, orgId, documentId, currentModel)) {
         documentsQueued += 1
         toEnqueue.push({ orgId, documentId })
@@ -163,13 +188,9 @@ export async function runKnowledgeReembedSweep(
   }
 
   let answersReembedded = 0
-  let skippedCap = 0
   for (const [orgId, rows] of byOrg) {
     try {
-      if (await atEmbedCap(deps, orgId, day, now)) {
-        skippedCap += 1
-        continue
-      }
+      if (await orgAtCap(orgId)) continue
 
       // Between transactions — real network I/O.
       const { vectors, tokens } = await deps.embedder.embed(rows.map((r) => r.questionText), 'document')

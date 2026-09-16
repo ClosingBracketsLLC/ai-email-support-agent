@@ -56,6 +56,8 @@ const ESCALATION_COPY: Record<NeedsOwnerReason, { title: string; body: string }>
   no_agent: { title: 'No agent is set up for this address', body: 'No agent is set up for the address this ticket arrived on.' },
   // -- Phase 6 (provider choice / BYOK). --
   provider_unavailable: { title: 'AI provider unavailable', body: 'The provider this agent uses rejected its key. Check Settings → AI; replies wait for you until then.' },
+  // -- Phase 7 (billing; ruling R27). The title `ticket.draft`'s org-level trial page carried before the fix wave. --
+  trial_budget: { title: 'Trial AI budget reached', body: 'The AI budget for this trial is used up, so this reply is waiting for you. Subscribe to keep the agent drafting.' },
 }
 
 export function escalationCopy(reason: NeedsOwnerReason): { title: string; body: string } {

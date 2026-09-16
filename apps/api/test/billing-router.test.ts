@@ -99,7 +99,7 @@ describe('billing router', () => {
     expect(await caught(() => org.mateClient.billing.startCheckout.mutate())).toMatchObject({ code: 'FORBIDDEN' })
   })
 
-  it('the soft codes map to PRECONDITION_FAILED (not_configured, already_subscribed, no_customer) and BAD_GATEWAY (stripe_unavailable), with BILLING_ERROR_MESSAGES', async () => {
+  it('the soft codes map to PRECONDITION_FAILED (not_configured, already_subscribed, checkout_pending, no_customer) and BAD_GATEWAY (stripe_unavailable), with BILLING_ERROR_MESSAGES', async () => {
     const org = await setupOrg()
 
     expect(await caught(() => org.ownerClient.billing.openPortal.mutate()))
@@ -115,6 +115,12 @@ describe('billing router', () => {
       .where(eq(billingSubscriptions.orgId, org.orgId)))
     expect(await caught(() => org.ownerClient.billing.startCheckout.mutate()))
       .toEqual({ code: 'PRECONDITION_FAILED', message: BILLING_ERROR_MESSAGES.already_subscribed })
+
+    // A deferred Checkout (R10) on a trialing row: still pending, not a second session (R30).
+    await t.api.withOrg(org.orgId, (tx) => tx.update(billingSubscriptions)
+      .set({ status: 'trialing', plan: 'trial' }).where(eq(billingSubscriptions.orgId, org.orgId)))
+    expect(await caught(() => org.ownerClient.billing.startCheckout.mutate()))
+      .toEqual({ code: 'PRECONDITION_FAILED', message: BILLING_ERROR_MESSAGES.checkout_pending })
   })
 
   it('an api with no STRIPE_* reports configured:false and refuses both paid paths with not_configured', async () => {

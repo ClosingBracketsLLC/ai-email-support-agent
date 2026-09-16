@@ -21,7 +21,7 @@
  */
 import { and, count, eq, gt, gte, sql } from 'drizzle-orm'
 import { INVARIANTS, PLANS, resolveSetting } from '@aesa/core'
-import { agentRuns, LLM_METERS, sumMeter, usageCounters, type OrgTx, type SettingSources } from '@aesa/db'
+import { agentRuns, LLM_METERS, sumMeter, usageCounters, type BillingStateView, type OrgTx, type SettingSources } from '@aesa/db'
 import { utcDayString } from '../date-utils.ts'
 
 /** The `usage_counters` meter the org-wide daily draft cap is measured against. */
@@ -42,10 +42,28 @@ export type GateOutcome =
   | { outcome: 'org_draft_capped' }
   | { outcome: 'org_spend_capped'; scope: SpendCapScope; costMicros: number }
 
-/** `sumMeter`'s inclusive lower bound for a total that means "since this workspace began". A
- *  literal rather than the org's creation date: `usage_counters` rows only exist from the first
- *  metered call onward, so any earlier day is the same sum. */
-const TRIAL_BUDGET_FROM_DAY = '1970-01-01'
+/** `sumMeter`'s inclusive lower bound when the trial has no clock of its own yet (the agent was
+ *  never switched on — a sandbox probe can still spend): "since this workspace began". A literal
+ *  rather than the org's creation date: `usage_counters` rows only exist from the first metered
+ *  call onward, so any earlier day is the same sum. */
+const TRIAL_BUDGET_EPOCH_DAY = '1970-01-01'
+
+/**
+ * Ruling R27: the trial's total Managed-AI budget applies ONLY to a genuine, unexpired trial — the
+ * derived billing STATE, never the plan. A cancelled workspace is back on `plan = 'trial'` (plan
+ * deviation 8) and an expired trial keeps its `trialing` row, but both are already review-only
+ * through `subscription_inactive` and bounded by the daily cap; summing a paying workspace's
+ * whole history against $10 the day it cancelled stopped its drafting outright, against the
+ * spec's "drafts continue".
+ */
+export const trialBudgetApplies = (billing: Pick<BillingStateView, 'state'>): boolean => billing.state === 'trialing'
+
+/** The day the trial budget is summed FROM (ruling R27): the trial's own clock —
+ *  `workspaces.agent_enabled_at` — so spend that predates the trial (the sandbox, an earlier
+ *  enable on a workspace 0025 later re-clocked) is not the trial's; the epoch only when null. */
+export function trialBudgetFromDay(billing: Pick<BillingStateView, 'agentEnabledAt'>): string {
+  return billing.agentEnabledAt ? utcDayString(billing.agentEnabledAt) : TRIAL_BUDGET_EPOCH_DAY
+}
 
 /** Start of `d`'s UTC day — the boundary every daily count here is measured from. */
 export function utcMidnight(d: Date): Date {
@@ -82,8 +100,9 @@ export interface GateParams {
   model: string
   input: Record<string, unknown>
   /** The org's own `org_settings` rows AND its PLAN's defaults (`loadSettingSources`, `@aesa/db`) —
-   *  a trial workspace's caps are the trial tier's unless an owner overrode them. `planId` is also
-   *  what decides whether branch 4b's total trial budget applies at all. */
+   *  a trial workspace's caps are the trial tier's unless an owner overrode them. Its `billing`
+   *  view (the derived state and the trial clock) is what decides whether branch 4b's total trial
+   *  budget applies at all, and from which day it is summed. */
   settings: SettingSources
   now: Date
 }
@@ -98,8 +117,8 @@ export interface GateParams {
  *   2. live running draft runs ≥ PER_ORG_DRAFT_CONCURRENCY        → org_busy
  *   3. usage_counters draft_runs      ≥ autonomy.daily_draft_cap  → org_draft_capped
  *   4. usage_counters llm_cost_micros ≥ autonomy.daily_llm_usd_cap × 1e6 → org_spend_capped/daily
- *  4b. trial only: the SAME meter summed over every day ≥ PLANS.trial.llmUsdBudget × 1e6
- *                                                          → org_spend_capped/trial
+ *  4b. a genuine trial only (`trialBudgetApplies`): the SAME meter summed from the trial's own
+ *      clock (`trialBudgetFromDay`) ≥ PLANS.trial.llmUsdBudget × 1e6 → org_spend_capped/trial
  *   5. otherwise: insert the `agent_runs` row (status `running`) and bump `draft_runs`.
  *
  * Step 4 and step 4b both read `LLM_METERS.costMicros` and never `costMicrosByok`: the daily cap and
@@ -137,11 +156,12 @@ export async function gateAndRecordRun(tx: OrgTx, p: GateParams): Promise<GateOu
   }
 
   // 4b, Phase 7: the trial's TOTAL Managed-AI budget (spec §Budgets) — a second, cumulative ceiling
-  // that only a trial workspace has. Evaluated AFTER the daily cap so a workspace that is over both
-  // reports the one that resets on its own, and skipped entirely on a paid plan (`llmUsdBudget: null`).
-  if (p.settings.planId === 'trial') {
+  // that only a genuine, unexpired trial has (ruling R27). Evaluated AFTER the daily cap so a
+  // workspace that is over both reports the one that resets on its own, and skipped entirely on a
+  // paid plan (`llmUsdBudget: null`), an expired trial and a cancelled workspace.
+  if (trialBudgetApplies(p.settings.billing)) {
     const budget = PLANS.trial.llmUsdBudget
-    const total = await sumMeter(tx, LLM_METERS.costMicros, TRIAL_BUDGET_FROM_DAY)
+    const total = await sumMeter(tx, LLM_METERS.costMicros, trialBudgetFromDay(p.settings.billing))
     if (total >= usdCapToMicros(budget)) return { outcome: 'org_spend_capped', scope: 'trial', costMicros: total }
   }
 
@@ -178,10 +198,11 @@ export async function readCapsUnlocked(
     ticketRunsToday: await draftRunsForTicketToday(tx, p.ticketId, utcMidnight(p.now)),
     orgCostMicrosToday: await meterValue(tx, day, LLM_METERS.costMicros),
     orgDraftsToday: await meterValue(tx, day, DRAFT_METER),
-    // Read for EVERY plan, not only `trial`: this is the unlocked mirror of branch 4b, and a caller
-    // comparing it against a budget its own `planId` says does not apply is the caller's business.
-    // One indexed aggregate over one org's counters — the same table the two reads above touch.
-    orgTrialCostMicros: await sumMeter(tx, LLM_METERS.costMicros, TRIAL_BUDGET_FROM_DAY),
+    // Read for EVERY state, not only a live trial: this is the unlocked mirror of branch 4b, and a
+    // caller comparing it against a budget its own billing state says does not apply is the
+    // caller's business. One indexed aggregate over one org's counters — the same table the two
+    // reads above touch — from the same day the locked gate sums from.
+    orgTrialCostMicros: await sumMeter(tx, LLM_METERS.costMicros, trialBudgetFromDay(p.settings.billing)),
   }
 }
 
@@ -190,6 +211,6 @@ export interface UnlockedCaps {
   ticketRunsToday: number
   orgCostMicrosToday: number
   orgDraftsToday: number
-  /** `llm_cost_micros` summed over EVERY day — branch 4b's trial budget input. */
+  /** `llm_cost_micros` summed from the trial's own clock (`trialBudgetFromDay`) — branch 4b's input. */
   orgTrialCostMicros: number
 }

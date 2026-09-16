@@ -3,7 +3,7 @@ import { useLocalSearchParams, useRouter } from 'expo-router'
 import { useEffect, useRef, useState } from 'react'
 import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native'
 import { SafeAreaView } from 'react-native-safe-area-context'
-import type { RejectAction } from '@aesa/contracts'
+import { canManageWorkspace, type RejectAction } from '@aesa/contracts'
 import { Banner } from '@/components/banner'
 import { Button } from '@/components/button'
 import { Chip, type ChipTone } from '@/components/chip'
@@ -90,6 +90,11 @@ export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?:
     },
   }))
   const draft = query.data?.draft ?? null
+  // "Remember this reply" is `managerProcedure` on the api (owner/admin): a member who could tap it
+  // would only be shown FORBIDDEN, so the button is offered on the role alone. `workspace.get` is
+  // already cached by the gate, so this costs no request.
+  const ws = useQuery(trpc.workspace.get.queryOptions())
+  const canRemember = ws.data ? canManageWorkspace(ws.data.role) : false
 
   // Keyed to the draft, never a bare boolean: a reject→redraft puts a DIFFERENT draft on this same
   // mounted screen, and it has to be opened on its own before Approve comes back.
@@ -339,7 +344,7 @@ export function TicketScreen({ pollMs = TICKET_POLL_MS, undoTickMs }: { pollMs?:
               key={m.id}
               message={m}
               outbound={outbound}
-              onRemember={outbound ? () => pressRemember(m.id) : undefined}
+              onRemember={outbound && canRemember ? () => pressRemember(m.id) : undefined}
               remembering={rememberingId === m.id && rememberReply.isPending}
             />
           )

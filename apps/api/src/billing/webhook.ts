@@ -100,15 +100,24 @@ const InvoiceSchema = z.object({
  * there would hand the workspace the paid product before the first payment succeeded; landing
  * `past_due` would page the owner for a payment that has not failed. The row simply keeps its
  * trial state until the `customer.subscription.updated` that resolves the payment arrives.
+ *
+ * `incomplete_expired` maps to nothing too (ruling R30, plan deviation 8): it is the SAME never-paid
+ * subscription 23 hours later, and a workspace that never received the paid product has nothing to
+ * lose — mapping it to `canceled` killed a running trial with ten days left. The dead subscription
+ * is forgotten instead (`subscriptionGone`, below) so a fresh Checkout can start.
  */
 function statusOf(stripeStatus: string): { status: 'active' | 'past_due' | 'canceled'; plan: 'trial' | 'standard' } | null {
   switch (stripeStatus) {
     case 'active': case 'trialing': return { status: 'active', plan: 'standard' }
     case 'past_due': case 'unpaid': case 'paused': return { status: 'past_due', plan: 'standard' }
-    case 'canceled': case 'incomplete_expired': return { status: 'canceled', plan: 'trial' }
-    default: return null   // 'incomplete' and anything Stripe adds later
+    case 'canceled': return { status: 'canceled', plan: 'trial' }
+    default: return null   // 'incomplete', 'incomplete_expired' and anything Stripe adds later
   }
 }
+
+/** Stripe statuses after which the subscription will never bill again — the two the `deleted`
+ *  event and a terminal `updated` can carry. */
+const GONE_STATUSES: ReadonlySet<string> = new Set(['canceled', 'incomplete_expired'])
 
 /** The audit action for each handled type — a stable name the audit trail can be searched on,
  *  rather than the raw dotted event type (`billing.checkout.session.completed` reads as nonsense). */
@@ -120,13 +129,15 @@ const AUDIT_ACTIONS: Record<string, string> = {
   'invoice.paid': 'billing.payment_succeeded',
 }
 
-/** The columns one event may change. Every field is optional: an event only ever patches what it knows. */
+/** The columns one event may change. Every field is optional: an event only ever patches what it
+ *  knows. The three ids may be set to null by ONE path only — a gone subscription on a trial-plan
+ *  row (see `applyStripeEvent`); `parseEvent` itself never writes a null. */
 interface BillingPatch {
   plan?: 'trial' | 'standard'
   status?: 'active' | 'past_due' | 'canceled'
-  stripeSubscriptionId?: string
-  stripeDomainItemId?: string
-  stripeOverageItemId?: string
+  stripeSubscriptionId?: string | null
+  stripeDomainItemId?: string | null
+  stripeOverageItemId?: string | null
   domainQuantity?: number
   currentPeriodStart?: Date
   currentPeriodEnd?: Date
@@ -200,6 +211,10 @@ interface Parsed {
    *  recorded but the plan and status are left alone. Carries the session's `payment_status` for
    *  the log line. */
   deferredFulfilment: { paymentStatus: string | null } | null
+  /** A `customer.subscription.*` event saying this subscription will never bill again (`deleted`,
+   *  or `updated` to `canceled`/`incomplete_expired`). On a trial-plan row that is a deferred
+   *  Checkout that died, and its ids are forgotten rather than its status moved (ruling R30). */
+  subscriptionGone: boolean
   auditDetail: Record<string, unknown>
 }
 
@@ -253,6 +268,7 @@ function parseEvent(event: StripeEvent, prices: PriceIds): Parsed | null {
         patch,
         fellBackToPosition,
         deferredFulfilment,
+        subscriptionGone: false,
         auditDetail: { subscriptionId: patch.stripeSubscriptionId ?? null },
       }
     }
@@ -275,6 +291,7 @@ function parseEvent(event: StripeEvent, prices: PriceIds): Parsed | null {
       return {
         kind: 'subscription', customerId: sub.customer, claimedOrgId: null, patch, fellBackToPosition,
         deferredFulfilment: null,
+        subscriptionGone: event.type === 'customer.subscription.deleted' || GONE_STATUSES.has(sub.status),
         auditDetail: { subscriptionId: sub.id, stripeStatus: sub.status },
       }
     }
@@ -295,7 +312,7 @@ function parseEvent(event: StripeEvent, prices: PriceIds): Parsed | null {
       if (subscriptionId) patch.stripeSubscriptionId = subscriptionId
       return {
         kind: 'invoice', customerId: inv.customer, claimedOrgId: null, patch, fellBackToPosition: false,
-        deferredFulfilment: null,
+        deferredFulfilment: null, subscriptionGone: false,
         auditDetail: { subscriptionId: subscriptionId ?? null },
       }
     }
@@ -353,8 +370,12 @@ export async function applyStripeEvent(deps: BillingServiceDeps, event: StripeEv
   const now = deps.now?.() ?? new Date()
   const outcome = await deps.api.withOrg<{
     result: StripeApplyOutcome
+    /** Why an `ignored` was ignored — decides the post-commit log line or alert. */
+    ignoredBecause?: 'foreign_invoice' | 'canceled_row' | 'foreign_subscription'
+    /** The id the row holds, for the `foreign_subscription` alert. */
+    rowSubscriptionId?: string
     notificationId?: string
-    /** Set when this event named a subscription other than the one the row already carries. */
+    /** Set when a Checkout introduced a subscription other than the LIVE one the row already carries. */
     displacedSubscriptionId?: string
   }>(orgId, async (tx) => {
     await ensureBillingRow(tx)
@@ -379,7 +400,28 @@ export async function applyStripeEvent(deps: BillingServiceDeps, event: StripeEv
     const invoiceSubscriptionId = parsed.patch.stripeSubscriptionId
     if (parsed.kind === 'invoice' && invoiceSubscriptionId !== undefined
         && state.stripeSubscriptionId !== null && invoiceSubscriptionId !== state.stripeSubscriptionId) {
-      return { result: 'ignored' }
+      return { result: 'ignored', ignoredBecause: 'foreign_invoice' }
+    }
+
+    // And no invoice at all speaks for a CANCELED row (ruling R32). A canceled Stripe subscription
+    // can never become active again, so an `invoice.paid` that lands after the `deleted` — the
+    // ordering a Portal "cancel immediately + prorate" produces, in the same second — is the final
+    // proration or a dunning recovery, not a resurrection, and nothing later would ever undo one.
+    // Re-subscribing goes through Checkout, which is the one event allowed to replace the id.
+    if (parsed.kind === 'invoice' && state.status === 'canceled') {
+      return { result: 'ignored', ignoredBecause: 'canceled_row' }
+    }
+
+    // A `customer.subscription.*` event speaks only for the subscription the row holds (ruling R31):
+    // the platform creates every subscription through Checkout, so `checkout.session.completed` is
+    // the ONE event that may introduce a different id — the same asymmetry the invoice guard has.
+    // Without this, cancelling the orphan named by a `stripe_double_subscription` alert delivered a
+    // `deleted` for the orphan that displaced the LIVE subscription: the row went canceled on the
+    // orphan's id, the survivor's next invoice was then "foreign" and ignored, and the workspace
+    // paid for a subscription it was no longer served.
+    if (parsed.kind === 'subscription' && parsed.patch.stripeSubscriptionId !== undefined
+        && state.stripeSubscriptionId !== null && parsed.patch.stripeSubscriptionId !== state.stripeSubscriptionId) {
+      return { result: 'ignored', ignoredBecause: 'foreign_subscription', rowSubscriptionId: state.stripeSubscriptionId }
     }
 
     // `invoice.paid` for the row's OWN subscription is what carries a deferred Checkout (see the
@@ -393,23 +435,46 @@ export async function applyStripeEvent(deps: BillingServiceDeps, event: StripeEv
       && state.stripeSubscriptionId !== null
       && invoiceSubscriptionId === state.stripeSubscriptionId
 
-    // A subscription id different from the one on the row means this customer now has TWO live
-    // subscriptions — two Checkout sessions started before either completed, typically. The newer
-    // one is taken (last-write-wins, as everywhere else here, and Stripe treats the newer as
-    // current), but the older one keeps billing the customer while being invisible to the platform,
-    // so an operator has to be told which id to cancel. Collected here, alerted after the commit.
-    const displaced = parsed.kind !== 'invoice'
+    // A Checkout naming a subscription other than the row's LIVE one means this customer now has
+    // TWO live subscriptions — two Checkout sessions started before either completed, typically.
+    // The newer one is taken (last-write-wins, as everywhere else here, and Stripe treats the newer
+    // as current), but the older one keeps billing the customer while being invisible to the
+    // platform, so an operator has to be told which id to cancel. Collected here, alerted after the
+    // commit. Only a Checkout can get here with a different id (the guard above), and a `canceled`
+    // row's old id is not a live subscription — a workspace subscribing again is one subscription,
+    // not two.
+    const displaced = parsed.kind === 'checkout'
       && parsed.patch.stripeSubscriptionId !== undefined
       && state.stripeSubscriptionId !== null
+      && state.status !== 'canceled'
       && parsed.patch.stripeSubscriptionId !== state.stripeSubscriptionId
       ? state.stripeSubscriptionId
       : undefined
 
-    const patch = {
+    const patch: BillingPatch & { stripeCustomerId: string; lastStripeEventCreated: number } = {
       ...parsed.patch,
       ...(invoicePromotesPlan ? { plan: 'standard' as const } : {}),
       stripeCustomerId: parsed.customerId,
       lastStripeEventCreated: event.created,
+    }
+
+    // Ruling R30: `past_due` and `canceled` land only on a row that HAS the paid product. On a
+    // trial-plan row the subscription named here is a deferred Checkout (R10) that never
+    // activated — a card that failed at completion, an SCA never finished — and a workspace that
+    // never received the product cannot lose it: no "Payment failed" page on a trial, no running
+    // trial cut short. The status and plan stay; the Stripe ids are recorded as facts, except that
+    // a subscription Stripe says is GONE is forgotten (ids cleared), because `startCheckout` reads
+    // a subscription id on a trialing row as a Checkout still pending and would otherwise refuse a
+    // fresh one forever.
+    if ((patch.status === 'past_due' || patch.status === 'canceled') && state.plan !== 'standard') {
+      delete patch.status
+      delete patch.plan
+    }
+    if (parsed.subscriptionGone && state.plan !== 'standard' && state.status === 'trialing') {
+      patch.stripeSubscriptionId = null
+      patch.stripeDomainItemId = null
+      patch.stripeOverageItemId = null
+      patch.cancelAtPeriodEnd = false
     }
     const written = await tx.update(billingSubscriptions)
       .set(patch)
@@ -474,11 +539,26 @@ export async function applyStripeEvent(deps: BillingServiceDeps, event: StripeEv
     )
   }
 
-  if (outcome.result === 'ignored' && parsed.kind === 'invoice') {
+  if (outcome.ignoredBecause === 'foreign_invoice') {
     deps.logger.warn(
       { eventId: event.id, type: event.type, orgId, invoiceSubscriptionId: parsed.patch.stripeSubscriptionId },
       'stripe.invoice_for_another_subscription',
     )
+  }
+  if (outcome.ignoredBecause === 'canceled_row') {
+    deps.logger.info(
+      { eventId: event.id, type: event.type, orgId, invoiceSubscriptionId: parsed.patch.stripeSubscriptionId ?? null },
+      'stripe.invoice_on_canceled_subscription',
+    )
+  }
+  if (outcome.ignoredBecause === 'foreign_subscription') {
+    // Routine after an operator cancels the orphan a `stripe_double_subscription` alert named (its
+    // `deleted` lands here), and otherwise a subscription this platform did not create through
+    // Checkout — either way a human should see which id Stripe is talking about.
+    alert(deps.logger, 'stripe_foreign_subscription_event', {
+      eventId: event.id, type: event.type, orgId,
+      rowSubscriptionId: outcome.rowSubscriptionId ?? null, eventSubscriptionId: parsed.patch.stripeSubscriptionId ?? null,
+    })
   }
 
   if (outcome.displacedSubscriptionId) {

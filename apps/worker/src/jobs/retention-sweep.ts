@@ -85,12 +85,14 @@ export interface RetentionSweepResult {
 }
 
 /**
- * One platform-wide age-based delete, in slices. `table`/`column` are literal identifiers this
- * module spells itself (never caller input), `extra` is a fixed predicate fragment, and the cutoff is
- * a bound parameter. Returns the total deleted.
+ * One platform-wide age-based delete, in slices. `table`/`column` are literal identifiers the
+ * calling module spells itself (never caller input — `column` defaults to `created_at`; the daily
+ * sweep's arm (g) ages `agent_runs` by `started_at`), `extra` is a fixed predicate fragment, and
+ * the cutoff is a bound parameter. Returns the total deleted. Exported for `sweeps-daily.ts`'s
+ * arm (g), the one other age-based delete large enough to need slicing.
  */
-async function deleteAged(
-  tx: PlatformTx, table: string, cutoff: Date, extra?: ReturnType<typeof sql>,
+export async function deleteAged(
+  tx: PlatformTx, table: string, cutoff: Date, extra?: ReturnType<typeof sql>, column = 'created_at',
 ): Promise<number> {
   let deleted = 0
   for (;;) {
@@ -98,7 +100,7 @@ async function deleteAged(
       DELETE FROM ${sql.identifier(table)}
       WHERE id IN (
         SELECT id FROM ${sql.identifier(table)}
-        WHERE created_at < ${cutoff}${extra ? sql` AND ${extra}` : sql``}
+        WHERE ${sql.identifier(column)} < ${cutoff}${extra ? sql` AND ${extra}` : sql``}
         LIMIT ${RETENTION_BATCH}
       )
     `)

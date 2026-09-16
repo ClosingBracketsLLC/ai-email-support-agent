@@ -18,9 +18,11 @@ export function setJobObserver(o: JobObserver | null): void {
 }
 
 /**
- * Called from `registerJob`'s catch, before `scrubJobError` and the rethrow. Never throws itself —
- * an observer's own failure (a bad Sentry call, a network hiccup) must never replace or mask the
- * job's real error, which is what pg-boss still needs to see.
+ * Called from `registerJob`'s catch AFTER `scrubJobError` and before the rethrow — the observer
+ * receives the scrubbed error (a `DrizzleQueryError` with its `query`/`params` gone), never the raw
+ * one, so a bound customer body cannot ride into Sentry this way. Never throws itself — an
+ * observer's own failure (a bad Sentry call, a network hiccup) must never replace or mask the job's
+ * real error, which is what pg-boss still needs to see.
  */
 export function notifyJobFailure(err: unknown, ctx: { name: string; jobId: string; orgId: string | null }): void {
   if (!observer) return

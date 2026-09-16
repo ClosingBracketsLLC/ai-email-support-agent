@@ -38,7 +38,11 @@ import type { WorkerConfig } from '../src/config.ts'
 const rand = () => randomBytes(4).toString('hex')
 const NOW = new Date('2026-09-09T12:00:00Z')
 const TODAY = '2026-09-09'
-const THIS_MONTH = '2026-09'
+/** The dedupe stamp `completeSend` writes for a TRIAL workspace (no Stripe period → the calendar
+ *  month, stamped as its 1st; ruling R26). `THIS_MONTH_LEGACY` is the pre-wave seven-character
+ *  form the compatibility shim must still honour. */
+const THIS_MONTH = '2026-09-01'
+const THIS_MONTH_LEGACY = '2026-09'
 const CUSTOMER = 'customer@example.test'
 const SIGNATURE = 'Acme Support'
 /** Passes every guardrail screen: no markup, no link, no address, no number, no promise token. */
@@ -484,7 +488,7 @@ describe('send.execute', () => {
     expect(fx.mailbox.drafts().get(send.providerDraftId!)).toEqual({ threadId: s.threadId, sent: true })
   })
 
-  it('11 ai_handled_conversations counts a ticket once a MONTH: a second send the same month does not, the next month does', async () => {
+  it('11 ai_handled_conversations counts a ticket once a BILLING PERIOD (a trial\'s is the calendar month): a second send the same period does not, the next period does', async () => {
     const s = await seedApprovedDraft()
     await run(makeDeps().deps, s.sendId)
 
@@ -496,7 +500,43 @@ describe('send.execute', () => {
     const third = await seedSecondSend(s.ticketId)
     await run(makeDeps({ now: monotonicClock(new Date('2026-10-02T09:00:00Z')) }).deps, third.sendId)
     expect(await meters()).toMatchObject({ [SEND_METERS.reviewSends]: 3, [SEND_METERS.aiHandledConversations]: 2 })
-    expect((await getTicket(s.ticketId)).aiHandledMonth).toBe('2026-10')
+    expect((await getTicket(s.ticketId)).aiHandledMonth).toBe('2026-10-01')
+  })
+
+  it('11b ruling R26 — on a paid plan the dedupe follows the STRIPE period: two replies straddling a calendar boundary inside one period count ONCE, the next period counts again', async () => {
+    // A Sep 15 – Oct 15 anniversary period on the row: the allowance and the overage are counted
+    // over it (`periodOf`), so the dedupe stamp must be too.
+    await seedBilling({
+      plan: 'standard', status: 'active', domainQuantity: 1,
+      currentPeriodStart: new Date('2026-09-15T00:00:00Z'), currentPeriodEnd: new Date('2026-10-15T00:00:00Z'),
+    })
+    const s = await seedApprovedDraft()
+    await run(makeDeps({ now: monotonicClock(new Date('2026-09-30T23:00:00Z')) }).deps, s.sendId)
+    expect((await getTicket(s.ticketId)).aiHandledMonth).toBe('2026-09-15')
+    expect(await meters()).toMatchObject({ [SEND_METERS.aiHandledConversations]: 1, [SEND_METERS.aiHandledManaged]: 1 })
+
+    // Oct 1: a new calendar month, the SAME billing period. Before the wave this billed a second
+    // conversation.
+    const second = await seedSecondSend(s.ticketId)
+    await run(makeDeps({ now: monotonicClock(new Date('2026-10-01T09:00:00Z')) }).deps, second.sendId)
+    expect((await getTicket(s.ticketId)).aiHandledMonth).toBe('2026-09-15')
+    expect(await meters()).toMatchObject({ [SEND_METERS.reviewSends]: 2, [SEND_METERS.aiHandledConversations]: 1, [SEND_METERS.aiHandledManaged]: 1 })
+
+    // The webhook rolls the period over; the next reply counts again, under the new stamp.
+    await seedBilling({ currentPeriodStart: new Date('2026-10-15T00:00:00Z'), currentPeriodEnd: new Date('2026-11-15T00:00:00Z') })
+    const third = await seedSecondSend(s.ticketId)
+    await run(makeDeps({ now: monotonicClock(new Date('2026-10-16T09:00:00Z')) }).deps, third.sendId)
+    expect((await getTicket(s.ticketId)).aiHandledMonth).toBe('2026-10-15')
+    expect(await meters()).toMatchObject({ [SEND_METERS.aiHandledConversations]: 2, [SEND_METERS.aiHandledManaged]: 2 })
+  })
+
+  it('11c ruling R26 — the compatibility shim: a ticket stamped with the pre-wave calendar month (\'YYYY-MM\') is not counted again by a send in that month', async () => {
+    const s = await seedApprovedDraft()
+    await withOrg(app.db, fx.orgId, (tx) => tx.update(tickets).set({ aiHandledMonth: THIS_MONTH_LEGACY }).where(eq(tickets.id, s.ticketId)))
+    await run(makeDeps().deps, s.sendId)
+    expect(await meters()).toMatchObject({ [SEND_METERS.reviewSends]: 1 })
+    expect((await meters())[SEND_METERS.aiHandledConversations]).toBeUndefined()
+    expect((await getTicket(s.ticketId)).aiHandledMonth).toBe(THIS_MONTH_LEGACY)
   })
 
   it('7 reply_from_address wins over the agent address as the From', async () => {

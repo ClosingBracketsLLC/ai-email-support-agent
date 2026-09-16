@@ -13,7 +13,7 @@ import {
 } from '@aesa/contracts'
 import { allowanceOf, billingStateOf, isBillingActive, periodOf, type BillingRowLike } from '@aesa/core'
 import { SEND_METERS, sumMeter } from './metering.ts'
-import { agents, billingSubscriptions } from './schema/index.ts'
+import { agents, billingSubscriptions, workspaces } from './schema/index.ts'
 import type { OrgTx } from './tenant.ts'
 
 export interface BillingStateRow extends BillingRowLike {
@@ -37,6 +37,11 @@ export interface BillingStateView extends BillingStateRow {
   /** True when the org has no `billing_subscriptions` row at all — a workspace that never ran
    *  `ensureBillingRow` (or predates it) reads as a fresh trial rather than throwing. */
   missingRow: boolean
+  /** `workspaces.agent_enabled_at` — the trial clock's ORIGIN (`trial_ends_at` is
+   *  `trialEndsAtFor(agent_enabled_at)`, one formula), and the day the trial's Managed-AI budget
+   *  is summed from (ruling R27). Null until the agent is first switched on, or when the org has
+   *  no workspace row. */
+  agentEnabledAt: Date | null
 }
 
 /** A workspace with no row yet has never had `ensureBillingRow` run for it — every field here
@@ -93,6 +98,7 @@ export async function readBillingState(tx: OrgTx, now: Date): Promise<BillingSta
         lastStripeEventCreated: found.lastStripeEventCreated,
       }
     : defaultRow(tx.orgId)
+  const [ws] = await tx.select({ agentEnabledAt: workspaces.agentEnabledAt }).from(workspaces).where(eq(workspaces.orgId, tx.orgId))
   const state = billingStateOf(row, now)
   return {
     ...row,
@@ -101,6 +107,7 @@ export async function readBillingState(tx: OrgTx, now: Date): Promise<BillingSta
     allowance: allowanceOf(row),
     period: periodOf(row, now),
     missingRow: !found,
+    agentEnabledAt: ws?.agentEnabledAt ?? null,
   }
 }
 

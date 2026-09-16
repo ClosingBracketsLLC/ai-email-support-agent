@@ -58,3 +58,32 @@ export function isAllowanceExhausted(p: { mode: 'managed' | 'byok'; plan: PlanId
 export function trialEndsAtFor(agentEnabledAt: Date): Date {
   return new Date(agentEnabledAt.getTime() + BILLING_PRICING.trialDays * 86_400_000)
 }
+
+/**
+ * `tickets.ai_handled_month`'s value for a billing period: the period START's UTC date
+ * (`'YYYY-MM-DD'`). The conversation meters count a ticket at most once per BILLING PERIOD — the
+ * Stripe anniversary period on a paid plan, the calendar month on a trial (`periodOf`) — so the
+ * dedupe stamp must be keyed on the same period the allowance and the overage are counted over
+ * (ruling R26). Before the Phase 7 fix wave the stamp was the calendar month (`'YYYY-MM'`), which
+ * billed a thread replied on Jan 31 and Feb 1 inside a Jan 15–Feb 15 period as two conversations.
+ */
+export function handledPeriodStamp(periodStart: Date): string {
+  return periodStart.toISOString().slice(0, 10)
+}
+
+/**
+ * Every stored value that means "already counted in this period": the period stamp itself and, for
+ * a period that starts on the 1st, the legacy seven-character calendar-month form it replaced — so
+ * a ticket already stamped `'2026-09'` when the wave deploys is not counted a second time by a
+ * September send that now writes `'2026-09-01'`. The compatibility shim is deliberately narrow: a
+ * mid-month period start has no legacy equivalent.
+ */
+export function handledPeriodStamps(periodStart: Date): string[] {
+  const stamp = handledPeriodStamp(periodStart)
+  return stamp.endsWith('-01') ? [stamp, stamp.slice(0, 7)] : [stamp]
+}
+
+/** Whether a ticket's stored stamp already counts it in the period starting at `periodStart`. */
+export function isHandledInPeriod(stored: string | null, periodStart: Date): boolean {
+  return stored !== null && handledPeriodStamps(periodStart).includes(stored)
+}

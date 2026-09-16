@@ -30,9 +30,18 @@ const CRAWL_URL_MESSAGE = 'Enter a full https:// address'
  * entire pasted article). */
 const TEXT_PREVIEW_MAX_CHARS = 500
 
+/** What the library's own type says a shared file carries. `fileName`/`mimeType` are typed as
+ *  strings, but `expo-share-intent` can hand over null for either (a file shared from an app that
+ *  never named it), and a null `fileName` throws inside `useUpload`'s synchronous `setPending` —
+ *  the Upload button then silently does nothing. `shareFileOf` coerces both at this one seam. */
 interface ShareFile { fileName: string; mimeType: string; path: string; size: number | null }
 interface ShareIntentShape { webUrl?: string | null; text?: string | null; files?: readonly ShareFile[] | null }
 type ShareKind = 'link' | 'text' | 'file' | 'empty'
+
+/** The ONE place a shared file's nullable-in-practice fields are coerced (fix wave). Exported for its test. */
+export function shareFileOf(raw: { fileName?: string | null; mimeType?: string | null; path: string; size?: number | null }): ShareFile {
+  return { fileName: raw.fileName ?? 'shared-file', mimeType: raw.mimeType ?? '', path: raw.path, size: raw.size ?? null }
+}
 
 function kindFor(intent: ShareIntentShape | null): ShareKind {
   if (!intent) return 'empty'
@@ -136,7 +145,7 @@ function ShareScreenBody() {
     <Screen testID="share">
       {kind === 'link' ? <LinkCard url={shareIntent!.webUrl ?? ''} maxCrawlPages={caps.maxCrawlPages} maxSources={caps.maxSources} onDone={onDone} /> : null}
       {kind === 'text' ? <TextCard text={shareIntent!.text ?? ''} maxSources={caps.maxSources} onDone={onDone} /> : null}
-      {kind === 'file' ? <FileCard file={shareIntent!.files![0]!} maxSources={caps.maxSources} onDone={onDone} /> : null}
+      {kind === 'file' ? <FileCard file={shareFileOf(shareIntent!.files![0]!)} maxSources={caps.maxSources} onDone={onDone} /> : null}
       {kind === 'empty' ? <Muted testID="share-empty">Nothing to add yet.</Muted> : null}
       <Button variant="secondary" label="Not now" onPress={notNow} testID="share-not-now" />
     </Screen>

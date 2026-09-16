@@ -49,9 +49,9 @@ const appActor = (ctx: BillingContext): BillingActor => ({
   userId: ctx.user.id, actor: ctx.actor, email: ctx.user.email ?? null, ip: ctx.ip, userAgent: ctx.userAgent,
 })
 
-/** `not_configured`, `already_subscribed` and `no_customer` are all states of the server or the
- *  workspace that a different action clears (configure Stripe; use the Portal; subscribe first) —
- *  PRECONDITION_FAILED. `stripe_unavailable` is the upstream being down, which is a BAD_GATEWAY and
+/** `not_configured`, `already_subscribed`, `checkout_pending` and `no_customer` are all states of
+ *  the server or the workspace that a different action (or time) clears (configure Stripe; use the
+ *  Portal; wait for the webhook; subscribe first) — PRECONDITION_FAILED. `stripe_unavailable` is the upstream being down, which is a BAD_GATEWAY and
  *  the one code the screen may offer a plain "try again" for. */
 const precondition = (message: string): TRPCError => new TRPCError({ code: 'PRECONDITION_FAILED', message })
 const badGateway = (message: string): TRPCError => new TRPCError({ code: 'BAD_GATEWAY', message })
@@ -65,6 +65,7 @@ export const billingRouter = router({
     switch (res.code) {
       case 'not_configured': throw precondition(BILLING_ERROR_MESSAGES.not_configured)
       case 'already_subscribed': throw precondition(BILLING_ERROR_MESSAGES.already_subscribed)
+      case 'checkout_pending': throw precondition(BILLING_ERROR_MESSAGES.checkout_pending)
       case 'stripe_unavailable': throw badGateway(BILLING_ERROR_MESSAGES.stripe_unavailable)
     }
   }),

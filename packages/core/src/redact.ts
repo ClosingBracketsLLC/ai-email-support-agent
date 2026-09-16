@@ -74,7 +74,11 @@ export function redactHeaders(headers: Record<string, string> | undefined): void
   for (const key of Object.keys(headers)) {
     if (SENSITIVE_HEADER_NAMES.has(key.toLowerCase())) { delete headers[key]; continue }
     const value = headers[key]
-    if (value !== undefined) headers[key] = redactText(value)
+    // The declared type says string, but the value arrives from a Sentry event nobody validated
+    // (`string[]` for a repeated header, a number, null). A scrubber never throws: anything that
+    // is not a string is dropped rather than passed through unredacted.
+    if (typeof value === 'string') headers[key] = redactText(value)
+    else delete headers[key]
   }
 }
 

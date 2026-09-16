@@ -39,8 +39,10 @@ import { errorMessage } from '../err-message.ts'
 import { alert } from '../observability.ts'
 import type { StripeUsagePort } from './stripe.ts'
 
-/** Bound on how many workspaces one nightly pass visits — the `stats.rollup` bound, same reasoning. */
-export const REPORT_ORGS_PER_RUN = 500
+/** There is deliberately NO per-run workspace bound here (ruling R28, the same reasoning as
+ *  `retention.sweep`'s R15 — and here the promise is money): a `LIMIT` with no rotation is a
+ *  workspace past the window that is never billed its overage and never told its trial is ending.
+ *  Phase 1 is reads under per-org SAVEPOINTs and phases 2 and 3 are per org already. */
 
 /** How close to `trial_ends_at` the "your trial is ending" page starts appearing. */
 export const TRIAL_ENDING_NOTICE_DAYS = 3
@@ -171,14 +173,19 @@ function planOverage(orgId: string, billing: BillingFacts, used: number): Overag
   }
 }
 
-/** Deviation 4: the licensed item's quantity is synced DAILY, not on every agent add or remove. */
+/** Deviation 4: the licensed item's quantity is synced DAILY, not on every agent add or remove.
+ *  The floor is ONE everywhere (ruling R29): Checkout starts the subscription at `max(1, …)` and
+ *  `allowanceOf` prices `max(1, domains)`, so a standard workspace with no active agent still pays
+ *  for — and is allowed — one domain. Syncing a 0 here would have Stripe credit the whole line
+ *  while the platform kept serving one domain's allowance. */
 function planQuantity(billing: BillingFacts, activeDomains: number): QuantityPlan | null {
   if (billing.stripeSubscriptionId === null || billing.stripeDomainItemId === null) return null
-  if (activeDomains === billing.domainQuantity) return null
+  const quantity = Math.max(1, activeDomains)
+  if (quantity === billing.domainQuantity) return null
   return {
     subscriptionId: billing.stripeSubscriptionId,
     itemId: billing.stripeDomainItemId,
-    quantity: activeDomains,
+    quantity,
     from: billing.domainQuantity,
   }
 }
@@ -293,11 +300,11 @@ export async function runBillingReportUsage(deps: ReportUsageDeps): Promise<Repo
   // --- Phase 1: collect. ONE platform transaction, pure reads, committed before any network call.
   const plans: OrgPlan[] = []
   await withPlatform(deps.db, 'cron:billing.report-usage', async (tx) => {
+    // No LIMIT: every workspace with a billing row, every night (R28). The list is one uuid per row.
     const orgRows = await tx
       .selectDistinct({ orgId: billingSubscriptions.orgId })
       .from(billingSubscriptions)
       .orderBy(asc(billingSubscriptions.orgId))
-      .limit(REPORT_ORGS_PER_RUN)
 
     for (const { orgId } of orgRows) {
       try {

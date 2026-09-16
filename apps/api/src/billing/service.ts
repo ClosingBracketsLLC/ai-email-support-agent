@@ -107,7 +107,7 @@ export async function getBilling(deps: BillingServiceDeps, orgId: string): Promi
 
 export type StartCheckoutResult =
   | { ok: true; url: string }
-  | { ok: false; code: 'not_configured' | 'already_subscribed' | 'stripe_unavailable' }
+  | { ok: false; code: 'not_configured' | 'already_subscribed' | 'checkout_pending' | 'stripe_unavailable' }
 
 export async function startCheckout(deps: BillingServiceDeps, orgId: string, actor: BillingActor): Promise<StartCheckoutResult> {
   const stripe = deps.stripe
@@ -126,6 +126,13 @@ export async function startCheckout(deps: BillingServiceDeps, orgId: string, act
   // starting a second Checkout — a `canceled` one may subscribe again.
   if (read.state.stripeSubscriptionId !== null && (read.state.state === 'active' || read.state.state === 'past_due')) {
     return { ok: false, code: 'already_subscribed' }
+  }
+  // A subscription id on a row still on the trial plan is a Checkout that completed but has not
+  // settled (ruling R10's deferred state) — the webhook will promote the row when the money lands,
+  // or forget the id when Stripe gives up on it (ruling R30). A second Checkout meanwhile would be a
+  // second subscription on the same customer.
+  if (read.state.stripeSubscriptionId !== null && read.state.plan === 'trial' && read.state.status === 'trialing') {
+    return { ok: false, code: 'checkout_pending' }
   }
 
   let customerId = read.state.stripeCustomerId

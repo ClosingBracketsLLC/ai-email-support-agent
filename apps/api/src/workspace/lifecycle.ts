@@ -188,10 +188,13 @@ export async function requestDeletion(
   if (confirm !== read.ws.businessName) return { ok: false, code: 'confirm_mismatch' }
   if (read.ws.deletionRequestedAt !== null) return { ok: false, code: 'deletion_pending' }
 
-  // The same "is there a live subscription" test `startCheckout`'s `already_subscribed` uses: an id
-  // plus a state that is still being billed. A `canceled` row needs nothing cancelled again.
+  // ANY subscription the row still holds is cancelled, not only one being billed today (fix wave):
+  // a deferred Checkout on a trialing row (ruling R10) is a subscription that can still SETTLE, and
+  // one that settled after the purge would bill a workspace with no row left to cancel it from.
+  // The one exception is a `canceled` row — Stripe has already ended that subscription, and
+  // cancelling it again is an error the port does not (yet) absorb.
   const subscriptionId = read.billing.stripeSubscriptionId
-  const live = subscriptionId !== null && (read.billing.state === 'active' || read.billing.state === 'past_due')
+  const live = subscriptionId !== null && read.billing.status !== 'canceled'
 
   if (live) {
     if (!deps.stripe) {

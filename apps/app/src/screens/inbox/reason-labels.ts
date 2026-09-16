@@ -54,6 +54,7 @@ export const REASON_SENTENCE: Record<NeedsOwnerReason, string> = {
   category_off: 'This category is switched off, so replies wait for you.',
   no_agent: 'No agent is set up for this address yet.',
   provider_unavailable: 'Your AI provider rejected its key, so replies wait for you — check Settings → AI.',
+  trial_budget: "This trial's AI budget is used up, so replies wait for you — subscribe in Settings → Billing to keep the agent drafting.",
 }
 
 /**

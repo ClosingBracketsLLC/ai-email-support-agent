@@ -26,6 +26,7 @@ describe('billing vocabulary', () => {
       not_configured: 'Billing is not set up on this server yet.',
       no_customer: 'Subscribe first, then manage billing.',
       already_subscribed: 'This workspace already has a subscription — use Manage billing.',
+      checkout_pending: 'Stripe is still confirming your payment. Check back in a few minutes.',
       stripe_unavailable: 'Stripe did not answer. Try again in a minute.',
       connection_limit: 'Your plan allows no more mailbox connections. Upgrade or disconnect one.',
     })

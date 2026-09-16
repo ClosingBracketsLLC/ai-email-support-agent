@@ -209,6 +209,10 @@ describe('stripe webhook', () => {
     // per workspace per day"), exactly like `escalationDedupeKey` and `provider_health:` do, so an
     // old event replayed today must still collapse onto today's page.
     const day = new Date().toISOString().slice(0, 10)
+    // A row that HAS the paid product (ruling R30: past_due lands only on a standard-plan row).
+    expect(await applyStripeEvent(deps, event('checkout.session.completed', {
+      customer: org.customerId, client_reference_id: org.orgId, subscription: 'sub_pd', payment_status: 'paid',
+    }, { created: T0 - 1 }))).toBe('applied')
 
     expect(await applyStripeEvent(deps, event('customer.subscription.updated', subscriptionObject({
       id: 'sub_pd', customer: org.customerId, status: 'past_due',
@@ -256,6 +260,11 @@ describe('stripe webhook', () => {
   it('invoice.payment_failed → past_due (+ the same day-deduped page); invoice.paid → active', async () => {
     const org = await seedOrg()
     const invoice = { customer: org.customerId, parent: { subscription_details: { subscription: 'sub_inv' } } }
+    // A row that HAS the paid product (ruling R30: past_due lands only on a standard-plan row — a
+    // payment failing on a never-activated subscription pages nobody, see the R30 cases below).
+    expect(await applyStripeEvent(deps, event('checkout.session.completed', {
+      customer: org.customerId, client_reference_id: org.orgId, subscription: 'sub_inv', payment_status: 'paid',
+    }, { created: T0 - 1 }))).toBe('applied')
 
     expect(await applyStripeEvent(deps, event('invoice.payment_failed', invoice, { created: T0 }))).toBe('applied')
     expect(await rowOf(org.orgId)).toMatchObject({ status: 'past_due', stripeSubscriptionId: 'sub_inv' })
@@ -264,11 +273,10 @@ describe('stripe webhook', () => {
 
     sent.length = 0
     expect(await applyStripeEvent(deps, event('invoice.paid', invoice, { created: T0 + 1 }))).toBe('applied')
-    // The plan moves too, but ONLY because the invoice names the subscription the row already
-    // carries (`sub_inv`, recorded by the payment_failed above). That guard is the whole point: the
-    // "foreign invoice" and "row id still null" cases below/above prove an invoice we cannot vouch
-    // for never promotes anyone. This is what carries a deferred checkout to standard once the
-    // money actually arrives (ruling R10).
+    // The plan stays standard because the invoice names the subscription the row already carries
+    // (`sub_inv`). That guard is the whole point: the "foreign invoice" and "row id still null"
+    // cases below/above prove an invoice we cannot vouch for never promotes anyone. It is also what
+    // carries a deferred checkout to standard once the money actually arrives (ruling R10).
     expect(await rowOf(org.orgId)).toMatchObject({ status: 'active', plan: 'standard' })
     expect(sent).toEqual([])
 
@@ -386,10 +394,43 @@ describe('stripe webhook', () => {
       status: 'canceled', plan: 'trial', stripeSubscriptionId: 'sub_current', lastStripeEventCreated: T0 + 1,
     })
 
-    // The matching subscription's own invoice still applies.
+    // The matching subscription's own invoice does NOT apply either (ruling R32): the row is
+    // canceled, and a canceled Stripe subscription can never become active again — this is the
+    // final proration or a dunning recovery, and nothing would ever undo a resurrection.
     const mine = { customer: org.customerId, parent: { subscription_details: { subscription: 'sub_current' } } }
-    expect(await applyStripeEvent(deps, event('invoice.paid', mine, { created: T0 + 100 }))).toBe('applied')
-    expect(await rowOf(org.orgId)).toMatchObject({ status: 'active' })
+    expect(await applyStripeEvent(deps, event('invoice.paid', mine, { created: T0 + 100 }))).toBe('ignored')
+    expect(await rowOf(org.orgId)).toMatchObject({ status: 'canceled', plan: 'trial', lastStripeEventCreated: T0 + 1 })
+  })
+
+  it('ruling R32 — invoice.paid (and invoice.payment_failed) for a canceled subscription is ignored: the Portal\'s "cancel immediately + prorate" delivers deleted then invoice.paid in the SAME second', async () => {
+    const org = await seedOrg()
+    await applyStripeEvent(deps, event('checkout.session.completed', {
+      customer: org.customerId, client_reference_id: org.orgId,
+      subscription: subscriptionObject({ id: 'sub_prorated', customer: org.customerId, status: 'active' }),
+    }))
+    expect(await applyStripeEvent(deps, event('customer.subscription.deleted', subscriptionObject({
+      id: 'sub_prorated', customer: org.customerId, status: 'canceled',
+    }), { created: T0 + 200 }))).toBe('applied')
+
+    const invoice = { customer: org.customerId, parent: { subscription_details: { subscription: 'sub_prorated' } } }
+    // Same `created` as the deleted — the monotonic guard lets it through (`<=`), so only R32 stands
+    // between this and a free-forever paid workspace.
+    expect(await applyStripeEvent(deps, event('invoice.paid', invoice, { created: T0 + 200 }))).toBe('ignored')
+    expect(await rowOf(org.orgId)).toMatchObject({ status: 'canceled', plan: 'trial' })
+    expect(await applyStripeEvent(deps, event('invoice.payment_failed', invoice, { created: T0 + 201 }))).toBe('ignored')
+    expect(await rowOf(org.orgId)).toMatchObject({ status: 'canceled', plan: 'trial' })
+    expect(await billingNotificationsOf(org.orgId)).toEqual([])
+
+    // Subscribing again goes through Checkout — the ONE event allowed to replace the id — and it
+    // is one subscription, not two: no `stripe_double_subscription` for a canceled row's old id.
+    const lines: string[] = []
+    const loud: BillingServiceDeps = { ...deps, logger: createAppLogger({ level: 'error', stream: { write: (l: string) => void lines.push(l) } }) }
+    expect(await applyStripeEvent(loud, event('checkout.session.completed', {
+      customer: org.customerId, client_reference_id: org.orgId,
+      subscription: subscriptionObject({ id: 'sub_again', customer: org.customerId, status: 'active' }),
+    }, { created: T0 + 300 }))).toBe('applied')
+    expect(await rowOf(org.orgId)).toMatchObject({ status: 'active', plan: 'standard', stripeSubscriptionId: 'sub_again' })
+    expect(lines.join('')).not.toContain('stripe_double_subscription')
   })
 
   it('an invoice arriving BEFORE the checkout (the row has no subscription yet) moves the status but NOT the plan', async () => {
@@ -498,6 +539,119 @@ describe('stripe webhook', () => {
     expect(line).toContain('sub_first')
     expect(line).toContain('sub_second')
     expect(line).toContain(org.orgId)
+  })
+
+  // ---- ruling R31: a customer.subscription.* event speaks only for the row's own subscription ----
+
+  it('ruling R31 — deleting the orphan named by stripe_double_subscription leaves the row on the survivor, and the survivor\'s next invoice.paid still applies; the foreign deleted is ignored and alerts stripe_foreign_subscription_event', async () => {
+    const org = await seedOrg()
+    const lines: string[] = []
+    const loud: BillingServiceDeps = { ...deps, logger: createAppLogger({ level: 'error', stream: { write: (l: string) => void lines.push(l) } }) }
+    const completed = (subscriptionId: string, created: number) => event('checkout.session.completed', {
+      customer: org.customerId, client_reference_id: org.orgId,
+      subscription: subscriptionObject({ id: subscriptionId, customer: org.customerId, status: 'active' }),
+    }, { created })
+
+    // Checkout A, then Checkout B: the row tracks B and the alert names A as the orphan.
+    expect(await applyStripeEvent(loud, completed('sub_A', T0))).toBe('applied')
+    expect(await applyStripeEvent(loud, completed('sub_B', T0 + 5))).toBe('applied')
+    expect(lines.join('')).toContain('stripe_double_subscription')
+    expect(await rowOf(org.orgId)).toMatchObject({ stripeSubscriptionId: 'sub_B', plan: 'standard', status: 'active' })
+
+    // The operator does what the alert says and cancels A. Before R31 this DISPLACED the live
+    // subscription: the row went trial/canceled on sub_A, B's invoices were then "foreign", and the
+    // workspace paid for B while served trial caps.
+    lines.length = 0
+    expect(await applyStripeEvent(loud, event('customer.subscription.deleted', subscriptionObject({
+      id: 'sub_A', customer: org.customerId, status: 'canceled',
+    }), { created: T0 + 10 }))).toBe('ignored')
+    expect(await rowOf(org.orgId)).toMatchObject({ stripeSubscriptionId: 'sub_B', plan: 'standard', status: 'active', lastStripeEventCreated: T0 + 5 })
+    const line = lines.join('')
+    expect(line).toContain('"alert":true')
+    expect(line).toContain('stripe_foreign_subscription_event')
+    expect(line).toContain('sub_A')
+    expect(line).toContain('sub_B')
+
+    // A foreign `updated` is ignored the same way — only Checkout may introduce a different id.
+    expect(await applyStripeEvent(loud, event('customer.subscription.updated', subscriptionObject({
+      id: 'sub_A', customer: org.customerId, status: 'active', quantity: 9,
+    }), { created: T0 + 11 }))).toBe('ignored')
+    expect(await rowOf(org.orgId)).toMatchObject({ stripeSubscriptionId: 'sub_B', domainQuantity: 2 })
+
+    // The survivor's own events keep applying.
+    const invoiceB = { customer: org.customerId, parent: { subscription_details: { subscription: 'sub_B' } } }
+    expect(await applyStripeEvent(deps, event('invoice.paid', invoiceB, { created: T0 + 20 }))).toBe('applied')
+    expect(await rowOf(org.orgId)).toMatchObject({ stripeSubscriptionId: 'sub_B', plan: 'standard', status: 'active', lastStripeEventCreated: T0 + 20 })
+    expect(await applyStripeEvent(deps, event('customer.subscription.updated', subscriptionObject({
+      id: 'sub_B', customer: org.customerId, status: 'active', quantity: 3,
+    }), { created: T0 + 21 }))).toBe('applied')
+    expect(await rowOf(org.orgId)).toMatchObject({ domainQuantity: 3 })
+  })
+
+  // ---- ruling R30: a workspace that never received the paid product cannot lose it ------------
+
+  it('ruling R30 — incomplete_expired on a deferred Checkout leaves a running trial running (status trialing, clock untouched) and forgets the dead subscription so a fresh Checkout can start', async () => {
+    const org = await seedOrg()
+    const trialEndsAt = new Date(Date.now() + 10 * 86_400_000)
+    await t.api.withOrg(org.orgId, (tx) => tx.update(billingSubscriptions)
+      .set({ trialEndsAt }).where(eq(billingSubscriptions.orgId, org.orgId)))
+
+    // R10's deferred state: the ids recorded, the plan still trial.
+    expect(await applyStripeEvent(deps, event('checkout.session.completed', {
+      customer: org.customerId, client_reference_id: org.orgId, subscription: 'sub_never_paid', payment_status: 'unpaid',
+    }))).toBe('applied')
+    expect(await rowOf(org.orgId)).toMatchObject({ plan: 'trial', status: 'trialing', stripeSubscriptionId: 'sub_never_paid' })
+
+    // 23 hours later Stripe gives up on it. Before R30 this landed `canceled` with `trial_ends_at`
+    // still ten days out — Autopilot off, caps dropped, on a workspace that never paid a cent.
+    expect(await applyStripeEvent(deps, event('customer.subscription.updated', subscriptionObject({
+      id: 'sub_never_paid', customer: org.customerId, status: 'incomplete_expired',
+    }), { created: T0 + 1 }))).toBe('applied')
+    const row = await rowOf(org.orgId)
+    expect(row).toMatchObject({
+      plan: 'trial', status: 'trialing', stripeSubscriptionId: null, stripeDomainItemId: null, stripeOverageItemId: null,
+      cancelAtPeriodEnd: false, lastStripeEventCreated: T0 + 1,
+    })
+    expect(row!.trialEndsAt).toEqual(trialEndsAt)
+    expect(await auditsOf(org.orgId, 'billing.subscription_updated')).toHaveLength(1)
+  })
+
+  it('ruling R30 — invoice.payment_failed on a never-activated subscription neither lands past_due nor pages "Payment failed" on a trial row; a deleted deferred subscription is forgotten, not a cancellation', async () => {
+    const org = await seedOrg()
+    expect(await applyStripeEvent(deps, event('checkout.session.completed', {
+      customer: org.customerId, client_reference_id: org.orgId, subscription: 'sub_deferred_pd', payment_status: 'unpaid',
+    }))).toBe('applied')
+
+    const invoice = { customer: org.customerId, parent: { subscription_details: { subscription: 'sub_deferred_pd' } } }
+    expect(await applyStripeEvent(deps, event('invoice.payment_failed', invoice, { created: T0 + 1 }))).toBe('applied')
+    expect(await rowOf(org.orgId)).toMatchObject({ plan: 'trial', status: 'trialing', stripeSubscriptionId: 'sub_deferred_pd', lastStripeEventCreated: T0 + 1 })
+    expect(await billingNotificationsOf(org.orgId)).toEqual([])
+    expect(sent).toEqual([])
+
+    // The same for `past_due` arriving on the subscription object itself.
+    expect(await applyStripeEvent(deps, event('customer.subscription.updated', subscriptionObject({
+      id: 'sub_deferred_pd', customer: org.customerId, status: 'past_due',
+    }), { created: T0 + 2 }))).toBe('applied')
+    expect(await rowOf(org.orgId)).toMatchObject({ plan: 'trial', status: 'trialing', stripeDomainItemId: 'si_domain_1' })
+    expect(await billingNotificationsOf(org.orgId)).toEqual([])
+
+    // Stripe (or the operator) cancels the never-paid subscription: the trial is not "canceled".
+    expect(await applyStripeEvent(deps, event('customer.subscription.deleted', subscriptionObject({
+      id: 'sub_deferred_pd', customer: org.customerId, status: 'canceled',
+    }), { created: T0 + 3 }))).toBe('applied')
+    expect(await rowOf(org.orgId)).toMatchObject({ plan: 'trial', status: 'trialing', stripeSubscriptionId: null, stripeDomainItemId: null })
+
+    // And the paid product, once received, is still lost the ordinary way.
+    expect(await applyStripeEvent(deps, event('checkout.session.completed', {
+      customer: org.customerId, client_reference_id: org.orgId,
+      subscription: subscriptionObject({ id: 'sub_real', customer: org.customerId, status: 'active' }),
+    }, { created: T0 + 4 }))).toBe('applied')
+    expect(await rowOf(org.orgId)).toMatchObject({ plan: 'standard', status: 'active', stripeSubscriptionId: 'sub_real' })
+    expect(await applyStripeEvent(deps, event('customer.subscription.updated', subscriptionObject({
+      id: 'sub_real', customer: org.customerId, status: 'past_due',
+    }), { created: T0 + 5 }))).toBe('applied')
+    expect(await rowOf(org.orgId)).toMatchObject({ plan: 'standard', status: 'past_due' })
+    expect(await billingNotificationsOf(org.orgId)).toHaveLength(1)
   })
 
   it('HTTP: a bad signature is 400 and records nothing; the route is 404 when stripe is null; the body reaches constructEvent as the RAW string (assert the fake saw the exact bytes, including whitespace)', async () => {

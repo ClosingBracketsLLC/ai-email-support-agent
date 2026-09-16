@@ -21,10 +21,12 @@
  *     database the owner asked to be emptied are the bigger exposure. A key that is not under
  *     `orgs/<orgId>/` is not deleted at all: an irreversible delete is the last operation that
  *     should act on a key it cannot account for, so it is skipped and paged instead.
- *  3. **rows** — one platform transaction: every tenant table, then `workspaces`, then the auth rows,
- *     then ONE platform audit row (`org_id NULL`). The tenant trail is gone by design — it is tenant
- *     data — so the platform keeps the fact that the purge happened, and nothing else. A throw here
- *     leaves the workspace HALF purged (objects gone, rows present), so it alerts before rethrowing.
+ *  3. **rows** — one platform transaction: the cancel re-checked under `FOR UPDATE` (a
+ *     `cancelDeletion` that landed after phase 1 wins, and the alert says the objects are already
+ *     gone), then every tenant table, then `workspaces`, then the auth rows, then ONE platform audit
+ *     row (`org_id NULL`). The tenant trail is gone by design — it is tenant data — so the platform
+ *     keeps the fact that the purge happened, and nothing else. A throw here leaves the workspace
+ *     HALF purged (objects gone, rows present), so it alerts before rethrowing.
  *
  * The job is idempotent by construction: phase 1 finds no `workspaces` row on a second run and
  * returns `skipped`, which is also what makes pg-boss's retries safe.
@@ -158,8 +160,26 @@ export async function runWorkspacePurge(
   }
 
   // --- Phase 3: rows. Tenant tables, then workspaces, then the auth rows (see the header for why).
+  let cancelledMidPurge = false
   try {
     await withPlatform(deps.db, 'job:workspace.purge', async (tx) => {
+      // The cancel is re-checked HERE, under a row lock, not only in phase 1 (fix wave B4): an
+      // owner's `cancelDeletion` landing between the read and this transaction would otherwise be
+      // lost — the rows purged under a stamp that was already cleared. `FOR UPDATE` makes the
+      // check and the purge one unit: a `cancelDeletion` arriving now waits on the lock and then
+      // finds no workspace row (its own guarded UPDATE matches nothing, and it reports
+      // `not_pending`), never a half-cancelled purge. The objects are already gone by this point —
+      // the alert says so, because nothing brings them back.
+      const [live] = await tx.execute(sql`
+        SELECT deletion_requested_at FROM workspaces WHERE org_id = ${orgId} FOR UPDATE
+      `).then((r) => r.rows as { deletion_requested_at: Date | string | null }[])
+      const requestedAt = live?.deletion_requested_at ? new Date(live.deletion_requested_at) : null
+      const stillDue = requestedAt !== null
+        && new Date(requestedAt.getTime() + WORKSPACE_DELETE_GRACE_DAYS * 24 * 60 * 60_000) <= now
+      if (!stillDue) {
+        cancelledMidPurge = true
+        return
+      }
       const rows = await purgeWorkspace(tx, orgId)
       await purgeAuthRows(tx, orgId)
       // org_id NULL: this row must survive the purge it describes, and it is a platform fact, not a
@@ -179,6 +199,15 @@ export async function runWorkspacePurge(
     // happens.
     alert(deps.logger, 'purge_failed', { orgId, phase: 'rows', error: errorMessage(err) })
     throw err
+  }
+  if (cancelledMidPurge) {
+    // The workspace survives with its rows intact, but phase 2 has already emptied the bucket:
+    // every upload and export this workspace held is gone, and nothing re-creates them. A human
+    // has to tell the owner (and the object count says how much there was to lose).
+    alert(deps.logger, 'purge_failed', {
+      orgId, phase: 'cancelled_mid_purge', objectsDeleted: plan.objectKeys.length - failedKeys.length,
+    })
+    return 'skipped'
   }
 
   deps.logger.info({ orgId, objects: plan.objectKeys.length }, 'workspace_purged')

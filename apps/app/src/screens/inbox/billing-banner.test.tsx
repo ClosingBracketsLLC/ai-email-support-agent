@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider, notifyManager } from '@tanstack/react-query'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react-native'
 import type { ReactNode } from 'react'
+import { BILLING_ERROR_MESSAGES } from '@aesa/contracts'
 import { BillingBanner } from './billing-banner'
 
 // See inbox.test.tsx: TanStack's default scheduler defers notifications through a real setTimeout(0),
@@ -14,6 +15,8 @@ let mockDeletionRequestedAt: Date | null = null
 let mockPurgeAfter: Date | null = null
 let mockBillingState = 'trialing'
 let mockTrialEndsAt: Date | null = null
+/** `billing.get`'s `configured` — false on a server with no STRIPE_* (every dev box without keys). */
+let mockConfigured = true
 const mockStartCheckoutCalls: unknown[] = []
 const mockOpenPortalCalls: unknown[] = []
 const mockOpenExternalCalls: Array<{ start: () => Promise<{ url: string }>; opts: { onBlocked: (msg: string) => void } }> = []
@@ -21,6 +24,8 @@ let mockStartCheckoutImpl: () => Promise<{ url: string }> = () => Promise.resolv
 let mockOpenPortalImpl: () => Promise<{ url: string }> = () => Promise.resolve({ url: 'https://billing.stripe.com/portal' })
 
 jest.mock('@/lib/open-external', () => ({
+  // Like the real one, a `start()` that rejects rejects this too (after closing its popup): the
+  // caller's own `onError` is what shows the refusal, and its handler must swallow the rethrow.
   openExternal: (start: () => Promise<{ url: string }>, opts: { onBlocked: (msg: string) => void }) => {
     mockOpenExternalCalls.push({ start, opts })
     return start().then(() => undefined)
@@ -41,7 +46,7 @@ jest.mock('@/lib/trpc', () => ({
       get: {
         queryOptions: () => ({
           queryKey: ['billing', 'get'],
-          queryFn: () => Promise.resolve({ state: mockBillingState, trialEndsAt: mockTrialEndsAt }),
+          queryFn: () => Promise.resolve({ state: mockBillingState, trialEndsAt: mockTrialEndsAt, configured: mockConfigured }),
         }),
       },
       startCheckout: { mutationOptions: (o: object) => ({ mutationFn: () => { mockStartCheckoutCalls.push(true); return mockStartCheckoutImpl() }, ...o }) },
@@ -75,6 +80,7 @@ beforeEach(() => {
   mockPurgeAfter = null
   mockBillingState = 'trialing'
   mockTrialEndsAt = daysFromNow(10)
+  mockConfigured = true
   mockStartCheckoutCalls.length = 0
   mockOpenPortalCalls.length = 0
   mockOpenExternalCalls.length = 0
@@ -164,4 +170,56 @@ test('an active, fully-paid workspace renders nothing', async () => {
   mockBillingState = 'active'
   await setup()
   await waitFor(() => expect(screen.toJSON()).toBeNull())
+})
+
+// ---- fix wave B12: the banner surfaces the api's refusals and hides a button that can only fail ----
+
+test('a refused Subscribe (not_configured, already_subscribed, checkout_pending, stripe_unavailable) renders the BILLING_ERROR_MESSAGES sentence in the blocked slot — and nothing rejects unhandled', async () => {
+  mockBillingState = 'trial_expired'
+  mockStartCheckoutImpl = () => Promise.reject(Object.assign(new Error(BILLING_ERROR_MESSAGES.checkout_pending), { data: { code: 'PRECONDITION_FAILED' } }))
+  const unhandled: unknown[] = []
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason) }
+  process.on('unhandledRejection', onUnhandled)
+  try {
+    await setup()
+    await waitFor(() => expect(screen.getByTestId('billing-banner-subscribe')).toBeTruthy())
+
+    await fireEvent.press(screen.getByTestId('billing-banner-subscribe'))
+    await waitFor(() => expect(screen.getByTestId('billing-banner-blocked')).toBeTruthy())
+    expect(screen.getByText(BILLING_ERROR_MESSAGES.checkout_pending)).toBeTruthy()
+    // Let any stray rejection surface before asserting there was none.
+    await new Promise((r) => setTimeout(r, 20))
+    expect(unhandled).toEqual([])
+  } finally {
+    process.off('unhandledRejection', onUnhandled)
+  }
+})
+
+test('an unrecognized failure never reaches the owner as raw text', async () => {
+  mockBillingState = 'past_due'
+  mockOpenPortalImpl = () => Promise.reject(new Error('ECONNRESET: socket hang up with a stripe key sk_live_abc'))
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('billing-banner-manage')).toBeTruthy())
+
+  await fireEvent.press(screen.getByTestId('billing-banner-manage'))
+  await waitFor(() => expect(screen.getByTestId('billing-banner-blocked')).toBeTruthy())
+  expect(screen.getByText('Could not complete that. Try again.')).toBeTruthy()
+  expect(screen.queryByText(/sk_live/)).toBeNull()
+})
+
+test('on a server with no Stripe (configured: false) the sentence still shows but the action does not — a button that could only be refused is not offered', async () => {
+  mockBillingState = 'trial_expired'
+  mockConfigured = false
+  await setup()
+
+  await waitFor(() => expect(screen.getByTestId('billing-banner')).toBeTruthy())
+  expect(screen.getByText('Your trial has ended — replies wait for your review until you subscribe.')).toBeTruthy()
+  expect(screen.queryByTestId('billing-banner-subscribe')).toBeNull()
+
+  // The failed-card arm too.
+  for (const teardown of teardowns.splice(0)) await teardown()
+  mockBillingState = 'past_due'
+  await setup()
+  await waitFor(() => expect(screen.getByTestId('billing-banner')).toBeTruthy())
+  expect(screen.queryByTestId('billing-banner-manage')).toBeNull()
 })

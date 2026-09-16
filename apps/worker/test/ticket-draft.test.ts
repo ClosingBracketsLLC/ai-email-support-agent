@@ -12,6 +12,7 @@
  */
 import { randomBytes } from 'node:crypto'
 import { and, eq } from 'drizzle-orm'
+import type PgBoss from 'pg-boss'
 import pino from 'pino'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { emptyRetriever, type DraftDecision } from '@aesa/agent'
@@ -31,6 +32,7 @@ import {
   type Capabilities, type ChatRequest, type ChatResult, type LlmProvider,
 } from '@aesa/llm'
 import type { AdmissionPool } from '../src/drafting/admission.ts'
+import { runTicketBackstopSweep } from '../src/jobs/ticket-backstop-sweep.ts'
 import { runTicketDraft, STOP_LOSS_BYOK_OUTPUT_TOKENS, STOP_LOSS_MICROS, type TicketDraftDeps } from '../src/jobs/ticket-draft.ts'
 import { staticRefusal, staticResolver } from '../src/provider-resolver.ts'
 
@@ -478,6 +480,101 @@ describe('runTicketDraft', () => {
     expect(capNotifications[0]!.title).toBe('Daily AI budget reached')
     expect(capNotifications[0]!.payload).toEqual({})
     expect(notified).toEqual([capNotifications[0]!.id])
+  })
+
+  // ---- Ruling R27: the trial's TOTAL budget lands through escalateTicket, keyed on the STATE ----
+
+  it('3c. a live trial at its $10 total budget: needs_owner/trial_budget, ONE ticket page, ONE org-level billing notice, ONE operator alert keyed on the org; a second ticket pages once more and alerts nobody; the backstop sweep re-selects neither', async () => {
+    // A genuine trial (no billing row → trialing, no clock), $10 spent over its life — $1 today
+    // (under the trial's $3 daily cap, which is checked first) and $9 on an earlier day.
+    await setUsageCounter('llm_cost_micros', 1_000_000)
+    await withOrg(app.db, fx.orgId, (tx) => tx.insert(usageCounters).values({ orgId: fx.orgId, day: '2026-08-15', meter: 'llm_cost_micros', value: 9_000_000 }))
+    const ticketId = await seedDraftableTicket()
+    const provider = createFakeProvider([{ parsed: REPLY }])
+    const { logger, errors } = spyLogger()
+    const { deps, notified, drafted } = makeDeps(provider, { logger })
+
+    await run(deps, ticketId)
+
+    const ticket = await getTicket(ticketId)
+    expect(ticket.status).toBe('needs_owner')
+    expect(ticket.needsOwnerReason).toBe('trial_budget')
+    expect(provider.calls).toHaveLength(0)
+    expect(await runsFor(ticketId)).toHaveLength(0)
+    const pages = await notificationsWithPrefix(`trial_budget:${ticketId}:`)
+    expect(pages).toHaveLength(1)
+    expect(pages[0]).toMatchObject({ kind: 'escalation', title: 'Trial AI budget reached', payload: { ticketId } })
+    const notices = await notificationsWithPrefix(`llm_cap:trial:${fx.orgId}`)
+    expect(notices).toHaveLength(1)
+    expect(notices[0]).toMatchObject({ kind: 'billing', dedupeKey: `llm_cap:trial:${fx.orgId}`, title: 'Trial AI budget reached' })
+    expect(notices[0]!.body).toContain('subscribe')
+    expect(notified.sort()).toEqual([pages[0]!.id, notices[0]!.id].sort())
+    const alerts = errors.filter((e) => e.alert === true && e.kind === 'org_spend_capped')
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0]).toMatchObject({ orgId: fx.orgId, scope: 'trial' })
+    // No day in the key: the old `llm_cap:trial:<org>:<day>` re-paged and re-alerted daily, forever.
+    expect(await notificationsWithPrefix(`llm_cap:trial:${fx.orgId}:`)).toEqual([])
+    const audited = await auditRowsFor(ticketId, 'ticket.escalated')
+    expect(audited).toHaveLength(1)
+    expect(audited[0]!.detail).toMatchObject({ reason: 'trial_budget', costMicros: 10_000_000 })
+
+    // A second ticket the same day: its own page, no second notice, no second alert.
+    const second = await seedDraftableTicket()
+    await run(deps, second)
+    expect((await getTicket(second)).needsOwnerReason).toBe('trial_budget')
+    expect(await notificationsWithPrefix(`trial_budget:${second}:`)).toHaveLength(1)
+    expect(await notificationsWithPrefix(`llm_cap:trial:${fx.orgId}`)).toHaveLength(1)
+    expect(errors.filter((e) => e.alert === true && e.kind === 'org_spend_capped')).toHaveLength(1)
+
+    // The refusal STAMPED the ticket out of `triaged`: a re-run is a no-op, and the backstop sweep's
+    // arm (a) — which used to re-enqueue an untouched `triaged` ticket every minute — selects
+    // nothing (the stub boss throws on any enqueue).
+    await run(deps, ticketId)
+    expect(await notificationsWithPrefix(`trial_budget:${ticketId}:`)).toHaveLength(1)
+    expect(drafted).toEqual([])
+    const noBoss = new Proxy({}, { get(_t, prop) { throw new Error(`the sweep enqueued something (boss.${String(prop)})`) } }) as unknown as PgBoss
+    expect(await runTicketBackstopSweep(noBoss, { db: app.db, logger: pino({ level: 'silent' }), now: () => new Date(NOW.getTime() + 20 * 60_000) }))
+      .toMatchObject({ draftsEnqueued: 0 })
+  })
+
+  it('3d. a CANCELED workspace with $500 of paid-era spend still drafts (review/subscription_inactive) — the trial budget is the live trial\'s alone', async () => {
+    await seedBilling({ plan: 'trial', status: 'canceled', domainQuantity: 0 })
+    await setUsageCounter('llm_cost_micros', 2_000_000)
+    await withOrg(app.db, fx.orgId, (tx) => tx.insert(usageCounters).values({ orgId: fx.orgId, day: '2026-08-01', meter: 'llm_cost_micros', value: 500_000_000 }))
+    const ticketId = await seedDraftableTicket()
+    const provider = createFakeProvider([{ parsed: REPLY }])
+    const { deps } = makeDeps(provider)
+
+    await run(deps, ticketId)
+
+    expect(provider.calls).toHaveLength(1)
+    const [draft] = await draftsFor(ticketId)
+    expect(draft).toMatchObject({ decision: 'review', decisionReason: 'subscription_inactive', body: CLEAN_BODY })
+    expect((await getTicket(ticketId)).status).toBe('awaiting_review')
+    expect(await notificationsWithPrefix('trial_budget:')).toEqual([])
+    expect(await notificationsWithPrefix('llm_cap:')).toEqual([])
+  })
+
+  it('3e. a live trial whose spend predates agent_enabled_at does not count it against the budget', async () => {
+    await withOrg(app.db, fx.orgId, (tx) => tx.update(workspaces).set({ agentEnabledAt: new Date('2026-09-05T08:00:00Z') }).where(eq(workspaces.orgId, fx.orgId)))
+    await setUsageCounter('llm_cost_micros', 1_000_000)                                      // $1 today, inside the trial
+    await withOrg(app.db, fx.orgId, (tx) => tx.insert(usageCounters).values({ orgId: fx.orgId, day: '2026-09-01', meter: 'llm_cost_micros', value: 9_500_000 }))   // $9.50 before it
+    const ticketId = await seedDraftableTicket()
+    const provider = createFakeProvider([{ parsed: REPLY }])
+    const { deps } = makeDeps(provider)
+
+    await run(deps, ticketId)
+
+    expect(provider.calls).toHaveLength(1)
+    expect((await draftsFor(ticketId))[0]).toMatchObject({ decision: 'review', body: CLEAN_BODY })
+    expect(await notificationsWithPrefix('trial_budget:')).toEqual([])
+
+    // Move the spend INSIDE the trial and the same workspace is capped.
+    await withOrg(app.db, fx.orgId, (tx) => tx.update(usageCounters).set({ day: '2026-09-06' }).where(eq(usageCounters.day, '2026-09-01')))
+    const next = await seedDraftableTicket()
+    await run(deps, next)
+    expect(provider.calls).toHaveLength(1)
+    expect((await getTicket(next)).needsOwnerReason).toBe('trial_budget')
   })
 
   it('4. a CAS-rejected duplicate audits draft.run_skipped and writes no run row', async () => {

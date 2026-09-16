@@ -11,7 +11,7 @@
  * have no `workspaces` row, so this job — their first real caller — is where that ordering is proven.
  */
 import { randomBytes } from 'node:crypto'
-import { getTableName, sql } from 'drizzle-orm'
+import { eq, getTableName, sql } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import pino from 'pino'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -293,6 +293,49 @@ describe('workspace.purge', () => {
     for (const key of [...a.storageKeys, a.exportKey]) expect(await store.head(key)).toBeNull()
     expect(await countRows('workspaces', a.orgId)).toBe(1)
     expect(await countRows('messages', a.orgId)).toBe(1)
+  })
+
+  // Fix wave B4: the cancel is re-checked INSIDE phase 3 under FOR UPDATE, not only in phase 1.
+  it('a cancelDeletion landing between phase 1 and the row purge wins: skipped, every row kept, one purge_failed/cancelled_mid_purge alert saying the objects are already gone', async () => {
+    const store = makeStore()
+    const a = await seedWorkspace(store, 'cancel-mid-a', daysAgo(31))
+    const { logger, alerts } = alertLogger()
+
+    // Same technique as the row-purge fault injection: phase 1's read is the first `db.transaction`
+    // call, phase 3's is the second — the cancel is injected just before the second opens.
+    let transactions = 0
+    const racingDb = new Proxy(app.db, {
+      get(target, prop, receiver) {
+        if (prop !== 'transaction') return Reflect.get(target, prop, receiver) as unknown
+        return async (...args: unknown[]) => {
+          transactions += 1
+          if (transactions === 2) {
+            await withOrg(app.db, a.orgId, (tx) => tx.update(workspaces)
+              .set({ deletionRequestedAt: null, deletionRequestedBy: null }).where(eq(workspaces.orgId, a.orgId)))
+          }
+          return (Reflect.get(target, prop, receiver) as (...a: unknown[]) => unknown).apply(target, args)
+        }
+      },
+    }) as typeof app.db
+
+    expect(await runWorkspacePurge(makeDeps(store, { db: racingDb, logger }), { orgId: a.orgId }, AbortSignal.timeout(30_000))).toBe('skipped')
+
+    // Every row survives; the objects do not — and the alert is what tells a human that.
+    expect(await countRows('workspaces', a.orgId)).toBe(1)
+    expect(await countRows('messages', a.orgId)).toBe(1)
+    expect(await countAuth('organization', a.orgId)).toBe(1)
+    for (const key of [...a.storageKeys, a.exportKey]) expect(await store.head(key)).toBeNull()
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0]).toMatchObject({
+      alert: true, kind: 'purge_failed', orgId: a.orgId, phase: 'cancelled_mid_purge', objectsDeleted: a.storageKeys.length + 1,
+    })
+    const purgedAudits = await withPlatform(app.db, 'test:purge-audit', async (tx) => {
+      const res = await tx.execute<{ n: number }>(sql`
+        SELECT count(*)::int AS n FROM audit_log
+        WHERE org_id IS NULL AND action = 'workspace.purged' AND entity_id = ${a.orgId}`)
+      return Number(res.rows[0]!.n)
+    })
+    expect(purgedAudits).toBe(0)
   })
 
   it('refuses an org still inside its 30-day grace period, and deletes nothing', async () => {

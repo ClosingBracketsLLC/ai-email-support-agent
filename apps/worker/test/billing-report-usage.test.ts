@@ -19,7 +19,7 @@ import {
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
 import {
-  REPORT_ORGS_PER_RUN, runBillingReportUsage, TRIAL_ENDING_NOTICE_DAYS, type ReportUsageDeps,
+  runBillingReportUsage, TRIAL_ENDING_NOTICE_DAYS, type ReportUsageDeps,
 } from '../src/billing/report-usage.ts'
 import { createFakeStripeUsage, usageCallsTo, type FakeStripeUsage } from './helpers/fake-stripe-usage.ts'
 
@@ -376,6 +376,21 @@ describe('billing.report-usage: the daily domain-quantity sync', () => {
     expect((await billingRow()).domainQuantity).toBe(1)
   })
 
+  // Ruling R29: the floor is 1 everywhere — Checkout, `allowanceOf` and this sync agree.
+  it('a standard workspace with NO active agent syncs to 1, never 0; at 1 already it calls nothing', async () => {
+    await seedBilling({ domainQuantity: 2 })
+
+    const h = makeDeps(DAY1)
+    expect(await runBillingReportUsage(h.deps)).toMatchObject({ quantitySynced: 1 })
+    expect(usageCallsTo(h.fake, 'setDomainQuantity')[0]!.params).toMatchObject({ quantity: 1 })
+    expect((await billingRow()).domainQuantity).toBe(1)
+    expect((await auditRows('billing.domain_quantity_synced'))[0]!.detail).toMatchObject({ from: 2, to: 1 })
+
+    const again = makeDeps(DAY1)
+    expect(await runBillingReportUsage(again.deps)).toMatchObject({ quantitySynced: 0 })
+    expect(usageCallsTo(again.fake, 'setDomainQuantity')).toEqual([])
+  })
+
   it('a row with no subscription item syncs nothing (a trial has no licensed line to update)', async () => {
     await seedBilling({ plan: 'trial', status: 'trialing', stripeSubscriptionId: null, stripeDomainItemId: null, domainQuantity: 0 })
     await seedAgents(['acme.test'])
@@ -557,7 +572,28 @@ describe('billing.report-usage: the pass', () => {
     expect(reported).toContain(`${secondOrg}:${PERIOD_START_ISO}:5`)
   })
 
-  it('bounds one pass at REPORT_ORGS_PER_RUN', () => {
-    expect(REPORT_ORGS_PER_RUN).toBe(500)
-  })
+  // Ruling R28: no per-run window. The old `LIMIT 500` never rotated, so org 501+ was never billed
+  // its overage and never told its trial was ending.
+  it('visits EVERY workspace with a billing row — 501 orgs, and the lexicographically LAST is reported', async () => {
+    await seedBilling()
+    const orgIds: string[] = []
+    for (let i = 0; i < 500; i += 1) orgIds.push(await createTestOrganization(app, `bulk-${i}`))
+    await withPlatform(app.db, 'test:seed-501', async (tx) => {
+      await tx.insert(billingSubscriptions).values(orgIds.map((id) => ({
+        orgId: id, plan: 'standard', status: 'active', stripeCustomerId: `cus_${rand()}`,
+        domainQuantity: 1, currentPeriodStart: PERIOD_START, currentPeriodEnd: PERIOD_END,
+      })))
+    })
+    const last = [...orgIds, orgId].sort().at(-1)!
+    await withOrg(app.db, last, (tx) =>
+      tx.insert(usageCounters).values({ orgId: last, day: '2026-06-10', meter: SEND_METERS.aiHandledManaged, value: 301 })
+        .onConflictDoUpdate({ target: [usageCounters.orgId, usageCounters.day, usageCounters.meter], set: { value: 301 } }))
+
+    const h = makeDeps(DAY1)
+    const result = await runBillingReportUsage(h.deps)
+
+    expect(result.orgs).toBe(501)
+    const reported = usageCallsTo(h.fake, 'reportOverage').map((c) => (c.params as { identifier: string }).identifier)
+    expect(reported).toContain(`${last}:${PERIOD_START_ISO}:1`)
+  }, 60_000)
 })

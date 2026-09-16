@@ -195,6 +195,23 @@ describe('billing service', () => {
     expect(await startCheckout(deps, org.orgId, org.actor)).toMatchObject({ ok: true })
   })
 
+  it('ruling R30 — a subscription id on a TRIALING row is a Checkout still pending (checkout_pending), never a second session; an expired trial or a canceled row with no id may subscribe', async () => {
+    const org = await seedOrg()
+    // R10's deferred state: an unpaid checkout.session.completed recorded the id, the plan is still trial.
+    await t.api.withOrg(org.orgId, (tx) => tx.update(billingSubscriptions)
+      .set({ stripeCustomerId: 'cus_pending_1', stripeSubscriptionId: 'sub_pending_1' })
+      .where(eq(billingSubscriptions.orgId, org.orgId)))
+    fake.calls.length = 0
+    expect(await startCheckout(deps, org.orgId, org.actor)).toEqual({ ok: false, code: 'checkout_pending' })
+    expect(fake.calls).toEqual([])
+    expect(await auditsOf(org.orgId, 'billing.checkout_started')).toEqual([])
+
+    // Once the webhook forgets the dead subscription (R30), Checkout is open again.
+    await t.api.withOrg(org.orgId, (tx) => tx.update(billingSubscriptions)
+      .set({ stripeSubscriptionId: null }).where(eq(billingSubscriptions.orgId, org.orgId)))
+    expect(await startCheckout(deps, org.orgId, org.actor)).toMatchObject({ ok: true })
+  })
+
   it('openPortal without a customer → no_customer; with one → a url under return_url = appWebOrigin/settings/billing', async () => {
     const org = await seedOrg()
 

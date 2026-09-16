@@ -13,6 +13,7 @@
  * simply selected again on the next run. Running it before the new key is on every replica is the one
  * thing that hurts: those replicas would hold a ring that cannot unwrap what this rotated.
  */
+import { pathToFileURL } from 'node:url'
 import { sql } from 'drizzle-orm'
 import { loadDotEnv } from '@aesa/core'
 import type { KekRing } from '@aesa/crypto'
@@ -74,6 +75,6 @@ async function main(): Promise<void> {
 
 // Importable (the test reads `selectOrgsNeedingRotate` out of this module) but runnable: `main` only
 // fires when this file IS the process entry point, never when something imports it.
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   await main()
 }

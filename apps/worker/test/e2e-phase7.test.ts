@@ -100,7 +100,7 @@ import { rememberReply, type MemoryActor, type MemoryServiceDeps } from '@aesa/a
 import { requestDeletion, setRetentionDays, type LifecycleActor, type LifecycleDeps } from '@aesa/api/workspace'
 import { applyStripeEvent } from '../../api/src/billing/webhook.ts'
 import { BILLING_PRICING, WORKSPACE_DELETE_GRACE_DAYS } from '@aesa/contracts'
-import { INVARIANTS, MEMORY_EXPIRY_DAYS, resolveSetting } from '@aesa/core'
+import { handledPeriodStamp, INVARIANTS, MEMORY_EXPIRY_DAYS, resolveSetting } from '@aesa/core'
 import { encrypt, hashToken, loadKekRing, Secret, type KekRing, type Resolver } from '@aesa/crypto'
 import {
   agentCategoryPolicies, agents, auditLog, billingSubscriptions, bumpMeter, categories, countHumanDecisions, createMeterSink,
@@ -722,6 +722,21 @@ describe('Phase 7 close-out E2E (billing, caps, retention, delete, rotate, remem
     return { ticketId, draft }
   }
 
+  /** A customer reply on an EXISTING thread → sync → triage → draft on the SAME ticket. */
+  async function followUpToDraft(o: Org, ticketId: string, subject: string) {
+    const ticket = await getTicket(o, ticketId)
+    const before = new Set((await allDrafts(o)).map((r) => r.id))
+    o.mailbox.receiveInbound({
+      from: ticket.customerEmail!, to: [o.selfAddress], subject, bodyText: CUSTOMER_TEXT, threadId: ticket.providerThreadId,
+    })
+    await triggerSync(o)
+    return waitFor(async () => {
+      const fresh = (await allDrafts(o)).filter((r) => !before.has(r.id) && r.ticketId === ticketId)
+      if (fresh.length === 1) return fresh[0]!
+      throw new Error(await whyNoDraft(o, ticketId, fresh.length))
+    })
+  }
+
   async function whyNoDraft(o: Org, ticketId: string, found: number): Promise<string> {
     const ticket = await getTicket(o, ticketId)
     const lines = logLines.filter((line) => line.includes(ticketId)).slice(-4)
@@ -953,7 +968,21 @@ describe('Phase 7 close-out E2E (billing, caps, retention, delete, rotate, remem
 
   // ---- 3: conversation 301 ---------------------------------------------------
 
-  it('3. conversation 601 of 600: four real sends through completeSend count on the MANAGED meter (and teach one answer), the rest of the allowance is seeded straight onto the meter, the nightly pass reports nothing at 600, exactly ONE unit as the delta at 601 with identifier <org>:<periodStartIso>:1 and moves the watermark, and a re-run reports nothing again', async () => {
+  it('3. conversation 601 of 600: four real sends through completeSend count on the MANAGED meter (and teach one answer), the rest of the allowance is seeded straight onto the meter, the nightly pass reports nothing at 600, exactly ONE unit as the delta at 601 with identifier <org>:<periodStartIso>:1 and moves the watermark, and a re-run reports nothing again — and (ruling R26) a follow-up on the 601st thread sent in the NEXT calendar month, inside the same Stripe period, is the same conversation: no meter, no overage', async () => {
+    // Ruling R26: org A's Stripe period is re-anchored to the 15th — a period that does NOT start on
+    // the 1st, so a calendar boundary falls inside it. The clock is first moved onto the 15th if the
+    // month is younger than that, so the boundary (the 1st of next month) is still ahead of every
+    // send below. `periodA` follows, so the identifier assertions and scenario 6's events use it.
+    const onOrAfter15 = clock.now()
+    if (onOrAfter15.getUTCDate() < 15) clock.advanceDays(15 - onOrAfter15.getUTCDate())
+    const anchor = clock.now()
+    periodA = {
+      start: new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth(), 15)),
+      end: new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth() + 1, 15)),
+    }
+    await withOrg(app.db, orgA.orgId, (tx) => tx.update(billingSubscriptions)
+      .set({ currentPeriodStart: periodA.start, currentPeriodEnd: periodA.end }).where(eq(billingSubscriptions.orgId, orgA.orgId)))
+    expect((await getBilling(billingDeps, orgA.orgId)).periodStart.getTime()).toBe(periodA.start.getTime())
     const day = utcDay(clock.now())
 
     // --- four REAL conversations. The first send teaches an answer (`memory.capture`); the next
@@ -1028,12 +1057,51 @@ describe('Phase 7 close-out E2E (billing, caps, retention, delete, rotate, remem
       expect((await answersFor(orgA))[0]!.approvals).toBe(4)
     })
     expect(await withOrg(app.db, orgA.orgId, (tx) => countHumanDecisions(tx, orgA.agentId, orgA.categoryId))).toBe(4)
+
+    // --- ruling R26: the 601st thread is stamped with the PERIOD start, and a follow-up on it sent
+    // across the calendar boundary — still inside the Sep 15 – Oct 15-shaped period — is the SAME
+    // conversation. Before the wave the stamp was the calendar month, and this billed conversation
+    // 602 with a second unit of overage.
+    const periodStamp = handledPeriodStamp(periodA.start)
+    expect(periodStamp.endsWith('-15')).toBe(true)
+    expect((await getTicket(orgA, fourth.ticketId)).aiHandledMonth).toBe(periodStamp)
+    const conversationsBefore = (await metersFor(orgA))[SEND_METERS.aiHandledConversations]
+    const reviewSendsBefore = (await metersFor(orgA))[SEND_METERS.reviewSends]
+
+    const beforeBoundary = clock.now()
+    const firstOfNextMonth = new Date(Date.UTC(beforeBoundary.getUTCFullYear(), beforeBoundary.getUTCMonth() + 1, 1))
+    clock.advanceDays(Math.ceil((firstOfNextMonth.getTime() - beforeBoundary.getTime()) / DAY_MS))
+    expect(clock.now().getUTCMonth()).not.toBe(beforeBoundary.getUTCMonth())
+    expect(clock.now().getTime()).toBeLessThan(periodA.end.getTime())
+
+    // The follow-up REUSES the learned answer (a reinforcement — approvals 4 → 5 — never a second
+    // active answer for the same question, which would outrank the first in scenario 4's prompt
+    // and read as approvals 1); its approve is one more human decision, which scenario 4 counts
+    // (it seeds five, not six, to reach the cold-start floor of ten).
+    scriptDraft({ parsed: reply({ usedAnswerIds: [`${USE}${ANSWER_NEEDLE}`] }) })
+    const followUp = await followUpToDraft(orgA, fourth.ticketId, `Re: ${QUESTION} (4)`)
+    expect(followUp.usedAnswerIds).toEqual([answerA])
+    await approveAndSend(orgA, followUp.id)
+    expect((await getTicket(orgA, fourth.ticketId)).aiHandledMonth).toBe(periodStamp)
+    const after = await metersFor(orgA)
+    expect(after[SEND_METERS.reviewSends]).toBe(reviewSendsBefore! + 1)
+    expect(after[SEND_METERS.aiHandledConversations]).toBe(conversationsBefore)
+    expect(after[SEND_METERS.aiHandledManaged]).toBe(601)
+    expect((await getBilling(billingDeps, orgA.orgId))).toMatchObject({ used: 601, overageUnits: 1 })
+    expect(await runReport()).toMatchObject({ reported: 0, trialNotices: 0 })
+    expect(fakeStripe.calls).toHaveLength(1)
+    // The reinforcement has landed before scenario 4 reads the answer's approvals.
+    await waitFor(async () => {
+      expect((await answersFor(orgA))[0]!.approvals).toBe(5)
+    })
+    expect(await answersFor(orgA)).toHaveLength(1)
   }, 240_000)
 
   // ---- 4: blocked vs automatic -------------------------------------------------
 
   it('4. blocked vs automatic at 601 of 600: with the cold-start floor met and a learned answer behind it, an auto-eligible draft under blocked overage lands review/allowance_exhausted (and the nightly pass pages "Included conversations used up" once — as it does for a TRIAL workspace under automatic at its flat 50, with the trial body); setOverageMode(automatic) → the next lands send — an approved auto draft, a queued send, the ticket on auto_sending', async () => {
-    await seedHumanDecisions(orgA, firstTicketA, 6)
+    // Scenario 3 left five owner decisions (its four conversations plus the R26 follow-up).
+    await seedHumanDecisions(orgA, firstTicketA, 5)
     expect(await withOrg(app.db, orgA.orgId, (tx) => countHumanDecisions(tx, orgA.agentId, orgA.categoryId))).toBe(10)
 
     expect(await setOverageMode(billingDeps, orgA.orgId, { mode: 'blocked' }, billingActor(orgA))).toEqual({ ok: true })
@@ -1046,7 +1114,7 @@ describe('Phase 7 close-out E2E (billing, caps, retention, delete, rotate, remem
     expect(blocked.draft.decisionReason).toBe('allowance_exhausted')
     expect((await getTicket(orgA, blocked.ticketId)).status).toBe('awaiting_review')
     const b = breakdownOf(blocked.draft)
-    expect(b.memory).toMatchObject({ answerId: answerA, approvals: 4 })
+    expect(b.memory).toMatchObject({ answerId: answerA, approvals: 5 })
     expect(b.evidence).toBeCloseTo(0.9, 10)
     expect(b.threshold).toBeCloseTo(0.8, 10)
     expect(b.blockers).toMatchObject({ coldStart: false, subscription: 'active', allowance: { used: 601, allowance: 600, mode: 'blocked', exhausted: true } })

@@ -40,7 +40,7 @@
  * (730 days, `org_id IS NOT NULL`), and the two arms are deliberately disjoint on that column so
  * neither cron can delete a row the other is responsible for.
  */
-import { and, eq, inArray, isNull, lt, sql } from 'drizzle-orm'
+import { and, eq, getTableName, inArray, isNull, lt, sql } from 'drizzle-orm'
 import type PgBoss from 'pg-boss'
 import type pino from 'pino'
 import { MEMORY_CANDIDATE_MAX_AGE_DAYS } from '@aesa/core'
@@ -52,6 +52,7 @@ import { registerCron } from '@aesa/queue'
 import { utcDayString } from '../date-utils.ts'
 import { errorMessage } from '../err-message.ts'
 import { enqueueNotifyDispatch } from './notify-dispatch.ts'
+import { deleteAged } from './retention-sweep.ts'
 
 /** How long `agent_run_events` traces are kept on a SURVIVING run; a run older than
  *  `AGENT_RUN_RETENTION_DAYS` is deleted outright and takes its events with it (FK cascade). */
@@ -189,7 +190,8 @@ export async function runSweepsDaily(
       }
     }
 
-    // (b) agent_run_events retention — the run rows themselves are never pruned.
+    // (b) agent_run_events retention — the run rows themselves outlive their events: arm (g) prunes
+    //     them at AGENT_RUN_RETENTION_DAYS, well past this cutoff.
     const eventCutoff = new Date(now.getTime() - RUN_EVENT_RETENTION_DAYS * 24 * 60 * 60_000)
     const deletedEvents = await tx.delete(agentRunEvents).where(lt(agentRunEvents.createdAt, eventCutoff)).returning({ id: agentRunEvents.id })
     eventsDeleted = deletedEvents.length
@@ -202,9 +204,12 @@ export async function runSweepsDaily(
     // (g) agent_runs retention — Phase 6 made ticket.triage write one run row per inbound email; a run
     //     older than AGENT_RUN_RETENTION_DAYS is bookkeeping nobody reads (Activity and the rollup read
     //     drafts; llm_calls carries the money). A `running` row that old is an abandoned crash, not a run.
+    //     In RETENTION_BATCH slices (`retention.sweep`'s `deleteAged`, fix wave): a Phase 6 backlog
+    //     of triage runs is one row per inbound email ever received, and one DELETE over all of it
+    //     could exceed the 30 s statement timeout — which, inside this one transaction, rolled back
+    //     EVERY arm every night.
     const runCutoff = new Date(now.getTime() - AGENT_RUN_RETENTION_DAYS * 24 * 60 * 60_000)
-    const deletedRuns = await tx.delete(agentRuns).where(lt(agentRuns.startedAt, runCutoff)).returning({ id: agentRuns.id })
-    runsDeleted = deletedRuns.length
+    runsDeleted = await deleteAged(tx, getTableName(agentRuns), runCutoff, undefined, 'started_at')
 
     // (h) platform.access rows — every withPlatform() call writes one; they are provenance for 30 days,
     //     then noise beside the 2-year tenant trail (which retention.sweep owns from Phase 7).

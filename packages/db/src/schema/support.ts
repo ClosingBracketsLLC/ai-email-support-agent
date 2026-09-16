@@ -84,6 +84,9 @@ export const tickets = pgTable('tickets', {
   ownerRedraftFeedback: text('owner_redraft_feedback'),
   redraftCount: integer('redraft_count').notNull().default(0),
   escalationNotifiedAt: timestamp('escalation_notified_at', { withTimezone: true }),
+  /** The conversation meters' dedupe stamp: the start DATE of the billing period the ticket was
+   *  last counted in (`handledPeriodStamp`, `@aesa/core`; ruling R26) — `'YYYY-MM-DD'`, or the
+   *  legacy `'YYYY-MM'` calendar month on a ticket last counted before the Phase 7 fix wave. */
   aiHandledMonth: text('ai_handled_month'),
   createdAt: createdAt(), updatedAt: updatedAt(),
 }, (t) => [

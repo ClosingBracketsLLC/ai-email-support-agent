@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider, notifyManager } from '@tanstack/react
 import { fireEvent, render, screen, waitFor } from '@testing-library/react-native'
 import { useState, type ReactNode } from 'react'
 import { Platform } from 'react-native'
-import { ShareScreen } from './share'
+import { ShareScreen, shareFileOf } from './share'
 
 // See knowledge.test.tsx: TanStack's default scheduler defers notifications through a real
 // setTimeout(0), outside RNTL's act() window. Running it synchronously keeps every update inside
@@ -238,6 +238,22 @@ describe('a file intent', () => {
     ]))
     await waitFor(() => expect(mockResetShareIntent).toHaveBeenCalledTimes(1))
     expect(mockReplace).toHaveBeenCalledWith('/settings/knowledge')
+  })
+
+  // Fix wave: the library's types say string, the library can hand over null — and a null name used
+  // to throw inside `useUpload`'s synchronous `setPending`, so Upload silently did nothing.
+  test('a file with a NULL fileName and mimeType is coerced at the seam (shared-file, empty mime) and still uploads', async () => {
+    mockShareIntent = { files: [{ fileName: null, mimeType: null, path: 'file:///tmp/unnamed', size: null } as unknown as { fileName: string; mimeType: string; path: string; size: number | null }] }
+    await setup()
+    await waitFor(() => expect(screen.getByTestId('file-card')).toBeTruthy())
+    expect(screen.getByText('shared-file')).toBeTruthy()
+
+    await fireEvent.press(screen.getByTestId('share-upload'))
+    await waitFor(() => expect(mockUploadStartCalls).toEqual([
+      [{ name: 'shared-file', mime: '', size: null, uri: 'file:///tmp/unnamed' }],
+    ]))
+    expect(shareFileOf({ fileName: undefined, mimeType: undefined, path: 'p' })).toEqual({ fileName: 'shared-file', mimeType: '', path: 'p', size: null })
+    expect(shareFileOf({ fileName: 'a.pdf', mimeType: 'application/pdf', path: 'p', size: 3 })).toEqual({ fileName: 'a.pdf', mimeType: 'application/pdf', path: 'p', size: 3 })
   })
 
   test('a cap refusal (the pending entry lands failed/cap) shows the shared cap banner and never navigates away', async () => {

@@ -1,5 +1,6 @@
 import { sql } from 'drizzle-orm'
 import { bigint, boolean, check, integer, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core'
+import { BILLING_PRICING } from '@aesa/contracts'
 import { createdAt, tenantPolicies, updatedAt } from './helpers.ts'
 
 /**
@@ -17,9 +18,12 @@ export const billingSubscriptions = pgTable('billing_subscriptions', {
   stripeDomainItemId: text('stripe_domain_item_id'),                   // the licensed item whose quantity is the domain count
   stripeOverageItemId: text('stripe_overage_item_id'),
   domainQuantity: integer('domain_quantity').notNull().default(0),
-  includedConversationsPerDomain: integer('included_conversations_per_domain').notNull().default(300),
+  // The two price-table defaults come from `BILLING_PRICING` (the ONE source, `@aesa/contracts`) so
+  // they cannot drift from what `allowanceOf` and the api quote. drizzle-kit inlines the value, so a
+  // change there becomes a generated migration `db:check` pins rather than a silent divergence.
+  includedConversationsPerDomain: integer('included_conversations_per_domain').notNull().default(BILLING_PRICING.includedPerDomain),
   overageMode: text('overage_mode').notNull().default('automatic'),    // OverageMode (CHECK)
-  overageUnitCents: integer('overage_unit_cents').notNull().default(12),
+  overageUnitCents: integer('overage_unit_cents').notNull().default(BILLING_PRICING.overageUnitCents),
   trialEndsAt: timestamp('trial_ends_at', { withTimezone: true }),
   currentPeriodStart: timestamp('current_period_start', { withTimezone: true }),
   currentPeriodEnd: timestamp('current_period_end', { withTimezone: true }),

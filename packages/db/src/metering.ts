@@ -21,8 +21,9 @@ export const LLM_METERS = {
  * writer and the reader). Plain strings, like `LLM_METERS` — adding a meter needs no migration.
  *
  * `review_sends` counts every reply that actually went out after an owner review;
- * `ai_handled_conversations` counts each TICKET at most once per calendar month (the
- * `tickets.ai_handled_month` stamp is what makes the second send of the same month a no-op);
+ * `ai_handled_conversations` counts each TICKET at most once per BILLING PERIOD (the
+ * `tickets.ai_handled_month` stamp — the period start's date since ruling R26, a calendar month on a
+ * trial — is what makes the second send of the same period a no-op);
  * `auto_sends` counts every reply sent without an owner review (Phase 5 autonomy).
  */
 export const SEND_METERS = {

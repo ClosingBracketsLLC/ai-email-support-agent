@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
-  allowanceOf, type BillingRowLike, billingStateOf, isAllowanceExhausted, isBillingActive, overageOf, periodOf, trialEndsAtFor,
+  allowanceOf, type BillingRowLike, billingStateOf, handledPeriodStamp, handledPeriodStamps, isAllowanceExhausted, isBillingActive,
+  isHandledInPeriod, overageOf, periodOf, trialEndsAtFor,
 } from '../src/billing.ts'
 
 const row = (over: Partial<BillingRowLike> = {}): BillingRowLike => ({
@@ -116,5 +117,39 @@ describe('worked example: overage reporting deltas across three days (plan devia
     const reportedSoFar = 50
     expect(overageDay3).toBe(50)
     expect(overageDay3 - reportedSoFar).toBe(0)
+  })
+})
+
+// Ruling R26: the conversation dedupe is keyed on the BILLING PERIOD, not the calendar month.
+describe('handledPeriodStamp / handledPeriodStamps / isHandledInPeriod', () => {
+  it('stamps the period START\'s UTC date — a Stripe anniversary period mid-month, a calendar-month trial period on the 1st', () => {
+    expect(handledPeriodStamp(new Date('2026-01-15T00:00:00Z'))).toBe('2026-01-15')
+    expect(handledPeriodStamp(periodOf(row({ status: 'trialing', plan: 'trial' }), new Date('2026-02-20T09:00:00Z')).start)).toBe('2026-02-01')
+    // The date, not the instant: a period that starts at 23:30 UTC on the 15th is still the 15th.
+    expect(handledPeriodStamp(new Date('2026-01-15T23:30:00Z'))).toBe('2026-01-15')
+  })
+
+  it('a stored legacy calendar-month stamp (\'YYYY-MM\') counts as \'YYYY-MM-01\' — and ONLY for a period starting on the 1st', () => {
+    expect(handledPeriodStamps(new Date('2026-09-01T00:00:00Z'))).toEqual(['2026-09-01', '2026-09'])
+    expect(handledPeriodStamps(new Date('2026-09-15T00:00:00Z'))).toEqual(['2026-09-15'])
+
+    const firstOfSept = new Date('2026-09-01T00:00:00Z')
+    expect(isHandledInPeriod('2026-09', firstOfSept)).toBe(true)      // stamped before the wave deployed
+    expect(isHandledInPeriod('2026-09-01', firstOfSept)).toBe(true)
+    expect(isHandledInPeriod('2026-08', firstOfSept)).toBe(false)
+    expect(isHandledInPeriod('2026-08-01', firstOfSept)).toBe(false)
+    expect(isHandledInPeriod(null, firstOfSept)).toBe(false)
+
+    const fifteenth = new Date('2026-09-15T00:00:00Z')
+    expect(isHandledInPeriod('2026-09-15', fifteenth)).toBe(true)
+    expect(isHandledInPeriod('2026-09', fifteenth)).toBe(false)       // a mid-month period has no legacy form
+    expect(isHandledInPeriod('2026-09-01', fifteenth)).toBe(false)    // the previous period's stamp — this is the new one
+  })
+
+  it('two replies straddling a calendar boundary inside one Stripe period read as the SAME period', () => {
+    const period = periodOf(row({ currentPeriodStart: new Date('2026-01-15T00:00:00Z'), currentPeriodEnd: new Date('2026-02-15T00:00:00Z') }), new Date('2026-02-01T08:00:00Z'))
+    const stampOnJan31 = handledPeriodStamp(period.start)
+    // Feb 1's send reads the same period start (it is stored on the row), so the Jan 31 stamp holds.
+    expect(isHandledInPeriod(stampOnJan31, period.start)).toBe(true)
   })
 })

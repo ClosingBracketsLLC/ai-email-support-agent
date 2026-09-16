@@ -10,7 +10,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { INVARIANTS, PLANS, planSettingDefaults } from '@aesa/core'
 import {
   agentRunEvents, agentRuns, LLM_METERS, mailboxConnections, tickets, usageCounters, user, withOrg, withPlatform, workspaces,
-  type SettingSources,
+  type BillingStateView, type SettingSources,
 } from '@aesa/db'
 import { createDb } from '@aesa/db/raw'
 import { createTestDatabase, createTestOrganization } from '@aesa/db/testing'
@@ -21,6 +21,7 @@ const rand = () => randomBytes(4).toString('hex')
 const NOW = new Date('2026-06-15T12:00:00Z')
 const TODAY = '2026-06-15'
 const YESTERDAY = '2026-06-14'
+const YESTERDAY_DATE = new Date('2026-06-14T12:00:00Z')
 const minutesAgo = (n: number) => new Date(NOW.getTime() - n * 60_000)
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -94,11 +95,27 @@ async function runRows() {
   return withOrg(app.db, orgId, (tx) => tx.select().from(agentRuns))
 }
 
+/** What `readBillingState` returns, as `loadSettingSources` carries it on `SettingSources.billing`
+ *  (ruling R27): the gate reads the derived `state` and the trial clock `agentEnabledAt` off it. */
+function billingView(over: Partial<BillingStateView> = {}): BillingStateView {
+  const plan = over.plan ?? 'standard'
+  return {
+    orgId, plan, status: plan === 'trial' ? 'trialing' : 'active', trialEndsAt: null,
+    currentPeriodStart: null, currentPeriodEnd: null, domainQuantity: 1, includedConversationsPerDomain: 300,
+    overageMode: 'automatic', overageUnitCents: 12, stripeCustomerId: null, stripeSubscriptionId: null,
+    stripeDomainItemId: null, stripeOverageItemId: null, overageReported: 0, overageReportedPeriodStart: null,
+    cancelAtPeriodEnd: false, lastStripeEventCreated: null,
+    state: plan === 'trial' ? 'trialing' : 'active', active: true, allowance: plan === 'trial' ? 50 : 300,
+    period: { start: new Date('2026-06-01T00:00:00Z'), end: new Date('2026-07-01T00:00:00Z') },
+    missingRow: false, agentEnabledAt: null,
+    ...over,
+  }
+}
 /** What `loadSettingSources` returns for a workspace on the paid plan with no overrides — the
  *  shape `GateParams.settings` now takes (Phase 7: org rows AND the plan's defaults). */
-const SETTINGS: SettingSources = { org: {}, plan: planSettingDefaults('standard'), planId: 'standard' }
+const SETTINGS: SettingSources = { org: {}, plan: planSettingDefaults('standard'), planId: 'standard', billing: billingView() }
 /** The same for a trial workspace: a 50-draft day, a $3 day and the $10 TOTAL trial budget. */
-const TRIAL_SETTINGS: SettingSources = { org: {}, plan: planSettingDefaults('trial'), planId: 'trial' }
+const TRIAL_SETTINGS: SettingSources = { org: {}, plan: planSettingDefaults('trial'), planId: 'trial', billing: billingView({ plan: 'trial' }) }
 
 const gate = (over: Partial<Parameters<typeof gateAndRecordRun>[1]> = {}, db = app.db) =>
   withOrg(db, orgId, (tx) =>
@@ -197,6 +214,33 @@ describe('gateAndRecordRun', () => {
     expect((await gate({ settings: SETTINGS })).outcome).toBe('proceed')
   })
 
+  // Ruling R27: the budget applies to the derived STATE `trialing` alone. A cancelled workspace is
+  // back on `plan = 'trial'` (deviation 8) with its whole paid-era spend behind it, and an expired
+  // trial keeps its `trialing` row — both are already review-only via `subscription_inactive`.
+  it('the same spend on a CANCELED workspace (plan trial, $500 of paid-era spend) and on an EXPIRED trial proceeds — only a live trial has the total budget', async () => {
+    await setUsageCounter(LLM_METERS.costMicros, 2_500_000)
+    await setUsageCounter(LLM_METERS.costMicros, 500_000_000, '2026-06-13')     // $500 while it paid
+
+    const canceled: SettingSources = { ...TRIAL_SETTINGS, billing: billingView({ plan: 'trial', status: 'canceled', state: 'canceled', active: false }) }
+    expect((await gate({ settings: canceled })).outcome).toBe('proceed')
+    await withOrg(app.db, orgId, (tx) => tx.delete(agentRuns))
+
+    const expired: SettingSources = { ...TRIAL_SETTINGS, billing: billingView({ plan: 'trial', state: 'trial_expired', active: false, trialEndsAt: YESTERDAY_DATE }) }
+    expect((await gate({ settings: expired })).outcome).toBe('proceed')
+  })
+
+  it("the trial budget is summed from the trial's OWN clock (agent_enabled_at): spend that predates it does not count; with no clock, from the epoch", async () => {
+    await setUsageCounter(LLM_METERS.costMicros, 2_500_000)                       // $2.50 today
+    await setUsageCounter(LLM_METERS.costMicros, 9_000_000, '2026-06-01')         // $9.00 BEFORE the trial began
+
+    const clocked: SettingSources = { ...TRIAL_SETTINGS, billing: billingView({ plan: 'trial', agentEnabledAt: new Date('2026-06-10T08:00:00Z') }) }
+    expect((await gate({ settings: clocked })).outcome).toBe('proceed')
+    await withOrg(app.db, orgId, (tx) => tx.delete(agentRuns))
+
+    // The same counters with no clock at all: everything ever spent is the trial's.
+    expect(await gate({ settings: TRIAL_SETTINGS })).toMatchObject({ outcome: 'org_spend_capped', scope: 'trial', costMicros: 11_500_000 })
+  })
+
   it("org_draft_capped: the PLAN's daily draft cap is what gates, not the catalog default", async () => {
     await setUsageCounter(DRAFT_METER, PLANS.trial.dailyDraftCap)
 
@@ -282,14 +326,18 @@ describe('readCapsUnlocked', () => {
     expect(caps).toEqual({ ticketRunsToday: 2, orgCostMicrosToday: 1_234_000, orgDraftsToday: 7, orgTrialCostMicros: 1_234_000 })
   })
 
-  it("mirrors the gate's trial budget read: orgTrialCostMicros sums EVERY day, not just today", async () => {
+  it("mirrors the gate's trial budget read: orgTrialCostMicros sums every day from the trial's clock (every day ever, with no clock)", async () => {
     await setUsageCounter(LLM_METERS.costMicros, 2_500_000)
     await setUsageCounter(LLM_METERS.costMicros, 8_000_000, YESTERDAY)
+    await setUsageCounter(LLM_METERS.costMicros, 4_000_000, '2026-06-01')
 
     const caps = await withOrg(app.db, orgId, (tx) => readCapsUnlocked(tx, { orgId, ticketId, settings: TRIAL_SETTINGS, now: NOW }))
-
     expect(caps.orgCostMicrosToday).toBe(2_500_000)
-    expect(caps.orgTrialCostMicros).toBe(10_500_000)
+    expect(caps.orgTrialCostMicros).toBe(14_500_000)
+
+    const clocked: SettingSources = { ...TRIAL_SETTINGS, billing: billingView({ plan: 'trial', agentEnabledAt: new Date('2026-06-10T08:00:00Z') }) }
+    const fromClock = await withOrg(app.db, orgId, (tx) => readCapsUnlocked(tx, { orgId, ticketId, settings: clocked, now: NOW }))
+    expect(fromClock.orgTrialCostMicros).toBe(10_500_000)
   })
 
   it('writes nothing — a capped ticket must never be stamped by a pre-check', async () => {

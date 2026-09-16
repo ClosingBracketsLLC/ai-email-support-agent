@@ -3,11 +3,12 @@ import { APIError } from 'better-auth/api'
 import { and, asc, count, desc, eq, inArray, sql } from 'drizzle-orm'
 import type pino from 'pino'
 import {
-  BILLING_PRICING, CreateWorkspaceInput, OPERATING_GUIDANCE_MAX, RequestDeletionInput, SetAgentEnabledInput,
+  CreateWorkspaceInput, OPERATING_GUIDANCE_MAX, RequestDeletionInput, SetAgentEnabledInput,
   SetKillSwitchInput, SetRetentionDaysInput, SuggestionIdInput, UpdateGuidanceInput, WORKSPACE_ERROR_MESSAGES,
   deriveAllowedHosts, isOnboardingStep, nextOnboardingStep, slugify,
   UpdateProfileInput, type ExportState, type OnboardingStep, type Tone,
 } from '@aesa/contracts'
+import { trialEndsAtFor } from '@aesa/core'
 import { agents, audit, billingSubscriptions, categories, drafts, ensureBillingRow, guidanceSuggestions, tickets, workspaces, type AuditActor } from '@aesa/db'
 import type { ObjectStore } from '@aesa/knowledge/storage'
 import type { Auth } from '../../auth.ts'
@@ -198,13 +199,22 @@ export const workspaceRouter = router({
    * timestamp survives every later on/off flip.
    */
   setAgentEnabled: managerProcedure.input(SetAgentEnabledInput).mutation(async ({ ctx, input }) => {
+    const now = new Date()
     const updated = await ctx.deps.api.withOrg(ctx.orgId, async (tx) => {
-      const [current] = await tx.select({ onboardingStep: workspaces.onboardingStep }).from(workspaces).where(eq(workspaces.orgId, ctx.orgId))
+      const [current] = await tx
+        .select({ onboardingStep: workspaces.onboardingStep, deletionRequestedAt: workspaces.deletionRequestedAt })
+        .from(workspaces).where(eq(workspaces.orgId, ctx.orgId))
       if (!current) throw new TRPCError({ code: 'NOT_FOUND', message: 'workspace not created yet' })
+      // A workspace on its way out stays off (fix wave): `requestDeletion` switched the agent off
+      // for the whole grace period, and an admin turning managed drafting back on meanwhile would
+      // spend against a workspace that is about to be erased. `cancelDeletion` lifts this.
+      if (input.enabled && current.deletionRequestedAt !== null) {
+        throw new TRPCError({ code: 'PRECONDITION_FAILED', message: WORKSPACE_ERROR_MESSAGES.deletion_pending })
+      }
       const onboardingStep = input.enabled && current.onboardingStep === 'go_live' ? 'done' : current.onboardingStep
 
       const patch: Record<string, unknown> = { agentEnabled: input.enabled, onboardingStep }
-      if (input.enabled) patch.agentEnabledAt = sql`COALESCE(${workspaces.agentEnabledAt}, now())`
+      if (input.enabled) patch.agentEnabledAt = sql`COALESCE(${workspaces.agentEnabledAt}, ${now}::timestamptz)`
 
       const [row] = await tx.update(workspaces).set(patch).where(eq(workspaces.orgId, ctx.orgId)).returning()
 
@@ -214,10 +224,16 @@ export const workspaceRouter = router({
       // toggling the switch). `ensureBillingRow` first, so a workspace created before Phase 7 has a
       // row for the UPDATE to hit. `trialEndsAt` stays NULL until then, which `billingStateOf`
       // reads as "trialing, no expiry yet" — a workspace that never went live never runs out.
+      //
+      // The clock is `trialEndsAtFor(agent_enabled_at)` — the ONE formula (`@aesa/core`), computed
+      // from the stamp the row now carries rather than from a second `now()`: migration 0025's
+      // backfill and this write therefore agree to the millisecond, and a workspace whose first
+      // enable predates the row (a NULL clock beside an old `agent_enabled_at`) gets the clock that
+      // enable earned, never a fresh fourteen days.
       if (input.enabled) {
         await ensureBillingRow(tx)
         await tx.update(billingSubscriptions)
-          .set({ trialEndsAt: sql`COALESCE(${billingSubscriptions.trialEndsAt}, now() + make_interval(days => ${BILLING_PRICING.trialDays}::int))` })
+          .set({ trialEndsAt: sql`COALESCE(${billingSubscriptions.trialEndsAt}, ${trialEndsAtFor(row!.agentEnabledAt ?? now)}::timestamptz)` })
           .where(eq(billingSubscriptions.orgId, ctx.orgId))
       }
 
