@@ -5,9 +5,11 @@ defines Phase 0 (rails and tenancy) plus seven build phases, Phases 1–7; this 
 build stands against them. As of 2026-09-16: Phases 0–6 and the brand are on `main` (Phase 4 via PR
 #5, merge commit `ef81169`; Phase 5 via PR #6, merge commit `99a852d`; Phase 6 via PR #7, merge
 commit `c999904`). **Phase 7 (billing, caps, launch hardening) is COMPLETE on branch `phase-7`** —
-gate green, every task reviewed, the whole-branch review record's structure written (its findings
-follow the review the controller runs after this close-out) — and lands on `main` through a GitHub
-PR merged with a merge commit, on Robert's go-ahead. **All seven build phases are built.** What
+gate green, every task reviewed, the whole-branch review done (five reviewers; 3 Critical and 15
+Important, all fixed in one wave and confirmed by a scoped re-review; the record is
+`docs/superpowers/reviews/2026-09-16-phase-7-final-review.md`), the branch clean to merge at
+`6f40203` — and lands on `main` through a GitHub PR merged with a merge commit, on Robert's
+go-ahead. **All seven build phases are built.** What
 remains is the launch itself: the manual list in `docs/runbooks/2026-09-phase-7-external-setup.md`,
 the CASA evidence package in `docs/security/2026-09-casa-evidence.md`, and the items the spec leaves
 open under *Next: after Phase 7* below.
@@ -1926,12 +1928,17 @@ the record)</summary>
   seams reviewer and the ledger's thirty-five deferred minors rolled up for triage were written at
   this close-out; the review then ran (five reports: 3 Critical, 15 Important, ~13 folded minors,
   ~12 carries — every seam the phase was designed around held), and **the fix wave landed all of it
-  as two commits on top of `f12dcd9`** (rulings R26–R35 below; the fix-wave paragraph after the gate
-  numbers says what changed). The scoped re-review follows the wave.
+  as two commits on top of `f12dcd9`** (rulings R26–R36 below; the fix-wave paragraph after the gate
+  numbers says what changed). The scoped re-review verdicted every A/B/C item ADDRESSED with tests,
+  the D carries recorded and not implemented, both implementer interpretations right, and ONE
+  residual — `+native-intent.ts`'s pass-through half — which ruling R36 closed directly in
+  `6f40203`; five minors are parked with their reasons in the record. **The branch is clean to merge
+  at `6f40203`, 37 commits over `main`.**
 - Plan: `docs/superpowers/plans/2026-09-12-phase-7-billing-caps-launch-hardening.md` (13 tasks,
   executed with subagent-driven development; its "Rulings during execution" appendix carries the
   rationale for every ruling below). Commits **`7cfc87b..`** (33 at the reviewed head `77f5a5e`,
-  the close-out's docs commit `f12dcd9`, then the fix wave's two) on `phase-7`, branched from `main` at `c999904` (the PR #7
+  the close-out's docs commit `f12dcd9`, the fix wave's two `58afd7a`+`ddf69ac`, ruling R36's
+  `6f40203`, and this record's final docs commit — 37 before it) on `phase-7`, branched from `main` at `c999904` (the PR #7
   merge commit) — the plan commit, twelve implementation tasks with their three pre-review
   correctness fixes and nine review-driven fix rounds, and the Task 13 close-out. The per-task list,
   newest last:
@@ -1968,13 +1975,17 @@ the record)</summary>
   alerts (twelve since the fix wave), `scripts/smoke-tenant.ts`; then the TWO Critical PII leaks
   closed at the event level, and R25's one redaction home ·
   `20b4bb3`+`77f5a5e` T12 the Phase 7 E2E (11 scenarios) and its two inert-assertion fixes ·
-  the Task 13 close-out commit (this record, the runbook, the CASA evidence package, CLAUDE.md, the
-  env examples, the EAS submit profiles, the plan's execution rulings, the review record's
-  structure). The per-task execution ledger was an ephemeral SDD artifact; everything load-bearing
-  from it is distilled below, and the git history is the durable account.
-  Gate at the fix-wave commit (the whole-branch review's fixes on top of `f12dcd9`; the baseline at
-  `77f5a5e` + docs was 2,998 tests — minio up, the dev `S3_*` exported so the storage suite runs):
-  typecheck and lint clean across all **15** packages/apps; `pnpm test` green with **3,051 tests**
+  `f12dcd9` the Task 13 close-out (this record, the runbook, the CASA evidence package, CLAUDE.md,
+  the env examples, the EAS submit profiles, the plan's execution rulings, the review record's
+  structure) · `58afd7a`+`ddf69ac` the whole-branch FIX WAVE (code + tests, then docs — the
+  paragraph after the gate numbers) · `6f40203` ruling R36 (the re-review's one residual) · the final
+  docs commit (the review record's findings, this baseline, the plan's rulings 26–36). The per-task
+  execution ledger was an ephemeral SDD artifact; everything load-bearing from it is distilled
+  below, and the git history is the durable account.
+  Gate at the head `6f40203` (the whole-branch review's fixes and ruling R36 on top of `f12dcd9`;
+  the baseline at `77f5a5e` + docs was 2,998 tests, so the wave added 37 — core +4, db +4, api +7,
+  worker +10, app +12 — minio up, the dev `S3_*` exported so the storage suite runs):
+  typecheck and lint clean across all **15** packages/apps; `pnpm test` green with **3,035 tests**
   plus 4 conditional skips (`@aesa/contracts` 42, `@aesa/crypto` 52, `@aesa/platform-mail` 19,
   `brand` 110, `@aesa/core` 300, `@aesa/llm` 158, `@aesa/agent` 71, `@aesa/db` 119, `@aesa/queue`
   29, `@aesa/mail` 242, `@aesa/knowledge` 165, `@aesa/test-kit` 43 [39 run + 4 conditional skips],
@@ -1987,7 +1998,9 @@ the record)</summary>
   runs against the SHARED dev database, so `DATABASE_URL=… pnpm --filter @aesa/db migrate` has to
   be run once after this phase's 0021–0025 land or it fails). The known `e2e-phase3.test.ts`
   case-10 timing flake is handled per ruling R4 (a gate that fails ONLY there is re-run solo for
-  that file); it did not fire in the fix wave's runs.
+  that file); it did not fire in the close-out's, the fix wave's or R36's runs. The 27 routes, the
+  Playwright pass and the E2E's 11/11 stand from the wave's own gate at `58afd7a`; the R36 commit
+  touched two `apps/app` files and the app suite ran 542/542 at `6f40203`.
 - **The whole-branch fix wave** (after the final review's five reports; ruling R35 sequenced it as
   ONE implementer over the whole brief, two commits — code + tests, then docs — and one scoped
   re-review). What landed, by ruling: **R33** migration `0025_billing_backfill.sql` re-runs 0023's
@@ -2036,7 +2049,15 @@ the record)</summary>
   value, `error-surface.test.ts`'s undici widening removed, `share.tsx` coercing a null
   `fileName`/`mimeType`, `danger-zone`'s export poll owner-only, and four stale comments. RED was
   captured for A1–A3, B1, B2, B4–B6, B8–B12 against the pre-wave code. The fix wave changed no
-  environment variable and added one migration.
+  environment variable and added one migration. **Then the scoped re-review's one residual, closed
+  by ruling R36 in `6f40203`:** the wave's `+native-intent.ts` returned `null` for every url without
+  `dataUrl=`, reading Expo Router's contract as "null = no redirect" — it is the opposite (both call
+  sites do `if (href) listener(href)`, and `getLinkingConfig.js` uses the return AS the initial url),
+  so every non-share native url was DROPPED rather than routed; latent today (no associated domains,
+  push taps use `router.push`, the connect flow polls) but the first universal link added later
+  would have been swallowed at launch. `redirectSystemPath` now returns the path unchanged for every
+  non-share url and `null` only for a non-string; the test's three "left alone" assertions flipped
+  from `toBeNull` to the path itself.
 - What exists now:
   - `packages/contracts` — `billing.ts`: `PLAN_IDS`/`PlanId` (the ONE home, ruling R2),
     `BILLING_STATUSES`, `BILLING_STATES` (`trialing`, `trial_expired`, `active`, `past_due`,
@@ -2260,9 +2281,15 @@ the record)</summary>
       `dataUrl=` to `/`, so the iOS share relaunch never lands on Page not found.
   35. **(sequencing)** One implementer lands the whole fix-wave brief as two commits, then one
       scoped re-review; residuals are adjudicated, not re-waved.
-  36. **(recorded deviation)** `billing.setOverageMode` is `ownerProcedure`, where the plan's Roles
-      paragraph implied `managerProcedure` — owner is the better call for a money mode; every
-      billing mutation is the owner's.
+  36. **(after the re-review)** B13's residual is fixed DIRECTLY by the orchestrator (one expression
+      + three assertion flips, verified against expo-router's source) rather than parked or
+      re-waved: `redirectSystemPath` now returns the path unchanged for every non-share url, null
+      only for a non-string. Cost if wrong: none reachable — passing the url through is exactly what
+      the router does when no `+native-intent` file exists, so the change is the no-op equivalent
+      for every url but the share relaunch.
+  A recorded deviation beside the rulings, not numbered: `billing.setOverageMode` is
+  `ownerProcedure`, where the plan's Roles paragraph implied `managerProcedure` — owner is the
+  better call for a money mode; every billing mutation is the owner's.
 - The E2E: `apps/worker/test/e2e-phase7.test.ts`, **11 scenarios** on one throwaway database with
   the REAL api services (billing, lifecycle, memory), the REAL webhook decision (`applyStripeEvent`
   fed real event bodies), the REAL jobs and crons, a fake Stripe implementing both ports, a fake
@@ -2461,13 +2488,13 @@ evidence package for the Gmail CASA assessment is `docs/security/2026-09-casa-ev
 Run the local setup from `CLAUDE.md` — including `pnpm db:up && pnpm s3:init` and the `S3_*`
 exports, so the minio-gated storage suite actually runs; a dev Postgres created before Phase 7 needs
 `DATABASE_URL=postgres://aesa:aesa@localhost:5434/aesa_dev pnpm --filter @aesa/db migrate` once for
-migrations **0021–0024** before `pnpm e2e` — and confirm the baseline (provisional, at `77f5a5e` +
-docs; re-stated after the final review):
+migrations **0021–0025** before `pnpm e2e` — and confirm the baseline (final, at the head
+`6f40203` after the whole-branch review, its fix wave and ruling R36):
 
-- **2,998 tests** plus 4 conditional test-kit skips with `S3_*` exported (`@aesa/contracts` 42,
-  `@aesa/crypto` 52, `@aesa/platform-mail` 19, `brand` 110, `@aesa/core` 296, `@aesa/llm` 158,
-  `@aesa/agent` 71, `@aesa/db` 115, `@aesa/queue` 29, `@aesa/mail` 242, `@aesa/knowledge` 165,
-  `@aesa/test-kit` 43, `apps/api` 391, `apps/worker` 739, `apps/app` 530 jest across 65 suites);
+- **3,035 tests** plus 4 conditional test-kit skips with `S3_*` exported (`@aesa/contracts` 42,
+  `@aesa/crypto` 52, `@aesa/platform-mail` 19, `brand` 110, `@aesa/core` 300, `@aesa/llm` 158,
+  `@aesa/agent` 71, `@aesa/db` 119, `@aesa/queue` 29, `@aesa/mail` 242, `@aesa/knowledge` 165,
+  `@aesa/test-kit` 43, `apps/api` 398, `apps/worker` 749, `apps/app` 542 jest across 66 suites);
 - **27 web routes** from `pnpm --filter @aesa/app export:web`;
 - `db:check` clean;
 - the Playwright signup smoke green (still ending at the gated mailbox step).
