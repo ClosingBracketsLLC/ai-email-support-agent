@@ -45,6 +45,8 @@ instruction from him in the session.
     pnpm --filter @aesa/app test                  # jest, no database
     pnpm e2e                                      # Playwright signup smoke against the api and the served web export
     pnpm brand:build   # after changing brand/tokens.json, mark.svg, wordmark.svg or icons/*.svg; commit the outputs
+    pnpm smoke:tenant                             # post-deploy walk of a throwaway workspace (SMOKE_API_URL, SMOKE_WEB_ORIGIN, SMOKE_COOKIE; never CI)
+    pnpm --filter @aesa/worker keys:rotate        # enqueue one keys.rotate per org behind the ring's active KEK — step 3 of the four-step rotation in docs/runbooks/2026-09-phase-7-external-setup.md §4
 
 - The database must be running for every suite except `@aesa/core` and `@aesa/crypto`. Tests read
   `DATABASE_URL` from the real environment (default `postgres://aesa:aesa@localhost:5434/aesa_dev`)
@@ -92,8 +94,9 @@ instruction from him in the session.
   outside production a missing key falls back to the deterministic hash embedder with one warning,
   and its vectors are NOT comparable with Voyage's), `KNOWLEDGE_EMBED_MODEL` (`voyage-4` default;
   stored on every chunk as `embedding_model` and part of the vector leg's `WHERE`, so changing it
-  on a live workspace hides every existing chunk from that leg until the re-embed job that is still a
-  carry-over, now → Phase 7) and
+  on a live workspace hides every existing chunk from that leg until Phase 7's
+  `knowledge.reembed-sweep` (every 10 minutes, `knowledge` role) has re-embedded them onto the new
+  model — chunks and learned answers both) and
   `KNOWLEDGE_RERANK` (`off` default; `on` adds Voyage's cross-encoder pass, inert without a key).
   `apps/api`: the same `GMAIL_OAUTH_CLIENT_ID`/`_SECRET`
   and `MS_OAUTH_CLIENT_ID`/`_SECRET` pairs (the connect flow's own OAuth, distinct from Better
@@ -132,6 +135,29 @@ instruction from him in the session.
   the api's BYOK connect flow needs no platform credential at all. Phase 6's ONE new runtime
   dependency is `openai@7.15.0` (pinned exactly, `packages/llm` only), so a deploy needs
   `pnpm install`.
+  **Phase 7 added NINE environment variable names across the two apps** (six to the api's schema,
+  five to the worker's, three shared, plus one both read outside their schemas). `apps/api`:
+  `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` / `STRIPE_PRICE_DOMAIN` (the licensed per-domain
+  price id) / `STRIPE_PRICE_OVERAGE` (the metered price id) — **all four or none** (`stripeGroup`
+  throws on a partial set) and **required in production**; unset locally is normal (`/meta` reports
+  `billing: false`, the Billing screen hides Subscribe, `POST /webhooks/stripe` answers 404).
+  `apps/worker`: `STRIPE_SECRET_KEY` (**required in production when `WORKER_ROLES` includes
+  `cron`** — `billing.report-usage` is what bills overage and syncs the licensed quantity; unset
+  elsewhere the cron runs its local half and counts every Stripe call it could not make),
+  `STRIPE_METER_EVENT_NAME` (default `ai_conversation_overage`; must name the SAME Billing Meter the
+  api's `STRIPE_PRICE_OVERAGE` price is attached to), and `MANAGED_DRAFT_SLOTS` (default 4, `0`
+  disables — the deployment-wide ceiling on in-flight MANAGED model calls, a session-level
+  `pg_try_advisory_lock` slot per call; the SAME value on every `agent` replica; sized between the
+  `agent` replica count and the Anthropic tier's concurrency ceiling, runbook §8). **Both apps**:
+  `SENTRY_DSN` / `SENTRY_ENVIRONMENT` (optional everywhere; unset = no Sentry, alerts still log via
+  pino) and `SENTRY_RELEASE`, read from `process.env` at each `src/index.ts` — deliberately not in
+  either config schema — and set from the deploy's git SHA. Three new runtime dependencies, pinned
+  exactly: `stripe@22.6.2` (api and worker), `@sentry/node@10.74.0` (api and worker),
+  `expo-share-intent@8.0.1` (app) — a deploy needs `pnpm install`. **Migration 0023 backfills a
+  `billing_subscriptions` row for every existing workspace on the TRIAL tier**, whose caps are far
+  tighter than the catalog defaults every workspace ran on before (sources 10, crawl pages 20,
+  connections 1, 50 drafts and $3 a day, a $10 total budget) — the runbook's §1 says how to
+  subscribe or override a workspace before it lands.
 
 ## Layout
 
@@ -142,7 +168,16 @@ instruction from him in the session.
   `AddCredentialInput` / `SetAgentModelInput` / `CredentialIdInput`, `ProbeResult` /
   `ProbeResultView`, `LLM_MAX_CREDENTIALS` (5), and `LLM_ERROR_MESSAGES` — the ONE source of the
   owner-facing sentence for every soft refusal Settings → AI can produce, thrown by the router and
-  keyed on by both screens (plain string constants; this file stays zod-only otherwise).
+  keyed on by both screens (plain string constants; this file stays zod-only otherwise). Phase 7
+  added `billing.ts` — `PLAN_IDS`/`PlanId` (the ONE home; `@aesa/core`'s `plans.ts` re-exports it),
+  `BILLING_STATUSES`, `BILLING_STATES`, `OVERAGE_MODES`, `BILLING_PRICING` (the numbers the app
+  renders AND the numbers `PLANS` is built from — 4999 ¢ per domain, 300 included per domain,
+  12 ¢ overage, 14 trial days, a FLAT 50 trial conversations, a $10 trial budget), `BillingView`,
+  `SetOverageModeInput`, `BILLING_ERROR_MESSAGES` — and, in `workspace.ts`, `SetKillSwitchInput`,
+  `SetRetentionDaysInput` (30–730), `RequestDeletionInput`, `WORKSPACE_DELETE_GRACE_DAYS` (30),
+  `EXPORT_STATES`, `exportObjectKey` (the ONE function the api mints an export key with and the
+  worker validates against) and `WORKSPACE_ERROR_MESSAGES`; `RememberReplyInput` in `memory.ts`;
+  the `billing`/`workspace` notification kinds and the `abandoned`/`stuck` source failure reasons.
 - `packages/db` — drizzle schema (`src/schema/`), SQL migrations, `createDb` (session role set through
   libpq startup options), `withOrg` / `withPlatform` / `withOrgIdentity` (lending a platform sweep's
   per-row SAVEPOINT tx one org's identity), per-org data keys, `escalateTicket` (the single entry
@@ -160,7 +195,22 @@ instruction from him in the session.
   (`model-config.ts`, the ONE reader of an agent's model choice, used by the api AND the worker),
   `loadModelPricing` (`pricing.ts`), `LLM_METERS.costMicrosByok`, `llm_calls`'s new
   `mode` / `credential_id` / `cost_unknown`, `DEMOTION_COPY.model_changed` and
-  `escalationCopy.provider_unavailable`.
+  `escalationCopy.provider_unavailable`. Phase 7 added `billing_subscriptions` (one row per
+  workspace from creation, migrations 0022–0023 with the backfill; `org_id` is the primary key),
+  the lifecycle/export columns on `workspaces`, `drafts.body_purged_at`,
+  `knowledge_sources.sweep_attempts`, `resolved_answers.source_message_id` (partial unique), the
+  three age indexes (0021 `agent_runs (started_at)`, 0023 `llm_calls`/`notifications
+  (created_at)`, 0024 `audit_log (created_at)`) and `resolve_stripe_customer` (SECURITY DEFINER,
+  the api's ONE cross-org read; zero rows for an unknown customer) — plus `billing.ts`
+  (**`readBillingState`**, the ONE reader of a workspace's billing state — see the Billing rule
+  below — `ensureBillingRow`, `countManagedConversations`, `countActiveDomains`), `settings.ts`
+  (**`loadSettingSources`** / `SettingSources` — see the Plans rule), `metering.ts`'s
+  `SEND_METERS.aiHandledManaged` and `sumMeter`, `keys.ts`'s `rewrapOrgDek` (guarded on the exact
+  bytes read; THROWS when the ring lacks the row's version), `purge.ts` (`PURGE_ORDER`,
+  `purgeWorkspace`, `purgeAuthRows` — see the Lifecycle rule) and `test/helpers/tables.ts`
+  (`EXPECTED_TABLES`, 42, and `RLS_EXEMPT`, shared by the migrations, RLS and purge tests). This
+  package now depends on `@aesa/core` (for `planSettingDefaults`); `@aesa/core` depends on
+  `@aesa/contracts` and zod only, so there is no cycle.
 - `packages/crypto` — `Secret`, domain-separated token hashing, AES-256-GCM envelope with a KEK ring,
   libsodium sealed boxes, the SSRF guard (`validateOutboundUrl`, `resolvePublic`, `pinnedFetch`) and
   Phase 6's `createPinnedFetch` — a `fetch`-shaped transport an SDK accepts for its `fetch` option
@@ -179,7 +229,14 @@ instruction from him in the session.
   constants (`MEMORY_RETRIEVE_MIN_COSINE`, `MEMORY_EXPIRY_DAYS`, `MEMORY_STRIKES_TO_RETIRE`,
   `THREAD_MAX_MESSAGES_FOR_AUTO`), and Phase 6's `quality.ts` — `QUALITY_CAPS` (1.0 / 0.9 / 0.6),
   `cappedModelConfidence` and `graduationRulesFor` (20 / 40 / never); `evaluateGraduation` now takes
-  an optional rules override.
+  an optional rules override. Phase 7 added `billing.ts` — the pure billing maths
+  (`billingStateOf`, `isBillingActive`, `allowanceOf` — a FLAT constant on a trial, ruling R6 —
+  `periodOf`, `overageOf`, `isAllowanceExhausted`, `trialEndsAtFor`), made `plans.ts` read
+  `BILLING_PRICING` (with the trial's `llmUsdBudget`), gave `invariants.ts` the trial-budget rules,
+  and added **`redact.ts`** (ruling R25): `redactUrl`, `redactText`, `SCRUB_KEYS`/`scrubKeys`,
+  `SENSITIVE_HEADER_NAMES`/`redactHeaders`, `redactQueryParams`, `redactBreadcrumbMessage` — the ONE
+  implementation the api's pino `err` serializer and both apps' Sentry `beforeSend` boundaries scrub
+  with (the api's `src/redact.ts` is a re-export). It has zero imports.
 - `packages/queue` — pg-boss wrappers (`startBoss`, `registerCron`), `defineJob` / `registerJob`,
   `enqueue`, `fairSelectSql`, and Phase 6's `QUEUE_OPTIONS` / `queueOptionsFor`
   (`queue-options.ts`) — the ONE source of every queue's options, read by `defineJob` AND both
@@ -187,6 +244,11 @@ instruction from him in the session.
   so a hand-built definition without queue options is a compile error; `enqueue` stays on the looser
   `JobDefinition`) and `scrubJobError`, which keeps a `DrizzleQueryError`'s `query`/`params` out of
   `pgboss.job.output` for every job at once. `drizzle-orm` is a runtime dependency here for that.
+  Phase 7 added the three queues `workspace.export` (`short`), `workspace.purge` (`short`) and
+  `keys.rotate` (`standard`) to `JOB_NAMES`/`QUEUE_OPTIONS`, and `observe.ts` —
+  `setJobObserver`/`notifyJobFailure`, the seam through which `registerJob` reports a SCRUBBED job
+  failure to whoever is listening (the worker wires Sentry to it at boot; this package takes no
+  Sentry dependency).
 - `packages/mail` — the provider-agnostic mailbox port: Gmail + Microsoft Graph adapters, credential
   lease/refresh, rfc2822/address/body/threading helpers, the sync walk (`sync.ts`), `MockMailbox`,
   the send limiter. No database dependency beyond what `sync.ts` itself needs via `@aesa/db`.
@@ -232,7 +294,9 @@ instruction from him in the session.
   ranking). Two PURE sub-paths the api imports and nothing else — `@aesa/knowledge/storage` and
   `@aesa/knowledge/url` — keep the parsers and the LLM client out of the api's module graph
   (`apps/api/test/error-surface.test.ts` walks it); `./testing` exports `fakeSite`. `@aesa/agent` is
-  a type-only devDependency (`RetrievedChunk`/`Retriever` erase at runtime).
+  a type-only devDependency (`RetrievedChunk`/`Retriever` erase at runtime). Phase 7 gave the
+  `ObjectStore` port `put` and `presignGet` (S3 and memory adapters) for the workspace export;
+  `presignGet` is a local SigV4 computation, not a request, pinned network-free by a test.
 - `packages/platform-mail` — the platform's own outbound mail (sign-in codes, invitations,
   address-verification codes, the daily digest): the `MailTransport` port with a Resend transport
   and a devsink, plus the templates. Shared by `apps/api` and `apps/worker`; no database dependency.
@@ -274,6 +338,22 @@ instruction from him in the session.
   elsewhere). It never touches `mailbox_credentials` either (platform-role only) — a connect flow's
   sealed OAuth tokens ride a job payload to the worker, which is the only process that ever opens
   them. The same holds for `llm_credential_secrets` (see the Provider credentials rule below).
+  Phase 7 added `ownerProcedure` (`role === 'owner'`, above `managerProcedure` in `trpc/init.ts`) and
+  the shape twice more: a `billing` router over `src/billing/service.ts` (`@aesa/api/billing` —
+  `getBilling`, `startCheckout`, `openPortal`, `setOverageMode`; `src/billing/stripe.ts` is the
+  `StripePort` and `src/billing/webhook.ts` is `applyStripeEvent` + `registerStripeWebhook`, the
+  raw-body `POST /webhooks/stripe` in its own encapsulated `register()` — signature over the bytes,
+  dedupe through `webhook_events`, the `last_stripe_event_created` watermark checked on the read AND
+  in the UPDATE's WHERE, items read by price, a foreign invoice refused, fulfilment on the session's
+  `payment_status`) and a `workspace` lifecycle service, `src/workspace/lifecycle.ts`
+  (`@aesa/api/workspace` — `setKillSwitch`, `setRetentionDays`, `requestDeletion` with the Stripe
+  cancel BEFORE its write transaction, `cancelDeletion`, `requestExport`, `exportStatus` — every one
+  `ownerProcedure` except `exportStatus`'s state read); `memory.rememberReply`; `workspace.create`
+  inserts the billing row and `setAgentEnabled` stamps `trial_ends_at`; `mailboxes.startConnect`
+  refuses beyond the plan's LIVE sync slots (`connected` + `pending_claim`); every `resolveSetting`
+  on `loadSettingSources` (`src/org-settings.ts` is gone); and `src/observability.ts`
+  (`initObservability`, `beforeSend`, `alert`, `captureWithOrg`, `ALERT_KINDS`) — see the
+  Observability rule. Every Stripe call the api makes happens outside every transaction.
 - `apps/worker` — `WORKER_ROLES` partition, KEK ring, `jobs/`: `platform.heartbeat` (cron),
   `mailbox.sync` / `mailbox.poll-sweep` / `mailbox.renew-watch` / `mailbox.store-credentials` /
   `mailbox.revoke` (mailbox lifecycle, `sync` role), `ticket.triage` / `ticket.draft` /
@@ -315,13 +395,42 @@ instruction from him in the session.
   Phase 6 also added `provider-resolver.ts` — the ONE way a worker gets a model provider
   (`createProviderResolver`, `staticResolver`/`staticRefusal` for tests, `openCredentialKey`,
   `secretAad`, `markCredentialDead`, `FALLBACK_CODES`, `cacheTtlFor`) — and
-  `provider-health-notify.ts`.
+  `provider-health-notify.ts`. Phase 7 added eight jobs and crons: `billing.report-usage`
+  (`billing/report-usage.ts`, `20 0 * * *`, `cron` role — collect in one platform transaction, act
+  on Stripe OUTSIDE every transaction, record with writes guarded on what was read; overage DELTAS as
+  Billing Meter events with an idempotent identifier, the daily licensed-quantity sync, the trial
+  and allowance pages; `billing/stripe.ts` is the `StripeUsagePort`), `retention.sweep`
+  (`45 3 * * *`, `cron` — ONE short `withPlatform` transaction PER workspace, every workspace, no
+  window; the three platform age deletes), `workspace.export` and `workspace.purge` (`knowledge`
+  role, which owns the store) with the `workspace.purge-sweep` cron (`15 4 * * *`, `cron`),
+  `keys.rotate` (`sync` role — the ring's home — plus `scripts/keys-rotate.ts`),
+  `knowledge.stuck-sweep` (`*/5 * * * *`) and `knowledge.reembed-sweep` (`*/10 * * * *`) (both
+  `knowledge` role); `drafting/admission.ts` (the managed slot pool: `MANAGED_DRAFT_SLOTS`
+  session-level advisory locks, a 60 s wait then PROCEED with an `admission_slot_timeout` alert — a
+  draft is never lost to admission control; BYOK calls never enter it); `drafting/caps.ts` reading
+  the plan and the trial's total budget; `ticket.draft`/`agent.sandbox` passing
+  `readBillingState(...).active` and `isAllowanceExhausted(...)` into `decide()`; `send.execute`'s
+  eighth kill lever `subscription_inactive` (an AUTO send only — a human approval still sends) and
+  the managed conversations meter; `memory.capture`'s `messageId` payload variant with every skip
+  audited; `sweeps.daily`'s arms (g) `agent_runs` 90 d and (h) `platform.access` 30 d;
+  `drafting/outcomes.ts` now home to `escalateProviderUnavailable`/`killCredential`; and
+  `src/observability.ts` (the api's twin; the job observer wired at boot).
 - `apps/app` — the Expo universal app (`@aesa/app`, SDK 57, Expo Router, `web.output` server):
   `src/app` routes only, `src/screens` bodies, `src/lib` clients and the session gate, `src/components`
   primitives; jest-expo + RNTL for units, Playwright for the signup smoke. Phase 6 added **route 25**,
   `(app)/settings/ai` (Managed AI vs provider connections: add, probe, remove, per-credential 30-day
   usage, the consent sentence), the agent edit screen's **Model** card, and the model each agent runs
-  on in the agent list row.
+  on in the agent list row. Phase 7 added **routes 26 and 27**: `(app)/settings/billing` (plan,
+  domains, allowance and usage, the period, Subscribe / Manage billing through Stripe in a popup
+  opened BEFORE the await, the overage-mode toggle for the owner) and `share` (the native share
+  sheet's landing — a link crawls, text pastes, a file uploads; `lib/share-intent{,.web}.tsx` keep
+  `expo-share-intent` out of the web bundle), plus the inbox `BillingBanner`, the owner-only danger
+  zone on Settings → Workspace (kill switch, retention, export, delete with a typed confirmation),
+  **Remember this reply** on an outbound message, and push routing for the `billing`/`workspace`
+  kinds.
+- `scripts/smoke-tenant.ts` — `pnpm smoke:tenant`, the post-deploy walk of a throwaway workspace's
+  authenticated surface (`/healthz`, `/meta`, `workspace.get`, `billing.get`, `agents.list`,
+  `knowledge.list`, `memory.summary`, optionally one sandbox run); never printing its cookie; not CI.
 
 ## Rules that hold here (most are test-enforced; do not work around them)
 
@@ -333,7 +442,9 @@ instruction from him in the session.
   `<table>_platform_all` for `aesa_platform`. Declare them with `tenantPolicies()` from
   `packages/db/src/schema/helpers.ts`. A table that is not tenant data (`platform_state`,
   `webhook_events`, Phase 6's `model_pricing` — platform price-table data; Better Auth's tables in
-  Phase 1) goes in that test's `RLS_EXEMPT` list instead. drizzle never
+  Phase 1) goes in `RLS_EXEMPT` (`packages/db/test/helpers/tables.ts`, beside the exact
+  `EXPECTED_TABLES` list — shared by the migrations, RLS and purge tests so the three cannot drift)
+  instead. drizzle never
   emits `FORCE`, so a custom migration adds it, and migration 0002's default privileges give
   `aesa_app` full DML on new tables, so a worker-only table needs an explicit `REVOKE`.
 - **Data access.** Tenant reads and writes go through `withOrg(db, orgId, fn)` (branded `OrgTx`) or
@@ -347,16 +458,19 @@ instruction from him in the session.
   `registerJob` hands the handler an `AbortSignal` that fires at `expireInSeconds` minus
   `JOB_SIGNAL_MARGIN_SECONDS` (owned by `@aesa/core`). **`singletonKey` only does something on a
   queue whose `policy` says so.** pg-boss 10 gates its singleton indexes on the queue's policy, and
-  `defineJob` defaults to `standard`, on which no index applies and the key is inert. The TEN
-  `short` queues — Phase 3's `ticket.draft`, `send.execute`, `agent.sandbox`, `notify.dispatch`,
+  `defineJob` defaults to `standard`, on which no index applies and the key is inert. `JOB_NAMES`
+  carries EIGHTEEN queues since Phase 7, TWELVE of them `short` — Phase 3's `ticket.draft`,
+  `send.execute`, `agent.sandbox`, `notify.dispatch`,
   Phase 4's `knowledge.ingest`, `knowledge.crawl`, `knowledge.embed-batch`, Phase 5's
   `memory.capture` (produced by the WORKER alone, from `send.execute`'s post-commit `onSent` seam)
   and `guidance.suggest` (produced by the API alone, from `approveDraft` after an edited
-  approval), and Phase 6's `llm.probe` (a producer on BOTH sides, like `ticket.draft`,
+  approval), Phase 6's `llm.probe` (a producer on BOTH sides, like `ticket.draft`,
   `send.execute` and `notify.dispatch` before it — the api's `addCredential`/`probeCredential` AND
   the worker's own `llm.reprobe-sweep` cron, so it sits in both pre-create lists with its
-  policy) — declare
-  `policy: 'short'` in `defineJob`'s `queue` options, which collapses a duplicate only while the
+  policy), and Phase 7's `workspace.export` (produced by the api's `requestExport`) and
+  `workspace.purge` (produced by the worker's own `workspace.purge-sweep`) — declare
+  `policy: 'short'` in `QUEUE_OPTIONS` (Phase 7's third queue, `keys.rotate`, stays `standard`: its
+  producer is a hand-run script, never a burst), which collapses a duplicate only while the
   first job is still `created` (a job that has gone `active`, or that is sitting in `retry`, never
   swallows a newer event; `enqueue` returns `null` when a duplicate was collapsed).
   `ticket.triage` and `mailbox.sync` stay `standard` on purpose: their burst source is a push
@@ -383,9 +497,12 @@ instruction from him in the session.
   optional for a `JOB_NAMES` name (it resolves from the table, and throws for a name the table does
   not carry) while `registerJob` demands a `RegisteredJobDefinition`, making "forgot the queue
   options" a compile error. A cron is NOT a queue in
-  this sense — `stats.rollup`, like `sweeps.daily`, `ticket.backstop-sweep` and Phase 6's
-  `llm.reprobe-sweep` (`15 */6 * * *`, `cron` role), is registered with `registerCron` and belongs in
-  none of the four places.
+  this sense — `stats.rollup`, like `sweeps.daily`, `ticket.backstop-sweep`, Phase 6's
+  `llm.reprobe-sweep` (`15 */6 * * *`, `cron` role) and Phase 7's five — `billing.report-usage`
+  (`20 0 * * *`, `cron`), `retention.sweep` (`45 3 * * *`, `cron`), `workspace.purge-sweep`
+  (`15 4 * * *`, `cron`), `knowledge.stuck-sweep` (`*/5 * * * *`, `knowledge`) and
+  `knowledge.reembed-sweep` (`*/10 * * * *`, `knowledge`) — is registered with `registerCron` and
+  belongs in none of the four places.
 - **Escalation.** Every entry into `needs_owner` from the drafting, send and api paths goes through
   `escalateTicket` (`@aesa/db`) — it owns the guarded transition, the `escalation_notified_at` reset,
   the audit row and the deduped notification, and its `dedupeKey` is reason-scoped where a second
@@ -415,7 +532,13 @@ instruction from him in the session.
   `warn` that flips no outcome). A BYOK draft is screened exactly like a managed one — **the provider
   never enters the `WorkspacePolicy`.**
 - **Autonomy.** `decide()`'s evaluation order IS the spec's — do not reorder a branch without
-  changing the spec and `packages/core/test/autonomy.test.ts`'s table. The auto branch compares
+  changing the spec and `packages/core/test/autonomy.test.ts`'s table (Phase 7's ruling R12 kept
+  `subscription_inactive` ahead of the tripwire/guardrail branches for exactly that reason, and
+  recorded the question for Robert). Phase 7 changed exactly TWO of its inputs from literals to
+  facts: `subscriptionActive` is `readBillingState(...).active` (`trialing` or `active`; an expired
+  trial, `past_due` and `canceled` are inactive) and `allowanceExhausted` is
+  `isAllowanceExhausted(...)` over the RESOLVED model's mode — never a BYOK draft, never a
+  `standard` workspace under `automatic` overage. The auto branch compares
   `confidence_breakdown.evidence` (`max(memory, grounding) × model`) against the category policy's
   `auto_send_min_confidence / 100`, **never `drafts.confidence`**, which still means the model's own
   self-assessment (plan deviation 1). Since Phase 6 that `model` term is
@@ -487,6 +610,10 @@ instruction from him in the session.
   `agent_category_policies` / `notifications` writes ride in that same fourth position). Taking them
   first is a real `40P01` cycle, which is why `rejectDraft` is wrapped in `withDeadlockRetry` like its
   siblings. `apps/api/src/drafts/service.ts`'s header spells the same order out call by call.
+  `billing_subscriptions` is never WRITTEN in a transaction that holds a draft or a ticket:
+  `readBillingState` is a read the draft job takes in its pre-claim transaction beside
+  `org_settings` and `send.execute` takes in its claim transaction beside `workspaces`; its writers
+  are the api's billing service and webhook and the worker's report cron, each on its own.
 - **Secrets.** Never logged, never returned by an API. `Secret` serializes as `[redacted]`; the api
   error handler strips SQL parameters and redacts URLs before anything reaches a log or a client.
 - **App bundle.** `apps/app` never value-imports a server package — `@aesa/db`, `@aesa/core`,
@@ -496,8 +623,11 @@ instruction from him in the session.
   `@aesa/knowledge/*`, `drizzle-orm/*`); `import type` is allowed
   throughout (ESLint block for `apps/app/**`). Share types through `@aesa/contracts`. The two PURE
   `@aesa/knowledge` sub-paths are pure for the API's sake, not the app's: they still reach `node:*`
-  and the AWS SDK. The Expo web export is **25 static routes** since Phase 6's
-  `(app)/settings/ai`.
+  and the AWS SDK. The Expo web export is **27 static routes** since Phase 7's
+  `(app)/settings/billing` and `share`. `expo-share-intent` is native-only and reaches the tree
+  through `src/lib/share-intent.tsx` with a `.web.tsx` twin that imports nothing from it — the
+  emitted web bundle was grepped for the package name to prove the split (no lint rule enforces it
+  yet; a carry).
 - **Brand files are generated.** `brand/mark-{ink,paper,lifted}.svg`, `brand/lockup-{horizontal,
   stacked}.svg`, `brand/og-image.svg`,
   `apps/app/assets/{icon,adaptive-icon,splash-icon,notification-icon,favicon}.png`,
@@ -550,11 +680,76 @@ instruction from him in the session.
   with no `model_pricing` row records `cost_unknown = true` and cost 0 rather than a wrong number,
   which is why the BYOK stop-loss is token-based (30k output tokens) beside the managed one ($0.40).
   Read sides that answer "what is this costing me" — Activity's headline tile — sum BOTH meters and
-  label the BYOK half; the SEPARATION is a cap rule, not a display rule.
+  label the BYOK half; the SEPARATION is a cap rule, not a display rule. **The cap rule's third
+  sentence (Phase 7): `LLM_METERS.costMicros` is the ONLY input to the daily USD cap AND to the
+  trial's total budget**, and `SEND_METERS.aiHandledManaged` (`ai_handled_conversations_managed`,
+  bumped in `completeSend` beside `aiHandledConversations` only when the sending agent's RESOLVED
+  mode is `managed`) is the ONLY meter the allowance and the overage read — a BYOK conversation
+  never counts toward the allowance and is never billed as overage.
+- **Billing.** `readBillingState(tx, now)` (`@aesa/db`) is the ONE reader that turns a
+  `billing_subscriptions` row into `{ plan, state, active, allowance, period, overageMode, … }` —
+  the api's `billing.get`, the worker's draft, sandbox, send and report-usage jobs,
+  `loadSettingSources` and the E2E all go through it, and a missing row reads as the trial defaults
+  (never a brick). `billingStateOf` / `allowanceOf` / `overageOf` / `isAllowanceExhausted`
+  (`@aesa/core`) are the pure maths it and the report cron call. The trial allowance is a FLAT
+  constant (`BILLING_PRICING.trialIncludedConversations`, 50), never `includedConversationsPerDomain`
+  — that column means "per domain on the paid plan" and is read only on `standard` (ruling R6).
+  `billing.report-usage` reports the DELTA of `max(0, used − allowance)` since the last report as
+  ONE meter event with identifier `${orgId}:${periodStartIso}:${overageTotal}`, and the guarded
+  `overage_reported` watermark is written only AFTER Stripe accepted the event — a row updated
+  ahead of a failed call would lose that overage forever. Every Stripe call in either app is BEFORE
+  or AFTER a transaction, never inside one, and the write that records its result is guarded on the
+  value that was read. The webhook is the ONLY writer of `plan`/`status` from Stripe's side; there
+  is no reconciliation sweep (a carry), so a missed delivery is repaired from the Dashboard.
+- **Plans.** `PLANS` (`@aesa/core`) is built from `BILLING_PRICING` (`@aesa/contracts`), and
+  `planSettingDefaults(plan)` is the ONLY way a plan becomes a `resolveSetting` source —
+  `loadSettingSources(tx, keys)` (`@aesa/db`) is its only caller and returns `{ org, plan, planId }`
+  resolved org > plan > default. **No production code passes `{ org: … }` alone to
+  `resolveSetting`**: every one of the 22 sites (worker and api) takes `loadSettingSources`'s
+  result, both `loadOrgSettings` twins and `apps/api/src/org-settings.ts` are gone, and a grep for
+  `resolveSetting(` with `{ org:` outside tests is a review failure. A plan change (a Checkout, a
+  Portal cancel) therefore lowers or raises every cap at the next call with no restart.
+- **Lifecycle.** `purgeWorkspace` (`@aesa/db`) deletes every tenant table in `PURGE_ORDER` (31,
+  children before parents) by `DELETE … WHERE org_id = $1` as the platform role — the explicit
+  predicate is the WHOLE safety, since RLS is bypassed — then `workspaces`; **`purge.test.ts` pins
+  `PURGE_ORDER` to `EXPECTED_TABLES − RLS_EXEMPT − workspaces`**, so a tenant table added without a
+  purge entry fails CI. `purgeAuthRows` runs AFTER it (`workspaces.org_id → organization.id` is
+  `NO ACTION`; the reverse order raises `23503`) and is **the ONE documented exception to "Better
+  Auth's tables only through Better Auth"**: the worker nulls `session.active_organization_id` and
+  deletes the `organization` row (cascading `member`/`invitation`) directly, because the plugin's
+  deletion is disabled and the worker holds no Better Auth instance. `workspace.purge` re-reads
+  `deletion_requested_at` on entry (a cancelled deletion wins over the enqueue), deletes the org's
+  objects OUTSIDE the transaction and refuses any key not under `orgs/<orgId>/`, and is idempotent
+  (no `workspaces` row → `skipped`). `requestDeletion` cancels the Stripe subscription
+  IMMEDIATELY and before its write transaction; a live subscription meeting a replica with no
+  Stripe is refused, never purged. `requestExport` refuses while `export_state = 'queued'` — that
+  api rule is what makes the export job's "queued for a different key" branch a programming error
+  rather than a race (rulings R14/R16), so a change to one is a change to the other. `exportStatus`
+  reports state to any member and mints the download URL for the OWNER only (the bundle carries the
+  whole audit log). `retention.sweep` is IRREVERSIBLE and per-workspace: it nulls the four body
+  columns past the workspace's own `retention_days` and nothing else; `resolved_answers` keep their
+  own 365-day expiry.
+- **Observability.** **`beforeSend` is the PII boundary, and it is EVENT-level** — it runs on every
+  Sentry event however it was captured (Fastify's own error handler, pg-boss's job failure through
+  `@aesa/queue`'s observer, the process-level uncaught-exception integrations), not only on
+  `alert()`/`captureWithOrg()`. It redacts every exception message and every breadcrumb message
+  (`redactText` — a `DrizzleQueryError`'s `Failed query: <sql>\nparams: …` can carry `final_body`),
+  strips `request.data`, the sensitive headers and every header value or query string carrying the
+  `/a/:draftId?t=` token, and drops every `detail`/`payload`-shaped key. **The scrubbers live in
+  `@aesa/core` (`redact.ts`) and nowhere else** — both `observability.ts` files and the api's
+  `logging.ts` import them; a private copy in either app is the defect ruling R25 removed. On the
+  worker the local log line is protected one step earlier: `registerJob` runs `scrubJobError` on
+  every job failure before pg-boss persists it or the observer sees it. Org
+  attribution is a TAG (`org_id`, plus `job`/`path`) set inside `withIsolationScope`; `alert(kind)`
+  is one of the ELEVEN `ALERT_KINDS`, always a pino `error` line with `alert: true` and, when Sentry
+  is initialised, a `captureMessage` tagged `kind` — never a throw. `SENTRY_DSN` unset is a no-op
+  everywhere. Never run either process with `--inspect` in production: Sentry's default
+  `localVariablesIntegration` would attach stack-frame locals outside `beforeSend`'s reach.
 - **Toolchain.** TypeScript strict NodeNext ESM with explicit `.ts` imports, `tsx` at runtime (no
   build step), runtime dependencies in `dependencies`, vitest, zod 4. This covers the server
   packages and `apps/api` / `apps/worker`; `apps/app` extends `expo/tsconfig.base` instead
   (bundler resolution, JSX, extensionless imports) with `allowImportingTsExtensions`, `noEmit` and
   `types: ["node", "jest"]`, and is built by EAS; the root ESLint TypeScript block covers `**/*.tsx`.
-- **Commits** end with the trailer `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`
-  (a convention, not a check).
+- **Commits** end with the trailer `Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>`
+  (a convention, not a check; the attribution changed mid-Phase 7 — commits before `cfc5a2d` carry
+  the earlier `Claude Fable 5.1` trailer, `eb9315b` a `Claude Sonnet 5` one, and none is rewritten).

@@ -15,5 +15,28 @@
       "env": { "EXPO_PUBLIC_API_URL": "https://api.example.com" }
     }
   },
-  "submit": { "production": {} }
+  "submit": {
+    "preview": {
+      "ios": {
+        "appleId": "REPLACE_ME_apple-developer-account-email",
+        "ascAppId": "REPLACE_ME_app-store-connect-numeric-app-id",
+        "appleTeamId": "REPLACE_ME_apple-team-id"
+      },
+      "android": {
+        "serviceAccountKeyPath": "REPLACE_ME_path-outside-git/play-service-account.json",
+        "track": "internal"
+      }
+    },
+    "production": {
+      "ios": {
+        "appleId": "REPLACE_ME_apple-developer-account-email",
+        "ascAppId": "REPLACE_ME_app-store-connect-numeric-app-id",
+        "appleTeamId": "REPLACE_ME_apple-team-id"
+      },
+      "android": {
+        "serviceAccountKeyPath": "REPLACE_ME_path-outside-git/play-service-account.json",
+        "track": "internal"
+      }
+    }
+  }
 }
