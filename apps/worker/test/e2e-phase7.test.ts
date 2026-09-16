@@ -80,7 +80,9 @@
  * automatic → past_due → downgrade → retention); **B** is the untouched control created beside A;
  * **C** is the one scenario 8 deletes (it needs a LIVE subscription for `cancelSubscription`, which A
  * no longer has after scenario 6); **D** is scenario 9's (provisioned under the ring the rotation
- * moves); **E** is scenario 10's (its ONE learned answer must be the remembered reply).
+ * moves); **E** is scenario 10's (its ONE learned answer must be the remembered reply); **F** is
+ * scenario 4's trial-plan workspace (R11's trial + automatic arm, whose page must not share A's
+ * period-scoped dedupe key).
  */
 import { randomBytes, randomUUID } from 'node:crypto'
 import { and, eq, getTableName, sql } from 'drizzle-orm'
@@ -833,6 +835,9 @@ describe('Phase 7 close-out E2E (billing, caps, retention, delete, rotate, remem
   let orgA: Org
   let orgB: Org
   let orgC: Org
+  /** Scenario 4's trial-plan org — R11's trial + automatic arm. Never touched again, so scenario 7's
+   *  `orgs` count is three (A, B, F) and its bodies are simply too young to purge. */
+  let orgF: Org
   let subA: string
   let customerA: string
   /** Org A's Stripe period, set by scenario 2's `customer.subscription.updated`. */
@@ -1002,7 +1007,8 @@ describe('Phase 7 close-out E2E (billing, caps, retention, delete, rotate, remem
     expect((await getBilling(billingDeps, orgA.orgId))).toMatchObject({ used: 601, overageUnits: 1 })
 
     const periodStartIso = new Date(Math.floor(periodA.start.getTime() / 1000) * 1000).toISOString()
-    expect(await runReport()).toMatchObject({ reported: 1, quantitySynced: 0, skipped: 0 })
+    // R11's third arm, pinned directly: standard + automatic PAST the allowance bills overage and pages nothing.
+    expect(await runReport()).toMatchObject({ reported: 1, quantitySynced: 0, trialNotices: 0, skipped: 0 })
     expect(fakeStripe.calls).toHaveLength(1)
     expect(fakeStripe.callsTo('reportOverage')[0]!.params).toEqual({ customerId: customerA, value: 1, identifier: `${orgA.orgId}:${periodStartIso}:1` })
     const reported = await billingRow(orgA)
@@ -1013,7 +1019,7 @@ describe('Phase 7 close-out E2E (billing, caps, retention, delete, rotate, remem
     expect(audits[0]!.detail).toMatchObject({ used: 601, allowance: 600, delta: 1, total: 1, identifier: `${orgA.orgId}:${periodStartIso}:1` })
 
     // Nothing changed → nothing reported: the watermark is what makes the pass idempotent.
-    expect(await runReport()).toMatchObject({ reported: 0 })
+    expect(await runReport()).toMatchObject({ reported: 0, trialNotices: 0 })
     expect(fakeStripe.calls).toHaveLength(1)
     expect((await billingRow(orgA)).overageReported).toBe(1)
 
@@ -1026,7 +1032,7 @@ describe('Phase 7 close-out E2E (billing, caps, retention, delete, rotate, remem
 
   // ---- 4: blocked vs automatic -------------------------------------------------
 
-  it('4. blocked vs automatic at 601 of 600: with the cold-start floor met and a learned answer behind it, an auto-eligible draft under blocked overage lands review/allowance_exhausted (and the nightly pass pages "Included conversations used up" once); setOverageMode(automatic) → the next lands send — an approved auto draft, a queued send, the ticket on auto_sending', async () => {
+  it('4. blocked vs automatic at 601 of 600: with the cold-start floor met and a learned answer behind it, an auto-eligible draft under blocked overage lands review/allowance_exhausted (and the nightly pass pages "Included conversations used up" once — as it does for a TRIAL workspace under automatic at its flat 50, with the trial body); setOverageMode(automatic) → the next lands send — an approved auto draft, a queued send, the ticket on auto_sending', async () => {
     await seedHumanDecisions(orgA, firstTicketA, 6)
     expect(await withOrg(app.db, orgA.orgId, (tx) => countHumanDecisions(tx, orgA.agentId, orgA.categoryId))).toBe(10)
 
@@ -1053,6 +1059,29 @@ describe('Phase 7 close-out E2E (billing, caps, retention, delete, rotate, remem
     expect(page.dedupeKey).toBe(`billing:allowance:${orgA.orgId}:${(await billingRow(orgA)).currentPeriodStart!.toISOString()}`)
     expect(page.body).toContain('all 600 included conversations')
     expect(await runReport()).toMatchObject({ trialNotices: 0 })
+
+    // R11's OTHER arm, the one a blocked-only test once missed (`report-usage.ts`'s own comment):
+    // a TRIAL workspace under AUTOMATIC overage is still exhausted at its flat 50, and pages with the
+    // trial body. A fresh org, so its page cannot collide with A's (`periodOf` keeps A's stored Stripe
+    // period, and the dedupe key is period-scoped). The 50 units are the scenario-3 shortcut again.
+    orgF = await createOrg({ name: 'foxtrot' })
+    await enableAgent(orgF)
+    expect(await getBilling(billingDeps, orgF.orgId)).toMatchObject({ plan: 'trial', state: 'trialing', overageMode: 'automatic', allowance: 50, used: 0 })
+    await withOrg(app.db, orgF.orgId, (tx) => bumpMeter(tx, orgF.orgId, utcDay(clock.now()), SEND_METERS.aiHandledManaged, 50))
+    expect(await getBilling(billingDeps, orgF.orgId)).toMatchObject({ used: 50, overageUnits: 0 })
+    expect(await runReport()).toMatchObject({ reported: 0, quantitySynced: 0, trialNotices: 1, skipped: 0 })
+    expect(fakeStripe.calls).toHaveLength(0)
+    const trialPages = await notificationsOf(orgF, 'billing')
+    expect(trialPages).toHaveLength(1)
+    expect(trialPages[0]!.title).toBe('Included conversations used up')
+    expect(trialPages[0]!.dedupeKey).toBe(`billing:allowance:${orgF.orgId}:${(await getBilling(billingDeps, orgF.orgId)).periodStart.toISOString()}`)
+    expect(trialPages[0]!.body).toContain("this trial's 50 included conversations are used up")
+    expect(trialPages[0]!.body).toContain('subscribe to lift the limit')
+    expect(await runReport()).toMatchObject({ trialNotices: 0 })
+    expect(await notificationsOf(orgF, 'billing')).toHaveLength(1)
+    await waitFor(async () => {
+      expect((await notificationsOf(orgF, 'billing'))[0]!.status).toBe('sent')
+    })
 
     expect(await setOverageMode(billingDeps, orgA.orgId, { mode: 'automatic' }, billingActor(orgA))).toEqual({ ok: true })
     gateSends()
@@ -1194,7 +1223,7 @@ describe('Phase 7 close-out E2E (billing, caps, retention, delete, rotate, remem
 
     clock.advanceDays(31)
     const result = await runRetentionSweep({ db: app.db, logger, now: clock.now })
-    expect(result).toMatchObject({ orgs: 2, messagesPurged: messagesA.length, draftsPurged: terminal.length, llmCallsDeleted: 0, notificationsDeleted: 0, auditDeleted: 0 })
+    expect(result).toMatchObject({ orgs: 3, messagesPurged: messagesA.length, draftsPurged: terminal.length, llmCallsDeleted: 0, notificationsDeleted: 0, auditDeleted: 0 })
 
     const purged = await messagesFor(orgA)
     expect(purged).toHaveLength(messagesA.length)
@@ -1233,7 +1262,7 @@ describe('Phase 7 close-out E2E (billing, caps, retention, delete, rotate, remem
 
   // ---- 8: delete with grace ----------------------------------------------------
 
-  it('8. delete with grace: on a live subscription requestDeletion cancels it at Stripe, flips the kill switch and holds the queued auto send on workspace_kill_switch; 31 days later the purge sweep enqueues the job, which empties every PURGE_ORDER table, the workspace, the organization and the bucket object — and orgs A and B keep every row', async () => {
+  it('8. delete with grace: on a live subscription requestDeletion cancels it at Stripe, flips the kill switch and holds the queued auto send on workspace_kill_switch; 31 days later the purge sweep enqueues the job, which empties every PURGE_ORDER table, the workspace, the organization and the bucket object — skipping, alerting on and leaving in place the one object keyed under another tenant — and orgs A and B keep every row', async () => {
     orgC = await createOrg({ name: 'charlie' })
     await enableAgent(orgC)
     const subC = `sub_${rand()}`
@@ -1248,8 +1277,14 @@ describe('Phase 7 close-out E2E (billing, caps, retention, delete, rotate, remem
     const uploadSourceId = randomUUID()
     const objectKey = uploadKey(orgC.orgId, uploadSourceId, 'catalogue.pdf')
     await store.put(objectKey, Buffer.from('%PDF-1.4 catalogue'), 'application/pdf')
+    // …and one row whose storage key sits under ANOTHER tenant's prefix — the purge's tenant-isolation
+    // arm (Task 6's review seeded exactly this and watched the old code delete somebody else's object).
+    const foreignOrgId = randomUUID()
+    const foreignKey = uploadKey(foreignOrgId, randomUUID(), 'not-yours.pdf')
+    await store.put(foreignKey, Buffer.from('%PDF-1.4 somebody else\'s'), 'application/pdf')
     await withOrg(app.db, orgC.orgId, async (tx) => {
       await tx.insert(knowledgeSources).values({ id: uploadSourceId, orgId: orgC.orgId, kind: 'upload', status: 'queued', title: 'Catalogue', storageKey: objectKey, mime: 'application/pdf', byteSize: 18 })
+      await tx.insert(knowledgeSources).values({ orgId: orgC.orgId, kind: 'upload', status: 'queued', title: 'Mis-keyed', storageKey: foreignKey, mime: 'application/pdf', byteSize: 24 })
       await tx.insert(orgSettings).values({ orgId: orgC.orgId, key: 'guidance.daily_suggest_cap', value: 5 })
     })
     const added = await addCredential(llmDeps, orgC.orgId, { provider: 'custom', label: 'Spare key', apiKey: CUSTOM_KEY, baseUrl: CUSTOM_BASE, probeModel: CUSTOM_MODEL }, llmActor(orgC))
@@ -1320,13 +1355,21 @@ describe('Phase 7 close-out E2E (billing, caps, retention, delete, rotate, remem
     expect(await app.db.select({ id: organization.id }).from(organization).where(eq(organization.id, orgC.orgId))).toHaveLength(0)
     expect(await app.db.select({ id: member.userId }).from(member).where(eq(member.organizationId, orgC.orgId))).toHaveLength(0)
     expect(store.objects.has(objectKey)).toBe(false)
+    // The foreign key was skipped, paged, and its object is still there: an irreversible delete never
+    // acts on a key it cannot account for.
+    expect(await store.head(foreignKey)).not.toBeNull()
+    const alerts = logged('"kind":"purge_failed"')
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0]).toContain('"alert":true')
+    expect(alerts[0]).toContain(`"orgId":"${orgC.orgId}"`)
+    expect(alerts[0]).toContain(`"key":"${foreignKey}"`)
+    expect(alerts[0]).not.toContain(objectKey)
     // The platform keeps the one fact that the purge happened — an `org_id NULL` row, numbers only.
     const record = await withPlatform(app.db, 'test:read', (tx) => tx.select().from(auditLog).where(and(eq(auditLog.action, 'workspace.purged'), eq(auditLog.entityId, orgC.orgId))))
     expect(record).toHaveLength(1)
     expect(record[0]!.orgId).toBeNull()
-    expect(record[0]!.detail).toMatchObject({ objectsDeleted: 1, objectsFailed: 0, objectsForeign: 0 })
-    expect((record[0]!.detail as { rows: Record<string, number> }).rows).toMatchObject({ tickets: before.tickets, messages: before.messages, drafts: before.drafts, workspaces: 1 })
-    expect(logged('purge_failed')).toHaveLength(0)
+    expect(record[0]!.detail).toMatchObject({ objectsDeleted: 1, objectsFailed: 0, objectsForeign: 1 })
+    expect((record[0]!.detail as { rows: Record<string, number> }).rows).toMatchObject({ tickets: before.tickets, messages: before.messages, drafts: before.drafts, knowledge_sources: before.knowledge_sources, workspaces: 1 })
     expect(await jobsFor(JOB_NAMES.workspacePurge, orgC.orgId)).toHaveLength(1)
 
     // The workspaces beside it: every table, the same count as before.
