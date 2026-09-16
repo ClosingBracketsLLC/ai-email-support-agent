@@ -10,11 +10,13 @@ describe('+native-intent redirectSystemPath (ruling R34)', () => {
     expect(redirectSystemPath({ path: '/dataUrl=aesaShareKey', initial: true })).toBe('/')
   })
 
-  test('every other url is left alone (null = no redirect): invitations, review links, the inbox', () => {
-    expect(redirectSystemPath({ path: 'aesa://invite/abc', initial: true })).toBeNull()
-    expect(redirectSystemPath({ path: 'https://app.example.com/a/draft-1?t=tok', initial: false })).toBeNull()
-    expect(redirectSystemPath({ path: '/inbox', initial: false })).toBeNull()
-    expect(redirectSystemPath({ path: '', initial: true })).toBeNull()
+  test('every other url is passed through UNCHANGED (a falsy return would drop it, not route it): invitations, review links, the inbox', () => {
+    expect(redirectSystemPath({ path: 'aesa://invite/abc', initial: true })).toBe('aesa://invite/abc')
+    expect(redirectSystemPath({ path: 'https://app.example.com/a/draft-1?t=tok', initial: false })).toBe(
+      'https://app.example.com/a/draft-1?t=tok',
+    )
+    expect(redirectSystemPath({ path: '/inbox', initial: false })).toBe('/inbox')
+    expect(redirectSystemPath({ path: '', initial: true })).toBe('')
   })
 
   test('never throws on a shape the router should not produce', () => {

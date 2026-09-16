@@ -15,13 +15,18 @@
  * RAW url off expo-linking, untouched by this rewrite — hands the intent to `useShareIntentRouting`
  * as it does on Android.
  *
- * Returning `null` means "no redirect" (the router's contract). Never throws: the docs warn a throw
- * here can crash the app at launch.
+ * Every other url is returned UNCHANGED. The router's contract is not "null = no redirect": both
+ * call sites do `href = await redirectSystemPath(...)` and then `if (href) listener(href)`
+ * (`link/linking.js`) / use the return AS the initial url (`getLinkingConfig.js`), so a falsy
+ * return DROPS the incoming url — the app stays where it is and an invitation or review link is
+ * never routed. Never throws: the docs warn a throw here can crash the app at launch; the fallback
+ * on a throw is the path itself for the same reason.
  */
 export function redirectSystemPath({ path }: { path: string; initial: boolean }): string | null {
   try {
-    return typeof path === 'string' && path.includes('dataUrl=') ? '/' : null
+    if (typeof path !== 'string') return null
+    return path.includes('dataUrl=') ? '/' : path
   } catch {
-    return null
+    return typeof path === 'string' ? path : null
   }
 }
