@@ -87,6 +87,22 @@ describe('beforeSend — the PII boundary, tested directly rather than trusted t
   })
 
   /**
+   * Fix round 2: header NAME filtering alone misses this — `referer`/`origin` are not sensitive
+   * header NAMES, but a `referer` following navigation from `/a/:draftId?t=<token>` carries that
+   * token verbatim in its VALUE. `@aesa/core`'s `redactHeaders` now runs every surviving header
+   * value through `redactText`, same as `request.url`.
+   */
+  it('redacts the action token out of a referer header VALUE, not only the sensitive-named headers', () => {
+    const event = {
+      request: { headers: { referer: 'https://app.example.com/a/draft-123?t=SECRET_ACTION_TOKEN', 'user-agent': 'curl/8' } },
+    } as unknown as Sentry.ErrorEvent
+    const out = beforeSend(event)
+    expect(out.request?.headers?.referer).not.toContain('SECRET_ACTION_TOKEN')
+    expect(out.request?.headers?.referer).toBe('https://app.example.com/a/draft-123?t=[redacted]')
+    expect(out.request?.headers?.['user-agent']).toBe('curl/8')   // an ordinary value survives untouched
+  })
+
+  /**
    * Critical 2: the `/a/:draftId?t=` one-click review link's `t` query param IS the credential that
    * approves and sends a customer reply — `request.url` and `request.query_string` both carry it on
    * a captured review-route error (`review/routes.ts:175` calls `approveDraft(...)` with no
@@ -194,6 +210,24 @@ describe('beforeSend — the PII boundary, tested directly rather than trusted t
     expect(out.breadcrumbs?.[0]?.message).toHaveLength(200)
     expect(out.breadcrumbs?.[0]?.message).toBe(long.slice(0, 200))
     expect(out.breadcrumbs?.[1]?.message).toBe('short')
+  })
+
+  /**
+   * Fix round 2 (the finding the re-reviewer's `util.format` repro landed): the default
+   * `consoleIntegration` renders `boss.on('error', (e) => console.error('[pg-boss]', e))`
+   * (`apps/api/src/boss.ts`) into the breadcrumb's `message`, and a `DrizzleQueryError`'s
+   * `Failed query: <sql>\nparams: <bound values>` comfortably fits under the 200-char cap — length
+   * truncation ALONE (the pre-fix-round-2 behaviour) never fires for it, so the raw SQL and its
+   * bound customer text (a `drafts.final_body`, say) would have ridden along untouched on whatever
+   * event Sentry captures NEXT.
+   */
+  it('redacts a Failed query: breadcrumb message even when it already fits under the 200-char cap', () => {
+    const message = 'DrizzleQueryError: Failed query: insert into "drafts" ("final_body") values ($1)\nparams: Dear customer, your refund has been processed.'
+    expect(message.length).toBeLessThan(200)   // pins the scenario: length-only truncation would never have fired
+    const event = { breadcrumbs: [{ message, category: 'console' }] } as unknown as Sentry.ErrorEvent
+    const out = beforeSend(event)
+    expect(out.breadcrumbs?.[0]?.message).toBe('DrizzleQueryError: Failed query: [redacted]')
+    expect(out.breadcrumbs?.[0]?.message).not.toContain('refund')
   })
 
   /**

@@ -1,4 +1,5 @@
 export const PACKAGE_NAME = '@aesa/core'
+export * from './redact.ts'
 export * from './tripwire.ts'
 export * from './transitions.ts'
 export * from './redraft.ts'

@@ -21,12 +21,23 @@
  * mail. `apps/api/src/logging.ts`'s pino `err` serializer already collapses exactly this string to
  * `Failed query: [redacted]` for the LOCAL log line; the external path must not be weaker than the
  * local one, so `beforeSend` — which runs on EVERY event regardless of how it was captured — applies
- * the SAME `redactText` to `event.exception.values[].value`. The default `requestDataIntegration`
- * also means a captured event's `request.headers` carries the live session cookie unfiltered (the
- * filtering helper it ships only applies on the SPAN path, not the event path) and, for the review
- * routes, `request.url`/`request.query_string` carry the `/a/:draftId?t=` one-click action token —
- * `withIsolationScope` FORKS the current isolation scope, so this reaches `captureWithOrg`'s own
- * events too, not only Fastify's. `beforeSend` strips both.
+ * the SAME `redactText` to `event.exception.values[].value` AND to every breadcrumb's `message` (the
+ * default `consoleIntegration` renders a logged error into `message` via `util.format`, so
+ * `console.error(...)` in `apps/api/src/boss.ts` puts the same string there, untouched by a
+ * length-only truncation). The default `requestDataIntegration` also means a captured event's
+ * `request.headers` carries the live session cookie unfiltered (the filtering helper it ships only
+ * applies on the SPAN path, not the event path) and, for the review routes, `request.url`/
+ * `request.query_string` carry the `/a/:draftId?t=` one-click action token, which can ALSO ride
+ * along on a `referer`/`origin` header after following that link — `withIsolationScope` FORKS the
+ * current isolation scope, so all of this reaches `captureWithOrg`'s own events too, not only
+ * Fastify's. `beforeSend` strips or redacts every one of these.
+ *
+ * Ruling R25 (Task 11 fix round 2): every pure redaction/scrub primitive below (`redactText`,
+ * `redactUrl`, `SCRUB_KEYS`, `SENSITIVE_HEADER_NAMES`, `scrubKeys`, `redactHeaders`,
+ * `redactQueryParams`, `redactBreadcrumbMessage`) is imported from `@aesa/core` — the ONE
+ * implementation this file and the worker's both scrub with, not a hand-diffed duplicate. Only
+ * `beforeSend` ITSELF (which event fields to touch, and in what order) stays local, because that
+ * orchestration is genuinely this app's own.
  *
  * Verified against the installed `@sentry/node@10.74.0` type declarations before writing this file
  * (see the task report for the exact files read): `init`, `withIsolationScope`, `setTag`,
@@ -39,10 +50,9 @@
  */
 import * as Sentry from '@sentry/node'
 import type pino from 'pino'
+import { redactBreadcrumbMessage, redactHeaders, redactQueryParams, redactText, redactUrl, scrubKeys } from '@aesa/core'
 import type { Secret } from '@aesa/crypto'
 import { scrubJobError } from '@aesa/queue'
-import { redactText } from './logging.ts'
-import { redactUrl } from './redact.ts'
 
 /**
  * The alert kinds actually raised, surveyed against every `alert(...)` call site left behind by
@@ -68,57 +78,15 @@ export const ALERT_KINDS = [
 ] as const
 export type AlertKind = (typeof ALERT_KINDS)[number]
 
-// ---------------------------------------------------------------------------------------------
-// beforeSend's building blocks
-// ---------------------------------------------------------------------------------------------
-
-/** Lower-cased key names `beforeSend` strips wherever they appear in `extra`, inside any one
- *  `contexts` entry, or nested up to `SCRUB_MAX_DEPTH` levels inside either (`extra.request.body`,
- *  not only `extra.body`) — the compare is case-insensitive so `extra.Authorization` is caught too. */
-const SCRUB_KEYS: ReadonlySet<string> = new Set([
-  'body', 'bodytext', 'detail', 'payload', 'apikey', 'key', 'token', 'cookie', 'authorization',
-])
-const SCRUB_MAX_DEPTH = 3
-const BREADCRUMB_MESSAGE_MAX = 200
-/** Header names `beforeSend` deletes outright from `event.request.headers` — `requestDataIntegration`
- *  copies these in UNFILTERED on the event path (its own filtering helper applies only to spans),
- *  and `createAppLogger`'s pino `redact` option already treats the same two as unconditional. */
-const SENSITIVE_HEADER_NAMES: ReadonlySet<string> = new Set(['cookie', 'authorization', 'x-api-key'])
-
-function scrubKeys(rec: Record<string, unknown> | undefined, depth = 0): void {
-  if (!rec || depth > SCRUB_MAX_DEPTH) return
-  for (const key of Object.keys(rec)) {
-    if (SCRUB_KEYS.has(key.toLowerCase())) { delete rec[key]; continue }
-    const value = rec[key]
-    if (value !== null && typeof value === 'object' && !Array.isArray(value)) scrubKeys(value as Record<string, unknown>, depth + 1)
-  }
-}
-
-/** Same value-masking convention as `redactUrl`'s query branch, generalised over Sentry's three
- *  `QueryParams` shapes (a raw `t=<action-token>` string, an object, or `[key, value]` pairs). */
-function redactQueryParams(qs: Sentry.RequestEventData['query_string']): Sentry.RequestEventData['query_string'] {
-  if (qs === undefined) return qs
-  if (typeof qs === 'string') return qs.split('&').map((pair) => { const i = pair.indexOf('='); return i === -1 ? pair : `${pair.slice(0, i)}=[redacted]` }).join('&')
-  if (Array.isArray(qs)) return qs.map(([key]) => [key, '[redacted]'] as [string, string])
-  return Object.fromEntries(Object.keys(qs).map((key) => [key, '[redacted]'])) as Record<string, string>
-}
-
-function redactHeaders(headers: Record<string, string> | undefined): void {
-  if (!headers) return
-  for (const key of Object.keys(headers)) {
-    if (SENSITIVE_HEADER_NAMES.has(key.toLowerCase())) delete headers[key]
-  }
-}
-
 /**
  * The PII boundary (CLAUDE.md: bodies, transcripts and tool results are PII at rest; secrets are
  * never logged). A stack trace's message, a manually-attached `extra`, Fastify's own request
- * context (headers, cookies, the URL's query string) or a console breadcrumb's raw argument dump
- * can all carry a customer body, a session cookie or an action token — none of it may leave this
- * process for Sentry's servers. This runs on EVERY event regardless of how it was captured — see
- * the module doc comment for why that matters more than any one call site's own scrubbing.
- * Exported past what the Produces interface lists on purpose, so it can be exercised directly
- * rather than only trusted through `Sentry.init`'s option wiring.
+ * context (headers, cookies, the URL's query string) or a console breadcrumb's message can all
+ * carry a customer body, a session cookie or an action token — none of it may leave this process
+ * for Sentry's servers. This runs on EVERY event regardless of how it was captured — see the module
+ * doc comment for why that matters more than any one call site's own scrubbing. Exported past what
+ * the Produces interface lists on purpose, so it can be exercised directly rather than only trusted
+ * through `Sentry.init`'s option wiring.
  */
 export function beforeSend(event: Sentry.ErrorEvent): Sentry.ErrorEvent {
   if (event.exception?.values) {
@@ -131,7 +99,7 @@ export function beforeSend(event: Sentry.ErrorEvent): Sentry.ErrorEvent {
     delete event.request.cookies
     redactHeaders(event.request.headers)
     if (event.request.url) event.request.url = redactUrl(event.request.url)
-    if (event.request.query_string !== undefined) event.request.query_string = redactQueryParams(event.request.query_string)
+    event.request.query_string = redactQueryParams(event.request.query_string)
   }
   scrubKeys(event.extra as Record<string, unknown> | undefined)
   if (event.contexts) {
@@ -139,15 +107,15 @@ export function beforeSend(event: Sentry.ErrorEvent): Sentry.ErrorEvent {
   }
   if (event.breadcrumbs) {
     for (const crumb of event.breadcrumbs) {
-      if (crumb.message && crumb.message.length > BREADCRUMB_MESSAGE_MAX) crumb.message = crumb.message.slice(0, BREADCRUMB_MESSAGE_MAX)
+      if (crumb.message) crumb.message = redactBreadcrumbMessage(crumb.message)
       // Dropped wholesale, not scrubbed key-by-key: the default `consoleIntegration` records
       // `data.arguments` — the raw argument array — beside the formatted message, so
-      // `console.error('[pg-boss]', e)` (packages/queue/src/pg-boss.ts, apps/api/src/boss.ts) would
-      // otherwise put a raw pg error object (a DatabaseError's `detail`/`where` can repeat the
-      // offending row value) into breadcrumb data untruncated. `category`/`type`/`message` still
-      // carry the breadcrumb's own information; only the free-form bag is removed. Disabling
-      // `consoleIntegration` outright was the alternative — rejected because it would also drop
-      // every operationally useful console breadcrumb, not just the risky `data` field.
+      // `console.error(...)` (`apps/api/src/boss.ts`) would otherwise put a raw pg error object (a
+      // DatabaseError's `detail`/`where` can repeat the offending row value) into breadcrumb data
+      // untruncated. `category`/`type`/`message` still carry the breadcrumb's own information; only
+      // the free-form bag is removed. Disabling `consoleIntegration` outright was the alternative —
+      // rejected because it would also drop every operationally useful console breadcrumb, not
+      // just the risky `data` field.
       delete crumb.data
     }
   }
