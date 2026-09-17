@@ -500,9 +500,14 @@ instruction from him in the session.
   first job is still `created` (a job that has gone `active`, or that is sitting in `retry`, never
   swallows a newer event; `enqueue` returns `null` when a duplicate was collapsed).
   `ticket.triage` and `mailbox.sync` stay `standard` on purpose: their burst source is a push
-  webhook, and those enqueues pass `enqueue`'s `debounceSeconds` (pg-boss `singletonSeconds`),
-  which is policy-independent — and `mailbox.sync`'s own per-connection lease serializes whatever
-  still gets through. `short`'s
+  webhook, and those enqueues pass `enqueue`'s `debounceSeconds` — pg-boss's DEBOUNCE
+  (`singletonSeconds` + `singletonNextSlot`, policy-independent): one job per wall-clock-aligned
+  slot, and a send that finds the slot taken lands in the NEXT slot rather than being dropped, so a
+  burst collapses but its last event always runs (a customer follow-up in the same 10 s slot as the
+  ticket's previous triage — even a COMPLETED one, since pg-boss's slot index excludes only
+  `cancelled` — is triaged ≤ 11 s later, not left `new` for `mailbox.poll-sweep` (d)'s ten-minute
+  rescue; `singletonSeconds` alone is the THROTTLE that dropped it, PR #9) — and `mailbox.sync`'s
+  own per-connection lease serializes whatever still gets through. `short`'s
   index keys on `COALESCE(singleton_key,'')`, so two KEYLESS `boss.send` calls on one of those
   queues collapse into one — **`enqueue` is the only send path, and ESLint bans a bare `boss.send`
   outside `packages/queue` and tests.** **A new queue is added in FOUR
