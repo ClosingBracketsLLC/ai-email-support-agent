@@ -1999,13 +1999,23 @@ the record)</summary>
   be run once after this phase's 0021–0025 land or it fails). The known `e2e-phase3.test.ts`
   case-10 timing flake is handled per ruling R4 (a gate that fails ONLY there is re-run solo for
   that file); it did not fire in the close-out's, the fix wave's or R36's runs. PR #8's FIRST CI
-  run added a second instance of the same class: `e2e-phase7.test.ts` scenario 3's
-  `inboundToDraft` wait (40 s) on the loaded runner — a fresh ticket left `new`, scenarios 4/6/7
-  cascading, every other suite green — and a re-run of the SAME commit was green, so it is load,
-  not a defect; the message the test printed read as "no log at all" because a job's failure line
-  is keyed by job id, not ticket id, and `whyNoDraft` now also reads the ticket's own
-  `ticket.triage` / `ticket.draft` rows from pg-boss's table (state, retries, timings, the kept
-  error) so the next one is classifiable from the CI log alone. The 27 routes, the
+  run failed in `e2e-phase7.test.ts` scenario 3 — the R26 follow-up's `followUpToDraft` wait
+  (40 s): the 601st ticket, re-opened to `new` by the sync, was never triaged; scenarios 4/6/7
+  cascaded, every other suite was green, and a re-run of the SAME commit passed — which read as a
+  load flake until PR #9's diagnostic (`whyNoDraft` now reads the ticket's own `ticket.triage` /
+  `ticket.draft` rows from pg-boss's table: state, retries, timings, the kept error) showed BOTH
+  jobs `completed` in 14 and 33 ms with no retry: they were the ticket's ORIGINAL triage and draft,
+  and the follow-up's triage enqueue had been silently dropped. **A real defect, fixed in PR #9:**
+  `enqueue`'s `debounceSeconds` mapped to pg-boss's `singletonSeconds` ALONE, which is its
+  THROTTLE — one job per wall-clock-aligned slot, every further send in that slot dropped, and the
+  slot index excludes only `cancelled`, so a triage that had already COMPLETED in the slot still
+  blocked the follow-up's. In production that customer's reply waited for `mailbox.poll-sweep` (d)
+  (`STUCK_NEW_MINUTES` = 10, on a 2-minute cron) — ten to twelve minutes; a second push webhook in
+  the same slot as a `mailbox.sync` waited for the 2-minute poll the same way. `enqueue` now sets
+  `singletonNextSlot` beside `singletonSeconds` (pg-boss's `sendDebounced` shape): the second send
+  in a slot lands in the NEXT slot with `startAfter` at its boundary (+1 s), and only a third finds
+  it pending and returns null. `packages/queue/test/pg-boss-behaviour.test.ts` pins both halves
+  (the raw throttle, and `enqueue`'s debounce), RED before the fix. The 27 routes, the
   Playwright pass and the E2E's 11/11 stand from the wave's own gate at `58afd7a`; the R36 commit
   touched two `apps/app` files and the app suite ran 542/542 at `6f40203`.
 - **The whole-branch fix wave** (after the final review's five reports; ruling R35 sequenced it as
@@ -2498,9 +2508,10 @@ exports, so the minio-gated storage suite actually runs; a dev Postgres created 
 migrations **0021–0025** before `pnpm e2e` — and confirm the baseline (final, at the head
 `6f40203` after the whole-branch review, its fix wave and ruling R36):
 
-- **3,035 tests** plus 4 conditional test-kit skips with `S3_*` exported (`@aesa/contracts` 42,
+- **3,035 tests** plus 4 conditional test-kit skips with `S3_*` exported — 3,036 once PR #9's
+  debounce test is in (`@aesa/contracts` 42,
   `@aesa/crypto` 52, `@aesa/platform-mail` 19, `brand` 110, `@aesa/core` 300, `@aesa/llm` 158,
-  `@aesa/agent` 71, `@aesa/db` 119, `@aesa/queue` 29, `@aesa/mail` 242, `@aesa/knowledge` 165,
+  `@aesa/agent` 71, `@aesa/db` 119, `@aesa/queue` 29 → 30, `@aesa/mail` 242, `@aesa/knowledge` 165,
   `@aesa/test-kit` 43, `apps/api` 398, `apps/worker` 749, `apps/app` 542 jest across 66 suites);
 - **27 web routes** from `pnpm --filter @aesa/app export:web`;
 - `db:check` clean;

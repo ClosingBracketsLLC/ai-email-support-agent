@@ -1,5 +1,8 @@
 import type PgBoss from 'pg-boss'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { z } from 'zod'
+import type { JobDefinition } from '../src/define-job.ts'
+import { enqueue } from '../src/enqueue.ts'
 import { createQueueRetrying } from '../src/pg-boss.ts'
 import { deleteAllJobs, startTestBoss, uniqueName } from './helpers/boss.ts'
 
@@ -67,9 +70,47 @@ describe('pg-boss 10 behaviour we rely on', () => {
       expect(second).not.toBeNull()
     }))
 
-  it("'singletonSeconds' debounces bursts on a standard queue", () =>
+  // `singletonSeconds` ALONE is pg-boss's THROTTLE (`sendThrottled`): one job per wall-clock-aligned
+  // slot, every further send in that slot DROPPED — and job_i4 excludes only `cancelled`, so a job
+  // that already COMPLETED in the slot still blocks a new one. That is what `enqueue`'s
+  // `debounceSeconds` inherited until PR #9: a customer follow-up landing in the same 10 s slot as
+  // the ticket's previous triage enqueue was silently dropped (the Phase 7 E2E's R26 follow-up,
+  // 2 of 3 CI runs), and only `mailbox.poll-sweep` (d) rescued it, ten minutes later.
+  it("'singletonSeconds' alone THROTTLES a burst on a standard queue — the second send in the slot is dropped", () =>
     withQueue('standard', async (name) => {
+      await waitForSlotStart(10)
       expect(await boss.send(name, {}, { singletonSeconds: 10 })).not.toBeNull()
       expect(await boss.send(name, {}, { singletonSeconds: 10 })).toBeNull()
-    }))
+    }), 20_000)
+
+  // `enqueue`'s `debounceSeconds` is a DEBOUNCE (`sendDebounced`: `singletonSeconds` +
+  // `singletonNextSlot`): a burst collapses to one job per slot, but the last event is never lost —
+  // when the slot is taken, the job is inserted for the NEXT slot with `startAfter` at its boundary,
+  // and only a send that finds the next slot taken too returns null (one is already pending, and it
+  // will run after this send's cause was committed).
+  it("enqueue's debounceSeconds DEBOUNCES: the second send in a slot lands in the next slot, the third finds it pending", () =>
+    withQueue('standard', async (name) => {
+      const def = { name, schema: z.object({ orgId: z.string() }) } as unknown as JobDefinition<{ orgId: string }>
+      await waitForSlotStart(10)
+      const first = await enqueue(boss, def, { orgId: 'o' }, { entityId: 'e', debounceSeconds: 10 })
+      expect(first).not.toBeNull()
+      const second = await enqueue(boss, def, { orgId: 'o' }, { entityId: 'e', debounceSeconds: 10 })
+      expect(second).not.toBeNull()
+      expect(second).not.toBe(first)
+      const row = await boss.getJobById(name, second!)
+      // Scheduled past the next slot boundary: pg-boss's `getDebounceStartAfter` is
+      // `(N − secondsIntoSlot) + 1` seconds — the boundary plus a one-second guard — so 2 to N+1 s.
+      const delayMs = row!.startAfter.getTime() - row!.createdOn.getTime()
+      expect(delayMs).toBeGreaterThan(1_000)
+      expect(delayMs).toBeLessThanOrEqual(11_500)
+      expect(await enqueue(boss, def, { orgId: 'o' }, { entityId: 'e', debounceSeconds: 10 })).toBeNull()
+    }), 20_000)
 })
+
+/** Park the test at the START of a `seconds`-wide wall-clock slot (≤ 1.5 s in), so the sends
+ *  below cannot straddle a boundary and the "same slot" premise holds for the whole case. */
+async function waitForSlotStart(seconds: number): Promise<void> {
+  const slotMs = seconds * 1000
+  const into = Date.now() % slotMs
+  if (into > 1_500) await new Promise((r) => setTimeout(r, slotMs - into + 50))
+}
