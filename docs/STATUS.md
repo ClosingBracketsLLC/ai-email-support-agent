@@ -1998,7 +1998,14 @@ the record)</summary>
   runs against the SHARED dev database, so `DATABASE_URL=… pnpm --filter @aesa/db migrate` has to
   be run once after this phase's 0021–0025 land or it fails). The known `e2e-phase3.test.ts`
   case-10 timing flake is handled per ruling R4 (a gate that fails ONLY there is re-run solo for
-  that file); it did not fire in the close-out's, the fix wave's or R36's runs. The 27 routes, the
+  that file); it did not fire in the close-out's, the fix wave's or R36's runs. PR #8's FIRST CI
+  run added a second instance of the same class: `e2e-phase7.test.ts` scenario 3's
+  `inboundToDraft` wait (40 s) on the loaded runner — a fresh ticket left `new`, scenarios 4/6/7
+  cascading, every other suite green — and a re-run of the SAME commit was green, so it is load,
+  not a defect; the message the test printed read as "no log at all" because a job's failure line
+  is keyed by job id, not ticket id, and `whyNoDraft` now also reads the ticket's own
+  `ticket.triage` / `ticket.draft` rows from pg-boss's table (state, retries, timings, the kept
+  error) so the next one is classifiable from the CI log alone. The 27 routes, the
   Playwright pass and the E2E's 11/11 stand from the wave's own gate at `58afd7a`; the R36 commit
   touched two `apps/app` files and the app suite ran 542/542 at `6f40203`.
 - **The whole-branch fix wave** (after the final review's five reports; ruling R35 sequenced it as

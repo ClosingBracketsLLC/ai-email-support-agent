@@ -737,10 +737,28 @@ describe('Phase 7 close-out E2E (billing, caps, retention, delete, rotate, remem
     })
   }
 
+  /** The failure message when no draft arrives. The log filter alone once read as "no log at all"
+   *  on a loaded CI runner (PR #8's first run: a ticket left `new` for the whole wait) because a
+   *  job's failure line is keyed by JOB id, not ticket id — so the message also reads the ticket's
+   *  own `ticket.triage` / `ticket.draft` rows straight from pg-boss's table (both jobs are
+   *  enqueued under the `${orgId}:${ticketId}` singleton key): state, retries, timings and the
+   *  serialised error pg-boss kept in `output`. A transient that retried past the wait is then
+   *  distinguishable from a job that never existed. */
   async function whyNoDraft(o: Org, ticketId: string, found: number): Promise<string> {
     const ticket = await getTicket(o, ticketId)
     const lines = logLines.filter((line) => line.includes(ticketId)).slice(-4)
-    return `no draft on ticket ${ticketId} (found ${found}); ticket ${ticket.status}/${ticket.needsOwnerReason ?? '-'}\nlog: ${lines.join(' | ')}`
+    const { rows: jobs } = await admin.query<{
+      name: string; state: string; retry_count: number; created_on: Date; started_on: Date | null; completed_on: Date | null; output: unknown
+    }>(
+      `SELECT name, state, retry_count, created_on, started_on, completed_on, output FROM ${SCHEMA}.job
+         WHERE singleton_key = $1 ORDER BY created_on`,
+      [`${o.orgId}:${ticketId}`],
+    )
+    const jobLines = jobs.map((j) => {
+      const output = j.output === null || j.output === undefined ? '' : ` output=${JSON.stringify(j.output).slice(0, 400)}`
+      return `${j.name} ${j.state} retries=${j.retry_count} created=${j.created_on.toISOString()} started=${j.started_on?.toISOString() ?? '-'} completed=${j.completed_on?.toISOString() ?? '-'}${output}`
+    })
+    return `no draft on ticket ${ticketId} (found ${found}); ticket ${ticket.status}/${ticket.needsOwnerReason ?? '-'}\njobs (${jobs.length}): ${jobLines.join(' | ') || 'none'}\nlog: ${lines.join(' | ')}`
   }
 
   /** Marks viewed, approves through the real gate, triggers `send.execute` and waits for delivery. */
